@@ -55,7 +55,37 @@ git clone https://github.com/bingling360/ComfyUI-minimaxH3-SequenceForge.git
 
 ### 2. 安装潜空间放大二采权重（可选，仅用二采高清时需要）
 
-从 HuggingFace [`LBH-123-AI/Minimax_h3_latent_Upscaler`](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载 `.pth` / `.safetensors`，放入 `ComfyUI/models/latent_upscale_models/`（目录不存在就新建）。本仓库 `放大模型放到latent_upscale_models/` 文件夹里预置了一份权重（**仅本地暂存，未入 git**——690MB 超 GitHub 单文件 100MB 限制，clone 后此文件夹为空），拷过去即可：
+从 HuggingFace [`LBH-123-AI/Minimax_h3_latent_Upscaler`](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载权重，放入 `ComfyUI/models/latent_upscale_models/`（目录不存在就新建）。**权重不入 git**（单个 691MB 超 GitHub 单文件 100MB 限制），必须单独下载：
+
+**可下载的权重文件**（三选一，均为 3D 骨干，精度不同）：
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `minimax_h3_latent_upscaler_3d_fp16.safetensors` | 691 MB | **推荐**，半精度，显存占用小 |
+| `minimax_h3_latent_upscaler_3d_bf16.safetensors` | 691 MB | 半精度（bf16），与 fp16 二选一 |
+| `minimax_h3_latent_upscaler_3d_fp32.pth` | 1.38 GB | 全精度，效果最好但显存翻倍 |
+
+**下载方式（三选一）**：
+
+```bash
+# 方式一：浏览器直接下载单文件（最简单）
+# 打开仓库页面，点击对应文件右侧的下载箭头：
+https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/tree/main
+
+# 方式二：huggingface-cli 命令行下载
+pip install -U "huggingface_hub[cli]"
+hf download LBH-123-AI/Minimax_h3_latent_Upscaler \
+   minimax_h3_latent_upscaler_3d_fp16.safetensors \
+   --local-dir ComfyUI/models/latent_upscale_models
+
+# 方式三：国内网络走 hf-mirror.com 镜像（无需代理，用法同上）
+HF_ENDPOINT=https://hf-mirror.com hf download LBH-123-AI/Minimax_h3_latent_Upscaler \
+   minimax_h3_latent_upscaler_3d_fp16.safetensors \
+   --local-dir ComfyUI/models/latent_upscale_models
+# 或直接用镜像页面下载：https://hf-mirror.com/LBH-123-AI/Minimax_h3_latent_Upscaler
+```
+
+- **本地已有权重**：若本机 `放大模型放到latent_upscale_models/` 文件夹里已有 `minimax_h3_latent_upscaler_3d_fp16.safetensors`（仅本地暂存，未入 git），直接拷入模型目录即可，无需再下载：
 
 ```bash
 mkdir -p ComfyUI/models/latent_upscale_models
@@ -63,7 +93,7 @@ cp ComfyUI-minimaxH3-SequenceForge/放大模型放到latent_upscale_models/*.saf
    ComfyUI/models/latent_upscale_models/
 ```
 
-- 放大模型的「网络架构」下拉须与权重匹配（2D 残差骨干 / 纯 3D 卷积），不匹配时插件会明确报错；当前预置为 **3D 骨干 fp16** 一份；
+- 放大模型的「网络架构」下拉须与权重匹配（2D 残差骨干 / 纯 3D 卷积），不匹配时插件会明确报错；上述三份均为 **3D 骨干**（架构下拉选 3D）；
 - 不装权重不影响主链生成，仅导演台「✦ 潜空间放大二采」面板不可用（下拉为空）。
 
 ### 3. 验证安装

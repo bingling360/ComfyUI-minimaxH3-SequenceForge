@@ -1,0 +1,15 @@
+# 二采放大权重（690MB，超 GitHub 单文件 100MB 限制，请从 HuggingFace 下载：
+# https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler ）
+放大模型放到latent_upscale_models/
+
+# 项目工作数据（AI 助手本地记忆，不属于插件本体）
+.workbuddy/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 系统杂物
+Thumbs.db
+.DS_Store

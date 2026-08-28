@@ -1,0 +1,13 @@
+[project]
+name = "ComfyUI-minimaxH3-SequenceForge"
+description = "MiniMax H3 长视频双节点：段间引导无缝续拍（上段尾帧 latent 直切钉入下段）+ 分镜模式（关键帧首尾双向锚定，误差不沿链传播），官方原生协议，零 monkey-patch，零额外依赖。"
+version = "0.2.0"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/bingling360/ComfyUI-minimaxH3-SequenceForge"
+
+[tool.comfy]
+PublisherId = "local"
+DisplayName = "ComfyUI-minimaxH3-SequenceForge"

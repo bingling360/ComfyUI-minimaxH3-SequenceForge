@@ -1,0 +1,1 @@
+# 无第三方依赖：仅使用 ComfyUI 自带的 torch / torchaudio / comfy 核心与官方 MiniMax H3 节点。

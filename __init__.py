@@ -17,20 +17,20 @@ try:
             try:
                 from .routes import add_routes as _add_routes
                 _add_routes(routes)
-                print("[ComfyUI-minimaxH3-SequenceForge] 路由已注册（扩展钩子，含 /api 前缀副本）："
+                print("[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子，含 /api 前缀副本）："
                       "GET /h3chain/ping, /h3chain/projects, /h3chain/project, "
                       "/h3chain/upscale_models, /h3chain/experiments, "
                       "POST /h3chain/create_project, /h3chain/save_prompts, "
                       "/h3chain/delete_project, /h3chain/delete_file, /h3chain/merge, "
                       "/h3chain/upscale_reset, /h3chain/redo_cancel")
             except Exception:
-                print("[ComfyUI-minimaxH3-SequenceForge] 扩展钩子路由注册失败，回退到 PromptServer。详细错误：")
+                print("[ComfyUI_H3_SeamlessChain] 扩展钩子路由注册失败，回退到 PromptServer。详细错误：")
                 traceback.print_exc()
                 try:
                     from .routes import register
                     register()
                 except Exception:
-                    print("[ComfyUI-minimaxH3-SequenceForge] 回退路由注册也失败。详细错误：")
+                    print("[ComfyUI_H3_SeamlessChain] 回退路由注册也失败。详细错误：")
                     traceback.print_exc()
 
     async def comfy_entrypoint() -> H3SeamlessChainExtension:
@@ -43,9 +43,9 @@ try:
         from .routes import register as _register_routes
         _register_routes()
     except Exception:
-        print("[ComfyUI-minimaxH3-SequenceForge] 路由注册入口调用失败。详细错误：")
+        print("[ComfyUI_H3_SeamlessChain] 路由注册入口调用失败。详细错误：")
         traceback.print_exc()
 except Exception:
-    print("[ComfyUI-minimaxH3-SequenceForge] 加载失败：本插件需要 ComfyUI v0.30.0 及以上（含官方 MiniMax H3 节点与 comfy_api.latest）。")
-    print("[ComfyUI-minimaxH3-SequenceForge] 请升级 ComfyUI 后重启。详细错误：")
+    print("[ComfyUI_H3_SeamlessChain] 加载失败：本插件需要 ComfyUI v0.30.0 及以上（含官方 MiniMax H3 节点与 comfy_api.latest）。")
+    print("[ComfyUI_H3_SeamlessChain] 请升级 ComfyUI 后重启。详细错误：")
     traceback.print_exc()

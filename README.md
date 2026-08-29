@@ -51,7 +51,7 @@ git clone https://github.com/bingling360/ComfyUI-minimaxH3-SequenceForge.git
 
 **依赖**：本插件零第三方依赖——`requirements.txt` 为空，只用 ComfyUI 自带的 torch / comfy 核心与官方 MiniMax H3 节点，`pip install -r requirements.txt` 一步可跳过。
 
-重启 ComfyUI。控制台出现 `[ComfyUI-minimaxH3-SequenceForge] 路由已注册…` 即加载成功；若提示「需要 ComfyUI v0.30.0 及以上」，先按下方「版本要求」升级。AutoDL 环境（`/root/miniconda3`）同样步骤，无需额外装包。
+重启 ComfyUI。控制台出现 `[ComfyUI-minimaxH3-SequenceForge] 路由已注册…` 即加载成功；若提示需要更高版本 ComfyUI，先按下方「版本要求」升级（建议 v0.34.0+）。AutoDL 环境（`/root/miniconda3`）同样步骤，无需额外装包。
 
 ### 2. 安装潜空间放大二采权重（可选，仅用二采高清时需要）
 
@@ -163,8 +163,8 @@ ComfyUI-minimaxH3-SequenceForge/
 
 ## 版本要求
 
-- ComfyUI **≥ v0.30.0**（含官方 MiniMax H3 节点），否则插件不加载并在控制台提示。
-- 段间引导的**多帧桥**与**音频锚定**需要 ComfyUI 含 [PR #15439](https://github.com/Comfy-Org/ComfyUI/pull/15439)（2026-08-09 之后构建）。旧版本（如 v0.32.0）的 keyframe 协议每个锚点只收单帧 latent，插件会在运行时自动探测：不支持时自动降级为**单帧桥 + 仅视频引导**（报告中注明，接缝质量受限）。**升级 ComfyUI 后无需改任何参数，自动恢复完整引导帧数**；r2v 链在旧版本上引导还会与参考素材冲突失效，务必升级。
+- **建议 ComfyUI ≥ v0.34.0**。硬性下限为 v0.30.0（含官方 MiniMax H3 节点与 `comfy_api.latest`），低于 v0.30.0 插件不加载并在控制台提示。
+- 旧版本（0.30–0.33）可以加载，但段间引导的**多帧桥**与**音频锚定**需要 ComfyUI 含 [PR #15439](https://github.com/Comfy-Org/ComfyUI/pull/15439)（2026-08-09 之后构建）——旧 keyframe 协议每个锚点只收单帧 latent，插件会运行时自动探测并降级为**单帧桥 + 仅视频引导**（报告中注明，接缝质量受限）。**升级 ComfyUI 后无需改任何参数，自动恢复完整引导帧数**；r2v 链在旧版本上引导还会与参考素材冲突失效，务必升级。
 
 ## 使用（节点界面为中文）
 

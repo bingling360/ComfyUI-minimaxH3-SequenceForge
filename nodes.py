@@ -45,6 +45,8 @@ from . import checkpoint
 from . import metrics
 from . import experiments
 from . import transition
+from . import bridge
+from . import guides
 from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
                    audio_tokens_for_frames, align_frame_count_down)
 
@@ -85,6 +87,43 @@ def cond_audio_rows_guard(dit):
 
     dit._cond_audio_rows = fixed
     return lambda: setattr(dit, "_cond_audio_rows", orig)
+
+
+def cond_video_rows_guard(dit):
+    """安装 _cond_video_rows 兜底 patch，返回恢复函数（try/finally 调用）。
+
+    ComfyUI 0.33.0~0.33.4 的 MiniMaxH3.extra_conds 在 refs 分支用「=」覆盖了
+    keyframes 分支刚写入的 cond_video_latents（0.34.2 起才改成 +=）：
+
+        keyframes -> payload["cond_video_latents"] = [kf latent...]
+        refs      -> payload["cond_video_latents"] = [ref latent...]   # 覆盖！
+
+    于是「段间桥 keyframe + 参考图」同段共存时，keyframe 的 latent 被整个丢掉，
+    而 PackedLayout 仍按 keyframes+refs 两者预留行数 —— _forward 里
+    all_video_rows[~img_update] = cond_video_rows 直接形状错位：
+        shape mismatch: [405, 96] cannot be broadcast to [810, 96]
+    （405 = 864×480 基础画幅一帧的 2×2 patch 行数，810 = 桥锚 + 参考图两份）
+
+    触发面：非首段且本段挂了参考素材（首段无桥所以不挂 keyframe，反而平安）；
+    与二采无关（关掉二采照样崩）。与 cond_audio_rows_guard 同机制，按 layout
+    段顺序（keyframe 在前、refs 在后）用 payload 里完好的素材在线重建。
+    """
+    orig = dit._cond_video_rows
+
+    def fixed(payload, device, _orig=orig):
+        want = [kf["latent"] for kf in (payload.get("keyframes") or [])
+                if kf.get("latent") is not None]
+        want += [r["latent"] for r in (payload.get("refs") or []) if "latent" in r]
+        supplied = payload.get("cond_video_latents") or []
+        # 身份比较：命中官方正确实现（0.34.2+）时零改动，只在被覆盖/被别的
+        # 插件重建过时才接管；不比较张量内容，避免无谓的 GPU 同步
+        if want and [id(z) for z in supplied] != [id(z) for z in want]:
+            payload = dict(payload)
+            payload["cond_video_latents"] = want
+        return _orig(payload, device)
+
+    dit._cond_video_rows = fixed
+    return lambda: setattr(dit, "_cond_video_rows", orig)
 
 
 def step_cond_noise_guard(dit, aug_start, aug_end, fade_ratio):
@@ -1043,6 +1082,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append("实验性功能：后端已强制关闭（H3_EXPERIMENTS=0）")
         elif exp.enabled:
             report.append(exp.describe())
+        # 软桥能力探测：只在开关打开时探测并报告（全关时报告与旧版逐行一致）。
+        # 等级 0 = 本机 ComfyUI 不支持逐 token 掩码 -> 整链自动回退现状路径。
+        _sb_level, _sb_reason = 0, "未启用"
+        if exp.has("soft_bridge"):
+            _sb_level, _sb_reason = bridge.probe_soft_bridge()
+            report.append("软桥：" + ("开" if _sb_level else "关") + " · "
+                          + bridge.level_text(_sb_level, _sb_reason))
+            if _sb_level == bridge.LEVEL_OFF:
+                report.append("软桥不可用，本次按现状「钉桥 + 裁头」生成（行为与关闭开关时一致）")
         if insert_specs:
             _ins_txt = "、".join(f"链位{p}={f}" for p, f in insert_specs)
             report.append(f"插入视频：{len(insert_specs)} 段（{_ins_txt}）——画面+原声进成片，尾帧桥指导下一段")
@@ -1753,12 +1801,27 @@ class H3SeamlessChainSampler(io.ComfyNode):
             replay = (use_ckpt and g < done and _redo_mode is None
                       and os.path.exists(checkpoint.seg_path(root, g)))
             next_wants_bridge = _next_wants_bridge(item_i)
-            skip_f = 0 if _is_fact_first(item_i) or seg_unlink[i] else ctx
+            # 桥区软着陆（实验）预检：段首钉住上段尾，只烧「钉住帧数」而不是整段 ctx 帧。
+            # 预检必须放在 cond 构造之前——seg_len 一旦按某档定死就不能中途改，
+            # 否则 cond 的帧数与裁剪量对不上。任一条件不满足即整段走现状路径。
+            _has_src = not (_is_fact_first(item_i) or seg_unlink[i])
+            _soft_hold = 0
+            if (exp.has("soft_bridge") and _sb_level > 0 and _has_src
+                    and guide is not None
+                    and _redo_mode not in ("仅锚下段", "无锚")):
+                _hf, _ht, _ha = bridge.plan_for_guide(
+                    guide, int(exp.param("soft_bridge", "钉住帧数", 9)))
+                if _ht > 0:
+                    _soft_hold = _hf
+            # skip_f 与采样额外帧数一次定死：回放分支与生成分支共用同一个值。
+            # 软桥段存下的是「段长+hold」帧的 latent，回放时若按 ctx 裁会多裁帧。
+            skip_f, _seg_extra = bridge.resolve_crop(_soft_hold, ctx, _has_src)
             # 首帧图段级引用（中段）：头锚 latent——生成段注入 cond，回放段二采补渲染同用
             #（定义在 replay 分支之前：两路都消费；独立镜头段照常注入，本段主动锚）
             _head_kf = head_frame_latent \
                 if (i > 0 and seg_first_on[i] and head_frame_latent is not None) else None
             _seg_t.update(cond=0.0, sample=0.0, decode=0.0)
+            _soft_note = ""   # 软桥报告后缀（只有采样段装配成功才非空；回放段为空）
             if replay:
                 video_t, audio_t = checkpoint.load_segment(root, g)
                 video_t = video_t.to(video_vae.device)
@@ -1780,7 +1843,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     cur_seed = (seeds[-1] + g - len(seeds) + 1) % 0xffffffffffffffff
                 else:
                     cur_seed = (seed + i) % 0xffffffffffffffff
-                seg_len = seg_lengths[i] + (0 if skip_f == 0 else ctx)
+                # 软桥：只补「钉住帧数」；现状路径仍补整段 ctx 帧（钉桥 + 裁头）
+                seg_len = seg_lengths[i] + _seg_extra
                 if has_refs:
                     # 段级注入：只把本段勾选的素材压实进 conditioning（未勾选的根本不进本段），
                     # 三类各自独立编号 ref_image_/ref_video_/ref_audio_（<Picture>/<Video>/<Audio>）
@@ -1870,15 +1934,72 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                 {"resolved_frame_index": fi, "latent": _ma}
                                 for fi in experiments.memory_anchor_positions(_pos_mode, _sampled_fc)
                             ]
+                    # 多锚点（实验）：段中锚点——复用本段已有的头锚/记忆锚素材，在段中部
+                    # 再钉一个锚抑制长段内部漂移。走 guides 的官方语义校验（越界/放不下就跳过）。
+                    mid_kfs = None
+                    if exp.has("mid_anchor"):
+                        _mid_fc = latent_t_to_frames(latent["samples"].tensors[0].shape[2])
+                        # 优先用记忆锚（首段**视频** latent，动态、与链同源）；头锚是
+                        # 静态首帧图，钉在段中会让画面构图突然回落——仅作退路并明确提示。
+                        _mid_is_still = False
+                        if memory_kfs:
+                            _mid_src = memory_kfs[0]["latent"]
+                        elif _head_kf is not None:
+                            _mid_src, _mid_is_still = _head_kf, True
+                        else:
+                            _mid_src = None
+                        if _mid_src is None:
+                            report.append(f"段{g + 1} 段中锚点跳过：本段没有头锚/记忆锚素材可复用")
+                        else:
+                            _mid_kf, _mid_why = guides.prepare_anchor(
+                                guides.mid_anchor_index(
+                                    _mid_fc, float(exp.param("mid_anchor", "锚点位置", 0.5))),
+                                _mid_fc, video_latent=_mid_src, label="段中")
+                            if _mid_kf is not None:
+                                mid_kfs = [_mid_kf]
+                                report.append(f"段{g + 1} 段中锚点：帧 {_mid_kf['resolved_frame_index']}"
+                                              f"/{_mid_fc}（抑制段内漂移）"
+                                              + ("，素材=静态首帧图（可能使构图回落，建议改用 E2 记忆锚）"
+                                                 if _mid_is_still else "，素材=E2 记忆锚"))
+                            else:
+                                report.append(f"段{g + 1} {_mid_why}")
                     cond = cls._apply_guide(
                         cond, eff_guide, latent_t_to_frames(latent["samples"].tensors[0].shape[2]),
                         tail_kf_latent=_tail_kf, e1_windows=e1_kfs, memory_kfs=memory_kfs,
-                        head_kf_latent=_head_kf)
+                        head_kf_latent=_head_kf, mid_kfs=mid_kfs)
+                    # 锚点越界体检（只报不拦）：官方 AddGuide 明确判越界，这里给出排查线索
+                    for _w in guides.audit_keyframes(
+                            cond[0][1].get("minimax_keyframes", []),
+                            latent_t_to_frames(latent["samples"].tensors[0].shape[2])):
+                        report.append(f"段{g + 1} {_w}")
                     # 锚定加噪（SkyReels-V2 addnoise_condition 思路）：H3 模型 payload
                     # 原生支持 cond 噪声增强（extra_conds 从 cond dict 任意键取参），
                     # aug=1.0 即不加噪；值越小锚定越「软」，缓解段首刹车/内容重演
                     if aug > 0.0:
                         cond = _apply_anchor_noise(cond, aug)
+
+                # 桥区软着陆装配：初始 latent 头部写入上段尾 + 逐 token 掩码（video/audio 各一份）。
+                # 装配失败不重来——仍按钉住帧数裁头（形状一致），只是没有钉住效果。
+                _sampling_latent = latent
+                _soft_note = ""
+                if _soft_hold:
+                    _sb_curve = str(exp.param("soft_bridge", "释放曲线", "hold"))
+                    if _sb_curve not in bridge.CURVES:
+                        _sb_curve = "hold"
+                    try:
+                        _sampling_latent, _sb_mask, _soft_info = bridge.apply_soft_bridge(
+                            latent, eff_guide, _soft_hold, _sb_curve)
+                        skip_f = int(_soft_info["hold_frames"])
+                        _soft_note = (f" · 软桥钉住上段尾 {_soft_info['hold_frames']}帧"
+                                      f"/{_soft_info['hold_tokens']}token"
+                                      f"（音频 {_soft_info['hold_audio_tokens']}token"
+                                      f" · {_sb_curve}）")
+                    except Exception as e:
+                        if "out of memory" in str(e).lower():
+                            raise   # 显存致命：不静默降级，交上层终止并报告
+                        _sampling_latent = latent
+                        skip_f = _soft_hold
+                        _soft_note = f" · 软桥装配失败（{e}），按 {_soft_hold} 帧裁头"
 
                 # 接缝自动重摇：本段生成后若缝差超阈值，换种子重采本段（上限内），
                 # 排除抽卡坏段（同参数下缝差 0.02-0.17 波动大）。cond/latent 与种子
@@ -1909,6 +2030,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 共存 H3 插件可能丢 keyframe/refs 音频导致 cond_audio 行数错位，
                     # 采样期挂模型层兜底（见 cond_audio_rows_guard），完成后恢复
                     restore_audio_rows = cond_audio_rows_guard(模型.model.diffusion_model)
+                    # 官方 0.33.x extra_conds 用「=」覆盖 cond_video_latents：
+                    # 参考图与段间桥/锚点同段共存时丢 keyframe latent（见
+                    # cond_video_rows_guard），同样在采样期兜底
+                    restore_video_rows = cond_video_rows_guard(模型.model.diffusion_model)
                     # 递减锚定：visual_cond_noise_aug 随采样进度从强到弱递减到消失。
                     # 开启时覆盖 _apply_anchor_noise 写入的固定值——每步动态计算
                     restore_step_aug = None
@@ -1918,11 +2043,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             模型.model.diffusion_model, aug_start, 0.0, fade_ratio)
                     try:
                         t0 = time.perf_counter()
+                        # 软桥开启时传的是装好钉住内容与 noise_mask 的 latent；
+                        # 未开启就是官方空 latent（与现状逐字节一致）
                         sampled = nodes.common_ksampler(
                             模型, cur_seed, 步数, CFG,
-                            采样器, 调度器, cond, negative, latent, denoise=1.0)[0]
+                            采样器, 调度器, cond, negative, _sampling_latent, denoise=1.0)[0]
                     finally:
                         restore_audio_rows()
+                        restore_video_rows()
                         if restore_step_aug:
                             restore_step_aug()
                     dt = time.perf_counter() - t0
@@ -1941,7 +2069,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 对缝区做 past|transition|future 三窗双锚 + 缝区独占噪声的定向重采样。
                     # 只改 transition 窗，前后帧不动；E4 优先于整段重摇，E4 后仍不合格再回退。
                     # 全关 / 独立镜头 / 无缝 / 过渡窗过小 → 跳过（零影响）。
+                    # 软桥段跳过 E4：E4 用「缝区独占纯噪声」重采过渡窗，会把刚钉住的
+                    # 上段尾衔接一并冲掉，与软桥目标相反；软桥缝差本就更小，E4 触发
+                    # 概率也低。两者不叠加，E4 仍是现状路径（无软桥）的兜底。
                     if (attempt == 0 and exp.has("e4_transition_res")
+                            and not _soft_hold
                             and prev_tail_frame is not None and not seg_unlink[i]
                             and d_raw is not None and d_raw > float(重摇阈值)):
                         _e4_tf = int(exp.param("e4_transition_res", "过渡窗帧数", 17))
@@ -1959,6 +2091,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             aug=aug, fade_ratio=fade_ratio,
                             eff_guide=eff_guide, tail_anchor_latent=tail_anchor_latent,
                             cond_audio_rows_guard=cond_audio_rows_guard,
+                            cond_video_rows_guard=cond_video_rows_guard,
                             step_cond_noise_guard=step_cond_noise_guard,
                             _apply_anchor_noise=_apply_anchor_noise,
                             latent_t_to_frames=latent_t_to_frames,
@@ -2023,7 +2156,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 增益不沿链累积；归一化已排除锚定区，此处兜住内容本身的响度差。
             # 独立镜头段跳过（独立镜头常配独立声音设计）
             if (item_i > 0 or off) and prev_tail_wav is not None and not seg_unlink[i]:
-                wav, gain_db = qc.loudness_align_head(wav, prev_tail_wav, rate=sample_rate)
+                # 软桥下音频头部与上段尾同帧钉住，接缝已逐帧连续：默认不再叠增益
+                # （强度 0 = 不干预），残留响度差由「音频接缝软过渡」开关按需要回加。
+                _la_strength = 1.0
+                if exp.has("audio_seam"):
+                    _la_strength = float(exp.param("audio_seam", "响度对齐强度", 0.0))
+                wav, gain_db = qc.loudness_align_head(wav, prev_tail_wav, rate=sample_rate,
+                                                      strength=_la_strength)
                 if gain_db is not None:
                     report.append(f"段{g + 1} 响度对齐：段首 {gain_db:+.1f} dB（1s 渐出）")
 
@@ -2125,7 +2264,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {_seg_t['sample']:.0f}s") + f" | {note}"
                           + (" · 独立镜头（断链）" if seg_unlink[i] else "")
                           + (" · 首帧图头锚" if _head_kf is not None else "")
-                          + (" · 尾帧图尾锚" if (seg_end_on[i] and end_frame_latent is not None) else ""))
+                          + (" · 尾帧图尾锚" if (seg_end_on[i] and end_frame_latent is not None) else "")
+                          + _soft_note)
             report.append(f"⏱ 段{g + 1}：条件 {_seg_t['cond']:.0f}s · 一采 {_seg_t['sample']:.0f}s"
                           f" · 基础解码 {_seg_t['decode']:.0f}s"
                           + (f" · TE缓存 命中{clip.hits}/未中{clip.misses}" if clip.hits or clip.misses else ""))
@@ -2294,7 +2434,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
     @staticmethod
     def _apply_guide(cond, guide, sampled_fc, tail_kf_latent=None, e1_windows=None,
-                     memory_kfs=None, head_kf_latent=None):
+                     memory_kfs=None, head_kf_latent=None, mid_kfs=None):
         """把 keyframe 注入 conditioning（官方 minimax_keyframes 协议）。
 
         guide: 首帧引导桥 keyframe（上段尾 latent 切片），None=首段无桥。
@@ -2306,6 +2446,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         注入位置由调用方算好）；None=不注入。与 guide/尾锚叠加、互不干扰。
         head_kf_latent: 段级首帧图引用的头锚 latent，注入段头（resolved_frame_index
         =0，与段首桥同位叠加）；None=不注入。
+        mid_kfs: 段中锚点 keyframe 列表（多锚点实验，官方 AddGuide 语义——同一
+        cond 里可挂多条 keyframe，位置由调用方算好并过 guides 校验）；None=不注入。
         """
         existing = cond[0][1].get("minimax_keyframes", [])
         keyframes = list(existing)
@@ -2318,6 +2460,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             keyframes.append({"resolved_frame_index": 0, "latent": head_kf_latent})
         if memory_kfs:
             keyframes.extend(memory_kfs)
+        if mid_kfs:
+            keyframes.extend(mid_kfs)
         if tail_kf_latent is not None:
             keyframes.append({"resolved_frame_index": sampled_fc - 1,
                               "latent": tail_kf_latent})
@@ -2339,6 +2483,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                  aug=0.0, fade_ratio=0.0,
                                  eff_guide=None, tail_anchor_latent=None,
                                  cond_audio_rows_guard=None,
+                                 cond_video_rows_guard=None,
                                  step_cond_noise_guard=None,
                                  _apply_anchor_noise=None,
                                  latent_t_to_frames=None,
@@ -2416,6 +2561,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         # 过渡重采样（低步数）
         restore_rows = cond_audio_rows_guard(模型.model.diffusion_model) if cond_audio_rows_guard else None
+        # 双锚 keyframe 与参考图共存时同样会撞 0.33.x 的 cond_video_latents 覆盖
+        restore_video_rows = cond_video_rows_guard(模型.model.diffusion_model) \
+            if cond_video_rows_guard else None
         restore_step = None
         if fade_ratio > 0 and step_cond_noise_guard is not None and dual_anchor_strength > 0:
             e4_aug_start = 1.0 - (aug / max(0.01, dual_anchor_strength)) if aug > 0 else 0.999
@@ -2428,6 +2576,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         finally:
             if restore_rows:
                 restore_rows()
+            if restore_video_rows:
+                restore_video_rows()
             if restore_step:
                 restore_step()
 

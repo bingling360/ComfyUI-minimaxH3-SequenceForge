@@ -1869,7 +1869,7 @@ async function deleteProject(dir) {
         });
         if (r.status === 404 || r.status === 405) {
             setApiError(`项目接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台是否出现`
-                + `「[ComfyUI-minimaxH3-SequenceForge] 路由已注册」日志；若仍失败请把控制台报错反馈给开发。`);
+                + `「[ComfyUI_H3_SeamlessChain] 路由已注册」日志；若仍失败请把控制台报错反馈给开发。`);
             setLed("error", `删除路由未注册 (HTTP ${r.status})`);
             return;
         }
@@ -2147,7 +2147,7 @@ async function collectData() {
     }
     setApiError(ping.ok ? "" :
         `项目存档接口未注册（HTTP ${ping.status || "??"}）：请重启 ComfyUI 并检查控制台是否出现`
-        + `「[ComfyUI-minimaxH3-SequenceForge] 路由已注册」日志；若仍失败请把控制台报错反馈给开发。`);
+        + `「[ComfyUI_H3_SeamlessChain] 路由已注册」日志；若仍失败请把控制台报错反馈给开发。`);
 
     /* 当前项目：节点「存档目录」指向优先（用户刚切换还没跑），回落 state 指针 */
     const stateRaw = await fetchJson("h3_projects", "h3chain_state.json");

@@ -69,6 +69,45 @@ EXPERIMENT_DEFS = {
             {"key": "双锚强度", "type": "num", "def": 1.0, "min": 0.0, "max": 2.0, "step": 0.1},
         ],
     ),
+    "soft_bridge": dict(
+        name="桥区软着陆",
+        group="生成结构",
+        desc="段首直接钉住上一段的真实尾巴（逐 token 噪声掩码），替代「多烧 ctx 帧再裁掉」；"
+             "接缝处模型是接着上段末帧画，而不是照条件重画一遍。需 ComfyUI v0.34+",
+        default=False,
+        params=("钉住帧数", "释放曲线"),
+        params_meta=[
+            {"key": "钉住帧数", "type": "num", "def": 9, "min": 5, "max": 22, "step": 4,
+             "desc": "段首被钉住的帧数（自动对齐到 token 网格：5/9/13/17/18/22）。"
+                     "越大上文越完整、省得越少；默认 9 帧 = 3 token"},
+            {"key": "释放曲线", "type": "enum", "def": "hold",
+             "opts": ["hold", "linear", "smoothstep", "ease_in"],
+             "desc": "hold=整窗钉死（默认，上文逐帧精确）；其余为对照档：钉住窗内提前放开生成"},
+        ],
+    ),
+    "audio_seam": dict(
+        name="音频接缝软过渡",
+        group="生成结构",
+        desc="软桥下音频头部与上段尾同帧钉住，接缝逐帧连续；本开关控制段首响度对齐的残留强度"
+             "（0=完全不做，1=现状）。需同时开启「桥区软着陆」才有钉住效果",
+        default=False,
+        params=("响度对齐强度",),
+        params_meta=[
+            {"key": "响度对齐强度", "type": "num", "def": 0.0, "min": 0.0, "max": 1.0, "step": 0.1},
+        ],
+    ),
+    "mid_anchor": dict(
+        name="段中锚点",
+        group="长链记忆",
+        desc="在段中部再钉一个锚（复用本段已有的头锚/记忆锚素材），抑制长段内部漂移。"
+             "对齐官方 MiniMaxH3AddGuide 的任意帧锚定语义",
+        default=False,
+        params=("锚点位置",),
+        params_meta=[
+            {"key": "锚点位置", "type": "num", "def": 0.5, "min": 0.25, "max": 0.75, "step": 0.05,
+             "desc": "锚点在本段中的相对位置（0.5=正中）"},
+        ],
+    ),
 }
 
 # 后端硬开关：H3_EXPERIMENTS=0 强制全关（优先级最高，忽略一切前端开关）

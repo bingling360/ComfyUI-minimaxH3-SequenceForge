@@ -253,16 +253,16 @@ def register(routes=None):
         try:
             add_routes(routes)
             _registered = True
-            print(f"[ComfyUI-minimaxH3-SequenceForge] 路由已注册（扩展钩子，含 /api 前缀副本）：{_ROUTES_LOG}")
+            print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子，含 /api 前缀副本）：{_ROUTES_LOG}")
             return True
         except Exception:
-            print("[ComfyUI-minimaxH3-SequenceForge] 路由注册失败（删除功能不可用）。详细错误：")
+            print("[ComfyUI_H3_SeamlessChain] 路由注册失败（删除功能不可用）。详细错误：")
             traceback.print_exc()
             return False
 
     PromptServer = _import_promptserver()
     if PromptServer is None:
-        print("[ComfyUI-minimaxH3-SequenceForge] 未找到 PromptServer，跳过路由注册（测试环境正常）")
+        print("[ComfyUI_H3_SeamlessChain] 未找到 PromptServer，跳过路由注册（测试环境正常）")
         return False
 
     inst = getattr(PromptServer, "instance", None)
@@ -283,7 +283,7 @@ def register(routes=None):
             add_routes(target)
             _registered = True
             where = "app.router" if router is not None else "PromptServer.instance.routes"
-            print(f"[ComfyUI-minimaxH3-SequenceForge] 路由已注册（{where}，含 /api 前缀副本）：{_ROUTES_LOG}")
+            print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（{where}，含 /api 前缀副本）：{_ROUTES_LOG}")
             return True
         except Exception:
             # app.router 失败则回退 RouteTableDef（保留旧版兼容）
@@ -292,12 +292,12 @@ def register(routes=None):
                 try:
                     add_routes(routes2)
                     _registered = True
-                    print(f"[ComfyUI-minimaxH3-SequenceForge] 路由已注册（RouteTableDef，含 /api 前缀副本）：{_ROUTES_LOG}")
+                    print(f"[ComfyUI_H3_SeamlessChain] 路由已注册（RouteTableDef，含 /api 前缀副本）：{_ROUTES_LOG}")
                     return True
                 except Exception:
                     traceback.print_exc()
                     return False
-            print("[ComfyUI-minimaxH3-SequenceForge] 路由注册失败（删除功能不可用）。详细错误：")
+            print("[ComfyUI_H3_SeamlessChain] 路由注册失败（删除功能不可用）。详细错误：")
             traceback.print_exc()
             return False
 
@@ -333,4 +333,4 @@ def _install_promptserver_hook(PromptServer):
 
     PromptServer.__init__ = _h3_init
     PromptServer._h3_route_hook_installed = True
-    print("[ComfyUI-minimaxH3-SequenceForge] PromptServer 尚未实例化，已安装实例化后自动注册路由的钩子")
+    print("[ComfyUI_H3_SeamlessChain] PromptServer 尚未实例化，已安装实例化后自动注册路由的钩子")

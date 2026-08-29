@@ -1206,6 +1206,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         negative = _tensors_to_device(negative, _edev)
 
     restore_rows = plugin_nodes.cond_audio_rows_guard(模型.model.diffusion_model)
+    # 参考图与段间桥/锚点同段共存时，官方 0.33.x extra_conds 会丢 keyframe latent
+    # （cond_video_latents 被 refs 分支覆盖）——二采同样要兜底，否则段2 高清
+    # 精化的第一步就形状错位
+    restore_video_rows = plugin_nodes.cond_video_rows_guard(模型.model.diffusion_model)
 
     def _is_oom(e):
         return "out of memory" in str(e).lower()
@@ -1401,6 +1405,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                               f"（{'采纳' if retried else '保留原轮'}）")
     finally:
         restore_rows()
+        restore_video_rows()
     _tmark("refine", _t)
     print(f"[H3二采] 段{seg_no}：精化重采样完成（{(_timing or {}).get('refine', 0.0):.0f}s）"
           "→ 高清解码…", flush=True)

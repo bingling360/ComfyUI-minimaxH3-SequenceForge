@@ -57,3 +57,37 @@ def frames_to_latent_t(frames, up=True):
 def audio_tokens_for_frames(frames):
     """像素帧数 -> 音频 latent token 数（1 视频帧 = FRAME_RESCALE 个音频 latent 帧）。"""
     return round(frames * FRAME_RESCALE)
+
+
+def token_start_frames(latent_t):
+    """各视频 latent token 的起始像素帧（长度 latent_t）。
+
+    首 token 承载 1 帧、其后每个 4 帧（FRAME_PER_TOKEN 循环），故 token 边界
+    不等距——逐 token 掩码必须按真实帧位计算，不能简单按 token 序号线性插值
+    （否则前 1 帧会被当成 4 帧，斜坡头部出现突变）。
+    """
+    out = []
+    f = 0
+    for k in range(int(latent_t)):
+        out.append(f)
+        f += FRAME_PER_TOKEN[k % len(FRAME_PER_TOKEN)]
+    return out
+
+
+def token_center_frames(latent_t):
+    """各视频 latent token 中心像素帧（斜坡采样点，语义同 token_start_frames）。"""
+    return [f + FRAME_PER_TOKEN[k % len(FRAME_PER_TOKEN)] / 2.0
+            for k, f in enumerate(token_start_frames(latent_t))]
+
+
+def snap_frames_to_tokens(frames, up=True):
+    """把「钉住帧数」对齐到 token 边界（向下/向上取到真实 token 网格）。
+
+    钉住区是整 token 切的（latent 不能切半个 token），而 token↔帧映射不等距
+    （首 token 1 帧、其后 4 帧、每 5 token 循环），可达帧数是
+    1/5/9/13/17/18/22/26/30/34/35/39…——不在其上的值按 up/down 就近落位。
+    """
+    if frames <= 0:
+        return 0
+    t = frames_to_latent_t(frames, up=up)
+    return latent_t_to_frames(t)

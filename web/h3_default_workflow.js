@@ -1441,7 +1441,7 @@ window.H3_DEFAULT_WORKFLOW = {
       ],
       "title": "H3 Seamless Chain · 导演台主节点",
       "properties": {
-        "aux_id": "bingling360/ComfyUI-minimaxH3-SequenceForge",
+        "aux_id": "bingling360/ComfyUI_H3_SeamlessChain",
         "ver": "731bde31a74ff438381a07c8d647795aed63952c",
         "Node name for S&R": "H3SeamlessChainSampler"
       },

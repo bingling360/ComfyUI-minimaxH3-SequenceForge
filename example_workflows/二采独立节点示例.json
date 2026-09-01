@@ -1,0 +1,716 @@
+{
+  "id": "h3-upscale-standalone-example",
+  "revision": 1,
+  "last_node_id": 10,
+  "last_link_id": 11,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        -760,
+        40
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "title": "H3 UNET",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "CLIPLoader",
+      "pos": [
+        -712,
+        200
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            3,
+            4
+          ]
+        }
+      ],
+      "title": "H3 CLIP",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "minimax",
+        "default"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        -720,
+        370
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "title": "视频 VAE",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_video_vae_fp16.safetensors"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "VAELoader",
+      "pos": [
+        -720,
+        480
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "title": "音频 VAE",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_audio_vae_fp32.safetensors"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "ModelAttentionBackend",
+      "pos": [
+        -197,
+        -40
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "title": "注意力后端",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "ModelAttentionBackend"
+      },
+      "widgets_values": [
+        "pytorch attention"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "CLIPTextEncode",
+      "pos": [
+        -360,
+        200
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "title": "负向提示词",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "模糊、畸变、低质量、水印、字幕"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "H3LatentLoadSegment",
+      "pos": [
+        -360,
+        470
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            8
+          ]
+        },
+        {
+          "name": "audio_latent",
+          "type": "LATENT",
+          "links": [
+            9
+          ]
+        },
+        {
+          "name": "guide_latent",
+          "type": "LATENT",
+          "links": [
+            10
+          ]
+        }
+      ],
+      "title": "H3 二采·取（读存档段 latent）",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "H3LatentLoadSegment"
+      },
+      "widgets_values": [
+        "D:/本地部署文件集合/comfyui/comfy shili/ComfyUI/ComfyUI/output/h3_projects/你的项目名",
+        0,
+        "22",
+        "开"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "UpscaleNode",
+      "pos": [
+        40,
+        40
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 2
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 4
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 5
+        },
+        {
+          "name": "audio_vae",
+          "type": "VAE",
+          "link": 6
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 7
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 8
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "root",
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "seg",
+          "type": "INT",
+          "link": null
+        },
+        {
+          "name": "scale",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "arch",
+          "type": [
+            "2D",
+            "3D"
+          ],
+          "link": null
+        },
+        {
+          "name": "steps",
+          "type": "INT",
+          "link": null
+        },
+        {
+          "name": "denoise",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "cfg",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "precision",
+          "type": [
+            "fp16",
+            "fp32",
+            "bf16"
+          ],
+          "link": null
+        },
+        {
+          "name": "encode",
+          "type": [
+            "标准",
+            "高清",
+            "极致"
+          ],
+          "link": null
+        },
+        {
+          "name": "audio_latent",
+          "type": "LATENT",
+          "link": 9
+        },
+        {
+          "name": "guide_latent",
+          "type": "LATENT",
+          "link": 10
+        },
+        {
+          "name": "guide_audio",
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "name": "tail_latent",
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "name": "head_latent",
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "name": "first_frame",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "time_bias",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "mix",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "shift",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "stg",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "stg_block",
+          "type": "INT",
+          "link": null
+        },
+        {
+          "name": "passes",
+          "type": "INT",
+          "link": null
+        },
+        {
+          "name": "decay",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "sharpen",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "pixel_sharpen",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "sampler",
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "scheduler",
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "retry",
+          "type": "BOOLEAN",
+          "link": null
+        },
+        {
+          "name": "retry_target",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "model_name",
+          "type": "STRING",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "status",
+          "type": "STRING",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "title": "H3 二采·归（UpscaleNode）",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "UpscaleNode"
+      },
+      "widgets_values": [
+        "",
+        "D:/本地部署文件集合/comfyui/comfy shili/ComfyUI/ComfyUI/output/h3_projects/你的项目名",
+        0,
+        2.0,
+        "3D",
+        6,
+        0.35,
+        1.0,
+        "fp16",
+        "高清",
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        25,
+        1,
+        0.5,
+        0.0,
+        0.0,
+        "",
+        "",
+        false,
+        0.15,
+        "minimax_h3_latent_upscaler_3d_fp16.safetensors"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "PreviewAny",
+      "pos": [
+        500,
+        -120
+      ],
+      "size": [
+        360,
+        110
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 11
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "运行报告(status)",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.34.2",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        -760,
+        620
+      ],
+      "size": [
+        640,
+        360
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "二采独立节点示例 · 使用说明",
+      "properties": {},
+      "widgets_values": [
+        "# 二采外置：取 → 归\n\n- **左（取）** `H3 二采·取`：从存档 `output/h3_projects/<项目名>/seg_NNN.pt`读基础段 latent + 音频 latent，可选带「上段尾桥锚」→ 喂 `UpscaleNode`。\n- **右（归）** `UpscaleNode`：放大网络超分 → 高清 cond 注入桥锚（CondSync）→ 低强度重采样 → 解码 → 覆盖 `seg_NNN.mp4` + 写 manifest。\n- **用法**：`root` 改你的项目目录、`seg` 改要二采的段号（0-based）；`model_name` 填 `models/latent_upscale_models/` 下的权重（如 `minimax_h3_latent_upscaler_3d_fp16.safetensors`）。\n- `带桥锚=开` 自动取上段尾 ctx 帧（5/22/39/56，需与主链 `引导帧数` 一致）作 guide；首段无上段，自动退化无桥锚。\n- 与导演台「🔄 重新二采此段」按钮共用同一引擎 `upscale.render_segment`，语义一致。"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      5,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      5,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      3,
+      2,
+      0,
+      6,
+      0,
+      "CLIP"
+    ],
+    [
+      4,
+      2,
+      0,
+      8,
+      1,
+      "CLIP"
+    ],
+    [
+      5,
+      3,
+      0,
+      8,
+      2,
+      "VAE"
+    ],
+    [
+      6,
+      4,
+      0,
+      8,
+      3,
+      "VAE"
+    ],
+    [
+      7,
+      6,
+      0,
+      8,
+      4,
+      "CONDITIONING"
+    ],
+    [
+      8,
+      7,
+      0,
+      8,
+      5,
+      "LATENT"
+    ],
+    [
+      9,
+      7,
+      1,
+      8,
+      16,
+      "LATENT"
+    ],
+    [
+      10,
+      7,
+      2,
+      8,
+      17,
+      "LATENT"
+    ],
+    [
+      11,
+      8,
+      0,
+      9,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "模型加载",
+      "bounding": [
+        -780,
+        0,
+        720,
+        620
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "二采：取 → 归",
+      "bounding": [
+        -400,
+        0,
+        1000,
+        640
+      ],
+      "color": "#88A",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.8,
+      "offset": [
+        400,
+        100
+      ]
+    },
+    "frontendVersion": "1.48.7"
+  },
+  "version": 0.4
+}

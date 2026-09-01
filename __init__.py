@@ -7,10 +7,11 @@ try:
 
     from .nodes import H3SeamlessChainSampler
     from .seam_doctor import H3SeamDoctor
+    from .upscale_node import UpscaleNode, H3LatentLoadSegment
 
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SeamlessChainSampler, H3SeamDoctor]
+            return [H3SeamlessChainSampler, H3SeamDoctor, UpscaleNode, H3LatentLoadSegment]
 
         async def add_routes(self, routes):
             # 新版 ComfyUI / Comfy Desktop 官方路径：框架直接传入 routes 对象

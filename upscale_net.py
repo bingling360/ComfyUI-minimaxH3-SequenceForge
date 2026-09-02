@@ -403,6 +403,7 @@ class LatentResizer3D(nn.Module):
 # ---- 模型目录与权重加载 ----
 
 MODEL_CACHE = {}
+_SUFFIXES = (".pth", ".safetensors")
 
 
 def register_folder():
@@ -427,16 +428,86 @@ def get_models_dir():
     return folder_paths.get_folder_paths(LATENT_UPSCALE_FOLDER)[0]
 
 
-def scan_models():
-    """模型目录里的权重文件名（排序后）；空目录返回空列表。"""
+_MODEL_DIRS_OVERRIDE = None   # 离线/单测注入的目录（None=走 folder_paths 口径）
+
+
+def set_model_dirs(dirs):
+    """临时覆盖模型根目录（离线单测 / 离线工具用；传 None 恢复 folder_paths 口径）。"""
+    global _MODEL_DIRS_OVERRIDE
+    _MODEL_DIRS_OVERRIDE = [str(d) for d in dirs] if dirs else None
+
+
+def _model_dirs():
+    """全部已注册的模型根目录（无 ComfyUI 时退化成单个目录）。"""
+    if _MODEL_DIRS_OVERRIDE:
+        return list(_MODEL_DIRS_OVERRIDE)
     try:
-        model_dir = get_models_dir()
+        register_folder()
+        import folder_paths
+        return list(folder_paths.get_folder_paths(LATENT_UPSCALE_FOLDER))
     except Exception:
-        return []
-    files = []
-    for ext in ("*.pth", "*.safetensors"):
-        files.extend(glob.glob(os.path.join(model_dir, ext)))
-    return sorted(os.path.basename(f) for f in files)
+        try:
+            return [get_models_dir()]
+        except Exception:
+            return []
+
+
+def scan_models():
+    """模型目录里的权重（递归子目录，返回目录内相对路径，排序后）。
+
+    优先走 folder_paths.get_filename_list（ComfyUI 自带递归扫描 + 缓存）；
+    无 ComfyUI 环境（离线单测）或列表为空（缓存未刷新）时回退 glob 递归。
+    统一把分隔符规范成 "/"，存档里存的名字跨平台可读——旧存档存的纯文件名
+    （无子目录）天然兼容。空目录返回空列表（占位提示由前端负责）。
+    """
+    names = []
+    try:
+        register_folder()
+        import folder_paths
+        names = list(folder_paths.get_filename_list(LATENT_UPSCALE_FOLDER) or [])
+    except Exception:
+        names = []
+    if not names:
+        model_dir = None
+        for d in _model_dirs():
+            model_dir = d
+            break
+        if not model_dir:
+            return []
+        for ext in _SUFFIXES:
+            for p in glob.glob(os.path.join(model_dir, "**", "*" + ext),
+                               recursive=True):
+                names.append(os.path.relpath(p, model_dir))
+    return sorted(n.replace(os.sep, "/") for n in names
+                  if os.path.splitext(n)[1].lower() in _SUFFIXES)
+
+
+def resolve_model_path(name):
+    """模型名（可含子目录相对路径）-> 绝对路径；找不到抛 FileNotFoundError。
+
+    优先 folder_paths.get_full_path_or_raise：路径穿越防护由 ComfyUI 保证
+    （内部先按 relpath 归一化再拼目录）。无 ComfyUI（离线单测）或旧版
+    ComfyUI（无该 API）时本地解析，并显式校验结果落在模型目录内（防 ../）。
+    """
+    register_folder()
+    try:
+        import folder_paths
+        getter = getattr(folder_paths, "get_full_path_or_raise", None)
+        if getter is not None:
+            try:
+                return getter(LATENT_UPSCALE_FOLDER, name)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"模型文件不存在: {name}（已搜索目录：{_model_dirs()}）") from None
+    except ImportError:
+        pass
+    norm = os.path.normpath(str(name).replace("/", os.sep).lstrip(os.sep))
+    for d in _model_dirs():
+        root = os.path.abspath(d)
+        p = os.path.abspath(os.path.join(root, norm))
+        if os.path.commonpath([root, p]) == root and os.path.isfile(p):
+            return p
+    raise FileNotFoundError(f"模型文件不存在: {name}（已搜索目录：{_model_dirs()}）")
 
 
 def _load_raw_sd(path):
@@ -452,11 +523,68 @@ def _load_raw_sd(path):
             for k, v in sd.items()}
 
 
+# 第三方 / 自训练权重的常见包装前缀（上游只剥 upscaler.，这里做防御性扩展）
+_SD_PREFIXES = ("model.", "module.", "net.", "state_dict.", "upscaler.")
+# 骨干键标识：剥到出现这些键就停
+_SD_MARKERS = ("conv_in.weight", "in_blocks.", "resizer.")
+
+
 def _extract_upscaler_sd(sd):
-    # 兼容合并权重中的 upscaler. 前缀
-    if any(k.startswith("upscaler.") for k in sd):
-        return {k[len("upscaler."):]: v for k, v in sd.items() if k.startswith("upscaler.")}
+    """循环剥离包装前缀（model./module./net./state_dict./upscaler.），直到出现骨干键。
+
+    上游只剥 upscaler.（其官方合并权重的前缀）；DDP 训练存 module.、
+    Lightning 存 state_dict.、自训练脚本存 model./net.——循环剥离这些前缀
+    最多 5 层，命中哪个剥哪个、只剥带前缀的键（其余键原样保留，不全量丢弃
+    防误伤）。剥到出现 conv_in.weight / in_blocks. / resizer. 即停。
+    """
+    for _ in range(len(_SD_PREFIXES)):
+        if any(k.startswith(_SD_MARKERS) for k in sd):
+            break
+        for p in _SD_PREFIXES:
+            if any(k.startswith(p) for k in sd):
+                sd = {k[len(p):] if k.startswith(p) else k: v
+                      for k, v in sd.items()}
+                break
+        else:
+            break        # 一个前缀都没命中——再剥也没用
     return sd
+
+
+def _detect_kind(sd, arch):
+    """state_dict + 面板架构 -> "2D" / "3D" / None（None=判不出，交给试装择优）。
+
+    判定顺序（面板显式指定最优先，其次两条廉价特征，都判不出才 None）：
+    ① 面板 arch ∈ {2D, 3D} → 直接采用（用户显式指定，不猜）；
+    ② 有 resizer. 前缀键 → 2D（上游 2D 权重是 VideoLatentResizer 的包装键）；
+    ③ conv_in.weight（剥离前缀后的键名）的 ndim：5 → 3D（Conv3d）、
+       4 → 2D（Conv2d，能救不带 resizer. 前缀的裸 2D 骨干）；
+    ④ 都没有 → None。
+    """
+    a = str(arch or "").strip().upper()
+    if a in ("2D", "3D"):
+        return a
+    if any(k.startswith("resizer.") for k in sd):
+        return "2D"
+    w = sd.get("conv_in.weight")
+    if w is not None and hasattr(w, "dim"):
+        if w.dim() == 5:
+            return "3D"
+        if w.dim() == 4:
+            return "2D"
+    return None
+
+
+def _normalize_kind_sd(sd, kind):
+    """把裸 2D 骨干权重补齐 resizer. 前缀，使其能装进 VideoLatentResizer。
+
+    2D 网络本体是 VideoLatentResizer（内部 resizer=LatentResizer + 两块
+    TemporalConv），官方权重带 resizer. 前缀；裸骨干（LatentResizer 直接
+    state_dict）需要补前缀才能装上。temporal_blocks.* 本就在顶层，不补。
+    """
+    if kind != "2D" or any(k.startswith("resizer.") for k in sd):
+        return sd
+    return {(k if k.startswith("temporal_blocks.") else f"resizer.{k}"): v
+            for k, v in sd.items()}
 
 
 def _detect_arch(sd, arch):
@@ -498,20 +626,22 @@ def _detect_arch(sd, arch):
             cfg["temporal_every"] = 0
         cfg["attn"] = False   # 推理强制关闭（上游同款）
         return cfg
-    # 2D：键带 resizer. 前缀
+    # 2D：键（通常）带 resizer. 前缀；正则统一加可选前缀，裸骨干权重也能读
     cfg = {"in_channels": 24, "in_blocks": 12, "out_blocks": 12,
            "channels": 640, "dropout": 0.1, "attn": False,
            "temporal_every": 2, "temporal_kernel": 5}
-    if "resizer.conv_in.weight" in sd:
-        w = sd["resizer.conv_in.weight"]
-        cfg["in_channels"] = w.shape[1]
-        cfg["channels"] = w.shape[0]
+    for ck in ("resizer.conv_in.weight", "conv_in.weight"):
+        if ck in sd:
+            w = sd[ck]
+            cfg["in_channels"] = w.shape[1]
+            cfg["channels"] = w.shape[0]
+            break
     in_ids, out_ids = set(), set()
     for k in sd.keys():
-        m = re.match(r"resizer\.in_blocks\.(\d+)\.in_layers\.", k)
+        m = re.match(r"(?:resizer\.)?in_blocks\.(\d+)\.in_layers\.", k)
         if m:
             in_ids.add(int(m.group(1)))
-        m = re.match(r"resizer\.out_blocks\.(\d+)\.in_layers\.", k)
+        m = re.match(r"(?:resizer\.)?out_blocks\.(\d+)\.in_layers\.", k)
         if m:
             out_ids.add(int(m.group(1)))
     if in_ids:
@@ -530,49 +660,104 @@ def _detect_arch(sd, arch):
     return cfg
 
 
-def load_model(name, device, precision, arch="2D"):
-    """按 名字::arch::device::precision 缓存加载放大网络（eval 模式）。"""
-    cache_key = f"{name}::{arch}::{device}::{precision}"
-    if cache_key in MODEL_CACHE:
-        return MODEL_CACHE[cache_key]
-    path = os.path.join(get_models_dir(), name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"模型文件不存在: {path}")
+_MISMATCH = 1 << 30      # 试装择优里「装不上」的比分（形状不符）
+
+
+def _is_attn_key(k):
+    """attn 相关键（推理强制 attn=False → 这些键缺失属正常，不算结构不匹配）。"""
+    return ".q." in k or ".k." in k or ".v." in k or "proj_out" in k
+
+
+def _build_model(kind, cfg):
+    """按判定出的架构构造网络（两种骨干参数名不同，构造与装权必须同 kind）。"""
+    if kind == "3D":
+        return LatentResizer3D(
+            in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"],
+            out_blocks=cfg["out_blocks"], channels=cfg["channels"],
+            dropout=cfg["dropout"], attn=cfg["attn"],
+            temporal_every=cfg["temporal_every"],
+            temporal_kernel=cfg["temporal_kernel"])
+    return VideoLatentResizer(
+        in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"],
+        out_blocks=cfg["out_blocks"], channels=cfg["channels"],
+        dropout=cfg["dropout"], attn=cfg["attn"],
+        temporal_every=cfg["temporal_every"],
+        temporal_kernel=cfg["temporal_kernel"])
+
+
+def kind_of(model):
+    """网络对象 -> "2D" / "3D"（upscale.py 据此决定 forward 的调用口径）。"""
+    return "3D" if isinstance(model, LatentResizer3D) else "2D"
+
+
+def load_model(name, device, precision, arch="auto"):
+    """按 名字::架构::设备::精度 缓存加载放大网络（eval 模式）。
+
+    arch：面板值，"2D" / "3D" / "auto"（默认）。auto 时按权重自动判定：
+    resizer. 前缀 → 2D；conv_in.weight 是 5 维 → 3D、4 维 → 2D；三条都判不出
+    时走「试装择优」——按 2D/3D 各构造一次、strict=False 试装，取缺键最少的
+    一种（命中即停，最多构造两次）。面板显式指定时不猜：装不上直接报可操作
+    的错误（提示改回「自动」）。缓存键用解析后的架构（auto 与显式同架构
+    共享一份缓存）。
+    """
+    path = resolve_model_path(name)
+    cache_key_probe = f"{name}::{arch}::{device}::{precision}"
+    if cache_key_probe in MODEL_CACHE:
+        return MODEL_CACHE[cache_key_probe]
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
-    is_3d_weights = not any(k.startswith("resizer.") for k in up_sd)
-    if (arch == "3D") != is_3d_weights:
-        raise ValueError(f"权重与架构不匹配：{name} 是{'纯 3D' if is_3d_weights else '2D 残差'}"
-                         f"权重，面板却选了 {arch}——请切换「网络架构」后重试")
-    cfg = _detect_arch(up_sd, arch)
-    if arch == "3D":
-        model = LatentResizer3D(
-            in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"],
-            out_blocks=cfg["out_blocks"], channels=cfg["channels"],
-            dropout=cfg["dropout"], attn=cfg["attn"],
-            temporal_every=cfg["temporal_every"],
-            temporal_kernel=cfg["temporal_kernel"])
-        model.load_state_dict(up_sd, strict=True)   # 3D：严格匹配
-    else:
-        model = VideoLatentResizer(
-            in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"],
-            out_blocks=cfg["out_blocks"], channels=cfg["channels"],
-            dropout=cfg["dropout"], attn=cfg["attn"],
-            temporal_every=cfg["temporal_every"],
-            temporal_kernel=cfg["temporal_kernel"])
-        # 2D：attn 强制关闭会缺 attn 键，strict=False 容忍
-        missing, unexpected = model.load_state_dict(up_sd, strict=False)
-        if missing:
-            print(f"[H3二采] 放大权重缺少键（attn 强制关闭属正常）: {missing[:5]}…")
-        if unexpected:
-            print(f"[H3二采] 放大权重多余键（可能来自合并文件）: {unexpected[:5]}…")
+    kind = _detect_kind(up_sd, arch)
+    # 只解出一种 → 直接装；判不出 → 2D/3D 依次试装择优（先试 2D：上游默认架构）
+    candidates = [kind] if kind in ("2D", "3D") else ["2D", "3D"]
+    best = None
+    for cand in candidates:
+        sd = _normalize_kind_sd(up_sd, cand)
+        cfg = _detect_arch(sd, cand)
+        if cfg["in_channels"] != 24 and any(k.endswith("conv_in.weight") for k in sd):
+            raise ValueError(
+                f"放大权重输入通道为 {cfg['in_channels']}——本插件只支持 H3 的 "
+                f"24 通道 latent 放大模型：{name}")
+        model = _build_model(cand, cfg)
+        try:
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            hard = [m for m in missing if not _is_attn_key(m)]
+            score = (len(hard), len(unexpected))
+        except (RuntimeError, KeyError) as e:
+            # strict=False 只容忍缺键/多键，不容忍形状不符——形状不符=架构真装错了
+            if len(candidates) == 1:
+                raise ValueError(
+                    f"放大权重与网络架构不匹配：{name} 按「{cand}」装不上（权重形状与"
+                    f"网络不符）——请把「网络架构」设为「自动」重试，或确认该权重就是"
+                    f"{cand} 架构的 H3 latent 放大模型。原始错误：{e}") from None
+            model, missing, unexpected, hard = None, [], [], []
+            score = (_MISMATCH, _MISMATCH)
+        if best is None or score < best[0]:
+            best = (score, cand, model, cfg, missing, unexpected, hard)
+        if score == (0, 0):
+            break
+    score, kind, model, cfg, missing, unexpected, hard = best
+    if model is None:
+        raise ValueError(
+            f"放大权重既装不进 2D 也装不进 3D 网络：{name}——请确认这是 H3 的 "
+            f"24 通道 latent 放大模型（LBH-123-AI/Minimax_h3_latent_Upscaler）")
+    if len(candidates) == 1 and hard:
+        raise ValueError(
+            f"放大权重与网络架构不匹配：{name} 按「{kind}」装不上，缺 {len(hard)} 个"
+            f"必需键（{'、'.join(hard[:5])}…）——请把「网络架构」设为「自动」重试，"
+            f"或确认该权重就是 {kind} 架构的 H3 latent 放大模型")
+    if missing:
+        print(f"[H3二采] 放大权重缺少键（attn 推理强制关闭属正常）: {missing[:5]}…")
+    if unexpected:
+        print(f"[H3二采] 放大权重多余键（可能来自合并文件）: {unexpected[:5]}…")
     dtype = {"fp32": torch.float32, "fp16": torch.float16,
              "bf16": torch.bfloat16}.get(precision, torch.float32)
     model = model.to(device).eval()
     if dtype != torch.float32:
         model = model.to(dtype)
-    MODEL_CACHE[cache_key] = model
-    print(f"[H3二采] 加载放大模型（{arch}）: {name} | 参数量 "
+    MODEL_CACHE[cache_key_probe] = model
+    MODEL_CACHE[f"{name}::{kind}::{device}::{precision}"] = model
+    print(f"[H3二采] 加载放大模型（{kind}"
+          f"{'' if kind == arch else f'，面板 {arch}'}）: {name} | 参数量 "
           f"{sum(p.numel() for p in model.parameters()):,} | 设备 {device} | Temporal "
           f"{'开' if cfg['temporal_every'] > 0 else '关'}"
           f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']})", flush=True)

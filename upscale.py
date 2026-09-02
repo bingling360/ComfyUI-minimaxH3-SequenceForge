@@ -49,6 +49,14 @@ _ENCODE_SETTINGS = {
     "极致": (13, "slow", 3, True),
 }
 _PARAM_KEYS = ("model", "arch", "scale", "denoise", "steps", "cfg", "precision")
+# 放大目标尺寸模式：倍率（现状）/ 目标尺寸（像素）/ 百万像素
+SIZE_MODES = ("倍率", "目标尺寸", "百万像素")
+
+
+def _norm_arch(v):
+    """面板架构值 -> "2D" / "3D" / "auto"（空或无法识别 = auto，由权重判定）。"""
+    s = str(v or "").strip().upper()
+    return s if s in ("2D", "3D") else "auto"
 
 
 # ---- 状态解析与重做判定（纯逻辑，无 ComfyUI 依赖，可单测） ----
@@ -123,7 +131,7 @@ def parse_state(ds):
         "mode": mode,
         "enlarge": enlarge,
         "model": (str(up.get("model") or "").strip() if enlarge else ""),
-        "arch": "3D" if str(up.get("arch") or "").strip().upper() == "3D" else "2D",
+        "arch": _norm_arch(up.get("arch")),
         "scale": (_num("scale", 2.0, 1.0, 4.0) if enlarge else 1.0),
         "denoise": denoise,
         "steps": steps,
@@ -568,18 +576,24 @@ def target_pixels(h, w, scale):
     return w2 * 16, h2 * 16
 
 
-def upscale_video(video_t, net, scale, arch="2D"):
-    """[B,24,T,H,W] latent -> 神经放大（T 不变，H/W×scale 偶数对齐），float32。
+def upscale_video(video_t, net, scale, arch="auto", hw=None):
+    """[B,24,T,H,W] latent -> 神经放大（T 不变，H/W 到目标尺寸偶数对齐），float32。
 
     归一化口径与上游训练一致：放大前 (x-μ)/σ，放大后反变换；网络精度由
-    load_model 的 precision 决定，输入输出统一 float32。scale 使目标等于
-    原尺寸时原样返回克隆（等价纯二采不放大）。
+    load_model 的 precision 决定，输入输出统一 float32。目标等于原尺寸时
+    原样返回克隆（等价纯二采不放大）。
+    arch 为 "auto"（或不认识的值）时按网络对象实际类型判定——架构自动判定后
+    cfg["arch"] 可能仍是 auto，调用口径只认网络的真身，不认面板值。
+    hw：显式目标 latent (H,W)（目标尺寸/百万像素模式）；给了就不再按 scale 换算
+    尺寸，但 scale 仍进 scale embedding（网络需要知道「放大了多少」）。
     """
     if net is None:
         # 放大关闭（enlarge=False）：精化画布 = 基础画布，视频 latent 与桥/尾/头锚
         # latent 一律原尺寸直通——一处守卫覆盖 render_latent 的四个调用点。
         return video_t.detach().to(torch.float32).clone()
-    h2, w2 = target_hw(video_t.shape[-2], video_t.shape[-1], scale)
+    from . import upscale_net
+    ak = arch if arch in ("2D", "3D") else upscale_net.kind_of(net)
+    h2, w2 = target_hw(video_t.shape[-2], video_t.shape[-1], scale) if hw is None else hw
     if (h2, w2) == (video_t.shape[-2], video_t.shape[-1]):
         return video_t.detach().to(torch.float32).clone()
     # 输入对齐网络设备：魔改 DynamicVRAM 运行时采样输出 latent 可能滞留 CPU，
@@ -589,7 +603,7 @@ def upscale_video(video_t, net, scale, arch="2D"):
     nd = next(net.parameters()).dtype
     mean, std = _norm_tensors(x.device, nd)
     xn = (x.to(nd) - mean) / std
-    if arch == "3D":
+    if ak == "3D":
         y = net(xn, scale=float(scale), target_size=(x.shape[2], h2, w2))
     else:
         y = net(xn, scale=float(scale), target_hw=(h2, w2))

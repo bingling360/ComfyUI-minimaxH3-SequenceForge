@@ -469,7 +469,7 @@ function defaultUpscale() {
        time_bias / mix / shift / stg / sharpen / pixel_sharpen 默认 0=关、adaptive / retry
        默认 false=关、passes=1=单轮、encode=标准、采样器空=沿用主链——仅启用时进后端
        指纹（不使既有记录失效）。抗糊武器库详见《更新说明_二采抗糊抗条纹》 */
-    return { schema: 2, on: true, mode: "关闭", model: "", arch: "2D", scale: 2.0,
+    return { schema: 2, on: true, mode: "关闭", model: "", arch: "auto", scale: 2.0,
              denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16",
              time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0,
              stg: 0.0, stg_block: 25, passes: 1, decay: 0.5,
@@ -588,7 +588,8 @@ function getDs(node) {
             enlarge: upRaw.enlarge !== false,
             mode: UP_MODES.includes(upRaw.mode) ? upRaw.mode : "关闭",
             model: typeof upRaw.model === "string" ? upRaw.model : "",
-            arch: upRaw.arch === "3D" ? "3D" : "2D",
+            /* 网络架构：auto=按权重自动判定（默认）；显式 2D/3D 才按面板指定装 */
+            arch: ["2D", "3D"].includes(upRaw.arch) ? upRaw.arch : "auto",
             scale: upNum(upRaw.scale, 2.0, 1.0, 4.0),
             denoise: upDenoise,
             steps: upSteps,
@@ -4220,18 +4221,21 @@ function renderUpscaleZone(sec, data) {
         body.append(modelField);
         upOnly.push(modelField);
 
-        /* 网络架构：2D 残差骨干 / 纯 3D 卷积 */
+        /* 网络架构：自动（按权重判定，默认）/ 2D 残差骨干 / 纯 3D 卷积 */
         const archField = el("div", "h3d-param");
         archField.append(el("label", "", "网络架构"));
         const archSel = document.createElement("select");
         archSel.className = "h3d-select";
-        archSel.title = "2D=残差骨干+时间卷积（快，上游默认）；3D=纯 3D 卷积（时序一致性更好）——"
-            + "须与权重训练结构匹配，加载时按权重自动推断层数";
-        for (const a of ["2D", "3D"]) {
+        archSel.title = "自动（默认，推荐）：按权重自动判定——有 resizer. 前缀键=2D、"
+            + "conv_in.weight 是 5 维=3D、4 维=2D，都判不出时 2D/3D 各试装一次取缺键少的；\n"
+            + "2D=残差骨干+时间卷积（快，上游默认）；3D=纯 3D 卷积（时序一致性更好）。\n"
+            + "换模型不用再手动切这一项；显式指定时若与权重不符会直接报错（提示改回自动）。"
+            + "层数/通道数仍按权重自动推断。";
+        for (const [v, t] of [["auto", "自动"], ["2D", "2D"], ["3D", "3D"]]) {
             const o = document.createElement("option");
-            o.value = a;
-            o.textContent = a;
-            if (a === up.arch) o.selected = true;
+            o.value = v;
+            o.textContent = t;
+            if (v === up.arch) o.selected = true;
             archSel.append(o);
         }
         archSel.onchange = () => setUpscaleField(node, "arch", archSel.value);

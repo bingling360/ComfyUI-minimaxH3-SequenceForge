@@ -584,6 +584,8 @@ function getDs(node) {
         const upscale = {
             schema: 2,
             on: upRaw.on !== false,
+            /* 神经放大开关：旧 JSON 缺键 = 开（保持既有行为） */
+            enlarge: upRaw.enlarge !== false,
             mode: UP_MODES.includes(upRaw.mode) ? upRaw.mode : "关闭",
             model: typeof upRaw.model === "string" ? upRaw.model : "",
             arch: upRaw.arch === "3D" ? "3D" : "2D",
@@ -4171,6 +4173,29 @@ function renderUpscaleZone(sec, data) {
     body.append(modeField);
 
     if (on) {
+        /* 神经放大开关：关掉 = 只做低强度重采样精化，不加载放大网络 */
+        const upOnly = [];
+        function showUp() {
+            upOnly.forEach((f) => { f.style.display = up.enlarge ? "" : "none"; });
+        }
+        const enField = el("div", "h3d-param");
+        enField.append(el("label", "", "神经放大"));
+        const enRow = el("div", "h3d-seedrow");
+        const enCb = document.createElement("input");
+        enCb.type = "checkbox";
+        enCb.checked = up.enlarge !== false;
+        enCb.title = "勾选（默认）：放大网络先把 latent 超分，再在高清 latent 上低强度重采样精化——产物是放大后的高清视频。"
+            + "取消勾选：跳过放大，直接在原分辨率 latent 上做低强度重采样精化——产物仍是原分辨率，"
+            + "且完全不加载放大网络（省显存、省加载时间，也没有放大模型带来的细节增益）。";
+        enCb.onchange = () => {
+            up.enlarge = enCb.checked;
+            setUpscaleField(node, "enlarge", enCb.checked);
+            showUp();
+        };
+        enRow.append(enCb);
+        enField.append(enRow);
+        body.append(enField);
+
         /* 放大模型（models/latent_upscale_models/ 目录扫描） */
         const modelField = el("div", "h3d-param");
         modelField.append(el("label", "", "放大模型"));
@@ -4193,6 +4218,7 @@ function renderUpscaleZone(sec, data) {
         modelSel.onchange = () => setUpscaleField(node, "model", modelSel.value);
         modelField.append(modelSel);
         body.append(modelField);
+        upOnly.push(modelField);
 
         /* 网络架构：2D 残差骨干 / 纯 3D 卷积 */
         const archField = el("div", "h3d-param");
@@ -4211,6 +4237,7 @@ function renderUpscaleZone(sec, data) {
         archSel.onchange = () => setUpscaleField(node, "arch", archSel.value);
         archField.append(archSel);
         body.append(archField);
+        upOnly.push(archField);
 
         /* 精度 */
         const precField = el("div", "h3d-param");
@@ -4229,10 +4256,15 @@ function renderUpscaleZone(sec, data) {
         precSel.onchange = () => setUpscaleField(node, "precision", precSel.value);
         precField.append(precSel);
         body.append(precField);
+        upOnly.push(precField);
 
-        body.append(upNumField("放大倍率", up.scale, 1.0, 4.0, 0.1,
-            "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大",
-            (v) => setUpscaleField(node, "scale", v)));
+        const scaleField = upNumField("放大倍率", up.scale, 1.0, 4.0, 0.1,
+            "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大；"
+            + "想连放大网络都不加载就取消上方「神经放大」",
+            (v) => setUpscaleField(node, "scale", v));
+        body.append(scaleField);
+        upOnly.push(scaleField);
+        showUp();
         body.append(upNumField("二采强度", up.denoise, 0.05, 1.0, 0.05,
             "尾段起始噪声 σ（sigma 尾段精化区间的起点）：0.3-0.45 常用；越大越接近重生成（会改写画面内容），越小仅轻修细节",
             (v) => setUpscaleField(node, "denoise", v)));

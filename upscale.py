@@ -114,11 +114,17 @@ def parse_state(ds):
     # 抗糊武器库（全部默认关：STG=0 / passes=1 / 锐化=0 / 标准编码 / 采样器沿用
     # 主链 / retry 关——启用任一项才进指纹，既有二采记录不失效）
     stg_block = int(_num("stg_block", 25, 0, 49))
+    # 「神经放大」开关：关闭 = 只做低强度重采样精化，完全不加载放大网络（产物仍是
+    # 原分辨率）。旧 JSON 缺键默认开，行为不变。
+    # 关闭时强制 model="" / scale=1.0：这两项本就在 _PARAM_KEYS 里进指纹，切换开关
+    # 自然会触发该段重做——故 enlarge 本身不进指纹（否则既有二采记录会全量失效）。
+    enlarge = up.get("enlarge") is not False
     return {
         "mode": mode,
-        "model": str(up.get("model") or "").strip(),
+        "enlarge": enlarge,
+        "model": (str(up.get("model") or "").strip() if enlarge else ""),
         "arch": "3D" if str(up.get("arch") or "").strip().upper() == "3D" else "2D",
-        "scale": _num("scale", 2.0, 1.0, 4.0),
+        "scale": (_num("scale", 2.0, 1.0, 4.0) if enlarge else 1.0),
         "denoise": denoise,
         "steps": steps,
         "cfg": _num("cfg", 1.0, 0.0, 100.0),
@@ -569,6 +575,10 @@ def upscale_video(video_t, net, scale, arch="2D"):
     load_model 的 precision 决定，输入输出统一 float32。scale 使目标等于
     原尺寸时原样返回克隆（等价纯二采不放大）。
     """
+    if net is None:
+        # 放大关闭（enlarge=False）：精化画布 = 基础画布，视频 latent 与桥/尾/头锚
+        # latent 一律原尺寸直通——一处守卫覆盖 render_latent 的四个调用点。
+        return video_t.detach().to(torch.float32).clone()
     h2, w2 = target_hw(video_t.shape[-2], video_t.shape[-1], scale)
     if (h2, w2) == (video_t.shape[-2], video_t.shape[-1]):
         return video_t.detach().to(torch.float32).clone()
@@ -667,10 +677,15 @@ def load_net(cfg):
 
     from . import upscale_net
 
+    if not cfg.get("enlarge", True):
+        # 纯精化模式：不加载放大网络（省显存、省加载时间），latent 走原尺寸直通
+        print("[H3二采] 神经放大已关闭：只做低强度重采样精化，不加载放大网络", flush=True)
+        return None
     if not cfg["model"]:
         raise ValueError("未选择放大模型——请从 HuggingFace "
                          "LBH-123-AI/Minimax_h3_latent_Upscaler 下载权重放入 "
-                         "models/latent_upscale_models/，刷新导演台后在二采面板选择")
+                         "models/latent_upscale_models/，刷新导演台后在二采面板选择"
+                         "（只想精化不想放大的话，取消勾选「神经放大」即可）")
     dev = comfy.model_management.intermediate_device()
     if dev.type == "cpu":
         dev2 = _cuda_if_room()
@@ -828,13 +843,16 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     lines = []
     fail = []
 
-    # 1) 放大模型就绪
-    try:
-        dev = next(net.parameters()).device
-        lines.append(f"✓ 放大模型就绪：{cfg.get('arch', '2D')} @ {dev}")
-    except (StopIteration, AttributeError):
-        lines.append("✗ 放大模型不可用——请先在二采面板选择有效权重")
-        fail.append("放大模型不可用")
+    # 1) 放大模型就绪（关闭放大时跳过——纯精化不需要放大网络，也不该因此判失败）
+    if net is None:
+        lines.append("… 神经放大：关闭（仅低强度重采样精化，不加载放大网络）")
+    else:
+        try:
+            dev = next(net.parameters()).device
+            lines.append(f"✓ 放大模型就绪：{cfg.get('arch', '2D')} @ {dev}")
+        except (StopIteration, AttributeError):
+            lines.append("✗ 放大模型不可用——请先在二采面板选择有效权重")
+            fail.append("放大模型不可用")
 
     # 2) 二采画布（latent 偶数 -> 像素 ·32）
     h, w = video_t.shape[-2], video_t.shape[-1]
@@ -1066,14 +1084,19 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         if _timing is not None:
             _timing[key] = _timing.get(key, 0.0) + (time.perf_counter() - t0)
 
-    dev = next(net.parameters()).device
-    if dev.type == 'cpu':
-        # 上段二采异常后放大网络留在 CPU：优先纠偏回 GPU（intermediate_device
-        # 在魔改运行时账面紧张时可能仍返回 CPU——此时 CPU 前向是分钟级）
-        dev = _cuda_if_room() or comfy.model_management.intermediate_device()
-        if dev.type == 'cuda':
-            print(f"[H3二采] 段{seg_no}：放大网络在 CPU，已挪回 {dev}", flush=True)
-        net.to(dev)
+    if net is not None:
+        dev = next(net.parameters()).device
+        if dev.type == 'cpu':
+            # 上段二采异常后放大网络留在 CPU：优先纠偏回 GPU（intermediate_device
+            # 在魔改运行时账面紧张时可能仍返回 CPU——此时 CPU 前向是分钟级）
+            dev = _cuda_if_room() or comfy.model_management.intermediate_device()
+            if dev.type == 'cuda':
+                print(f"[H3二采] 段{seg_no}：放大网络在 CPU，已挪回 {dev}", flush=True)
+            net.to(dev)
+    else:
+        # 放大关闭：无放大网络可问设备，退回 ComfyUI 中间设备（dev 仍需有值——
+        # 下面桥/尾/头锚 latent 与 video_t 都按它对齐；精化执行设备另见 _edev）
+        dev = comfy.model_management.intermediate_device()
     if dev.type == "cuda" and video_t.device != dev:
         # 魔改 DynamicVRAM 运行时采样输出可能滞留 CPU：统一对齐后再进放大，
         # 防止「输入 CPU × 网络 cuda」的 addmm 设备崩溃
@@ -1104,7 +1127,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     mix = float(cfg.get("mix") or 0.0)
     up_v_base = up_v.detach().to("cpu", torch.float32) if mix > 0.0 else None
     _tmark("up", _t)
-    print(f"[H3二采] 段{seg_no}：神经放大完成 → 高清条件构建"
+    _up_done = "神经放大完成" if net is not None else "跳过神经放大（纯精化，原分辨率）"
+    print(f"[H3二采] 段{seg_no}：{_up_done} → 高清条件构建"
           "（挂了参考素材时需按高清画幅重编码，分钟级属正常，此间 GPU 应有占用）…",
           flush=True)
 
@@ -1155,8 +1179,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(
             cond, up_guide, length, tail_kf_latent=up_tail, head_kf_latent=up_head)
 
-    # 放大网络工作完毕，卸回 CPU 释放显存给高清重采样
-    net.cpu()
+    # 放大网络工作完毕，卸回 CPU 释放显存给高清重采样（纯精化模式无网络可卸）
+    if net is not None:
+        net.cpu()
     _tmark("cond", _t)
     # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
     if _timing is not None:
@@ -1165,7 +1190,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _te_note = "" if _te_hit is None else \
         ("（TE命中缓存，无文本编码器前向）" if _te_hit is True
          else "（TE未命中——文本编码器前向中，魔改分页环境下可能分钟级）")
-    print(f"[H3二采] 段{seg_no}：放大+高清条件就绪{_te_note}"
+    print(f"[H3二采] 段{seg_no}：{'放大+' if net is not None else ''}高清条件就绪{_te_note}"
           + " → 显存腾挪（卸载驻留模型）…", flush=True)
     # 抢占式显存腾挪（README 既定设计，be43db8 重构时随三级降级一起被误删，
     # 2026-08-25 1.4× 精化实测 OOM 后恢复）：cond 已建好，TE/videoVAE/audioVAE
@@ -1439,8 +1464,12 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     purge_legacy(root, g)
     _h, _w = int(video_t.shape[-2]), int(video_t.shape[-1])
     _tw, _th = target_pixels(_h, _w, float(cfg.get("scale") or 2.0))
-    print(f"[H3二采] 段{g + 1}：开始渲染（{cfg['arch']} {cfg['scale']:g}× → {_tw}×{_th} 像素，"
-          f"放大网络 @ {next(net.parameters()).device}）", flush=True)
+    if net is None:
+        print(f"[H3二采] 段{g + 1}：开始渲染（纯精化不放大 → {_tw}×{_th} 像素，"
+              f"未加载放大网络）", flush=True)
+    else:
+        print(f"[H3二采] 段{g + 1}：开始渲染（{cfg['arch']} {cfg['scale']:g}× → {_tw}×{_th} 像素，"
+              f"放大网络 @ {next(net.parameters()).device}）", flush=True)
     _timing = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,

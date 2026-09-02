@@ -148,6 +148,12 @@ ComfyUI-minimaxH3-SequenceForge/
 ├─ example_workflows/          # 示例工作流
 │   └─ 备用初始化导演台工作流.json   # 导演台初始化工作流（模型加载 + 主节点 + 提示词×3 预连线）
 │
+├─ docs/                       # 工程文档（不参与运行时）
+│   ├─ UPSTREAM.md             # 上游跟进台账（放大网络）：移植范围 / 锚点表 / 与上游的
+│   │                          #   差异台账 / 同步 SOP —— 改 upscale_net.py 前先读它
+│   └─ upstream_snapshot/      # 上游基线快照（按抓取日期存 nodes/*.py 原文，供 diff）
+│       └─ 2026-09-02/         #   d7c01b9：minimax_h3_latent_upscaler_{2d,3d}.py
+│
 ├─ 放大模型放到latent_upscale_models/  # 预置的二采放大权重（仅本地暂存不入 git；安装时拷入 ComfyUI/models/latent_upscale_models/）
 │   └─ minimax_h3_latent_upscaler_3d_fp16.safetensors
 │
@@ -160,6 +166,10 @@ ComfyUI-minimaxH3-SequenceForge/
 ```
 
 运行时产出（不在仓库内）：成片 / 分段 / 存档统一落在 `ComfyUI/output/h3_projects/<项目名>/`，体检报告落在 `ComfyUI/output/h3_seam_doctor/`，详见「自动存档」章节。
+
+## 上游跟进（放大网络）
+
+二采的放大网络逐行移植自 [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)（只移植**网络结构与权重加载**，不移植它的节点层与推理接口）。跟进台账、与上游的差异清单、同步 SOP 全部记在 **[`docs/UPSTREAM.md`](docs/UPSTREAM.md)**——**改 `upscale_net.py` 之前请先读一遍**，避免把本地的刻意增强当 bug 修回去，也避免重复调研上游已经实现的东西。
 
 ## 版本要求
 

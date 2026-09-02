@@ -140,6 +140,7 @@ class TemporalConv(nn.Module):
         return identity + h
 
 
+# ↑ upstream/nodes/minimax_h3_latent_upscaler_2d.py:137（同步于 d7c01b9）
 class LatentResizer(nn.Module):
     """2D 主干（与训练代码完全一致）。"""
 
@@ -194,6 +195,7 @@ class LatentResizer(nn.Module):
         return x
 
 
+# ↑ upstream/nodes/minimax_h3_latent_upscaler_2d.py:191（同步于 d7c01b9）
 class VideoLatentResizer(nn.Module):
     """5D 包装器（含 Temporal 块），与训练代码完全一致。"""
 
@@ -339,6 +341,7 @@ class TemporalConv3D(nn.Module):
         return identity + h
 
 
+# ↑ upstream/nodes/minimax_h3_latent_upscaler_3d.py:215（同步于 d7c01b9）
 class LatentResizer3D(nn.Module):
     """纯 3D 主干（与训练代码一致）。"""
 
@@ -587,6 +590,9 @@ def _normalize_kind_sd(sd, kind):
             for k, v in sd.items()}
 
 
+# ↑ upstream/nodes/minimax_h3_latent_upscaler_2d.py:298
+#   upstream/nodes/minimax_h3_latent_upscaler_3d.py:379（同步于 d7c01b9）
+#   本地合并版：按 arch 参数同时覆盖 2D/3D 两套键约定（上游是两个独立文件）
 def _detect_arch(sd, arch):
     """从 state_dict 推断网络结构（与上游训练配置一致；attn 推理强制关闭）。"""
     if arch == "3D":
@@ -690,6 +696,8 @@ def kind_of(model):
     return "3D" if isinstance(model, LatentResizer3D) else "2D"
 
 
+# ↑ upstream/nodes/minimax_h3_latent_upscaler_2d.py:358
+#   upstream/nodes/minimax_h3_latent_upscaler_3d.py:417（同步于 d7c01b9）
 def load_model(name, device, precision, arch="auto"):
     """按 名字::架构::设备::精度 缓存加载放大网络（eval 模式）。
 

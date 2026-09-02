@@ -2493,6 +2493,9 @@ function injectStyles() {
     .h3d-adv[open] summary{border-bottom:1px solid #302c25;color:var(--h3d-cyan)}
     .h3d-adv-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px}
     .h3d-adv .h3d-param{margin:0}
+    /* 二采「目标尺寸」模式的条件字段容器：整行跨列 + 内部同款 2 列，
+       字段布局与其他网格项一致；display 由 showUp() 在 ""/none 间切换 */
+    .h3d-size-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;grid-column:1 / -1}
     .h3d-updet{border-color:#2c4a52;background:#141d21}
     .h3d-updet summary::before{content:"✦ "}
     .h3d-updet.on{border-color:#316dca80;box-shadow:inset 0 0 0 1px #316dca26}
@@ -4366,7 +4369,22 @@ function renderUpscaleZone(sec, data) {
             if (m === up.size_mode) o.selected = true;
             sizeSel.append(o);
         }
-        sizeSel.onchange = () => setUpscaleField(node, "size_mode", sizeSel.value);
+        sizeSel.onchange = () => {
+            /* 本地 up 是 getDs 的 JSON 快照（非活引用）：同步改快照 + 直接重渲染
+               条件字段（镜像上方 enlarge 勾选的处理模式）——sig 重渲染在下拉
+               聚焦时被抑制（contains(activeElement)），不等失焦字段就该切换 */
+            up.size_mode = sizeSel.value;
+            setUpscaleField(node, "size_mode", sizeSel.value);
+            renderSizeFields();
+            const tgt = upTargetCanvas(node, up);
+            if (tgt) {
+                tgtBadge.textContent =
+                    `目标画布 ${escapeHtml(tgt)}（latent 偶数对齐 · 时间维不变）`;
+                tgtBadge.style.display = "";
+            } else {
+                tgtBadge.style.display = "none";
+            }
+        };
         sizeField.append(sizeSel);
         body.append(sizeField);
         upOnly.push(sizeField);
@@ -4378,19 +4396,19 @@ function renderUpscaleZone(sec, data) {
             if (m === "目标尺寸") {
                 sizeFieldsWrap.append(upNumField("目标宽", up.target_w, 64, 8192, 8,
                     "目标像素宽（latent 取偶对齐后实际可能略小，对齐到 32 倍数）",
-                    (v) => setUpscaleField(node, "target_w", v)));
+                    (v) => { up.target_w = v; setUpscaleField(node, "target_w", v); }));
                 sizeFieldsWrap.append(upNumField("目标高", up.target_h, 64, 8192, 8,
                     "目标像素高",
-                    (v) => setUpscaleField(node, "target_h", v)));
+                    (v) => { up.target_h = v; setUpscaleField(node, "target_h", v); }));
             } else if (m === "百万像素") {
                 sizeFieldsWrap.append(upNumField("百万像素", up.megapixels, 0.1, 16.0, 0.1,
                     "目标总像素数（按基础宽高比分配宽高）；1MP≈1024×1024",
-                    (v) => setUpscaleField(node, "megapixels", v)));
+                    (v) => { up.megapixels = v; setUpscaleField(node, "megapixels", v); }));
             } else {
                 sizeFieldsWrap.append(upNumField("放大倍率", up.scale, 1.0, 4.0, 0.1,
                     "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大；"
                     + "想连放大网络都不加载就取消上方「神经放大」",
-                    (v) => setUpscaleField(node, "scale", v)));
+                    (v) => { up.scale = v; setUpscaleField(node, "scale", v); }));
             }
         }
         renderSizeFields();
@@ -4526,16 +4544,21 @@ function renderUpscaleZone(sec, data) {
             + "仅增益重试开启时生效",
             (v) => setUpscaleField(node, "retry_target", v)));
 
-        /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径） */
-        const target = upTargetCanvas(node, up);
-        if (target) {
-            const b = el("div", "h3d-convbadge",
-                `目标画布 ${escapeHtml(target)}（latent 偶数对齐 · 时间维不变）`);
-            b.title = "基础画布 × 倍率后按 latent 偶数（=像素 32 倍数）对齐；"
-                + "超过 2.5MP 时后端会警告显存压力";
-            body.append(b);
+        /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径）。
+           函数作用域声明（上方 sizeSel.onchange 的闭包要就地刷新它）；画幅未知
+           时隐藏而非不创建，避免闭包引用悬空 */
+        const tgtBadge = el("div", "h3d-convbadge", "");
+        tgtBadge.title = "基础画布 × 倍率后按 latent 偶数（=像素 32 倍数）对齐；"
+            + "超过 2.5MP 时后端会警告显存压力";
+        const _tgt = upTargetCanvas(node, up);
+        if (_tgt) {
+            tgtBadge.textContent =
+                `目标画布 ${escapeHtml(_tgt)}（latent 偶数对齐 · 时间维不变）`;
+        } else {
+            tgtBadge.style.display = "none";
         }
-        if (up.scale > 2.0) {
+        body.append(tgtBadge);
+        if (up.scale > 2.0 && up.size_mode === "倍率") {
             body.append(el("div", "h3d-upwarn",
                 `注意：倍率 ${up.scale}× 目标画布大，二采显存/耗时显著增加，建议先小倍率试一段`));
         }

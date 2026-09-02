@@ -572,7 +572,14 @@ def resolve_model_path(name):
     for d in _model_dirs():
         root = os.path.abspath(d)
         p = os.path.abspath(os.path.join(root, norm))
-        if os.path.commonpath([root, p]) == root and os.path.isfile(p):
+        try:
+            if os.path.commonpath([root, p]) != root:   # 解析结果逃出模型目录
+                continue
+        except ValueError:
+            # Windows 跨盘符（如 root 在 D: 而名字含 "C:\..."）commonpath 直接抛
+            # ValueError——同样视为「不在目录内」，不当未知异常漏出去
+            continue
+        if os.path.isfile(p):
             return p
     raise FileNotFoundError(f"模型文件不存在: {name}（已搜索目录：{_model_dirs()}）")
 
@@ -783,10 +790,10 @@ def load_model(name, device, precision, arch="auto"):
     的错误（提示改回「自动」）。缓存键用解析后的架构（auto 与显式同架构
     共享一份缓存）。
     """
-    path = resolve_model_path(name)
     cache_key_probe = f"{name}::{arch}::{device}::{precision}"
     if cache_key_probe in MODEL_CACHE:
         return MODEL_CACHE[cache_key_probe]
+    path = resolve_model_path(name)
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
     kind = _detect_kind(up_sd, arch)
@@ -823,10 +830,20 @@ def load_model(name, device, precision, arch="auto"):
         raise ValueError(
             f"放大权重既装不进 2D 也装不进 3D 网络：{name}——请确认这是 H3 的 "
             f"24 通道 latent 放大模型（LBH-123-AI/Minimax_h3_latent_Upscaler）")
-    if len(candidates) == 1 and hard:
+    # temporal_blocks.* 缺键可容忍（pwconv 零初始化，缺整块=恒等映射，行为安全）；
+    # 其他缺键 = 结构对不齐，按「显式指定」与「auto 择优」两条路径分别报错
+    fatal = [k for k in hard if not k.startswith("temporal_blocks.")]
+    if fatal and len(candidates) == 2:
+        # auto 择优后仍缺必需键：按「缺键较少者」硬跑只会静默产出垃圾视频
         raise ValueError(
-            f"放大权重与网络架构不匹配：{name} 按「{kind}」装不上，缺 {len(hard)} 个"
-            f"必需键（{'、'.join(hard[:5])}…）——请把「网络架构」设为「自动」重试，"
+            f"放大权重与两种网络结构都对不齐：{name}（按「{kind}」装仍缺 "
+            f"{len(fatal)} 个必需键：{'、'.join(fatal[:5])}…）——请确认这是 "
+            f"H3 的 24 通道 latent 放大模型（LBH-123-AI/"
+            f"Minimax_h3_latent_Upscaler），或改用其官方插件加载")
+    if fatal and len(candidates) == 1:
+        raise ValueError(
+            f"放大权重与网络架构不匹配：{name} 按「{kind}」装不上，缺 {len(fatal)} 个"
+            f"必需键（{'、'.join(fatal[:5])}…）——请把「网络架构」设为「自动」重试，"
             f"或确认该权重就是 {kind} 架构的 H3 latent 放大模型")
     if missing:
         print(f"[H3二采] 放大权重缺少键（attn 推理强制关闭属正常）: {missing[:5]}…")

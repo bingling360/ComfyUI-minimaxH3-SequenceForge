@@ -484,16 +484,17 @@ def _hash_params(cfg):
     尺寸/百万像素模式不进 scale（该值此时无效，避免无谓重做）。
     """
     keys = {k: cfg[k] for k in _PARAM_KEYS}
+    # 目标尺寸模式：仅非倍率模式进指纹（target_w/h、megapixels 两组键与
+    # scale 键天然互斥，模式切换必然变 hash）；倍率模式指纹与旧版逐位一致
+    # ——既有二采记录不因新增 size_mode 字段而失效重做（项目铁律）。
     sm = str(cfg.get("size_mode") or "倍率")
-    if cfg.get("enlarge", True):
-        keys["size_mode"] = sm
+    if cfg.get("enlarge", True) and sm != "倍率":
         if sm == "目标尺寸":
             keys["target_w"] = cfg["target_w"]
             keys["target_h"] = cfg["target_h"]
-            keys.pop("scale", None)
-        elif sm == "百万像素":
+        else:                                   # 百万像素
             keys["megapixels"] = cfg["megapixels"]
-            keys.pop("scale", None)
+        keys.pop("scale", None)                 # 该模式下 scale 无效，不进指纹
     if cfg.get("time_bias"):
         keys["time_bias"] = cfg["time_bias"]
     if cfg.get("mix"):
@@ -632,10 +633,14 @@ def resolve_target_hw(h, w, cfg):
       目标可能略小于用户输入（最多差 30px，对齐到 32 倍数）；
     - 百万像素：按基础宽高比 aspect=w/h，h_px=sqrt(target_px/aspect)、w_px=h_px*aspect，
       latent 同样向上取偶。
+    enlarge=False（纯精化）直接原尺寸直通——尺寸模式此时无意义（面板已隐藏
+    对应字段），但旧存档可能残留目标尺寸设置，不做直通会误判下采样而炸链。
     生效倍率 = (w2/w + h2/h)/2（用于 scale embedding；目标尺寸/百万像素模式也
     需要告诉网络「放大了多少」）。下采样（生效倍率 < 1.0 且目标真小于基础）抛
     ValueError——放大网络只支持放大。
     """
+    if not cfg.get("enlarge", True):
+        return h, w, 1.0
     mode = str(cfg.get("size_mode") or "倍率")
     if mode == "目标尺寸":
         tw = max(64, int(float(cfg.get("target_w") or 1280)))
@@ -661,12 +666,6 @@ def resolve_target_hw(h, w, cfg):
             f"{w2 * VAE_DOWNSAMPLE}×{h2 * VAE_DOWNSAMPLE} 小于基础 "
             f"{w * VAE_DOWNSAMPLE}×{h * VAE_DOWNSAMPLE}）——请调大目标或倍率")
     return h2, w2, scale
-
-
-def resolve_target_pixels(h, w, cfg):
-    """基础 latent (H, W) + 配置 -> 像素 (宽, 高)（resolve_target_hw 的像素包装）。"""
-    h2, w2, _ = resolve_target_hw(h, w, cfg)
-    return w2 * VAE_DOWNSAMPLE, h2 * VAE_DOWNSAMPLE
 
 
 def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True):
@@ -805,9 +804,15 @@ def load_net(cfg):
                 dev = dev2
     print(f"[H3二采] 放大模型目标设备：{upscale_net._backend_label(dev)}", flush=True)
     try:
-        return upscale_net.load_model(cfg["model"], dev, cfg["precision"], cfg["arch"])
+        net = upscale_net.load_model(cfg["model"], dev, cfg["precision"], cfg["arch"])
     except FileNotFoundError as e:
         raise ValueError(f"放大模型加载失败：{e}") from None
+    # 把解析出的真身架构写回 cfg：① auto 判定结果固化，后续 params_hash /
+    # write_record 记录的是确定值（旧版存档的 arch 恒与权重匹配——旧加载代码
+    # 强制一致——故 auto 解析后 hash 与旧记录兼容，既有二采记录不失效）；
+    # ② upscale_video 的调用口径直接拿到 2D/3D，不必再问网络真身。
+    cfg["arch"] = upscale_net.kind_of(net)
+    return net
 
 
 def _build_seg_refs(i, seg_label_orders, pool_tensors, refs):
@@ -1226,13 +1231,18 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 只回载 UNET 到 GPU——CLIP/VAE 不再占显存，26GB UNET + 高清激活即可放下。
     # 未触发 OOM 则原样跑；一级降级=全卸只回 UNET；二级降级=LOW_VRAM 分块兜底。
     h, w = video_t.shape[-2], video_t.shape[-1]
-    h2, w2, eff_scale = resolve_target_hw(h, w, cfg)
-    tw, th = w2 * VAE_DOWNSAMPLE, h2 * VAE_DOWNSAMPLE
     length = grid.latent_t_to_frames(video_t.shape[2])
 
-    # 前置健康预检：在放大/分配高清内存【之前】把显存不足、画布越界、模型缺失
-    # 一次暴露——任一 ✗ 抛 UpscaleAbortError，由主循环 re-raise 终止整链（不降级）。
+    # 前置健康预检：在放大/分配高清内存【之前】把显存不足、画布越界、模型缺失、
+    # 目标尺寸非法（下采样等）一次暴露——任一 ✗ 抛 UpscaleAbortError，由主循环
+    # re-raise 终止整链（不降级）。必须先于 resolve_target_hw：尺寸配置错误经由
+    # preflight 转成 UpscaleAbortError（防「一段高清一段基础」混合产物），而不是
+    # 裸 ValueError 被 nodes.py 按普通异常逐段降级。
     preflight(模型, cfg, net, video_t, audio_t, report)
+
+    # 预检已通过（同一纯函数、同参数），此处解析不会再抛
+    h2, w2, eff_scale = resolve_target_hw(h, w, cfg)
+    tw, th = w2 * VAE_DOWNSAMPLE, h2 * VAE_DOWNSAMPLE
 
     # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）；
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
@@ -1584,8 +1594,15 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     t0 = time.perf_counter()
     purge_legacy(root, g)
     _h, _w = int(video_t.shape[-2]), int(video_t.shape[-1])
-    _h2, _w2, _eff = resolve_target_hw(_h, _w, cfg)
-    _tw, _th = _w2 * VAE_DOWNSAMPLE, _h2 * VAE_DOWNSAMPLE
+    try:
+        _h2, _w2, _eff = resolve_target_hw(_h, _w, cfg)
+        _tw, _th = _w2 * VAE_DOWNSAMPLE, _h2 * VAE_DOWNSAMPLE
+    except ValueError as e:
+        # 目标尺寸非法（下采样等）：日志行占位，真正的 ✗ 报告与整链终止由
+        # render_latent 里的 preflight 统一产出（同一纯函数、同参数必复现）
+        _tw = _th = 0
+        _eff = 1.0
+        print(f"[H3二采] 段{g + 1}：目标尺寸非法（{e}）——交给预检统一报告", flush=True)
     if net is None:
         print(f"[H3二采] 段{g + 1}：开始渲染（纯精化不放大 → {_tw}×{_th} 像素，"
               f"未加载放大网络）", flush=True)

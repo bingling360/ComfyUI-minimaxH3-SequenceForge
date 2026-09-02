@@ -578,9 +578,20 @@ def resolve_model_path(name):
 
 
 def _load_raw_sd(path):
+    """读权重 state_dict（safetensors 优先 safe_open 零拷贝，.pth 走 torch.load）。
+
+    与上游 3d.py:356-372 同口径：safetensors 先试 safe_open（按键惰性取张量，
+    比 load_file 少一次整图拷贝），无 safetensors 包时回退 load_file；.pth 用
+    weights_only=False（旧 ckpt 兼容）。顶层 'model' 键解包；FP8 权重转 FP16。
+    """
     if path.endswith(".safetensors"):
-        from safetensors.torch import load_file
-        sd = load_file(path, device="cpu")
+        try:
+            from safetensors import safe_open
+            with safe_open(path, framework="pt", device="cpu") as f:
+                sd = {k: f.get_tensor(k) for k in f.keys()}
+        except ImportError:
+            from safetensors.torch import load_file
+            sd = load_file(path, device="cpu")
     else:
         sd = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "model" in sd:
@@ -834,3 +845,80 @@ def load_model(name, device, precision, arch="auto"):
           f"{'开' if cfg['temporal_every'] > 0 else '关'}"
           f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']})", flush=True)
     return model
+
+
+# ---- 设备 / 显存管理（对齐上游 3d.py:108-129、L599-608） ----
+
+def _is_rocm_build():
+    """当前 PyTorch 是否为 ROCm/HIP 构建（rocm 后端仍映射 cuda 设备对象）。"""
+    return getattr(torch.version, "hip", None) is not None
+
+
+def _backend_label(device):
+    """设备的人类可读标签（rocm/cuda/cpu 区分，仅日志用）。"""
+    if device.type == "cuda" and _is_rocm_build():
+        return f"ROCm/HIP {torch.version.hip}"
+    if device.type == "cuda":
+        return f"CUDA {getattr(torch.version, 'cuda', None) or 'unknown'}"
+    return "CPU"
+
+
+def resolve_device(cfg):
+    """面板设备值 -> torch device；None = 交给 ComfyUI 调度（默认，现状）。
+
+    "" / "auto"：返回 None（调用方走 intermediate_device + _cuda_if_room 纠偏）；
+    "cuda"：cuda 可用则 cuda，否则 cpu（带提示）；
+    "rocm"：须为 ROCm 构建且能访问 GPU，否则抛错（rocm 仍映射 cuda 设备对象，
+            仅日志/选项区分；本地无 ROCm 环境，未验证）；
+    "cpu"：强制 CPU（3D 卷积 CPU 前向是分钟级，仅排错用）。
+    """
+    d = str((cfg or {}).get("device") or "").strip().lower()
+    if d in ("", "auto"):
+        return None
+    if d == "cpu":
+        return torch.device("cpu")
+    if d == "rocm":
+        if not _is_rocm_build():
+            raise ValueError("选择了 ROCm，但当前 PyTorch 无 HIP/ROCm 支持")
+        if not torch.cuda.is_available():
+            raise ValueError("选择了 ROCm，但 PyTorch 访问不到 AMD GPU")
+        return torch.device("cuda")
+    if d == "cuda":
+        if not torch.cuda.is_available():
+            print("[H3二采] 面板选了 CUDA 但 torch.cuda 不可用，回退 CPU", flush=True)
+            return torch.device("cpu")
+        return torch.device("cuda")
+    return None
+
+
+def soft_empty_cache():
+    """释放显存缓存：优先 comfy.model_management.soft_empty_cache（会卸载驻留
+    模型），无 ComfyUI 时回退 torch.cuda.empty_cache（只清分配器）。"""
+    try:
+        import comfy.model_management as mm
+        if hasattr(mm, "soft_empty_cache"):
+            mm.soft_empty_cache()
+            return
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def force_unload(model):
+    """把放大网络从 MODEL_CACHE 彻底移除并释放显存（每段二采后调用 = 下段重新
+    从磁盘加载，换取最大显存/内存头寸；关 = 保留缓存段间零加载，现状默认）。
+
+    与上游 force_unload 的口径差异：上游把 model.to('cpu')（留在缓存）；我们在
+    二采通道里本来就 net.cpu() 腾 GPU 给 UNET 精化，这里 force_unload 进一步
+    把 CPU 上的权重也从缓存里删掉 + soft_empty_cache——多段链后段比首段更易
+    OOM 的主因即在此（CPU 侧的权重副本占着内存）。
+    """
+    if model is None:
+        return
+    drop = [k for k, v in MODEL_CACHE.items() if v is model]
+    for k in drop:
+        MODEL_CACHE.pop(k, None)
+    soft_empty_cache()

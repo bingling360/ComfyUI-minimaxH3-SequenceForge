@@ -127,12 +127,17 @@ def parse_state(ds):
     # 关闭时强制 model="" / scale=1.0：这两项本就在 _PARAM_KEYS 里进指纹，切换开关
     # 自然会触发该段重做——故 enlarge 本身不进指纹（否则既有二采记录会全量失效）。
     enlarge = up.get("enlarge") is not False
+    device = str(up.get("device") or "").strip().lower()
+    if device not in ("", "auto", "cuda", "rocm", "cpu"):
+        device = "auto"
     size_mode = str(up.get("size_mode") or "").strip()
     if size_mode not in SIZE_MODES:
         size_mode = "倍率"
     return {
         "mode": mode,
         "enlarge": enlarge,
+        "device": device,
+        "force_unload": up.get("force_unload") is True,
         "model": (str(up.get("model") or "").strip() if enlarge else ""),
         "arch": _norm_arch(up.get("arch")),
         "scale": (_num("scale", 2.0, 1.0, 4.0) if enlarge else 1.0),
@@ -512,6 +517,11 @@ def _hash_params(cfg):
         keys["encode"] = cfg["encode"]
     if cfg.get("chunk") is False:      # 3D 时序分块：默认开，只有关掉才进指纹
         keys["chunk"] = False
+    if cfg.get("force_unload"):         # 强制卸载：默认关，开了才进指纹
+        keys["force_unload"] = True
+    dev = str(cfg.get("device") or "")
+    if dev and dev != "auto":           # 设备：默认自动不进指纹，显式指定才进
+        keys["device"] = dev
     if cfg.get("sampler"):
         keys["sampler"] = cfg["sampler"]
     if cfg.get("scheduler"):
@@ -784,14 +794,16 @@ def load_net(cfg):
                          "LBH-123-AI/Minimax_h3_latent_Upscaler 下载权重放入 "
                          "models/latent_upscale_models/，刷新导演台后在二采面板选择"
                          "（只想精化不想放大的话，取消勾选「神经放大」即可）")
-    dev = comfy.model_management.intermediate_device()
-    if dev.type == "cpu":
-        dev2 = _cuda_if_room()
-        if dev2 is not None:
-            print(f"[H3二采] intermediate_device 返回 CPU 但空闲显存充足"
-                  f"——放大模型强制上 {dev2}", flush=True)
-            dev = dev2
-    print(f"[H3二采] 放大模型目标设备：{dev}", flush=True)
+    dev = upscale_net.resolve_device(cfg)
+    if dev is None:
+        dev = comfy.model_management.intermediate_device()
+        if dev.type == "cpu":
+            dev2 = _cuda_if_room()
+            if dev2 is not None:
+                print(f"[H3二采] intermediate_device 返回 CPU 但空闲显存充足"
+                      f"——放大模型强制上 {dev2}", flush=True)
+                dev = dev2
+    print(f"[H3二采] 放大模型目标设备：{upscale_net._backend_label(dev)}", flush=True)
     try:
         return upscale_net.load_model(cfg["model"], dev, cfg["precision"], cfg["arch"])
     except FileNotFoundError as e:
@@ -1664,7 +1676,13 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   f"高清解码 {_timing.get('decode', 0.0):.0f}s · "
                   f"编码落盘 {_timing.get('store', 0.0):.0f}s")
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
-    torch.cuda.empty_cache()
+    if net is not None and cfg.get("force_unload"):
+        # 强制卸载：把放大网络从缓存里删掉 + soft_empty_cache（下段重新从磁盘加载，
+        # 换取最大显存/内存头寸——多段链后段比首段更易 OOM 的主因即 CPU 侧权重副本）
+        from . import upscale_net
+        upscale_net.force_unload(net)
+    else:
+        torch.cuda.empty_cache()
     return frames[-1].detach().float().cpu(), up_state
 
 

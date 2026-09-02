@@ -59,10 +59,10 @@
 | D3 | 模型目录注册延迟到首次扫描；新增 `set_model_dirs()` 供离线单测注入 | 无 ComfyUI 环境也能 `import upscale_net` 做前向单测 |
 | D4 | 缓存键含架构（`name::arch::device::precision`） | 同一权重按 2D/3D 分别加载时不串味；auto 与显式同架构共享一份缓存 |
 | D5 | 归一化/反归一化外移到 `upscale.py` | 二采要在放大后的 latent 上继续采样，网络只管前向 |
-| D6 | 设备选择：上游是面板下拉 `cuda/rocm/cpu`；我们原走 `comfy.model_management.intermediate_device()` | 二采在 UNET 常驻的显存环境里跑，交回 ComfyUI 调度更稳；阶段 6 补上面板下拉（默认仍自动） |
+| D6 | 设备选择：上游是面板下拉 `cuda/rocm/cpu`；我们原走 `comfy.model_management.intermediate_device()`，阶段 6 补上面板下拉（默认仍「自动」= 走 ComfyUI 调度 + `_cuda_if_room` 纠偏） | 二采在 UNET 常驻的显存环境里跑，默认交回 ComfyUI 调度最稳；显式 cuda/rocm/cpu 仅排错/专用卡用 |
 | D7 | 3D `forward` 加 temporal chunking（上游 `3d.py:244-339` 同样实现） | 长段省显存 + 治末端闪烁；本地默认开，且只做 3D 前向 |
 | D8 | 目标尺寸 / 百万像素模式（上游 `3d.py:455-578`） | 面板直接给像素尺寸更符合视频工作流；本地沿用「latent 偶数 = 像素 32 对齐」口径 |
-| D9 | `force_unload` / `soft_empty_cache` / rocm 检测 / `safe_open` 零拷贝（上游 `3d.py:108-129`、L356-372、L599-608） | 阶段 6 并入；rocm 本地无法验证，代码注明「未验证」 |
+| D9 | `force_unload` / `soft_empty_cache` / rocm 检测 / `safe_open` 零拷贝（上游 `3d.py:108-129`、L356-372、L599-608），阶段 6 并入 | 与上游的口径差：我们的 `force_unload` 是缓存逐出 + `soft_empty_cache`（上游只 `to('cpu')` 留缓存）——多段链后段更易 OOM 的主因是 CPU 侧权重副本，逐出才真释放；rocm 仍映射 cuda 设备对象，本地无法验证，代码注明 |
 | D10 | 3D 装权从 `strict=True` 放宽为 `strict=False` + attn 白名单 | 与 2D 同口径（attn 推理强制关闭会缺键）；非 attn 缺键仍报错 |
 
 ## 5. 同步 SOP

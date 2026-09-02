@@ -478,6 +478,8 @@ function defaultUpscale() {
              sharpen: 0.0, pixel_sharpen: 0.0, encode: "标准",
              /* 3D 时序分块：默认开（省显存 + 治末端闪烁），关掉才进二采指纹 */
              chunk: true,
+             /* 设备：自动（默认）/ cuda / rocm / cpu；强制卸载默认关 */
+             device: "auto", force_unload: false,
              sampler: "", scheduler: "", retry: false, retry_target: 0.15,
              include: [] };
 }
@@ -617,6 +619,8 @@ function getDs(node) {
             encode: UP_ENCODES.includes(upRaw.encode) ? upRaw.encode : "标准",
             /* 3D 时序分块：旧 JSON 缺键 = 开（对齐后端「默认开」） */
             chunk: upRaw.chunk !== false,
+            device: ["", "auto", "cuda", "rocm", "cpu"].includes(upRaw.device) ? upRaw.device : "auto",
+            force_unload: upRaw.force_unload === true,
             sampler: typeof upRaw.sampler === "string" ? upRaw.sampler.trim() : "",
             scheduler: typeof upRaw.scheduler === "string" ? upRaw.scheduler.trim() : "",
             retry: upRaw.retry === true,
@@ -4126,6 +4130,7 @@ function upscaleSig(data) {
         up.stg ?? 0, up.stg_block ?? 25, up.passes ?? 1, up.decay ?? 0.5,
         up.sharpen ?? 0, up.pixel_sharpen ?? 0, up.encode ?? "标准",
         up.chunk !== false,
+        up.device ?? "auto", up.force_unload === true,
         up.size_mode ?? "倍率", up.target_w ?? 0, up.target_h ?? 0, up.megapixels ?? 0,
         up.sampler ?? "", up.scheduler ?? "", up.retry === true, up.retry_target ?? 0,
         (data.upscaleModels || []).join(","),
@@ -4291,6 +4296,27 @@ function renderUpscaleZone(sec, data) {
         body.append(precField);
         upOnly.push(precField);
 
+        /* 设备：自动（交给 ComfyUI 调度，默认）/ cuda / rocm / cpu */
+        const devField = el("div", "h3d-param");
+        devField.append(el("label", "", "设备"));
+        const devSel = document.createElement("select");
+        devSel.className = "h3d-select";
+        devSel.title = "放大网络运行设备：自动（默认，交给 ComfyUI 的 intermediate_device"
+            + " + 空闲显存纠偏，与主链协调最稳）；cuda/rocm/cpu 显式指定（排错或专用卡用）。"
+            + "rocm 仍映射为 cuda 设备对象，仅日志区分（本地无 ROCm 环境，未验证）。"
+            + "显式指定才进二采指纹";
+        for (const [v, t] of [["auto", "自动"], ["cuda", "cuda"], ["rocm", "rocm"], ["cpu", "cpu"]]) {
+            const o = document.createElement("option");
+            o.value = v;
+            o.textContent = t;
+            if (v === up.device) o.selected = true;
+            devSel.append(o);
+        }
+        devSel.onchange = () => setUpscaleField(node, "device", devSel.value);
+        devField.append(devSel);
+        body.append(devField);
+        upOnly.push(devField);
+
         /* 3D 时序分块：长段按 32 帧分块前向（省显存 + 治末端闪烁），2D 不受影响 */
         const ckField = el("div", "h3d-param");
         ckField.append(el("label", "", "时序分块"));
@@ -4307,6 +4333,23 @@ function renderUpscaleZone(sec, data) {
         ckField.append(ckRow);
         body.append(ckField);
         upOnly.push(ckField);
+
+        /* 强制卸载：每段二采后把放大网络从缓存删掉 + soft_empty_cache（下段重载） */
+        const fuField = el("div", "h3d-param");
+        fuField.append(el("label", "", "强制卸载"));
+        const fuRow = el("div", "h3d-seedrow");
+        const fuCb = document.createElement("input");
+        fuCb.type = "checkbox";
+        fuCb.checked = up.force_unload === true;
+        fuCb.title = "每段二采结束后把放大网络从缓存里彻底删掉 + 调 soft_empty_cache"
+            + "——下段重新从磁盘加载（换取最大显存/内存头寸，代价是每段重载 ~1s）。"
+            + "默认关（段间保留缓存零加载）。多段链后段比首段更易 OOM 时再开。"
+            + "开了才进二采指纹";
+        fuCb.onchange = () => setUpscaleField(node, "force_unload", fuCb.checked);
+        fuRow.append(fuCb);
+        fuField.append(fuRow);
+        body.append(fuField);
+        upOnly.push(fuField);
 
         /* 目标尺寸模式：倍率 / 目标尺寸 / 百万像素 —— 三选一，按模式显示对应字段 */
         const sizeField = el("div", "h3d-param");

@@ -147,6 +147,8 @@ def parse_state(ds):
         "decay": _num("decay", 0.5, 0.2, 0.8),
         "sharpen": _num("sharpen", 0.0, 0.0, 1.0),
         "pixel_sharpen": _num("pixel_sharpen", 0.0, 0.0, 1.0),
+        # 3D 时序分块：默认开（省显存 + 治末端闪烁），关掉才进指纹（既有记录不失效）
+        "chunk": up.get("chunk") is not False,
         "encode": encode,
         "sampler": str(up.get("sampler") or "").strip(),
         "scheduler": str(up.get("scheduler") or "").strip(),
@@ -484,6 +486,8 @@ def _hash_params(cfg):
         keys["pixel_sharpen"] = cfg["pixel_sharpen"]
     if cfg.get("encode") and cfg["encode"] != "标准":
         keys["encode"] = cfg["encode"]
+    if cfg.get("chunk") is False:      # 3D 时序分块：默认开，只有关掉才进指纹
+        keys["chunk"] = False
     if cfg.get("sampler"):
         keys["sampler"] = cfg["sampler"]
     if cfg.get("scheduler"):
@@ -576,7 +580,7 @@ def target_pixels(h, w, scale):
     return w2 * 16, h2 * 16
 
 
-def upscale_video(video_t, net, scale, arch="auto", hw=None):
+def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True):
     """[B,24,T,H,W] latent -> 神经放大（T 不变，H/W 到目标尺寸偶数对齐），float32。
 
     归一化口径与上游训练一致：放大前 (x-μ)/σ，放大后反变换；网络精度由
@@ -604,7 +608,8 @@ def upscale_video(video_t, net, scale, arch="auto", hw=None):
     mean, std = _norm_tensors(x.device, nd)
     xn = (x.to(nd) - mean) / std
     if ak == "3D":
-        y = net(xn, scale=float(scale), target_size=(x.shape[2], h2, w2))
+        y = net(xn, scale=float(scale), target_size=(x.shape[2], h2, w2),
+                enable_chunking=chunk)
     else:
         y = net(xn, scale=float(scale), target_hw=(h2, w2))
     mean32, std32 = _norm_tensors(x.device, torch.float32)
@@ -1134,7 +1139,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）；
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
     _t = time.perf_counter()
-    up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"])
+    up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"],
+                         chunk=cfg.get("chunk", True))
     hf_up = latent_hf_energy(up_v)
     # 频域细节混合启用时保留纯放大 latent 的 CPU 副本（避开采样期显存峰值，
     # 精化后作低频锚；关闭时零开销不复制）
@@ -1180,16 +1186,19 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         if guide is not None:
             up_guide = dict(guide)
             up_guide["latent"] = upscale_video(guide["latent"].to(dev, torch.float32),
-                                               net, cfg["scale"], cfg["arch"])
+                                               net, cfg["scale"], cfg["arch"],
+                                               chunk=cfg.get("chunk", True))
             bridged = True
         up_tail = None
         if tail_kf_latent is not None:
             up_tail = upscale_video(tail_kf_latent.to(dev, torch.float32),
-                                    net, cfg["scale"], cfg["arch"])
+                                    net, cfg["scale"], cfg["arch"],
+                                    chunk=cfg.get("chunk", True))
         up_head = None
         if head_kf_latent is not None:
             up_head = upscale_video(head_kf_latent.to(dev, torch.float32),
-                                    net, cfg["scale"], cfg["arch"])
+                                    net, cfg["scale"], cfg["arch"],
+                                    chunk=cfg.get("chunk", True))
         cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(
             cond, up_guide, length, tail_kf_latent=up_tail, head_kf_latent=up_head)
 

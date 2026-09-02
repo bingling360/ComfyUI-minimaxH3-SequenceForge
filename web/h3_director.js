@@ -474,6 +474,8 @@ function defaultUpscale() {
              time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0,
              stg: 0.0, stg_block: 25, passes: 1, decay: 0.5,
              sharpen: 0.0, pixel_sharpen: 0.0, encode: "标准",
+             /* 3D 时序分块：默认开（省显存 + 治末端闪烁），关掉才进二采指纹 */
+             chunk: true,
              sampler: "", scheduler: "", retry: false, retry_target: 0.15,
              include: [] };
 }
@@ -607,6 +609,8 @@ function getDs(node) {
             sharpen: upNum(upRaw.sharpen, 0.0, 0.0, 1.0),
             pixel_sharpen: upNum(upRaw.pixel_sharpen, 0.0, 0.0, 1.0),
             encode: UP_ENCODES.includes(upRaw.encode) ? upRaw.encode : "标准",
+            /* 3D 时序分块：旧 JSON 缺键 = 开（对齐后端「默认开」） */
+            chunk: upRaw.chunk !== false,
             sampler: typeof upRaw.sampler === "string" ? upRaw.sampler.trim() : "",
             scheduler: typeof upRaw.scheduler === "string" ? upRaw.scheduler.trim() : "",
             retry: upRaw.retry === true,
@@ -4098,6 +4102,7 @@ function upscaleSig(data) {
         up.adaptive === true, up.shift ?? 0, (up.include || []).join(","),
         up.stg ?? 0, up.stg_block ?? 25, up.passes ?? 1, up.decay ?? 0.5,
         up.sharpen ?? 0, up.pixel_sharpen ?? 0, up.encode ?? "标准",
+        up.chunk !== false,
         up.sampler ?? "", up.scheduler ?? "", up.retry === true, up.retry_target ?? 0,
         (data.upscaleModels || []).join(","),
         data.mf?.upscale?.hash ?? "",
@@ -4261,6 +4266,23 @@ function renderUpscaleZone(sec, data) {
         precField.append(precSel);
         body.append(precField);
         upOnly.push(precField);
+
+        /* 3D 时序分块：长段按 32 帧分块前向（省显存 + 治末端闪烁），2D 不受影响 */
+        const ckField = el("div", "h3d-param");
+        ckField.append(el("label", "", "时序分块"));
+        const ckRow = el("div", "h3d-seedrow");
+        const ckCb = document.createElement("input");
+        ckCb.type = "checkbox";
+        ckCb.checked = up.chunk !== false;
+        ckCb.title = "仅 3D 架构生效（2D 是逐帧卷积，不分块）：长段按时序切成 32 帧一块、"
+            + "块间带 overlap 线性融合后拼回——显存峰值随帧数不再线性增长，末端帧也"
+            + "不会因为缺右侧上下文而闪烁。默认开；关掉=整段一次前向（短段更快，"
+            + "输出与分块版仅有数值噪声级差异）。关掉才进二采指纹";
+        ckCb.onchange = () => setUpscaleField(node, "chunk", ckCb.checked);
+        ckRow.append(ckCb);
+        ckField.append(ckRow);
+        body.append(ckField);
+        upOnly.push(ckField);
 
         const scaleField = upNumField("放大倍率", up.scale, 1.0, 4.0, 0.1,
             "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大；"

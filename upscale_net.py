@@ -16,6 +16,7 @@ nodes/minimax_h3_latent_upscaler_2d.py 与 minimax_h3_latent_upscaler_3d.py
   ComfyUI/models/latent_upscale_models/（.pth/.safetensors）
 """
 
+import gc
 import glob
 import os
 import re
@@ -27,6 +28,7 @@ from einops import rearrange
 
 LATENT_UPSCALE_FOLDER = "latent_upscale_models"
 _FOLDER_REGISTERED = False
+_TEMPORAL_CHUNK = 32     # 3D 时序分块的帧数（上游同款常量，3d.py:264）
 
 LATENTS_MEAN = [
     0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
@@ -342,6 +344,7 @@ class TemporalConv3D(nn.Module):
 
 
 # ↑ upstream/nodes/minimax_h3_latent_upscaler_3d.py:215（同步于 d7c01b9）
+#   forward 的 temporal chunking 与 _forward_seg 对齐上游 3d.py:244-339
 class LatentResizer3D(nn.Module):
     """纯 3D 主干（与训练代码一致）。"""
 
@@ -370,7 +373,15 @@ class LatentResizer3D(nn.Module):
         self.norm_out = normalization(channels)
         self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
 
-    def forward(self, x, scale=None, target_size=None):
+    def forward(self, x, scale=None, target_size=None, enable_chunking=True):
+        """放大前向：长段按时序分块（chunk=32）跑，块间 overlap 线性融合。
+
+        分块动机（上游同款，3d.py:244-311）：3D 卷积的激活随 T 线性增长，长段
+        一次性前向容易爆显存；且末端帧缺右侧上下文会闪（end-frame flickering）。
+        分块后每块左右各带 overlap 帧的上下文（overlap = 时序卷积核 tk），只取
+        中间有效区、块间用线性权重叠加融合——首块左侧与末块右侧不 ramp（那里
+        没有邻居可融）。enable_chunking=False 或 T<=chunk 时退化为整段单次前向。
+        """
         if target_size is not None:
             size = target_size
         elif scale is not None:
@@ -379,6 +390,59 @@ class LatentResizer3D(nn.Module):
             return x
         if size == x.shape[-3:]:
             return x
+        B, C, T, H, W = x.shape
+        tk = 0
+        for b in self.in_blocks:
+            if isinstance(b, TemporalConv3D):
+                tk = b.dwconv.weight.shape[2]
+                break
+        overlap, chunk = tk, _TEMPORAL_CHUNK
+        if not enable_chunking or T <= chunk:
+            return self._forward_seg(x, scale, size)
+        print(f"[H3二采] 3D 时序分块：T={T} 分 {(T + chunk - 1) // chunk} 块 "
+              f"（chunk={chunk}，overlap={overlap}）", flush=True)
+        x_padded = F.pad(x, (0, 0, 0, 0, overlap, overlap), mode="replicate")
+        out_full = torch.zeros(B, C, T, size[-2], size[-1],
+                               device=x.device, dtype=x.dtype)
+        weight_full = torch.zeros(1, 1, T, 1, 1, device=x.device, dtype=x.dtype)
+        start = 0
+        while start < T:
+            seg_start = start
+            seg_end = min(T, start + chunk)
+            out_start = max(0, seg_start - overlap)
+            out_end = min(T, seg_end + overlap)
+            lo = max(0, out_start - overlap)
+            hi = min(T + 2 * overlap, out_end + overlap)
+            seg = x_padded[:, :, lo:hi].contiguous()
+            seg_size = (hi - lo, size[-2], size[-1])
+            seg_out = self._forward_seg(seg, scale, seg_size)
+            s0 = (out_start + overlap) - lo
+            s1 = s0 + (out_end - out_start)
+            valid_out = seg_out[:, :, s0:s1]
+            n_valid = out_end - out_start
+            weight = torch.ones(n_valid, device=x.device, dtype=x.dtype)
+            if seg_start > out_start:      # 首块左侧不 ramp（没有左邻居）
+                blend_len = seg_start - out_start
+                weight[:blend_len] = torch.arange(
+                    1, blend_len + 1, device=x.device, dtype=x.dtype) / (blend_len + 1)
+            if out_end > seg_end:          # 末块右侧不 ramp（没有右邻居）
+                blend_len = out_end - seg_end
+                weight[-blend_len:] = torch.arange(
+                    blend_len, 0, -1, device=x.device, dtype=x.dtype) / (blend_len + 1)
+            out_full[:, :, out_start:out_end] += valid_out * weight.view(1, 1, n_valid, 1, 1)
+            weight_full[:, :, out_start:out_end] += weight.view(1, 1, n_valid, 1, 1)
+            start += chunk
+            del seg, seg_out, valid_out
+            if start % (chunk * 4) == 0:
+                gc.collect()
+        return out_full / weight_full.clamp(min=1e-8)
+
+    def _forward_seg(self, x, scale, size):
+        """单块前向（conv_in → in_blocks → trilinear → out_blocks → norm_out → conv_out）。
+
+        size 含 T：分块时 T 与原片段一致（trilinear 在 T 上是恒等缩放），这样
+        每块输出的时间轴才与 out_full 的时间下标一一对齐。
+        """
         scale_emb = torch.tensor(
             [scale - 1 if scale is not None else 0.0],
             dtype=x.dtype, device=x.device).unsqueeze(0)

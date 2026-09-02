@@ -127,12 +127,19 @@ def parse_state(ds):
     # 关闭时强制 model="" / scale=1.0：这两项本就在 _PARAM_KEYS 里进指纹，切换开关
     # 自然会触发该段重做——故 enlarge 本身不进指纹（否则既有二采记录会全量失效）。
     enlarge = up.get("enlarge") is not False
+    size_mode = str(up.get("size_mode") or "").strip()
+    if size_mode not in SIZE_MODES:
+        size_mode = "倍率"
     return {
         "mode": mode,
         "enlarge": enlarge,
         "model": (str(up.get("model") or "").strip() if enlarge else ""),
         "arch": _norm_arch(up.get("arch")),
         "scale": (_num("scale", 2.0, 1.0, 4.0) if enlarge else 1.0),
+        "size_mode": size_mode,
+        "target_w": int(_num("target_w", 1280, 64, 8192)),
+        "target_h": int(_num("target_h", 704, 64, 8192)),
+        "megapixels": _num("megapixels", 1.0, 0.1, 16.0),
         "denoise": denoise,
         "steps": steps,
         "cfg": _num("cfg", 1.0, 0.0, 100.0),
@@ -463,8 +470,25 @@ def time_bias_sigma(sigma_v, sigma_start, bias, start_progress=0.70,
 
 
 def _hash_params(cfg):
-    """进指纹/记录的参数字典（params_hash 与 write_record.params 同口径）。"""
+    """进指纹/记录的参数字典（params_hash 与 write_record.params 同口径）。
+
+    time_bias / mix / shift 仅在 >0、adaptive 仅在开启时进指纹——默认全关
+    不改变哈希，既有二采记录不因新增参数而失效重做。adaptive 开启后每段
+    生效 σ 由该段基础 latent（经 base_hash 指纹）决定论派生，无需逐段进
+    指纹也不会串档。size_mode 始终进指纹（切换模式改变目标尺寸）；目标
+    尺寸/百万像素模式不进 scale（该值此时无效，避免无谓重做）。
+    """
     keys = {k: cfg[k] for k in _PARAM_KEYS}
+    sm = str(cfg.get("size_mode") or "倍率")
+    if cfg.get("enlarge", True):
+        keys["size_mode"] = sm
+        if sm == "目标尺寸":
+            keys["target_w"] = cfg["target_w"]
+            keys["target_h"] = cfg["target_h"]
+            keys.pop("scale", None)
+        elif sm == "百万像素":
+            keys["megapixels"] = cfg["megapixels"]
+            keys.pop("scale", None)
     if cfg.get("time_bias"):
         keys["time_bias"] = cfg["time_bias"]
     if cfg.get("mix"):
@@ -561,6 +585,15 @@ def in_scope(cfg, g):
 
 # ---- latent 放大数学（纯 torch，可单测） ----
 
+VAE_DOWNSAMPLE = 16
+
+
+def _even(n):
+    """整数向上取偶（latent 偶数 = 像素 32 对齐，官方画布口径）。"""
+    n = max(2, int(n))
+    return n + n % 2
+
+
 def target_hw(h, w, scale):
     """latent 目标尺寸：round(H×scale) 向上取偶（latent 偶数 = 像素 32 对齐）。"""
     h2 = max(2, int(round(h * float(scale))))
@@ -577,7 +610,53 @@ def target_pixels(h, w, scale):
     （拼接被喂 960×1728 这类竖参，Linux 实测 EINVAL 22）。统一走本函数杜绝复发。
     """
     h2, w2 = target_hw(h, w, scale)
-    return w2 * 16, h2 * 16
+    return w2 * VAE_DOWNSAMPLE, h2 * VAE_DOWNSAMPLE
+
+
+def resolve_target_hw(h, w, cfg):
+    """基础 latent (H, W) + 配置 -> (目标 latent H, W, 生效倍率)。
+
+    三种模式（对齐上游 3d.py:541-556 的 UpscaleMode）：
+    - 倍率：latent = round(H×scale) 向上取偶（现状）；
+    - 目标尺寸：像素 (W,H) -> latent = 向上取偶(floor(px/16))——像素 32 对齐，
+      目标可能略小于用户输入（最多差 30px，对齐到 32 倍数）；
+    - 百万像素：按基础宽高比 aspect=w/h，h_px=sqrt(target_px/aspect)、w_px=h_px*aspect，
+      latent 同样向上取偶。
+    生效倍率 = (w2/w + h2/h)/2（用于 scale embedding；目标尺寸/百万像素模式也
+    需要告诉网络「放大了多少」）。下采样（生效倍率 < 1.0 且目标真小于基础）抛
+    ValueError——放大网络只支持放大。
+    """
+    mode = str(cfg.get("size_mode") or "倍率")
+    if mode == "目标尺寸":
+        tw = max(64, int(float(cfg.get("target_w") or 1280)))
+        th = max(64, int(float(cfg.get("target_h") or 704)))
+        w2 = _even(tw // VAE_DOWNSAMPLE)
+        h2 = _even(th // VAE_DOWNSAMPLE)
+        scale = (w2 / w + h2 / h) / 2.0
+    elif mode == "百万像素":
+        mp = float(cfg.get("megapixels") or 1.0)
+        target_px = mp * 1024 * 1024
+        aspect = w / max(h, 1)
+        h_px = (target_px / aspect) ** 0.5
+        w_px = h_px * aspect
+        w2 = _even(int(w_px) // VAE_DOWNSAMPLE)
+        h2 = _even(int(h_px) // VAE_DOWNSAMPLE)
+        scale = (w2 / w + h2 / h) / 2.0
+    else:
+        scale = float(cfg.get("scale") or 2.0)
+        h2, w2 = target_hw(h, w, scale)
+    if scale < 1.0 and (w2 < w or h2 < h):
+        raise ValueError(
+            f"放大网络只支持放大（生效倍率 {scale:.3f} < 1.0，目标 "
+            f"{w2 * VAE_DOWNSAMPLE}×{h2 * VAE_DOWNSAMPLE} 小于基础 "
+            f"{w * VAE_DOWNSAMPLE}×{h * VAE_DOWNSAMPLE}）——请调大目标或倍率")
+    return h2, w2, scale
+
+
+def resolve_target_pixels(h, w, cfg):
+    """基础 latent (H, W) + 配置 -> 像素 (宽, 高)（resolve_target_hw 的像素包装）。"""
+    h2, w2, _ = resolve_target_hw(h, w, cfg)
+    return w2 * VAE_DOWNSAMPLE, h2 * VAE_DOWNSAMPLE
 
 
 def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True):
@@ -868,27 +947,33 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     else:
         try:
             dev = next(net.parameters()).device
-            lines.append(f"✓ 放大模型就绪：{cfg.get('arch', '2D')} @ {dev}")
-        except (StopIteration, AttributeError):
-            lines.append("✗ 放大模型不可用——请先在二采面板选择有效权重")
-            fail.append("放大模型不可用")
+            from . import upscale_net
+            lines.append(f"✓ 放大模型就绪：{upscale_net.kind_of(net)} @ {dev}")
+        except (StopIteration, AttributeError, ImportError):
+            lines.append("✓ 放大模型就绪")
 
-    # 2) 二采画布（latent 偶数 -> 像素 ·32）
+    # 2) 二采画布（latent 偶数 -> 像素 ·32）：按 size_mode 解析目标 + 生效倍率
     h, w = video_t.shape[-2], video_t.shape[-1]
-    scale = float(cfg.get("scale", 2.0) or 2.0)
-    h2, w2 = target_hw(h, w, scale)
-    tw, th = w2 * 16, h2 * 16
+    try:
+        h2, w2, scale = resolve_target_hw(h, w, cfg)
+    except ValueError as e:
+        lines.append(f"✗ {e}")
+        fail.append("目标尺寸非法")
+        h2, w2, scale = h, w, 1.0
+    tw, th = w2 * VAE_DOWNSAMPLE, h2 * VAE_DOWNSAMPLE
     mp = tw * th / 1e6
+    sm = str(cfg.get("size_mode") or "倍率")
     lines.append(f"… 画布：基础 {w * 16}×{h * 16} → 二采 {tw}×{th}"
-                 f"（{mp:.1f}MP，×{scale:g}）")
+                 f"（{mp:.1f}MP，生效 ×{scale:g}"
+                 f"{'' if sm == '倍率' else f'，{sm}'}）")
     if mp > _CANVAS_ABORT_MP:
         cap = _calc_scale_cap(h, w)
         lines.append(f"✗ 二采画布 {tw}×{th}（{mp:.1f}MP）超上限 {_CANVAS_ABORT_MP:.0f}MP"
-                     f"——VAE 解码与显存双重爆点；请把放大倍率降到 ≤{cap:g}×")
+                     f"——VAE 解码与显存双重爆点；请调小目标尺寸/倍率（≤{cap:g}×）")
         fail.append(f"画布超限 {mp:.1f}MP")
     elif mp > 2.5:
         lines.append(f"⚠ 高清画布 {mp:.1f}MP 超 2.5MP 安全解码区，注意 fp16 高频溢出"
-                     f"（出花屏/色块就降倍率或提采样精度）")
+                     f"（出花屏/色块就降目标尺寸或提采样精度）")
 
     # 3) 显存账目：对比【重采样时刻】可用 vs 高清新增峰值。
     # 预检时 TE/VAE/UNET 常全驻留（DynamicVRAM 更会把显存当权重缓存填满，
@@ -1129,7 +1214,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 只回载 UNET 到 GPU——CLIP/VAE 不再占显存，26GB UNET + 高清激活即可放下。
     # 未触发 OOM 则原样跑；一级降级=全卸只回 UNET；二级降级=LOW_VRAM 分块兜底。
     h, w = video_t.shape[-2], video_t.shape[-1]
-    tw, th = target_pixels(h, w, cfg["scale"])
+    h2, w2, eff_scale = resolve_target_hw(h, w, cfg)
+    tw, th = w2 * VAE_DOWNSAMPLE, h2 * VAE_DOWNSAMPLE
     length = grid.latent_t_to_frames(video_t.shape[2])
 
     # 前置健康预检：在放大/分配高清内存【之前】把显存不足、画布越界、模型缺失
@@ -1139,8 +1225,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）；
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
     _t = time.perf_counter()
-    up_v = upscale_video(video_t, net, cfg["scale"], cfg["arch"],
-                         chunk=cfg.get("chunk", True))
+    up_v = upscale_video(video_t, net, eff_scale, cfg["arch"],
+                         hw=(h2, w2), chunk=cfg.get("chunk", True))
     hf_up = latent_hf_energy(up_v)
     # 频域细节混合启用时保留纯放大 latent 的 CPU 副本（避开采样期显存峰值，
     # 精化后作低频锚；关闭时零开销不复制）
@@ -1186,19 +1272,19 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         if guide is not None:
             up_guide = dict(guide)
             up_guide["latent"] = upscale_video(guide["latent"].to(dev, torch.float32),
-                                               net, cfg["scale"], cfg["arch"],
-                                               chunk=cfg.get("chunk", True))
+                                               net, eff_scale, cfg["arch"],
+                                               hw=(h2, w2), chunk=cfg.get("chunk", True))
             bridged = True
         up_tail = None
         if tail_kf_latent is not None:
             up_tail = upscale_video(tail_kf_latent.to(dev, torch.float32),
-                                    net, cfg["scale"], cfg["arch"],
-                                    chunk=cfg.get("chunk", True))
+                                    net, eff_scale, cfg["arch"],
+                                    hw=(h2, w2), chunk=cfg.get("chunk", True))
         up_head = None
         if head_kf_latent is not None:
             up_head = upscale_video(head_kf_latent.to(dev, torch.float32),
-                                    net, cfg["scale"], cfg["arch"],
-                                    chunk=cfg.get("chunk", True))
+                                    net, eff_scale, cfg["arch"],
+                                    hw=(h2, w2), chunk=cfg.get("chunk", True))
         cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(
             cond, up_guide, length, tail_kf_latent=up_tail, head_kf_latent=up_head)
 
@@ -1486,12 +1572,14 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     t0 = time.perf_counter()
     purge_legacy(root, g)
     _h, _w = int(video_t.shape[-2]), int(video_t.shape[-1])
-    _tw, _th = target_pixels(_h, _w, float(cfg.get("scale") or 2.0))
+    _h2, _w2, _eff = resolve_target_hw(_h, _w, cfg)
+    _tw, _th = _w2 * VAE_DOWNSAMPLE, _h2 * VAE_DOWNSAMPLE
     if net is None:
         print(f"[H3二采] 段{g + 1}：开始渲染（纯精化不放大 → {_tw}×{_th} 像素，"
               f"未加载放大网络）", flush=True)
     else:
-        print(f"[H3二采] 段{g + 1}：开始渲染（{cfg['arch']} {cfg['scale']:g}× → {_tw}×{_th} 像素，"
+        from . import upscale_net
+        print(f"[H3二采] 段{g + 1}：开始渲染（{upscale_net.kind_of(net)} → {_tw}×{_th} 像素，"
               f"放大网络 @ {next(net.parameters()).device}）", flush=True)
     _timing = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
@@ -1546,7 +1634,13 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _enc = str(cfg.get("encode") or "标准")
     _sam = str(cfg.get("sampler") or "").strip()
     _sch = str(cfg.get("scheduler") or "").strip()
-    report.append(f"段{g + 1} 二采：{tw}×{th} · {cfg['arch']} {cfg['scale']:g}× · "
+    _kind = "—"
+    if net is not None:
+        from . import upscale_net
+        _kind = upscale_net.kind_of(net)
+    _sm_lbl = str(cfg.get("size_mode") or "倍率")
+    _mode_bit = "" if _sm_lbl == "倍率" else f"（{_sm_lbl}）"
+    report.append(f"段{g + 1} 二采：{tw}×{th} · {_kind} ×{_eff:g}{_mode_bit} · "
                   f"精化 {('×'.join([str(_n)] * _passes))} 步 @ σ≈{_sig_str} · "
                   f"细节 {hf_gain:+.0%} · 清晰 {sharp:.1f} · "
                   f"{time.perf_counter() - t0:.0f}s"

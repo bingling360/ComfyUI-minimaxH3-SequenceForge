@@ -470,6 +470,8 @@ function defaultUpscale() {
        默认 false=关、passes=1=单轮、encode=标准、采样器空=沿用主链——仅启用时进后端
        指纹（不使既有记录失效）。抗糊武器库详见《更新说明_二采抗糊抗条纹》 */
     return { schema: 2, on: true, mode: "关闭", model: "", arch: "auto", scale: 2.0,
+             /* 目标尺寸模式：倍率（现状默认）/ 目标尺寸 / 百万像素 */
+             size_mode: "倍率", target_w: 1280, target_h: 704, megapixels: 1.0,
              denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16",
              time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0,
              stg: 0.0, stg_block: 25, passes: 1, decay: 0.5,
@@ -593,6 +595,10 @@ function getDs(node) {
             /* 网络架构：auto=按权重自动判定（默认）；显式 2D/3D 才按面板指定装 */
             arch: ["2D", "3D"].includes(upRaw.arch) ? upRaw.arch : "auto",
             scale: upNum(upRaw.scale, 2.0, 1.0, 4.0),
+            size_mode: UP_SIZE_MODES.includes(upRaw.size_mode) ? upRaw.size_mode : "倍率",
+            target_w: Math.round(upNum(upRaw.target_w, 1280, 64, 8192)),
+            target_h: Math.round(upNum(upRaw.target_h, 704, 64, 8192)),
+            megapixels: upNum(upRaw.megapixels, 1.0, 0.1, 16.0),
             denoise: upDenoise,
             steps: upSteps,
             cfg: upNum(upRaw.cfg, 1.0, 0.0, 100.0),
@@ -1082,6 +1088,8 @@ const REDO_MODES = [
 ];
 const UP_PRECISIONS = ["fp32", "fp16", "bf16"];
 const UP_ENCODES = ["标准", "高清", "极致"];
+/* 放大目标尺寸模式（与后端 upscale.py SIZE_MODES 同表） */
+const UP_SIZE_MODES = ["倍率", "目标尺寸", "百万像素"];
 
 function setUpscaleField(node, field, value) {
     const ds = getDs(node);
@@ -1099,7 +1107,7 @@ function setUpscaleField(node, field, value) {
 /** 目标画布估算（与后端 target_hw 同口径：latent 偶数对齐=像素 32 倍数）。
  *  画幅来源与后端 _resolve_canvas / 链参数换算徽章同源：非「自定义」按 宽高比×百万像素
  *  换算——宽/高控件此时只是旧残留，直接读会算出与主徽章打架的错数；「自定义」才读宽高。 */
-function upTargetCanvas(node, scale) {
+function upTargetCanvas(node, up) {
     const ar = String(getWidgetValue(node, W_AR) ?? "");
     let w = 0, h = 0;
     if (AR_RATIO[ar]) {
@@ -1110,7 +1118,22 @@ function upTargetCanvas(node, scale) {
         h = Number(getWidgetValue(node, W_HEIGHT));
     }
     if (!isFinite(w) || !isFinite(h) || !w || !h) return "";
-    const even = (x) => { const v = Math.max(2, Math.round(x)); return v + v % 2; };
+    const even = (x) => { const v = Math.max(2, Math.floor(x)); return v + v % 2; };
+    const mode = up.size_mode || "倍率";
+    if (mode === "目标尺寸") {
+        const tw = Math.max(64, Number(up.target_w ?? 1280));
+        const th = Math.max(64, Number(up.target_h ?? 704));
+        return `${even(tw / 16) * 16}×${even(th / 16) * 16}`;
+    }
+    if (mode === "百万像素") {
+        const mp = Number(up.megapixels ?? 1.0);
+        const target = mp * 1024 * 1024;
+        const aspect = w / h;
+        const hPx = (target / aspect) ** 0.5;
+        const wPx = hPx * aspect;
+        return `${even(wPx / 16) * 16}×${even(hPx / 16) * 16}`;
+    }
+    const scale = Number(up.scale ?? 2.0);
     return `${even(w / 16 * scale) * 16}×${even(h / 16 * scale) * 16}`;
 }
 
@@ -4103,6 +4126,7 @@ function upscaleSig(data) {
         up.stg ?? 0, up.stg_block ?? 25, up.passes ?? 1, up.decay ?? 0.5,
         up.sharpen ?? 0, up.pixel_sharpen ?? 0, up.encode ?? "标准",
         up.chunk !== false,
+        up.size_mode ?? "倍率", up.target_w ?? 0, up.target_h ?? 0, up.megapixels ?? 0,
         up.sampler ?? "", up.scheduler ?? "", up.retry === true, up.retry_target ?? 0,
         (data.upscaleModels || []).join(","),
         data.mf?.upscale?.hash ?? "",
@@ -4284,12 +4308,51 @@ function renderUpscaleZone(sec, data) {
         body.append(ckField);
         upOnly.push(ckField);
 
-        const scaleField = upNumField("放大倍率", up.scale, 1.0, 4.0, 0.1,
-            "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大；"
-            + "想连放大网络都不加载就取消上方「神经放大」",
-            (v) => setUpscaleField(node, "scale", v));
-        body.append(scaleField);
-        upOnly.push(scaleField);
+        /* 目标尺寸模式：倍率 / 目标尺寸 / 百万像素 —— 三选一，按模式显示对应字段 */
+        const sizeField = el("div", "h3d-param");
+        sizeField.append(el("label", "", "目标尺寸"));
+        const sizeSel = document.createElement("select");
+        sizeSel.className = "h3d-select";
+        sizeSel.title = "倍率：latent H/W 同乘一个系数（现状）；"
+            + "目标尺寸：直接给像素宽×高（latent 取偶对齐到像素 32 倍数，可能略小于输入）；"
+            + "百万像素：按基础宽高比换算总像素数。三种模式都只放大 H/W，时间维不变";
+        for (const m of UP_SIZE_MODES) {
+            const o = document.createElement("option");
+            o.value = m;
+            o.textContent = m;
+            if (m === up.size_mode) o.selected = true;
+            sizeSel.append(o);
+        }
+        sizeSel.onchange = () => setUpscaleField(node, "size_mode", sizeSel.value);
+        sizeField.append(sizeSel);
+        body.append(sizeField);
+        upOnly.push(sizeField);
+
+        const sizeFieldsWrap = el("div", "h3d-size-fields");
+        function renderSizeFields() {
+            sizeFieldsWrap.replaceChildren();
+            const m = up.size_mode || "倍率";
+            if (m === "目标尺寸") {
+                sizeFieldsWrap.append(upNumField("目标宽", up.target_w, 64, 8192, 8,
+                    "目标像素宽（latent 取偶对齐后实际可能略小，对齐到 32 倍数）",
+                    (v) => setUpscaleField(node, "target_w", v)));
+                sizeFieldsWrap.append(upNumField("目标高", up.target_h, 64, 8192, 8,
+                    "目标像素高",
+                    (v) => setUpscaleField(node, "target_h", v)));
+            } else if (m === "百万像素") {
+                sizeFieldsWrap.append(upNumField("百万像素", up.megapixels, 0.1, 16.0, 0.1,
+                    "目标总像素数（按基础宽高比分配宽高）；1MP≈1024×1024",
+                    (v) => setUpscaleField(node, "megapixels", v)));
+            } else {
+                sizeFieldsWrap.append(upNumField("放大倍率", up.scale, 1.0, 4.0, 0.1,
+                    "latent H/W 同乘（时间维不变）；目标画布见下方徽章。倍率 1.0 = 纯二采不放大；"
+                    + "想连放大网络都不加载就取消上方「神经放大」",
+                    (v) => setUpscaleField(node, "scale", v)));
+            }
+        }
+        renderSizeFields();
+        body.append(sizeFieldsWrap);
+        upOnly.push(sizeFieldsWrap);
         showUp();
         body.append(upNumField("二采强度", up.denoise, 0.05, 1.0, 0.05,
             "尾段起始噪声 σ（sigma 尾段精化区间的起点）：0.3-0.45 常用；越大越接近重生成（会改写画面内容），越小仅轻修细节",
@@ -4421,7 +4484,7 @@ function renderUpscaleZone(sec, data) {
             (v) => setUpscaleField(node, "retry_target", v)));
 
         /* 目标画布徽章（latent 偶数对齐 = 像素 32 倍数，与后端 target_hw 同口径） */
-        const target = upTargetCanvas(node, up.scale);
+        const target = upTargetCanvas(node, up);
         if (target) {
             const b = el("div", "h3d-convbadge",
                 `目标画布 ${escapeHtml(target)}（latent 偶数对齐 · 时间维不变）`);

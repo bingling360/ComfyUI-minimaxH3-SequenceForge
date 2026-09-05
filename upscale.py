@@ -1208,11 +1208,31 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     if net is not None:
         dev = next(net.parameters()).device
         if dev.type == 'cpu':
+            # 上轮二采尾部 net.cpu() / 缓存命中残留都可能让网络留在 CPU。
+            # 纠偏必须在腾挪之后：基础采样刚结束时 UNET/TE/VAE 全驻留，
+            # 账面 free 极小、_cuda_if_room 必失败，原地纠偏必回落 CPU。
+            # 先 unload_all_models 腾出真空闲再抢 GPU；cond 构建随后按需回载
+            # TE/VAE（Comfy 原生机制），精化前本就还有一次全卸，只多一次换页。
+            try:
+                comfy.model_management.unload_all_models()
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                print(f"[H3二采] 段{seg_no}：放大前显存腾挪（放大网络在 CPU，先卸驻留模型再抢 GPU）…",
+                      flush=True)
+            except Exception:
+                pass
             # 上段二采异常后放大网络留在 CPU：优先纠偏回 GPU（intermediate_device
             # 在魔改运行时账面紧张时可能仍返回 CPU——此时 CPU 前向是分钟级）
             dev = _cuda_if_room() or comfy.model_management.intermediate_device()
             if dev.type == 'cuda':
                 print(f"[H3二采] 段{seg_no}：放大网络在 CPU，已挪回 {dev}", flush=True)
+            else:
+                print(f"[H3二采] 段{seg_no}：⚠ 放大网络仍在 CPU（腾挪后空闲仍不足 2GB）——"
+                      f"3D 卷积 CPU 前向是分钟级（非卡死，块进度会逐块打印）；"
+                      f"可把「设备」设为 cuda、调小放大倍率/目标尺寸，或开强制卸载", flush=True)
             net.to(dev)
     else:
         # 放大关闭：无放大网络可问设备，退回 ComfyUI 中间设备（dev 仍需有值——
@@ -1608,8 +1628,14 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
               f"未加载放大网络）", flush=True)
     else:
         from . import upscale_net
+        try:
+            _ndev = next(net.parameters()).device
+        except StopIteration:
+            _ndev = "?"
+        _heal_note = "" if str(_ndev).startswith("cuda") \
+            else "（放大前腾挪显存后自愈回 GPU，见下行）"
         print(f"[H3二采] 段{g + 1}：开始渲染（{upscale_net.kind_of(net)} → {_tw}×{_th} 像素，"
-              f"放大网络 @ {next(net.parameters()).device}）", flush=True)
+              f"放大网络 @ {_ndev}{_heal_note}）", flush=True)
     _timing = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,

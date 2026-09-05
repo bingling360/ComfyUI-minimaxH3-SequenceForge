@@ -20,6 +20,7 @@ import gc
 import glob
 import os
 import re
+import time
 
 import torch
 import torch.nn as nn
@@ -399,22 +400,28 @@ class LatentResizer3D(nn.Module):
         overlap, chunk = tk, _TEMPORAL_CHUNK
         if not enable_chunking or T <= chunk:
             return self._forward_seg(x, scale, size)
-        print(f"[H3二采] 3D 时序分块：T={T} 分 {(T + chunk - 1) // chunk} 块 "
-              f"（chunk={chunk}，overlap={overlap}）", flush=True)
+        n_blocks = (T + chunk - 1) // chunk
+        print(f"[H3二采] 3D 时序分块：T={T} 分 {n_blocks} 块 "
+              f"（chunk={chunk}，overlap={overlap}，设备 {x.device}）", flush=True)
         x_padded = F.pad(x, (0, 0, 0, 0, overlap, overlap), mode="replicate")
         out_full = torch.zeros(B, C, T, size[-2], size[-1],
                                device=x.device, dtype=x.dtype)
         weight_full = torch.zeros(1, 1, T, 1, 1, device=x.device, dtype=x.dtype)
         start = 0
+        t_all = time.perf_counter()
         while start < T:
             seg_start = start
             seg_end = min(T, start + chunk)
+            blk = start // chunk + 1
             out_start = max(0, seg_start - overlap)
             out_end = min(T, seg_end + overlap)
             lo = max(0, out_start - overlap)
             hi = min(T + 2 * overlap, out_end + overlap)
             seg = x_padded[:, :, lo:hi].contiguous()
             seg_size = (hi - lo, size[-2], size[-1])
+            print(f"[H3二采] 3D 分块 {blk}/{n_blocks}：帧 [{seg_start},{seg_end}) 前向中…",
+                  flush=True)
+            t_seg = time.perf_counter()
             seg_out = self._forward_seg(seg, scale, seg_size)
             s0 = (out_start + overlap) - lo
             s1 = s0 + (out_end - out_start)
@@ -432,6 +439,9 @@ class LatentResizer3D(nn.Module):
             out_full[:, :, out_start:out_end] += valid_out * weight.view(1, 1, n_valid, 1, 1)
             weight_full[:, :, out_start:out_end] += weight.view(1, 1, n_valid, 1, 1)
             start += chunk
+            print(f"[H3二采] 3D 分块 {blk}/{n_blocks} 完成"
+                  f"（{time.perf_counter() - t_seg:.0f}s，累计 {time.perf_counter() - t_all:.0f}s）",
+                  flush=True)
             del seg, seg_out, valid_out
             if start % (chunk * 4) == 0:
                 gc.collect()
@@ -792,7 +802,23 @@ def load_model(name, device, precision, arch="auto"):
     """
     cache_key_probe = f"{name}::{arch}::{device}::{precision}"
     if cache_key_probe in MODEL_CACHE:
-        return MODEL_CACHE[cache_key_probe]
+        # 缓存命中也必须恢复设备/精度：render_latent 尾部 net.cpu() 腾显存后对象
+        # 留在缓存里仍是 CPU 态——下次运行直接返回会跳过 .to(device)，叠加基础
+        # 采样后显存占满、纠偏又拿不到空闲，就会全程 CPU 前向（分钟级、观感卡死）
+        model = MODEL_CACHE[cache_key_probe]
+        try:
+            want_dtype = {"fp32": torch.float32, "fp16": torch.float16,
+                          "bf16": torch.bfloat16}.get(precision, torch.float32)
+            cur_dev = next(model.parameters()).device
+            cur_dtype = next(model.parameters()).dtype
+            if str(cur_dev) != str(device):
+                model = model.to(device)
+            if cur_dtype != want_dtype:
+                model = model.to(want_dtype)
+            model = model.eval()
+        except (StopIteration, AttributeError):
+            pass
+        return model
     path = resolve_model_path(name)
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)

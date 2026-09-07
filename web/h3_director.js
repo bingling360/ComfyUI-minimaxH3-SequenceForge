@@ -2943,6 +2943,145 @@ function renderLeftColumn(sec, data) {
         sec.append(meter);
         sec.append(el("div", "h3d-foot", `项目文件夹：output/h3_projects/${escapeHtml(state.dir)}`));
     }
+    renderV2Section(sec, data);
+}
+
+/* ---- v2 扩展区（M4二期，纯增量）：编译预览 / 资产保存校验 / latent切片 / 入出点裁剪 ----
+ * <details> 默认收起，不干扰现有布局；内部全 try/catch，任一失败只显示提示，不破坏左栏渲染。
+ * 依赖 window.H3Api/H3Prompts/H3Assets/H3Latent（web/h3_*.js 自动加载），缺失则提示刷新。 */
+function renderV2Section(sec, data) {
+    try {
+        const wrap = el("details", "h3d-v2");
+        const sum = el("summary", "", "v2 扩展（编译预览 · 资产 · latent · 裁剪）");
+        wrap.append(sum);
+        const body = el("div", "h3d-v2-body");
+        wrap.append(body);
+        sec.append(wrap);
+        const { state, mf, ds } = data || {};
+        const dir = state?.dir || "";
+        const out = el("pre", "h3d-v2-out", "");
+        out.style.display = "none";
+        const say = (t) => { out.style.display = ""; out.textContent = String(t); };
+        const need = () => {
+            if (!window.H3Api) { say("h3_api.js 未加载：请确认 web/ 下 4 个 h3_*.js 已同步并刷新浏览器"); return null; }
+            if (!dir) { say("先新建/读档一个项目"); return null; }
+            return window.H3Api;
+        };
+        body.append(el("div", "h3d-foot",
+            `revision=${escapeHtml(mf?.revision ?? "?")} · manifest-v2.1 · 资产×${(mf?.assets || []).length} · latent×${(mf?.latents || []).length} · 片段×${(mf?.clips || []).length}`));
+        const row1 = el("div", "h3d-newrow");
+        const bPrev = el("button", "h3d-btn", "编译预览第1段");
+        bPrev.title = "把第1段（prompt_v2 有则直用，无则从旧三字段迁移）发往 POST /h3chain/compile 预览官方英文";
+        bPrev.onclick = async () => {
+            const H3Api = need(); if (!H3Api) return;
+            try {
+                const seg0 = Object.assign({}, ((ds?.segments || [])[0] || {}),
+                    { prompt: ((ds?.prompts || [])[0] || "") });
+                const payload = (window.H3Prompts || {}).compilePayload
+                    ? window.H3Prompts.compilePayload(seg0, {})
+                    : { prompt: seg0, seconds: Number(seg0.seconds) || 5.0 };
+                const r = await H3Api.compilePreview(payload);
+                say(r.body?.ok
+                    ? `[${r.body.compiled?.mode}] errors=0\n${r.body.compiled?.prompt_text || ""}`
+                    : `编译未通过 (${(r.body?.errors || []).length} errors):\n` +
+                      (r.body?.errors || []).map((e) => `- ${e.code}: ${e.message}`).join("\n"));
+            } catch (e) { say(`编译请求失败：${e?.message || e}`); }
+        };
+        const bSaveA = el("button", "h3d-btn", "保存资产库");
+        bSaveA.title = "把当前导演台素材池（ref_assets）全量存入 manifest（revision 乐观锁）";
+        bSaveA.onclick = async () => {
+            const H3Api = need(); if (!H3Api) return;
+            try {
+                const r = await H3Api.saveAssets(dir, (ds?.ref_assets || []), mf?.revision);
+                if (!r.body?.ok) throw new Error(H3Api.errText(r, "保存失败"));
+                setLed("done", `资产库已保存（revision=${r.body.manifest?.revision}）`);
+                scheduleRefresh(600);
+            } catch (e) { say(`保存资产失败：${e?.message || e}（若为 REVISION_CONFLICT 请等刷新后重试）`); }
+        };
+        const bCheckA = el("button", "h3d-btn", "校验资产");
+        bCheckA.title = "缺文件/重标签/单段上限早爆检查，不落盘";
+        bCheckA.onclick = async () => {
+            const H3Api = need(); if (!H3Api) return;
+            try {
+                const r = await H3Api.assetCheck(ds?.ref_assets || [],
+                    (ds?.segments || []).map((s) => ({ refs: s?.refs || [] })));
+                say(r.body?.report || JSON.stringify(r.body));
+            } catch (e) { say(`校验失败：${e?.message || e}`); }
+        };
+        row1.append(bPrev, bSaveA, bCheckA);
+        body.append(row1);
+        // latent 切片：段存档/已登记 latent 按帧窗 -> latent/<名>.pt
+        const row2 = el("div", "h3d-newrow");
+        const inSeg = document.createElement("input");
+        inSeg.value = "0"; inSeg.title = "段文件号（0-based，对应 seg_000.pt）"; inSeg.size = 4;
+        const inS = document.createElement("input");
+        inS.value = "0"; inS.title = "起始像素帧（含）"; inS.size = 6;
+        const inE = document.createElement("input");
+        inE.value = "48"; inE.title = "结束像素帧（不含）"; inE.size = 6;
+        const inN = document.createElement("input");
+        inN.value = ""; inN.placeholder = "保存名.pt"; inN.title = "latent 文件名（须以 .pt 结尾）"; inN.size = 14;
+        const bSlice = el("button", "h3d-btn", "latent切片");
+        bSlice.title = "POST /h3chain/latent_slice：无需 VAE，整 token 切";
+        bSlice.onclick = async () => {
+            const H3Api = need(); if (!H3Api) return;
+            try {
+                if (!window.H3Latent) throw new Error("h3_latent.js 未加载");
+                const r = await window.H3Latent.slice(dir, { seg: parseInt(inSeg.value, 10) || 0 },
+                    parseInt(inS.value, 10) || 0, parseInt(inE.value, 10) || 0,
+                    inN.value.trim(), mf?.revision);
+                setLed("done", `已存 ${r.file}`);
+                scheduleRefresh(600);
+            } catch (e) { say(`切片失败：${e?.message || e}`); }
+        };
+        row2.append(document.createTextNode("latent切片 段"), inSeg,
+            document.createTextNode("帧"), inS, document.createTextNode("~"), inE, inN, bSlice);
+        body.append(row2);
+        for (const L of (mf?.latents || [])) {
+            if (!L?.file) continue;
+            const r = el("div", "h3d-newrow");
+            r.append(el("span", "", escapeHtml(`${L.file} ← ${L.src || "?"} [${L.start_f ?? "?"}, ${L.end_f ?? "?"})`)));
+            const del = el("button", "h3d-btn", "删");
+            del.onclick = async () => {
+                const H3Api = need(); if (!H3Api) return;
+                try {
+                    await window.H3Latent.remove(dir, L.file, mf?.revision);
+                    scheduleRefresh(600);
+                } catch (e) { say(`删除失败：${e?.message || e}`); }
+            };
+            r.append(del);
+            body.append(r);
+        }
+        // 入出点裁剪：项目内 mp4 -> 新文件
+        const row3 = el("div", "h3d-newrow");
+        const inF = document.createElement("input");
+        inF.value = ""; inF.placeholder = "源seg_000.mp4"; inF.title = "项目内 mp4 文件名"; inF.size = 16;
+        const inTS = document.createElement("input");
+        inTS.value = "0"; inTS.title = "起始秒"; inTS.size = 5;
+        const inTE = document.createElement("input");
+        inTE.value = "2"; inTE.title = "结束秒"; inTE.size = 5;
+        const bTrim = el("button", "h3d-btn", "裁剪");
+        bTrim.title = "POST /h3chain/trim：重编码，耗时任务";
+        bTrim.onclick = async () => {
+            const H3Api = need(); if (!H3Api) return;
+            try {
+                if (!window.H3Latent) throw new Error("h3_latent.js 未加载");
+                const r = await window.H3Latent.trim(dir, inF.value.trim(),
+                    parseFloat(inTS.value) || 0, parseFloat(inTE.value) || 0, "", mf?.revision);
+                setLed("done", `已存 ${r.file}`);
+                scheduleRefresh(600);
+            } catch (e) { say(`裁剪失败：${e?.message || e}`); }
+        };
+        row3.append(document.createTextNode("裁剪"), inF,
+            document.createTextNode("秒"), inTS, document.createTextNode("~"), inTE, bTrim);
+        body.append(row3);
+        for (const C of (mf?.clips || [])) {
+            if (!C?.file) continue;
+            body.append(el("div", "h3d-foot", escapeHtml(`${C.file} ← ${C.src || "?"} [${C.start_s ?? "?"}s, ${C.end_s ?? "?"}s)`)));
+        }
+        body.append(out);
+    } catch (e) {
+        try { sec.append(el("div", "h3d-empty", "v2 扩展区加载失败（不影响主功能）")); } catch (_) { /* 空 */ }
+    }
 }
 
 function mergeProjects(projects, state) {
@@ -5039,3 +5178,6 @@ app.registerExtension({
         });
     },
 });
+
+/* M4集成点（默认关闭）：新模块 web/h3_api.js,h3_prompts.js,h3_assets.js,h3_latent.js 由ComfyUI自动加载并挂 window.H3*；本块仅做存在性标记，不改现有UI。开功能时在此后挂按钮/面板。*/
+try { if (typeof window !== 'undefined') { window.__H3_V2_MODULES__ = { api: !!window.H3Api, prompts: !!window.H3Prompts, assets: !!window.H3Assets, latent: !!window.H3Latent }; } } catch (e) {}

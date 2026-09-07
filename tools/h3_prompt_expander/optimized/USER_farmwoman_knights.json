@@ -1,0 +1,38 @@
+{
+  "intent": {
+    "logline_zh": "乡野空地上，挎花篮的农家妇女以花海凝成的木剑群击退潮水般的骑士冲锋。",
+    "invariants": {
+      "characters": [
+        { "id": "CHAR_A", "desc_zh": "中年农家妇女模样，粗布衣衫，手挎编织花篮，全程不说话", "speaks": false }
+      ],
+      "setting_zh": "黄昏乡野空地",
+      "key_props_zh": ["编织花篮", "花海", "木剑群"],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-4.0", "what_zh": "骑士群压境冲锋，妇女站定高举花篮", "camera_zh": "固定广角" },
+      { "t": "4.0-8.5", "what_zh": "繁花自篮中涌出铺满原野，马匹在花海边缘扬蹄", "camera_zh": "微震" },
+      { "t": "8.5-12.0", "what_zh": "花海已凝成木剑群攒射，前排落马，残部溃退", "camera_zh": "缓慢推近" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": ["马蹄轰鸣", "花潮涌动", "木剑破空", "兵器碰撞"],
+      "music_wanted": true,
+      "music_zh": "史诗管弦：战鼓加高亢弦乐，随施法渐强、随溃退渐弱"
+    },
+    "constraints": { "duration": 12, "shots": 3, "mode": "T2VA" },
+    "risks": [
+      "“数百名”已改写为潮水般：H3 画不出精确大数字",
+      "花变剑的变形过程未直拍：Shot2 收在花海已成，Shot3 开在木剑已成，跨切完成形态转换（aftermath 模式）",
+      "用户已确认：单段12秒、史诗配乐、花篮持物"
+    ],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 12,
+    "integrated_multimodal_description": "[Shot 1] Live-action open countryside at dusk. A tide of armored knights on horseback thunders across the field toward a lone middle-aged peasant woman in a coarse tunic, a woven flower basket on her arm. The camera holds a static wide shot as she plants her feet and lifts the basket high. [Shot 2] At 00:04.000, the camera cuts closer and shakes slightly as countless blossoms burst from the basket and blanket the field in a rolling sea of flowers, horses rearing at its edge. [Shot 3] At 00:08.500, the camera pushes in with small amplitude at slow speed as the sea of flowers has become a volley of wooden swords sweeping the front rank from their saddles, the survivors fleeing past the woman standing firm amid settling petals.",
+    "overall_soundscape": "Thundering hooves, a floral rush swelling into whistling sword volleys and clashing steel, then petals settling in the wind.",
+    "non_diegetic_music": "Epic orchestral score with war drums and soaring strings, swelling as the spell breaks and receding as the knights flee."
+  }
+}

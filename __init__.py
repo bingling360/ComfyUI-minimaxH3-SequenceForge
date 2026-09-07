@@ -7,10 +7,12 @@ try:
 
     from .nodes import H3SeamlessChainSampler
     from .seam_doctor import H3SeamDoctor
+    from .asset_hub import H3AssetHub
+    from .latent_tools import H3LatentExtract
 
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SeamlessChainSampler, H3SeamDoctor]
+            return [H3SeamlessChainSampler, H3SeamDoctor, H3AssetHub, H3LatentExtract]
 
         async def add_routes(self, routes):
             # 新版 ComfyUI / Comfy Desktop 官方路径：框架直接传入 routes 对象
@@ -20,7 +22,9 @@ try:
                 print("[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子，含 /api 前缀副本）："
                       "GET /h3chain/ping, /h3chain/projects, /h3chain/project, "
                       "/h3chain/upscale_models, /h3chain/experiments, "
-                      "POST /h3chain/create_project, /h3chain/save_prompts, "
+                      "POST /h3chain/create_project, /h3chain/save_prompts, /h3chain/compile, "
+                      "/h3chain/assets, /h3chain/asset_check, /h3chain/latent_slice, "
+                      "/h3chain/latent_delete, /h3chain/trim, "
                       "/h3chain/delete_project, /h3chain/delete_file, /h3chain/merge, "
                       "/h3chain/upscale_reset, /h3chain/redo_cancel")
             except Exception:

@@ -1,0 +1,24 @@
+{
+  "intent": {
+    "logline_zh": "女孩说今天天气真好",
+    "invariants": {
+      "characters": [{ "id": "S1", "desc_zh": "女孩", "speaks": true }],
+      "setting_zh": "街道",
+      "key_props_zh": [],
+      "must_keep_quotes": ["今天天气真好，快跟上我呀"]
+    },
+    "beats": [{ "t": "0.0-5.0", "what_zh": "女孩走路说话" }],
+    "dialogue": [],
+    "audio": { "ambience_zh": [], "music_wanted": false, "music_zh": "" },
+    "constraints": { "duration": 5, "shots": 1, "mode": "T2VA" },
+    "risks": [],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 5,
+    "integrated_multimodal_description": "[Shot 1] A beautiful cinematic girl says \"今天天气真好，快跟上我呀\" and nothing about her changes, don't move.",
+    "overall_soundscape": "She says 今天天气真好 with piano background music.",
+    "non_diegetic_music": ""
+  }
+}

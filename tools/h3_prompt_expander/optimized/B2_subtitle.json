@@ -1,0 +1,35 @@
+{
+  "intent": {
+    "logline_zh": "雨夜霓虹街，女孩停在写着营业中的招牌下说跟上我。",
+    "invariants": {
+      "characters": [
+        { "id": "S1", "desc_zh": "20岁左右年轻女孩，深色马尾，牛仔夹克，在画内行走", "speaks": true }
+      ],
+      "setting_zh": "雨夜室外街道，霓虹倒影",
+      "key_props_zh": ["写着营业中的红色霓虹招牌"],
+      "must_keep_quotes": ["跟上我", "营业中"]
+    },
+    "beats": [
+      { "t": "0.0-3.0", "what_zh": "女孩走过店面，相机侧跟", "camera_zh": "侧跟" },
+      { "t": "3.0-5.0", "what_zh": "女孩在招牌下停住，转身说出台词", "camera_zh": "侧跟收止" }
+    ],
+    "dialogue": [
+      { "speaker": "S1", "lang": "Chinese", "line": "跟上我。", "voiceover": false }
+    ],
+    "audio": {
+      "ambience_zh": ["雨声", "脚步声"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 5, "shots": 1, "mode": "T2VA" },
+    "risks": [],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 5,
+    "integrated_multimodal_description": "[Shot 1] Live-action rainy night street, wet asphalt with neon reflections. A young woman in her 20s (S1), on-screen, dark ponytail and denim jacket, walks past shopfronts as the camera tracks beside her at slow speed. She stops beneath a red neon sign reading \"营业中\", turns toward the camera and says firmly in Mandarin <d>[Chinese] 跟上我。</d> One continuous shot with no cuts.",
+    "overall_soundscape": "Steady rain on awnings and her footsteps on wet stone.",
+    "non_diegetic_music": "N/A"
+  }
+}

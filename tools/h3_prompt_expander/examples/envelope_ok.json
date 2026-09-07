@@ -1,0 +1,35 @@
+{
+  "intent": {
+    "logline_zh": "雨夜霓虹市场，年轻女孩回头一笑，叫观众跟上她。",
+    "invariants": {
+      "characters": [
+        { "id": "S1", "desc_zh": "20岁左右年轻女孩，深色短发，红色外套", "speaks": true }
+      ],
+      "setting_zh": "雨夜室外霓虹市场，湿地面倒影",
+      "key_props_zh": ["霓虹招牌"],
+      "must_keep_quotes": ["跟上我"]
+    },
+    "beats": [
+      { "t": "0.0-3.0", "what_zh": "女孩在人群中向前走，相机从身后跟拍", "camera_zh": "跟拍" },
+      { "t": "3.0-5.0", "what_zh": "女孩停下回头一笑，说跟上我", "camera_zh": "缓慢推近" }
+    ],
+    "dialogue": [
+      { "speaker": "S1", "lang": "Chinese", "line": "跟上我。", "voiceover": false }
+    ],
+    "audio": {
+      "ambience_zh": ["雨声", "市场人声", "脚步声"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 5, "shots": 1, "mode": "T2VA" },
+    "risks": [],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 5,
+    "integrated_multimodal_description": "[Shot 1] Live-action night street market in the rain, wet ground with neon reflections. A young woman in her 20s (S1), short dark hair, red coat, walks through the crowd as the camera tracks behind her at slow speed. She stops, turns back and smiles, then says in Mandarin in a light voice <d>[Chinese] 跟上我。</d> One continuous shot with no cuts.",
+    "overall_soundscape": "Steady rain on awnings, distant market chatter and footsteps on wet stone.",
+    "non_diegetic_music": "N/A"
+  }
+}

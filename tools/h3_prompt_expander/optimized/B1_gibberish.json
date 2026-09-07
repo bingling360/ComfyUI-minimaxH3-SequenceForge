@@ -1,0 +1,35 @@
+{
+  "intent": {
+    "logline_zh": "晴天街头，年轻女孩笑着说出今天天气真好、叫人跟上。",
+    "invariants": {
+      "characters": [
+        { "id": "S1", "desc_zh": "20岁左右年轻女孩，肩长发，浅色夹克，在画内行走", "speaks": true }
+      ],
+      "setting_zh": "晴天室外街道，白天",
+      "key_props_zh": [],
+      "must_keep_quotes": ["今天天气真好，快跟上我呀"]
+    },
+    "beats": [
+      { "t": "0.0-2.5", "what_zh": "女孩笑着朝镜头方向走，相机缓慢推近", "camera_zh": "推近" },
+      { "t": "2.5-5.0", "what_zh": "女孩说出台词", "camera_zh": "推近延续" }
+    ],
+    "dialogue": [
+      { "speaker": "S1", "lang": "Chinese", "line": "今天天气真好，快跟上我呀。", "voiceover": false }
+    ],
+    "audio": {
+      "ambience_zh": ["微风", "远处车流", "脚步声"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 5, "shots": 1, "mode": "T2VA" },
+    "risks": ["原文无说话人归属，已默认唯一的女孩为 S1 并钉身份；若另有其人需改 ID"],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 5,
+    "integrated_multimodal_description": "[Shot 1] Live-action sunny street in daylight. A young woman in her 20s (S1), on-screen, shoulder-length hair and a light jacket, walks toward the camera with a bright smile. The camera pushes in with small amplitude at slow speed as she says cheerfully in Mandarin <d>[Chinese] 今天天气真好，快跟上我呀。</d> One continuous shot with no cuts.",
+    "overall_soundscape": "Light wind, distant traffic and her footsteps on the pavement.",
+    "non_diegetic_music": "N/A"
+  }
+}

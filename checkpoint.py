@@ -145,10 +145,32 @@ def _atomic_write(path: str, data: bytes):
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                pass
         os.replace(tmp, path)
+        # 清理同目录残留 .part（24h 以上，避免崩溃堆积）
+        try:
+            d = os.path.dirname(path)
+            now = __import__("time").time()
+            for n in os.listdir(d):
+                if n.startswith(".tmp_") and n.endswith(".part"):
+                    p = os.path.join(d, n)
+                    try:
+                        if now - os.path.getmtime(p) > 86400:
+                            os.remove(p)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     finally:
         if os.path.exists(tmp):
-            os.remove(tmp)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _json_fallback(obj):

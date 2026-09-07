@@ -1,0 +1,33 @@
+{
+  "intent": {
+    "logline_zh": "朋友突然出现，女孩僵住屏息，特写只做一个睁眼后退的主反应。",
+    "invariants": {
+      "characters": [
+        { "id": "CHAR_A", "desc_zh": "20岁左右年轻女性，宽松毛衣，头发束起，全程不说话", "speaks": false }
+      ],
+      "setting_zh": "傍晚昏暗公寓走廊",
+      "key_props_zh": ["走廊门"],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-2.5", "what_zh": "朋友从门后走出，女孩僵住屏息", "camera_zh": "固定机位" },
+      { "t": "2.5-5.0", "what_zh": "切特写：睁眼加后退半步，一个主反应", "camera_zh": "固定特写" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": ["走廊安静", "门轴声", "倒吸气"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 5, "shots": 2, "mode": "T2VA" },
+    "risks": ["9连拍已拆成刺激加屏息加单主反应；停顿留给剪辑，未写任何静止句"],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 5,
+    "integrated_multimodal_description": "[Shot 1] Live-action dim apartment hallway in the evening. A young woman in her 20s in a loose sweater with tied hair walks down the hallway as a friend steps out from behind a door. She freezes mid-step, shoulders locked high, breath held. [Shot 2] At 00:02.500, the camera cuts to a close-up as her upper eyelids open fully and she falls back a half-step with a sharp inhale.",
+    "overall_soundscape": "Hallway quiet, a door creak, then her sharp inhale.",
+    "non_diegetic_music": "N/A"
+  }
+}

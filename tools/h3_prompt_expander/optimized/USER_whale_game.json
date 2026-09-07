@@ -1,0 +1,42 @@
+{
+  "intent": {
+    "logline_zh": "图2的画面直接动起来：Q版鲸鱼娘在电脑前敲键盘写魔塔，抬头对口说出来写个魔塔玩一下吧。",
+    "invariants": {
+      "characters": [
+        { "id": "S1", "desc_zh": "Q版蓝发鲸鱼娘，女仆装，鲸鱼尾，在画内对口说话", "speaks": true }
+      ],
+      "setting_zh": "图2的房间：电脑、键盘、桌上糖果",
+      "key_props_zh": ["电脑与网格游戏屏幕（只保布局发光，数字后制）", "键盘", "桌上糖果"],
+      "must_keep_quotes": ["来写个魔塔玩一下吧！"]
+    },
+    "beats": [
+      { "t": "0.0-3.5", "what_zh": "女孩双手敲键盘，屏幕网格游戏发光", "camera_zh": "缓慢推近" },
+      { "t": "3.5-6.0", "what_zh": "女孩转头看镜头，对口说出台词", "camera_zh": "推近延续" }
+    ],
+    "dialogue": [
+      { "speaker": "S1", "lang": "Chinese", "line": "来写个魔塔玩一下吧！", "voiceover": false }
+    ],
+    "audio": {
+      "ambience_zh": ["键盘敲击", "电脑风扇轻响"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 6, "shots": 1, "mode": "Ref2VA" },
+    "risks": [
+      "图1非Q版与图2Q版画风冲突：图1已降为 attribute_transfer 只借发色服装鲸鱼尾，比例以图2为准",
+      "屏幕HP/ATK数字后制合成，提示词只保布局与发光，不写具体数字",
+      "台词11字约2.6秒，放在3.5-6秒；时长取默认6秒，可调"
+    ],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "Ref2VA",
+    "duration": 6,
+    "subject_definitions": "<Subject 1>: the chibi blue whale-girl from <Picture 2>, long blue hair, maid outfit, whale tail\n<Picture 1>: identity reference for <Subject 1>, hair color, outfit colors and whale-tail features only, chibi proportions come from <Picture 2>\n<Picture 2>: first frame of [Shot 1] and scene reference, <Subject 1> at the computer with the grid game glowing on screen",
+    "summary": "[reference generation] A 6-second clip bringing <Picture 2> to life: <Subject 1> types code while the grid game runs on screen, then turns to the camera and speaks her line on-screen.",
+    "retention_analysis": "<Subject 1> (appears in [Shot 1]): partially_preserved, chibi proportions and scene pose from <Picture 2>, hair color, outfit and whale tail from <Picture 1>\n<Picture 1> (identity): attribute_transfer, features only, not proportions or art style\n<Picture 2> ([Shot 1] first frame and scene): fully_preserved layout and pose, screen numerals excluded for post compositing",
+    "detailed_description": "[Shot 1] Cozy game room consistent with <Picture 2>. <Subject 1>, a chibi whale-girl in her teens (S1), on-screen, sits at the computer and types briskly with both hands while the grid-game layout glows on the monitor with numeral areas left blank for post compositing. The camera pushes in with small amplitude at slow speed as she turns to the camera with a bright smile and says cheerfully in Mandarin <d>[Chinese] 来写个魔塔玩一下吧！</d> One continuous shot with no cuts.",
+    "overall_soundscape": "Brisk keyboard clacks and a soft computer fan hum.",
+    "non_diegetic_music": "N/A"
+  }
+}

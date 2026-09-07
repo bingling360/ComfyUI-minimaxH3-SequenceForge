@@ -1,0 +1,140 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "H3 Intent IR + PE envelope",
+  "description": "LLM 输出的唯一合法信封：先锁定中文意图，再给出 H3 英文编译结果。validate.py 按此校验。",
+  "type": "object",
+  "required": ["intent", "pe"],
+  "additionalProperties": false,
+  "properties": {
+    "intent": {
+      "type": "object",
+      "required": ["logline_zh", "invariants", "beats", "constraints"],
+      "additionalProperties": false,
+      "properties": {
+        "logline_zh": {
+          "type": "string",
+          "description": "一句话复述用户真正想要什么（中文，不超过60字），必须能被用户点头确认"
+        },
+        "invariants": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "characters": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "desc_zh"],
+                "additionalProperties": false,
+                "properties": {
+                  "id": { "type": "string", "description": "S1/S2…，不出声的角色不编号，只给 label，如 CHAR_A" },
+                  "desc_zh": { "type": "string" },
+                  "speaks": { "type": "boolean" }
+                }
+              }
+            },
+            "setting_zh": { "type": "string" },
+            "key_props_zh": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "必须在画面里稳定存在的关键物，提到即会生成，宁缺毋滥"
+            },
+            "must_keep_quotes": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "用户引号内的原文，一个字都不许改（含对白和屏显文字）"
+            }
+          }
+        },
+        "beats": {
+          "type": "array",
+          "description": "按时间顺序的动作/情绪节拍，每个 beat 一句话中文",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "required": ["t", "what_zh"],
+            "additionalProperties": false,
+            "properties": {
+              "t": { "type": "string", "description": "如 0.0-3.0，单位秒，必须落在 duration 内且连续" },
+              "what_zh": { "type": "string" },
+              "camera_zh": { "type": "string" }
+            }
+          }
+        },
+        "dialogue": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["speaker", "lang", "line"],
+            "additionalProperties": false,
+            "properties": {
+              "speaker": { "type": "string" },
+              "lang": { "type": "string", "description": "Chinese / English 等原文语种" },
+              "line": { "type": "string", "description": "逐字台词原文" },
+              "voiceover": { "type": "boolean" }
+            }
+          }
+        },
+        "audio": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ambience_zh": { "type": "array", "items": { "type": "string" } },
+            "music_wanted": { "type": "boolean" },
+            "music_zh": { "type": "string" }
+          }
+        },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "duration": { "type": "number", "minimum": 4, "maximum": 15 },
+            "shots": { "type": "integer", "minimum": 1, "maximum": 4 },
+            "mode": { "type": "string", "enum": ["T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA"] }
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "预判的 H3 翻车点，如 碰撞因果/液体体积/多节拍挤单镜"
+        },
+        "clarify": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "拿不准、宁愿问用户也不要猜的点；能确定则为空数组"
+        },
+        "candidates": {
+          "type": "array",
+          "description": "输入含糊时给出2-3个候选方向供用户选；输入明确时为空数组",
+          "items": {
+            "type": "object",
+            "required": ["id", "label_zh", "logline_zh"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "description": "A/B/C" },
+              "label_zh": { "type": "string" },
+              "logline_zh": { "type": "string" },
+              "diff_zh": { "type": "string", "description": "与其它候选的关键分歧点" }
+            }
+          }
+        }
+      }
+    },
+    "pe": {
+      "type": "object",
+      "required": ["mode", "duration", "integrated_multimodal_description"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA"] },
+        "duration": { "type": "number", "minimum": 4, "maximum": 15 },
+        "integrated_multimodal_description": { "type": "string" },
+        "overall_soundscape": { "type": ["string", "null"] },
+        "non_diegetic_music": { "type": "string", "description": "有配乐写 1-3 句英文，无配乐必须写 N/A" },
+        "subject_definitions": { "type": "string", "description": "仅 Ref2VA：<Subject/Picture/Video/Audio N> 定义块" },
+        "summary": { "type": "string", "description": "仅 Ref2VA：[任务前缀] 开头的一段任务说明" },
+        "retention_analysis": { "type": "string", "description": "仅 Ref2VA：每标签一行的保留标记" },
+        "detailed_description": { "type": "string", "description": "仅 Ref2VA：1-2 句风格 + Shot 时间线（350-500 词是官方上限，短片按时长压缩）" }
+      }
+    }
+  }
+}

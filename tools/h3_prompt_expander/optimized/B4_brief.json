@@ -1,0 +1,33 @@
+{
+  "intent": {
+    "logline_zh": "赛博朋克少女穿过霓虹都市，停步抬头，眼神从迷茫转坚定。",
+    "invariants": {
+      "characters": [
+        { "id": "CHAR_A", "desc_zh": "十几岁少女，银色齐耳短发，打补丁的机能夹克，全程不说话", "speaks": false }
+      ],
+      "setting_zh": "雨夜赛博朋克都市街道，霓虹招牌密集",
+      "key_props_zh": [],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-4.5", "what_zh": "少女低头穿过人群，相机侧跟", "camera_zh": "侧跟" },
+      { "t": "4.5-8.0", "what_zh": "少女停步抬头直视前方，推近", "camera_zh": "推近" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": ["雨声", "人群杂音", "脚步声"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 8, "shots": 2, "mode": "T2VA" },
+    "risks": ["原文300字企划已压缩：身世隐喻与三幕情绪只保留迷茫到坚定，其余是分镜与剪辑的工作，不进单条 prompt"],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 8,
+    "integrated_multimodal_description": "[Shot 1] Stylized cyberpunk night city, rain-slicked streets under dense neon signage. A teenage girl with silver bob hair and a patched techwear jacket drifts through the crowd with lowered gaze as the camera tracks beside her at slow speed. [Shot 2] At 00:04.500, the camera cuts to a slow push in on her face as she stops, lifts her chin and stares ahead with hardened resolve.",
+    "overall_soundscape": "Steady rain, muffled crowd murmur and footsteps on wet pavement.",
+    "non_diegetic_music": "N/A"
+  }
+}

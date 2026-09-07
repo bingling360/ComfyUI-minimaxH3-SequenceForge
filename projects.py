@@ -15,6 +15,20 @@ import time
 from . import checkpoint
 
 
+MANIFEST_SCHEMA = "h3seamless/manifest-v2.1"
+
+
+def _ensure_revision(manifest: dict) -> dict:
+    """老 manifest 懒迁移：缺 revision/schema_version 则补 1，不重写 ID。"""
+    if not isinstance(manifest, dict):
+        return manifest
+    if not isinstance(manifest.get("revision"), int):
+        manifest["revision"] = 1
+    if not manifest.get("manifest_schema"):
+        manifest["manifest_schema"] = MANIFEST_SCHEMA
+    return manifest
+
+
 def safe_name(name) -> str:
     """项目目录名安全校验：拒空、路径分隔、盘符、与点开头（防目录穿越）。"""
     s = str(name or "").strip()
@@ -68,9 +82,36 @@ def list_projects() -> list:
             "merges": [m.get("file") for m in (manifest.get("merges") or [])
                        if isinstance(m, dict) and m.get("file")],
             "params": manifest.get("params") or {},
+            "revision": int(manifest.get("revision") or 1),
+            "manifest_schema": manifest.get("manifest_schema") or MANIFEST_SCHEMA,
+            "seg_count": len(manifest.get("prompts") or []),
         })
     out.sort(key=lambda p: p["updated_at"] or 0, reverse=True)
     return out
+
+
+def list_projects_summary(page: int = 1, size: int = 50) -> dict:
+    """轻量摘要分页：M1 新增，前端列表只拿摘要，详情走 read_project。"""
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = min(200, max(1, int(size)))
+    except (TypeError, ValueError):
+        size = 50
+    all_items = list_projects()
+    total = len(all_items)
+    start = (page - 1) * size
+    items = []
+    for p in all_items[start:start + size]:
+        items.append({
+            "dir": p["dir"], "title": p["title"],
+            "revision": p["revision"], "seg_count": p["seg_count"],
+            "done": p["done"], "total": p["total"],
+            "updated_at": p["updated_at"], "cover": p["cover"],
+        })
+    return {"items": items, "total": total, "page": page, "size": size}
 
 
 def read_project(name: str):
@@ -79,14 +120,86 @@ def read_project(name: str):
         return None
     root = os.path.join(checkpoint.projects_root(), safe_name(name))
     manifest = checkpoint.load_manifest(root)
-    return manifest if isinstance(manifest, dict) else None
+    if not isinstance(manifest, dict):
+        return None
+    return _ensure_revision(manifest)
+
+
+_ASSET_KINDS = ("image", "video", "audio")
+_ASSET_LABEL_MAX = 24
+_ASSET_TOTAL_MAX = 999
+
+
+def _clean_asset(raw) -> dict | None:
+    """资产条目白名单清洗：{label,kind,file}；总量不限（999封顶防膨胀），单段上限执行期卡。"""
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("kind") or "image").strip()
+    if kind not in _ASSET_KINDS:
+        kind = "image"
+    label = str(raw.get("label") or "").strip()[:_ASSET_LABEL_MAX]
+    file = str(raw.get("file") or "").strip().replace("\\", "/")
+    if not file or not label:
+        return None
+    # 文件名防穿越：允许至多两级子目录，每段过 safe_name
+    parts = [p for p in file.split("/") if p and p != "."]
+    if not parts or len(parts) > 2 or not all(safe_name(p) for p in parts):
+        return None
+    if not os.path.splitext(parts[-1])[1]:
+        return None
+    return {"label": label, "kind": kind, "file": "/".join(parts)}
+
+
+def _dedupe_assets(items: list) -> list:
+    """按 label 去重（首个为准），保持入库顺序。"""
+    seen, out = set(), []
+    for a in items:
+        c = _clean_asset(a)
+        if c is None or c["label"] in seen:
+            continue
+        seen.add(c["label"])
+        out.append(c)
+    return out[:_ASSET_TOTAL_MAX]
+
+
+def save_assets(name: str, assets, base_revision=None):
+    """资产库持久化：manifest["assets"] 全量覆盖写，revision+1，乐观锁可选。
+
+    总量不限（999封顶），单段 9/3/3 不在这里卡（执行期按段卡）。
+    目录或 manifest 不存在返回 None；base_revision 不一致抛 ValueError(REVISION_CONFLICT)。
+    """
+    name = safe_name(name)
+    if not name or not isinstance(assets, list):
+        return None
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    manifest["assets"] = _dedupe_assets(assets)
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
 
 
 _SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music")
 
 
 def _clean_seg_field(raw) -> dict | None:
-    """前端分段字段白名单清洗：未知键剔除、类型收敛（防脏 JSON 膨胀 manifest）。"""
+    """前端分段字段白名单清洗：未知键剔除、类型收敛（防脏 JSON 膨胀 manifest）。
+
+    M2.5：透存 prompt_v2（具象化结构，经 prompts.clean_prompt 收敛，失败则丢弃该键不炸链）。
+    """
     if not isinstance(raw, dict):
         return None
     out = {k: (str(raw[k]) if isinstance(raw.get(k), str) else "") for k in _SEG_STR_FIELDS}
@@ -95,18 +208,277 @@ def _clean_seg_field(raw) -> dict | None:
     out["unlink"] = bool(raw.get("unlink"))
     out["disabled"] = bool(raw.get("disabled"))
     refs = raw.get("refs")
-    out["refs"] = [str(x) for x in refs if isinstance(x, (str, int))][:16] \
+    out["refs"] = [str(x) for x in refs if isinstance(x, (str, int))][:64] \
         if isinstance(refs, list) else []
     fr = raw.get("frame_refs")
     out["frame_refs"] = [str(x) for x in fr if isinstance(x, (str, int))][:4] \
         if isinstance(fr, list) else None
+    pv = raw.get("prompt_v2")
+    if isinstance(pv, dict):
+        try:
+            from . import prompts as _prompts
+        except ImportError:
+            import prompts as _prompts
+        try:
+            out["prompt_v2"] = _prompts.clean_prompt(pv)
+        except Exception:
+            pass
+    # M3：每段 latent 保存策略透存 {mode: all|range|tail|off, start_f, end_f, tail_f}
+    ls = raw.get("latent_save")
+    if isinstance(ls, dict):
+        mode = str(ls.get("mode") or "all").strip()
+        if mode not in ("all", "range", "tail", "off"):
+            mode = "all"
+        try:
+            sf = int(ls.get("start_f", 0))
+        except (TypeError, ValueError):
+            sf = 0
+        try:
+            ef = int(ls.get("end_f", 0))
+        except (TypeError, ValueError):
+            ef = 0
+        try:
+            tf = int(ls.get("tail_f", 0))
+        except (TypeError, ValueError):
+            tf = 0
+        out["latent_save"] = {"mode": mode, "start_f": max(0, sf),
+                              "end_f": max(0, ef), "tail_f": max(0, tf)}
     return out
 
 
-def save_prompts(name: str, prompts, segments=None):
+def _latent_dir(root: str) -> str:
+    d = os.path.join(root, "latent")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _clean_latent_name(name) -> str:
+    s = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    if not safe_name(s) or not os.path.splitext(s)[1]:
+        return ""
+    if not s.endswith(".pt"):
+        s += ".pt"
+    return s
+
+
+def slice_latent(name, src, start_f, end_f, save_name, base_revision=None):
+    """latent-to-latent 剪辑：段存档 .pt / 已登记 latent 按像素帧窗切片 -> latent/<save_name>.pt。
+
+    M3 三源之一（段范围/尾帧/已存 latent 再剪），纯 torch 无需 VAE：
+    video [B,C,T,H,W] 按 frames_to_latent_t 换算 token 窗整 token 切，
+    audio [1,32,2,T] 按 audio_tokens_for_frames 比例切。越界/切空抛 ValueError。
+    src: {"seg": 0-based段文件号} | {"file": "latent/x.pt"}。登记 manifest["latents"] 并 revision+1。
+    """
+    import torch
+    try:
+        from .grid import frames_to_latent_t, latent_t_to_frames, audio_tokens_for_frames
+    except ImportError:
+        from grid import frames_to_latent_t, latent_t_to_frames, audio_tokens_for_frames
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    if not isinstance(src, dict):
+        raise ValueError("src 须为 {seg: 段号} 或 {file: latent/x.pt}")
+    if "seg" in src:
+        try:
+            idx = int(src["seg"])
+        except (TypeError, ValueError):
+            raise ValueError(f"段号必须是整数：{src.get('seg')!r}") from None
+        if idx < 0:
+            raise ValueError("段号从 0 开始（0-based 段文件号）")
+        src_path = os.path.join(root, f"seg_{idx:03d}.pt")
+        src_desc = f"seg_{idx:03d}.pt"
+    else:
+        f = str(src.get("file") or "").strip().replace("\\", "/")
+        parts = [p for p in f.split("/") if p and p != "."]
+        if len(parts) != 2 or parts[0] != "latent" or not safe_name(parts[1]):
+            raise ValueError(f"非法 latent 文件：{f!r}（须为 latent/<名>.pt）")
+        src_path = os.path.join(root, *parts)
+        src_desc = "/".join(parts)
+    if not os.path.isfile(src_path):
+        raise ValueError(f"源 latent 不存在：{src_desc}（该段还没生成存档？）")
+    try:
+        sf, ef = int(start_f), int(end_f)
+    except (TypeError, ValueError):
+        raise ValueError("start_f/end_f 须为整数像素帧") from None
+    if ef <= sf or sf < 0:
+        raise ValueError(f"帧窗为空（[{sf}, {ef})，须 0 <= start < end）")
+    clean = _clean_latent_name(save_name)
+    if not clean:
+        raise ValueError(f"非法保存名：{save_name!r}")
+    with open(src_path, "rb") as fh:
+        payload = torch.load(fh, map_location="cpu", weights_only=True)
+    video, audio = payload.get("video"), payload.get("audio")
+    if video is None or getattr(video, "dim", lambda: 0)() != 5:
+        raise ValueError("源 latent 视频张量形态异常（须 5 维 [B,C,T,H,W]）")
+    total_t = int(video.shape[2])
+    total_frames = latent_t_to_frames(total_t)
+    if sf >= total_frames:
+        raise ValueError(f"start_f {sf} 越界（源共约 {total_frames} 帧）")
+    ef = min(ef, total_frames)
+    t0 = max(0, frames_to_latent_t(sf, up=False))
+    t1 = min(total_t, frames_to_latent_t(ef, up=True))
+    if t1 <= t0:
+        # 帧窗落在同一 token 内：按整 token 取 1 个（含目标帧），不返回空
+        t0 = max(0, min(total_t - 1, frames_to_latent_t(sf, up=True) - 1))
+        t1 = min(total_t, t0 + 1)
+    cut_v = video[:, :, t0:t1].contiguous().clone()
+    cut_a = None
+    if audio is not None and getattr(audio, "dim", lambda: 0)() == 4:
+        a_total = int(audio.shape[-1])
+        a0 = max(0, int(round(sf / max(1, total_frames) * a_total)))
+        a1 = max(a0 + 1, min(a_total, int(round(ef / max(1, total_frames) * a_total))))
+        cut_a = audio[..., a0:a1].contiguous().clone()
+    _ = audio_tokens_for_frames(ef - sf)  # 换算自检（比例异常时不断言，只记录）
+    out_payload = {"video": cut_v}
+    if cut_a is not None:
+        out_payload["audio"] = cut_a
+    elif audio is not None:
+        out_payload["audio"] = audio
+    ldir = _latent_dir(root)
+    tmp_path = os.path.join(ldir, clean + ".part")
+    final_path = os.path.join(ldir, clean)
+    import tempfile
+    buf = tempfile.SpooledTemporaryFile(max_size=64 << 20)
+    torch.save(out_payload, buf)
+    buf.seek(0)
+    with open(tmp_path, "wb") as fh:
+        fh.write(buf.read())
+    buf.close()
+    os.replace(tmp_path, final_path)
+    manifest.setdefault("latents", [])
+    manifest["latents"] = [x for x in manifest["latents"]
+                           if isinstance(x, dict) and x.get("file") != f"latent/{clean}"]
+    manifest["latents"].append({"file": f"latent/{clean}", "src": src_desc,
+                                "start_f": sf, "end_f": ef,
+                                "tokens": [t0, t1], "updated_at": time.time()})
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def delete_latent(name, file, base_revision=None):
+    """删除 latent 登记文件（幂等）。"""
+    name = safe_name(name)
+    f = str(file or "").strip().replace("\\", "/")
+    parts = [p for p in f.split("/") if p and p != "."]
+    if not name or len(parts) != 2 or parts[0] != "latent" or not safe_name(parts[1]):
+        raise ValueError(f"非法 latent 文件：{file!r}")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在")
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    try:
+        os.remove(os.path.join(root, *parts))
+    except OSError:
+        pass
+    manifest["latents"] = [x for x in (manifest.get("latents") or [])
+                           if not (isinstance(x, dict) and x.get("file") == f)]
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def trim_asset(name, src_file, start_s, end_s, save_name=None, base_revision=None,
+               fps=24, crf=20):
+    """资产/成片入出点裁剪：项目内 mp4 [start_s, end_s) -> 新文件（重编码）。
+
+    M3 最小剪辑集：资产库行内剪 + 成片库片段截取共用。长耗时放调用方线程池。
+    src_file 须为项目内 mp4（seg_/final_/merged_/clip_*.mp4）；save_name 缺省
+    clip_<stamp>.mp4。登记 manifest["clips"] 并 revision+1。失败抛 ValueError/RuntimeError。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    f = str(src_file or "").strip().replace("\\", "/")
+    parts = [p for p in f.split("/") if p and p != "."]
+    if len(parts) != 1 or not safe_name(parts[0]) or not parts[0].endswith(".mp4"):
+        raise ValueError(f"非法源文件：{src_file!r}（须为项目内 xxx.mp4）")
+    src_path = os.path.join(root, parts[0])
+    if not os.path.isfile(src_path):
+        raise ValueError(f"源文件不存在：{parts[0]}")
+    try:
+        ss, es = float(start_s), float(end_s)
+    except (TypeError, ValueError):
+        raise ValueError("start_s/end_s 须为数字秒") from None
+    if es <= ss or ss < 0:
+        raise ValueError(f"裁剪区间为空（[{ss}s, {es}s)，须 0 <= start < end）")
+    if save_name:
+        clean = str(save_name).strip().replace("\\", "/").split("/")[-1]
+        if not safe_name(clean):
+            raise ValueError(f"非法保存名：{save_name!r}")
+        if not clean.endswith(".mp4"):
+            clean += ".mp4"
+    else:
+        clean = f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        k = 2
+        while os.path.exists(os.path.join(root, clean)):
+            clean = f"clip_{time.strftime('%Y%m%d_%H%M%S')}_{k}.mp4"
+            k += 1
+    try:
+        from . import media
+    except ImportError:
+        import media
+    ok = media.trim_av_mp4(src_path, os.path.join(root, clean), ss, es,
+                           fps=fps, crf=crf)
+    if not ok:
+        raise RuntimeError(f"裁剪编码失败：{media.last_error}")
+    fresh = checkpoint.load_manifest(root)
+    if isinstance(fresh, dict):
+        manifest = fresh
+        _ensure_revision(manifest)
+    manifest.setdefault("clips", []).append({"file": clean, "src": parts[0],
+                                             "start_s": ss, "end_s": es,
+                                             "updated_at": time.time()})
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def save_prompts(name: str, prompts, segments=None, base_revision=None):
     """把导演台当前提示词组回写进项目 manifest（提示词的持久源=项目文件夹）。
 
-    只更新 prompts / seg_fields / total / updated_at（及 done 超界钳制），不动
+    只更新 prompts / seg_fields / total / updated_at / revision（及 done 超界钳制），不动
     params / seeds / prompt_hashes / finals / merges——运行时的重做判定依旧按
     节点控件提示词 vs prompt_hashes 逐段比对，改词段落照常自动重做。
     manifest.prompts 与磁盘段文件按全局槽位对齐（前端卡片/合并按此索引）：
@@ -117,6 +489,8 @@ def save_prompts(name: str, prompts, segments=None):
     manifest["seg_fields"] 并按全局槽位对齐（序章/插入槽为 null）——
     切换项目时前端据此还原各段卡片，不再丢分段字段。
     目录或 manifest 不存在（未跑过的指纹目录）返回 None，调用方按无项目跳过。
+    base_revision 非空时做乐观锁：与当前 revision 不一致抛 ValueError(REVISION_CONFLICT)，
+    调用方映射 409。M1 新增，向后兼容（不传即不检查）。
     """
     name = safe_name(name)
     if not name or not isinstance(prompts, list):
@@ -125,6 +499,15 @@ def save_prompts(name: str, prompts, segments=None):
     manifest = checkpoint.load_manifest(root)
     if manifest is None:
         return None
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
     seg_prompts = [str(p) for p in prompts][:64]
     seg_meta = [_clean_seg_field(x) for x in segments] \
         if isinstance(segments, list) else []
@@ -159,6 +542,8 @@ def save_prompts(name: str, prompts, segments=None):
     manifest["total"] = len(rows)
     manifest["done"] = min(int(manifest.get("done") or 0), manifest["total"])
     manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
     checkpoint.save_manifest(root, manifest)
     return manifest
 
@@ -178,11 +563,12 @@ def create_project(name: str):
     root = os.path.join(checkpoint.projects_root(), name)
     manifest = checkpoint.load_manifest(root)
     if manifest is not None:
-        return manifest
+        return _ensure_revision(manifest)
     os.makedirs(root, exist_ok=True)
     now = time.time()
     manifest = {
-        "schema": checkpoint.SCHEMA, "done": 0, "total": 0,
+        "schema": checkpoint.SCHEMA, "manifest_schema": MANIFEST_SCHEMA,
+        "revision": 1, "done": 0, "total": 0,
         "title": name, "created_at": now, "updated_at": now,
         "prompts": [], "params": {}, "finals": [],
     }

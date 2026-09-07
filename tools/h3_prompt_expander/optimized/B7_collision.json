@@ -1,0 +1,31 @@
+{
+  "intent": {
+    "logline_zh": "晨光厨房，手臂扫过遮挡转场，切杯倒渍定的 aftermath。",
+    "invariants": {
+      "characters": [],
+      "setting_zh": "晨光厨房木桌",
+      "key_props_zh": ["桌边的陶瓷杯", "铜钥匙", "已停住的咖啡渍"],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-2.5", "what_zh": "手臂从画边扫过盖住镜头，自然转场", "camera_zh": "固定机位" },
+      { "t": "2.5-6.0", "what_zh": "切 aftermath 静帧：杯倒、渍停、钥匙未被碰到", "camera_zh": "固定近景" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": ["转场处的陶瓷轻响与液体飞溅", "之后房间安静"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 6, "shots": 2, "mode": "T2VA" },
+    "risks": ["碰撞瞬间未直拍：H3 做不出接触因果与液体体积守恒，改用遮挡转场加静帧，因果由音效补"],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 6,
+    "integrated_multimodal_description": "[Shot 1] Live-action wooden kitchen table in morning light, an upright ceramic mug near the edge and a brass key beside it. A forearm sweeps in from the frame edge and passes close across the lens, fully covering the view for a beat. [Shot 2] At 00:02.500, the camera cuts to the settled aftermath from a static close angle: the mug lies on its side, a dark coffee stain spread about as far as the width of a hand and no further, its leading edge a few centimetres short of the brass key.",
+    "overall_soundscape": "A ceramic clink and a soft liquid splash at the cut, then room quiet.",
+    "non_diegetic_music": "N/A"
+  }
+}

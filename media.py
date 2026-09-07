@@ -344,3 +344,65 @@ def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, th
         except OSError:
             pass
         return False
+
+
+def probe_fps(path, default=24.0):
+    """视频平均帧率；探测失败回 default（调用方显式记录兜底）。"""
+    try:
+        import av
+        with av.open(path) as c:
+            vs = next((s for s in c.streams if s.type == "video"), None)
+            if vs is not None and getattr(vs, "average_rate", None):
+                return float(vs.average_rate)
+    except Exception:
+        pass
+    return float(default)
+
+
+def trim_av_mp4(src_path, out_path, start_s, end_s, fps=24, crf=20,
+                preset="veryfast", aq_mode=None, dither=False):
+    """入出点裁剪：[start_s, end_s) 秒 -> 新 mp4（重编码，与 save_av_mp4 同档）。
+
+    M3 最小剪辑集：资产库行内设入出点、成片库片段截取共用。短素材（2-15s）
+    全量解码后切片，内存可控；先写 .part 再原子改名；失败存 last_error。
+    start_s < 0 钳 0；end_s <= start_s 或超长按实际钳制；切空返回 False。
+    """
+    global last_error
+    try:
+        import torch
+    except Exception as e:
+        last_error = f"torch 导入失败：{type(e).__name__}: {e}"
+        return False
+    try:
+        real_fps = probe_fps(src_path, fps)
+        frames, wav, sr = decode_av(src_path)
+    except Exception as e:
+        last_error = f"解码失败：{type(e).__name__}: {e}"
+        return False
+    n = int(frames.shape[0])
+    if n <= 0:
+        last_error = "源视频无帧"
+        return False
+    s0 = max(0, int(round(float(start_s) * real_fps)))
+    s1 = min(n, int(round(float(end_s) * real_fps)))
+    if s1 <= s0:
+        last_error = (f"裁剪区间为空（[{start_s}s, {end_s}s) -> 帧[{s0}, {s1})，"
+                      f"源共{n}帧@{real_fps:.2f}fps）")
+        return False
+    cut = frames[s0:s1]
+    rate = int(sr or 44100)
+    if wav is not None and getattr(wav, "numel", lambda: 0)() > 0:
+        a0 = max(0, int(round(s0 / real_fps * rate)))
+        a1 = max(a0, int(round(s1 / real_fps * rate)))
+        try:
+            cut_wav = wav[..., a0:a1]
+        except Exception:
+            cut_wav = wav
+    else:
+        cut_wav = torch.zeros(1, 0)
+        rate = int(sr or 44100)
+    ok = save_av_mp4(out_path, cut, cut_wav, rate, fps=int(round(real_fps)) or 24,
+                     crf=crf, preset=preset, aq_mode=aq_mode, dither=dither)
+    if not ok and not last_error:
+        last_error = "重编码失败（见 save_av_mp4 日志）"
+    return ok

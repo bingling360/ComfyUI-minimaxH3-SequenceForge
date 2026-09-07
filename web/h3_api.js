@@ -1,0 +1,64 @@
+/* H3 API 封装（M4）：新后端接口 + revision 乐观锁 + 结构化错误。
+ * ComfyUI 会自动加载 web/ 下所有 js，本文件只挂 window.H3Api，不注册入口。
+ * 依赖：全局 fetch（ComfyUI 前端 api.fetchApi 优先，有则用，无则 fetch 直调）。
+ */
+(function () {
+  "use strict";
+
+  async function _call(path, opts) {
+    opts = opts || {};
+    // 优先走 ComfyUI 前端 api.fetchApi（自动处理 /api 前缀），无则直 fetch
+    try {
+      if (typeof window !== "undefined" && window.comfyAPI?.api?.api) {
+        const r = await window.comfyAPI.api.api.fetchApi(path, opts);
+        const body = await r.json().catch(() => ({}));
+        return { status: r.status, body };
+      }
+    } catch (e) { /* fallthrough */ }
+    const r = await fetch(path, opts);
+    const body = await r.json().catch(() => ({}));
+    return { status: r.status, body };
+  }
+
+  function _json(method, path, data) {
+    return _call(path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: data === undefined ? undefined : JSON.stringify(data),
+    });
+  }
+
+  function isConflict(res) {
+    return res && (res.status === 409 || res.body?.code === "REVISION_CONFLICT");
+  }
+
+  function errText(res, fallback) {
+    if (!res) return fallback || "网络异常";
+    if (res.body?.message) return res.body.message;
+    if (res.body?.error) return res.body.error;
+    return (fallback || "请求失败") + `（HTTP ${res.status}）`;
+  }
+
+  const Api = {
+    getProjects: (summary) => _call(summary ? "/h3chain/projects?summary=1" : "/h3chain/projects"),
+    getProject: (dir) => _call("/h3chain/project?dir=" + encodeURIComponent(dir || "")),
+    createProject: (dir) => _json("POST", "/h3chain/create_project", { dir }),
+    savePrompts: (dir, prompts, segments, base_revision) =>
+      _json("POST", "/h3chain/save_prompts", { dir, prompts, segments, base_revision }),
+    compilePreview: (payload) => _json("POST", "/h3chain/compile", payload),
+    saveAssets: (dir, assets, base_revision) =>
+      _json("POST", "/h3chain/assets", { dir, assets, base_revision }),
+    assetCheck: (assets, segments) => _json("POST", "/h3chain/asset_check", { assets, segments }),
+    latentSlice: (dir, src, start_f, end_f, save_name, base_revision) =>
+      _json("POST", "/h3chain/latent_slice", { dir, src, start_f, end_f, save_name, base_revision }),
+    latentDelete: (dir, file, base_revision) =>
+      _json("POST", "/h3chain/latent_delete", { dir, file, base_revision }),
+    trim: (dir, src, start_s, end_s, save_name, base_revision) =>
+      _json("POST", "/h3chain/trim", { dir, src, start_s, end_s, save_name, base_revision }),
+    merge: (dir, items) => _json("POST", "/h3chain/merge", { dir, items }),
+    isConflict,
+    errText,
+  };
+
+  if (typeof window !== "undefined") window.H3Api = Api;
+})();

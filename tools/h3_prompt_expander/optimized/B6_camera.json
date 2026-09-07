@@ -1,0 +1,33 @@
+{
+  "intent": {
+    "logline_zh": "清晨跑者穿出隧道奔向光明，单次摇镜揭示跑道。",
+    "invariants": {
+      "characters": [
+        { "id": "CHAR_A", "desc_zh": "20岁左右女性跑者，灰色背心，全程不说话", "speaks": false }
+      ],
+      "setting_zh": "清晨混凝土隧道与户外跑道",
+      "key_props_zh": [],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-4.0", "what_zh": "跑者冲出隧道，固定广角", "camera_zh": "固定机位" },
+      { "t": "4.0-6.0", "what_zh": "切户外跑道，单次右摇揭示空跑道", "camera_zh": "右摇" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": ["隧道回声脚步", "户外风声与鸟鸣"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 6, "shots": 2, "mode": "T2VA" },
+    "risks": ["原文环绕推近拉远跟拍全要，已砍到只剩固定+单次右摇：单镜单运镜，否则必随机切镜"],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 6,
+    "integrated_multimodal_description": "[Shot 1] Live-action concrete tunnel interior at dawn, bright daylight glowing at the exit. A female runner in her 20s in a grey singlet sprints toward the light as the camera holds a static wide shot. [Shot 2] At 00:04.000, the camera cuts to the open track outside and pans right once at slow speed to reveal the empty lanes ahead as she runs on.",
+    "overall_soundscape": "Echoing footsteps swelling in the tunnel, then wind and birdsong outside.",
+    "non_diegetic_music": "N/A"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "intent": {
+    "logline_zh": "女孩转身快步走向车站，停下后完整说出那段近40字的话。",
+    "invariants": {
+      "characters": [
+        { "id": "S1", "desc_zh": "20岁左右年轻女孩，浅色风衣，背帆布包，在画内", "speaks": true }
+      ],
+      "setting_zh": "白天户外车站前广场",
+      "key_props_zh": [],
+      "must_keep_quotes": ["我昨天想了一整晚，我觉得我们还是应该把这件事说清楚，不然以后见面多尴尬啊你说对不对"]
+    },
+    "beats": [
+      { "t": "0.0-3.0", "what_zh": "女孩转身快步走向车站，相机跟拍", "camera_zh": "跟拍" },
+      { "t": "3.0-12.0", "what_zh": "女孩停步，完整说出台词", "camera_zh": "缓慢推近" }
+    ],
+    "dialogue": [
+      { "speaker": "S1", "lang": "Chinese", "line": "我昨天想了一整晚，我觉得我们还是应该把这件事说清楚，不然以后见面多尴尬啊你说对不对。", "voiceover": false }
+    ],
+    "audio": {
+      "ambience_zh": ["广场人声", "脚步声", "行李箱滚轮声"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 12, "shots": 2, "mode": "T2VA" },
+    "risks": ["39字台词约需9秒，已把时长延至12秒；若坚持5秒必须剪到20字内，否则必 rushed 被截断"],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 12,
+    "integrated_multimodal_description": "[Shot 1] Live-action station plaza in daylight. A young woman in her 20s (S1), on-screen, light trench coat and canvas bag, turns and strides toward the station entrance as the camera follows behind her at steady speed. [Shot 2] At 00:03.000, the camera cuts to a medium close-up and pushes in with small amplitude at slow speed as she stops and speaks earnestly in Mandarin <d>[Chinese] 我昨天想了一整晚，我觉得我们还是应该把这件事说清楚，不然以后见面多尴尬啊你说对不对。</d>",
+    "overall_soundscape": "Plaza crowd murmur, her hurrying footsteps and rolling luggage nearby.",
+    "non_diegetic_music": "N/A"
+  }
+}

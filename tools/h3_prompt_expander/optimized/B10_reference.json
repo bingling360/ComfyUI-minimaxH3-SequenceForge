@@ -1,0 +1,35 @@
+{
+  "intent": {
+    "logline_zh": "参考图钉身份，少女穿指定夹克走过指定霓虹街。",
+    "invariants": {
+      "characters": [
+        { "id": "S1", "desc_zh": "图1的少女，银色齐耳短发，穿图3夹克，在画内行走，不说话", "speaks": false }
+      ],
+      "setting_zh": "图2的雨夜霓虹街道",
+      "key_props_zh": ["图3的机能夹克"],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-5.0", "what_zh": "少女走过霓虹街，相机侧跟，一镜", "camera_zh": "侧跟" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": ["雨声", "脚步声"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 5, "shots": 1, "mode": "Ref2VA" },
+    "risks": [],
+    "clarify": []
+  },
+  "pe": {
+    "mode": "Ref2VA",
+    "duration": 5,
+    "subject_definitions": "<Subject 1>: the teenage girl from <Picture 1>, silver bob hair, slim build\n<Picture 1>: identity reference for <Subject 1>, face and hair\n<Picture 2>: background and style reference, rainy neon street at night\n<Picture 3>: outfit reference, patched techwear jacket for <Subject 1>",
+    "summary": "[reference generation] A 5-second clip of <Subject 1> walking through the rainy neon street from <Picture 2>, wearing the jacket from <Picture 3>.",
+    "retention_analysis": "<Subject 1> (appears in [Shot 1]): fully_preserved, same face, hair and proportions\n<Picture 1> (identity): fully_preserved\n<Picture 2> (background): partially_preserved, neon layout and wet mood kept, crowd may change\n<Picture 3> (outfit): attribute_transfer, jacket pattern transferred onto <Subject 1>",
+    "detailed_description": "[Shot 1] Stylized rainy neon street at night consistent with <Picture 2>. <Subject 1> walks through the crowd with lowered gaze, the patched jacket from <Picture 3> clearly visible. The camera tracks beside <Subject 1> at slow speed. One continuous shot with no cuts.",
+    "overall_soundscape": "Steady rain and footsteps on wet pavement.",
+    "non_diegetic_music": "N/A"
+  }
+}

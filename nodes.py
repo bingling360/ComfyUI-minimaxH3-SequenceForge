@@ -719,6 +719,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                tooltip="基础链（≈一采）分段视频与成片的 mp4 编码质量——二采关闭时直接决定正片清晰度："
                                        "标准=crf20 veryfast（现状兼容）；高清=crf16 medium + 暗部自适应量化 + Bayer 抖动；"
                                        "极致=crf13 slow + 同上（编码明显变慢）。二采开启时其高清产物同名覆盖，此档自动失效"),
+                io.String.Input("资产包", multiline=True, default="", advanced=True,
+                               tooltip="H3AssetHub「规范包」输出连这里：单线分发。非空时优先于「导演台状态」内 "
+                                       "ref_assets（总量不限，单段上限执行期按段卡）。空=走导演台状态/画布旧路径。"),
                 io.Image.Input("首帧图片", optional=True,
                                tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
                 io.Image.Input("尾帧图片", optional=True,
@@ -782,7 +785,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
-                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准"):
+                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准", 资产包=""):
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
         try:
             from .routes import ensure_registered
@@ -791,6 +794,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
             pass
         # ---- 导演台状态驱动：有 JSON 状态时优先于画布接线 ----
         ds = _parse_director_state(导演台状态)
+        # M2：Hub 规范包优先于 ds.ref_assets（单线分发；总量不限）
+        if isinstance(资产包, str) and 资产包.strip():
+            try:
+                from .asset_hub import normalize_pack as _hub_norm
+                _hub_items, _hub_warns = _hub_norm(资产包)
+            except Exception:
+                _hub_items, _hub_warns = [], []
+            if _hub_items:
+                ds = dict(ds)
+                ds["ref_assets"] = [{"label": a["label"], "kind": a["kind"], "file": a["file"]}
+                                    for a in _hub_items]
         ds_used = bool(ds)
         # 实验性功能开关：从 ds.experiments 归一化；全关/FORCE_DISABLED => 空 context，
         # 后续所有实验分支以 exp.has(...) 包裹，关闭时逐字节走现状路径
@@ -876,7 +890,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
                             order.append((pool_kind[lbl], lbl))
                 else:
-                    # refs 缺省/显式空 = 引用全部素材（与旧行为一致，避免 ref2va 链空参考段）
+                    # M2：refs 缺省 = 引用全部（兼容旧链），但总量超单段上限时不再硬套全部，
+                    # 而是要求该段显式勾选（否则全段都会超限报错，总量永远被卡在 9/3/3）
+                    _pool_count = {}
+                    for k, _, _ in pool_files:
+                        _pool_count[k] = _pool_count.get(k, 0) + 1
+                    _over = [(k, _pool_count.get(k, 0), REF_CAPS[k])
+                             for k in REF_CAPS if _pool_count.get(k, 0) > REF_CAPS[k]]
+                    if _over:
+                        _detail = "、".join(f"{_KIND_NAME[k]}{n}个（单段上限{cap}）" for k, n, cap in _over)
+                        raise ValueError(
+                            f"段{i + 1} 未勾选素材，但素材库共 {_detail}：请在该段卡片勾选本段要用的素材"
+                            f"（单段最多 9图3视3音），总量不限、单段限选")
                     order = [(k, lbl) for k, lbl, _ in pool_files]
                 # 官方单段上限：图 9 / 视 3 / 音 3（超了报错并指出勾选明细）
                 for _k, _cap in REF_CAPS.items():
@@ -1000,14 +1025,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
                               "<Picture 1> (from [Shot 1]) is fully referenced.\n" + seg_prompts[0])
 
         # 素材池张量（按类别）：JSON 池各类别独立加载；图片池空时回退画布 autogrow（全段共用）
+        # M2：总量不限（JSON 资产库可上百），单段 9/3/3 执行期按段卡；缺文件早爆并点名标签
         pool_tensors = {"image": {}, "video": {}, "audio": {}}
         for _k, _lbl, _fn in pool_files:
-            if _k == "image":
-                pool_tensors["image"][_lbl] = _load_input_image(_fn)
-            elif _k == "video":
-                pool_tensors["video"][_lbl] = _load_input_video(_fn)   # (帧张量, 同源音轨)
-            else:
-                pool_tensors["audio"][_lbl] = _load_input_audio(_fn)
+            try:
+                if _k == "image":
+                    pool_tensors["image"][_lbl] = _load_input_image(_fn)
+                elif _k == "video":
+                    pool_tensors["video"][_lbl] = _load_input_video(_fn)   # (帧张量, 同源音轨)
+                else:
+                    pool_tensors["audio"][_lbl] = _load_input_audio(_fn)
+            except ValueError:
+                raise
+            except Exception as e:
+                raise ValueError(f"素材「{_lbl}」加载失败（文件 {_fn}）：{e}——请确认文件仍在 ComfyUI input 目录且可解码")
         refs = {
             "ref_videos": _autogrow_items(参考视频组, "ref_video_"),
             "ref_video_audios": _autogrow_items(参考视频音轨组, "ref_video_audio_"),

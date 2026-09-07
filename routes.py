@@ -43,6 +43,12 @@ ROUTES = [
     ("GET", "/h3chain/experiments"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
+    ("POST", "/h3chain/compile"),
+    ("POST", "/h3chain/latent_slice"),
+    ("POST", "/h3chain/latent_delete"),
+    ("POST", "/h3chain/trim"),
+    ("POST", "/h3chain/assets"),
+    ("POST", "/h3chain/asset_check"),
     ("POST", "/h3chain/delete_project"),
     ("POST", "/h3chain/delete_file"),
     ("POST", "/h3chain/merge"),
@@ -57,6 +63,12 @@ def _routes_desc() -> list:
     return [{"method": m, "path": p} for m, p in ROUTES]
 
 
+def _err(message, code="BAD_REQUEST", status=400, **extra):
+    body = {"ok": False, "code": code, "message": message}
+    body.update(extra)
+    return web.json_response(body, status=status)
+
+
 def add_routes(routes):
     """把路由挂到 routes 对象（aiohttp）。
 
@@ -68,66 +80,100 @@ def add_routes(routes):
     """
 
     async def ping(request):
-        return web.json_response({"ok": True, "version": "v3", "routes": _routes_desc()})
+        return web.json_response({"ok": True, "version": "v4-manifest-v2.1", "routes": _routes_desc()})
 
     async def list_projects(request):
+        # ?summary=1 走轻量分页（M1 新增）；默认保持旧 {ok,projects} 兼容
+        if str(request.query.get("summary") or "").lower() in ("1", "true", "yes"):
+            data = projects.list_projects_summary(
+                request.query.get("page") or 1, request.query.get("size") or 50)
+            return web.json_response({"ok": True, **data})
         return web.json_response({"ok": True, "projects": projects.list_projects()})
 
     async def project_detail(request):
         manifest = projects.read_project(request.query.get("dir") or "")
         if manifest is None:
-            return web.json_response({"error": "项目不存在"}, status=404)
+            return _err("项目不存在", code="NOT_FOUND", status=404)
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def create_project(request):
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
         manifest = projects.create_project(str(data.get("dir") or ""))
         if manifest is None:
-            return web.json_response({"error": "无效的项目目录名"}, status=400)
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def save_prompts(request):
-        data = await request.json()
-        manifest = projects.save_prompts(str(data.get("dir") or ""), data.get("prompts"),
-                                         data.get("segments"))
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            manifest = projects.save_prompts(
+                str(data.get("dir") or ""), data.get("prompts"),
+                data.get("segments"), data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                # 乐观锁冲突：带回 server_revision，前端据此刷新重试
+                try:
+                    cur = projects.read_project(str(data.get("dir") or ""))
+                    srv = int((cur or {}).get("revision") or 0)
+                except Exception:
+                    srv = 0
+                return _err(msg, code="REVISION_CONFLICT", status=409,
+                            server_revision=srv)
+            return _err(msg, code="BAD_REQUEST", status=400)
         if manifest is None:
-            return web.json_response(
-                {"error": "项目不存在（未新建也未跑过，无 manifest 可写）"}, status=404)
+            return _err("项目不存在（未新建也未跑过，无 manifest 可写）",
+                        code="NOT_FOUND", status=404)
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def delete_project(request):
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
         name = projects.safe_name(data.get("dir"))
         if not name:
-            return web.json_response({"error": "无效的项目目录名"}, status=400)
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
         try:
             deleted = projects.delete_project(name)
         except OSError as e:
-            return web.json_response(
-                {"error": f"删除失败（文件可能被播放器/编码器占用）：{e}"}, status=500)
+            return _err(f"删除失败（文件可能被播放器/编码器占用）：{e}",
+                        code="DELETE_FAILED", status=500)
         if deleted is None:
-            return web.json_response({"error": "项目不存在"}, status=404)
+            return _err("项目不存在", code="NOT_FOUND", status=404)
         return web.json_response({"ok": True, "deleted": deleted})
 
     async def delete_file(request):
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
         rel = str(data.get("path") or "").strip().replace("\\", "/")
         parts = rel.split("/")
         if (len(parts) != 3 or parts[0] != "h3_projects"
                 or not projects.safe_name(parts[1])
                 or not projects.safe_name(parts[2])
                 or not os.path.splitext(parts[2])[1]):
-            return web.json_response(
-                {"error": "路径必须是 h3_projects/<项目>/<文件名>"}, status=400)
+            return _err("路径必须是 h3_projects/<项目>/<文件名>",
+                        code="BAD_PATH", status=400)
         root = os.path.realpath(get_output_directory())
         target = os.path.realpath(os.path.join(root, *parts))
         if not target.startswith(root + os.sep) or not os.path.isfile(target):
-            return web.json_response({"error": "文件不存在"}, status=404)
+            return _err("文件不存在", code="NOT_FOUND", status=404)
         os.remove(target)
         return web.json_response({"ok": True})
 
     async def merge(request):
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
         items = data.get("items")
         try:
             # PyAV 流式编码是 CPU 密集长任务（分钟级），放线程池避免
@@ -135,9 +181,9 @@ def add_routes(routes):
             manifest = await asyncio.get_event_loop().run_in_executor(
                 None, projects.merge_project, str(data.get("dir") or ""), items)
         except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
+            return _err(str(e), code="BAD_REQUEST", status=400)
         except RuntimeError as e:
-            return web.json_response({"error": str(e)}, status=500)
+            return _err(str(e), code="MERGE_FAILED", status=500)
         return web.json_response({
             "ok": True, "manifest": manifest,
             "file": manifest["merges"][-1]["file"]})
@@ -161,21 +207,162 @@ def add_routes(routes):
         return web.json_response(payload)
 
     async def upscale_reset(request):
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
         try:
             manifest = projects.upscale_reset(str(data.get("dir") or ""), data.get("seg"))
         except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
+            return _err(str(e), code="BAD_REQUEST", status=400)
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def redo_cancel(request):
         """撤销重摇标记：从 manifest 重摇队列移除该槽位（幂等）。"""
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
         try:
             manifest = projects.redo_cancel(str(data.get("dir") or ""), data.get("slot"))
         except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
+            return _err(str(e), code="BAD_REQUEST", status=400)
         return web.json_response({"ok": True, "manifest": manifest})
+
+    async def save_assets(request):
+        """资产库全量覆盖写：总量不限，revision 乐观锁可选。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            manifest = projects.save_assets(
+                str(data.get("dir") or ""), data.get("assets"),
+                data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                try:
+                    cur = projects.read_project(str(data.get("dir") or ""))
+                    srv = int((cur or {}).get("revision") or 0)
+                except Exception:
+                    srv = 0
+                return _err(msg, code="REVISION_CONFLICT", status=409,
+                            server_revision=srv)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        if manifest is None:
+            return _err("项目不存在或资产列表非法", code="NOT_FOUND", status=404)
+        return web.json_response({"ok": True, "manifest": manifest})
+
+    async def asset_check(request):
+        """资产包校验（不落盘）：缺文件/重标签/单段上限早爆，点名标签。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import asset_hub
+        except ImportError:
+            import asset_hub
+        res = asset_hub.validate_pack(data.get("assets"), data.get("segments"))
+        status = 200 if res["ok"] else 422
+        return web.json_response({"ok": res["ok"], **res}, status=status)
+
+    def _rev_conflict(request_dir, msg):
+        try:
+            cur = projects.read_project(request_dir)
+            srv = int((cur or {}).get("revision") or 0)
+        except Exception:
+            srv = 0
+        return _err(msg, code="REVISION_CONFLICT", status=409, server_revision=srv)
+
+    async def latent_slice(request):
+        """latent 切片：段存档/已登记 latent 按帧窗 -> latent/<save>.pt（无 VAE）。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            manifest = projects.slice_latent(
+                str(data.get("dir") or ""), data.get("src"),
+                data.get("start_f"), data.get("end_f"),
+                data.get("save_name"), data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(str(data.get("dir") or ""), msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="SLICE_FAILED", status=500)
+        return web.json_response({"ok": True, "manifest": manifest,
+                                  "file": (manifest.get("latents") or [{}])[-1].get("file")})
+
+    async def latent_delete(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            manifest = projects.delete_latent(
+                str(data.get("dir") or ""), data.get("file"), data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(str(data.get("dir") or ""), msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        return web.json_response({"ok": True, "manifest": manifest})
+
+    async def trim(request):
+        """入出点裁剪：项目内 mp4 -> 新文件（线程池重编码）。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            manifest = await asyncio.get_event_loop().run_in_executor(
+                None, projects.trim_asset, str(data.get("dir") or ""),
+                data.get("src"), data.get("start_s"), data.get("end_s"),
+                data.get("save_name"), data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(str(data.get("dir") or ""), msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="TRIM_FAILED", status=500)
+        return web.json_response({"ok": True, "manifest": manifest,
+                                  "file": (manifest.get("clips") or [{}])[-1].get("file")})
+
+    async def compile_prompt(request):
+        """结构化 prompt 编译预览（不落盘）：返回官方英文 + 校验，供段卡分组调用。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import prompts as _prompts
+        except ImportError:
+            import prompts as _prompts
+        prompt = data.get("prompt")
+        if prompt is None and isinstance(data.get("segment"), dict):
+            seg = data["segment"]
+            prompt = seg.get("prompt_v2") or _prompts.migrate_legacy_seg(seg)
+        try:
+            seconds = float(data.get("seconds") or 5.0)
+        except (TypeError, ValueError):
+            seconds = 5.0
+        has_start = bool(data.get("has_start"))
+        has_end = bool(data.get("has_end"))
+        try:
+            compiled = _prompts.compile_segment(prompt, seconds=seconds,
+                                                has_start=has_start, has_end=has_end)
+            verdict = _prompts.validate_compiled(compiled)
+        except Exception as e:
+            return _err(f"编译失败：{e}", code="COMPILE_FAILED", status=400)
+        status = 200 if verdict["ok"] else 422
+        return web.json_response({"ok": verdict["ok"], "compiled": compiled,
+                                  "errors": verdict["errors"],
+                                  "warnings": verdict["warnings"]}, status=status)
 
     handlers = [
         ("GET", "/h3chain/ping", ping),
@@ -185,6 +372,12 @@ def add_routes(routes):
         ("GET", "/h3chain/experiments", experiment_defs),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),
+        ("POST", "/h3chain/compile", compile_prompt),
+        ("POST", "/h3chain/latent_slice", latent_slice),
+        ("POST", "/h3chain/latent_delete", latent_delete),
+        ("POST", "/h3chain/trim", trim),
+        ("POST", "/h3chain/assets", save_assets),
+        ("POST", "/h3chain/asset_check", asset_check),
         ("POST", "/h3chain/delete_project", delete_project),
         ("POST", "/h3chain/delete_file", delete_file),
         ("POST", "/h3chain/merge", merge),

@@ -1,0 +1,33 @@
+{
+  "intent": {
+    "logline_zh": "深夜便利店内店员独自值班，安静，无配乐。",
+    "invariants": {
+      "characters": [
+        { "id": "CHAR_A", "desc_zh": "30岁左右男性店员，深色制服，在收银台后，全程不说话", "speaks": false }
+      ],
+      "setting_zh": "深夜便利店内，冷白荧光灯，空货架",
+      "key_props_zh": ["收银台", "玻璃门"],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-3.5", "what_zh": "店员缓慢擦收银台，固定广角", "camera_zh": "固定机位" },
+      { "t": "3.5-6.0", "what_zh": "店员停下，望向玻璃门外空街道", "camera_zh": "固定延续" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": ["荧光灯电流声", "门外远处车流"],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 6, "shots": 1, "mode": "T2VA" },
+    "risks": ["原文“独白”无具体台词，暂按无对白处理；若有词请补，勿把独白写进 soundscape"],
+    "clarify": ["“独白”的具体台词是哪一句？补上后可配对口 <d> 或画外音（配“lips remain closed”）。"]
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 6,
+    "integrated_multimodal_description": "[Shot 1] Live-action convenience store interior past midnight, cool fluorescent light over empty aisles. A male clerk in his 30s in a dark uniform slowly wipes the counter, the only person in the store. The camera holds a static wide shot as he pauses and gazes out the glass door at the empty street. One continuous shot with no cuts.",
+    "overall_soundscape": "Low fluorescent hum and faint traffic beyond the glass, nothing else.",
+    "non_diegetic_music": "N/A"
+  }
+}

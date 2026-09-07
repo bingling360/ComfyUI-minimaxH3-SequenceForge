@@ -1,0 +1,35 @@
+{
+  "intent": {
+    "logline_zh": "（含糊）用户想要一条有感觉的夜晚氛围短片，主体与动作未定。",
+    "invariants": {
+      "characters": [],
+      "setting_zh": "夜晚（待定）",
+      "key_props_zh": [],
+      "must_keep_quotes": []
+    },
+    "beats": [
+      { "t": "0.0-5.0", "what_zh": "（待用户选方向后细化）", "camera_zh": "" }
+    ],
+    "dialogue": [],
+    "audio": {
+      "ambience_zh": [],
+      "music_wanted": false,
+      "music_zh": ""
+    },
+    "constraints": { "duration": 5, "shots": 1, "mode": "T2VA" },
+    "risks": ["输入含糊：pe 为候选 A 草稿，禁止直接投产，须三选一确认"],
+    "clarify": ["主角是人还是空镜？", "要对白吗？还是纯氛围？"],
+    "candidates": [
+      { "id": "A", "label_zh": "独行女孩雨夜", "logline_zh": "雨夜霓虹街，独行女孩撑伞走远，无对白。", "diff_zh": "有人物、有故事感" },
+      { "id": "B", "label_zh": "城市夜景空镜", "logline_zh": "高楼霓虹与车流延时感空镜，无人物。", "diff_zh": "无人物、纯视觉" },
+      { "id": "C", "label_zh": "深夜便利店", "logline_zh": "深夜便利店内店员独处，荧光灯加远车流。", "diff_zh": "室内、静谧、可能加独白" }
+    ]
+  },
+  "pe": {
+    "mode": "T2VA",
+    "duration": 5,
+    "integrated_multimodal_description": "[Shot 1] Live-action rainy night street with neon reflections. A lone young woman with an umbrella walks away down the empty street as the camera holds a static wide shot. One continuous shot with no cuts.",
+    "overall_soundscape": "Steady rain and distant traffic.",
+    "non_diegetic_music": "N/A"
+  }
+}

@@ -345,10 +345,18 @@ def test_v2_group_form_wired():
     assert "function setPromptV2Field(node, idx, mutate" in d
     assert "function debouncePromptV2Write" in d
     assert "function getSegPromptV2" in d
-    # 五组中文标题齐全
-    for g in ["画面 · 媒介/构图/环境/光照/角色/道具", "镜头 Shots", "声音 · 环境音",
-              "参考 · 素材引用", "高级 · 源码覆盖"]:
+    # 五组中文标题齐全（官方字段名口径）
+    for g in ["画面 · 风格/构图/环境/光照/角色/道具", "镜头 ×", "声音 · overall_soundscape",
+              "参考 · subject_definitions", "高级 · 源码覆盖"]:
         assert g in d, g
+    # 五模式：模式选择 + 手动覆写 + 对齐指令预览 + 编译透传 mode
+    for sym in ["V2_MODES", "effV2Mode", "defaultV2Mode", "setV2Mode",
+                "v2InstrPreview", "v2mode", "assignV2FromText"]:
+        assert sym in d or sym in p, sym
+    # 中文显示 ⇄ 英文存储：运镜/说话人/语言/任务类型映射齐全
+    for sym in ["V2_CAM_ZH", "V2_AMP_ZH", "V2_SPD_ZH", "V2_TASK_ZH", "V2_MARKER_ZH",
+                "zhSpeaker", "enSpeaker", "zhLang", "enLang", "zhTasks", "enTasks", "mkMapSel"]:
+        assert sym in d, sym
     # 校验入口：编译预览+模式徽
     assert "编译预览+校验" in d and "detectMode" in d
     # 5.3 最小接线：AI扩写复制命令行

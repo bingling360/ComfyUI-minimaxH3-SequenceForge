@@ -223,6 +223,10 @@ def _clean_seg_field(raw) -> dict | None:
             out["prompt_v2"] = _prompts.clean_prompt(pv)
         except Exception:
             pass
+    # v2 手动模式（null=跟随导演台）：白名单透存，未知值归 null
+    vm = raw.get("v2mode")
+    out["v2mode"] = vm if isinstance(vm, str) and vm in (
+        "T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA") else None
     # M3：每段 latent 保存策略透存 {mode: all|range|tail|off, start_f, end_f, tail_f}
     ls = raw.get("latent_save")
     if isinstance(ls, dict):

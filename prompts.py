@@ -4,7 +4,8 @@
 - base：integrated_multimodal_description + overall_soundscape(空省略) + non_diegetic_music(空=N/A)
 - ref：subject_definitions + summary + retention_analysis + detailed_description + soundscape + music
 - Shot：[Shot 1]无时间戳，[Shot N] At MM:SS.mmm 严格递增；单镜单运镜；对白 <d>[语言] 原文</d> + (S1)；双引号只给屏显。
-- 模式自动判定，不设手动切换。
+- 模式：默认自动判定（detect_mode），前端可传 mode 手动覆写（T2VA/I2VA/FL2VA/L2VA/Ref2VA），
+  覆盖仅切换字段集与校验口径，对齐指令行仍按实际 has_start/has_end 生成（缺帧会如实报错）。
 
 与旧链关系：只增不改。旧 seg {scene_prompt/character_prompt/soundscape/music}
 由 migrate_legacy_seg 转新结构；nodes.py 主链继续用旧组装，新前端段卡用本模块
@@ -25,6 +26,8 @@ REF_FIELDS = ("subject_definitions", "summary", "retention_analysis",
               "detailed_description", "overall_soundscape", "non_diegetic_music")
 
 MAX_PIC, MAX_VID, MAX_AUD = 9, 3, 3  # 官方单段上限（与 nodes.py REF_CAPS 一致）
+
+VALID_MODES = ("T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA")
 
 _SHOT_TAG_RE = re.compile(r"^\s*\[Shot\s+\d+\]\s*")
 _LABEL_RE = re.compile(r"<(Subject|Picture|Video|Audio)\s+(\d+)>", re.I)
@@ -329,7 +332,7 @@ def compose_reference(prompt, *, duration=5.0):
     for r in refs:
         subj_lines.append(f"{_norm_label(r.get('label'))}: {_s(r.get('note')) or 'reference asset'}")
     tasks = [_s(t) for t in (prompt.get("task_types") or []) if _s(t)]
-    prefix = "[" + " ".join(tasks or ["reference generation"]) + "]"
+    prefix = "[" + " + ".join(tasks or ["reference generation"]) + "]"
     summary = _s(prompt.get("summary_override"))
     if not summary:
         bits = [f"{prefix} A {max(1, int(round(float(duration or 5.0))))}-second clip"]
@@ -359,11 +362,17 @@ def compose_reference(prompt, *, duration=5.0):
     return fields
 
 
-def compile_segment(prompt_raw, *, seconds=5.0, has_start=False, has_end=False):
-    """结构化 prompt -> {mode, fields, prompt_text, warnings, diagnostics}。"""
+def compile_segment(prompt_raw, *, seconds=5.0, has_start=False, has_end=False, mode=None):
+    """结构化 prompt -> {mode, fields, prompt_text, warnings, diagnostics}。
+    mode：None/非法=自动判定；合法五模式之一=手动覆写（字段集与校验按该模式，
+    对齐指令行仍按 has_start/has_end 实际生成）。"""
     prompt = clean_prompt(prompt_raw)
-    mode = detect_mode(prompt, has_start=has_start, has_end=has_end)
+    auto = detect_mode(prompt, has_start=has_start, has_end=has_end)
+    mode = mode if mode in VALID_MODES else auto
     warnings, diagnostics = [], {}
+    if mode != auto:
+        warnings.append({"code": "W_MODE_OVERRIDE",
+                         "message": f"手动模式 {mode}（自动判定为 {auto}）"})
     kf_lines = []
     n_shots = len(prompt.get("shots") or [])
     if mode in ("I2VA", "L2VA", "FL2VA"):

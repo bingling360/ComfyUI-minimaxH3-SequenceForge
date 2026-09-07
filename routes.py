@@ -397,9 +397,12 @@ def add_routes(routes):
             seconds = 5.0
         has_start = bool(data.get("has_start"))
         has_end = bool(data.get("has_end"))
+        mode = data.get("mode")
+        mode = mode if isinstance(mode, str) and mode else None
         try:
             compiled = _prompts.compile_segment(prompt, seconds=seconds,
-                                                has_start=has_start, has_end=has_end)
+                                                has_start=has_start, has_end=has_end,
+                                                mode=mode)
             verdict = _prompts.validate_compiled(compiled)
         except Exception as e:
             return _err(f"编译失败：{e}", code="COMPILE_FAILED", status=400)

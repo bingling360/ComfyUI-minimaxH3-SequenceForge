@@ -78,17 +78,27 @@
     return "T2VA";
   }
 
-  // 段卡 -> /h3chain/compile 载荷；prompt_v2 有则直用，无则现场迁移
+  // 段卡 -> /h3chain/compile 载荷；prompt_v2 有则直用，无则现场迁移。
+  // opts.mode 为五模式之一时手动覆写（后端 VALID_MODES），缺省=后端自动判定。
   function compilePayload(seg, opts) {
     opts = opts || {};
     const pv = seg && typeof seg.prompt_v2 === "object" && seg.prompt_v2
       ? seg.prompt_v2 : migrateLegacySeg(seg || {});
-    return {
+    const out = {
       prompt: pv,
       seconds: Number(seg?.seconds) || Number(opts.seconds) || 5.0,
       has_start: !!opts.has_start,
       has_end: !!opts.has_end,
     };
+    if (typeof opts.mode === "string" && opts.mode) out.mode = opts.mode;
+    return out;
+  }
+
+  /* 预留：外部 agent / 本地模型的自动解析分配接口（总提示词框式）。
+   *  后续实现：把一段自然语言/官方文本解析成 prompt_v2 各字段并写回 ds.segments。
+   *  当前为占位，调用方应捕获其抛出的未实现错误。 */
+  function assignV2FromText() {
+    throw new Error("assignV2FromText 未实现：后续自动解析分配接口在此落地");
   }
 
   // latent 策略默认值（M3 seg_fields.latent_save 透存，前端按钮写回）
@@ -107,7 +117,8 @@
     window.H3Prompts = {
       defaultShot, defaultPromptV2, migrateLegacySeg, compilePayload,
       defaultLatentSave, cleanLatentSave, ensurePromptV2, hasPromptV2,
-      detectMode, CAMERA_MOVES, CAMERA_AMPS, CAMERA_SPEEDS, RETENTION_MARKERS,
+      detectMode, assignV2FromText,
+      CAMERA_MOVES, CAMERA_AMPS, CAMERA_SPEEDS, RETENTION_MARKERS,
     };
   }
 })();

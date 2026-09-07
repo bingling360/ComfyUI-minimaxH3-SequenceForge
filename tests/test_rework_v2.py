@@ -338,8 +338,10 @@ def test_v2_group_form_wired():
     assert "prompt_v2: (s.prompt_v2" in d
     assert "prompt_v2: (s.prompt_v2" in d and "latent_save" in d
     assert "JSON.stringify(s.prompt_v2)" in d
-    assert "function renderPromptV2Panel(body, node, data, segIdx)" in d
-    assert "renderPromptV2Panel(body, node, data, it.idx)" in d
+    assert "function renderPromptV2Panel(body, node, data, segIdx)" in d or \
+        "function renderPromptV2Panel(" in d
+    assert "renderPromptV2Panel(paneV2, node, data, it.idx)" in d or \
+        "renderPromptV2Panel(body, node, data, it.idx)" in d
     assert "function setPromptV2Field(node, idx, mutate" in d
     assert "function debouncePromptV2Write" in d
     assert "function getSegPromptV2" in d
@@ -377,3 +379,59 @@ def test_prompts_full_groups(prompts):
     # 非法运镜词被清洗为空，不炸链
     pv["shots"][0]["camera_move"] = "乱写"
     assert prompts.clean_prompt(pv)["shots"][0]["camera_move"] == ""
+
+
+# ---- 切换式段卡 + 自研优化后端 ----
+def test_optimizer_backend():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "h3optimizer", os.path.join(ROOT, "optimizer.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    # 规则文件齐全
+    files = m.load_rule_files()
+    assert len(files) >= 3 and any("custom" in k for k in files)
+    # 规则选择
+    assert m.pick_rule_text({"rule_file": "none"}, files) is None
+    assert m.pick_rule_text({"rule_file": "auto", "output_language": "中文"}, files)
+    # 配置归一+脱敏
+    cfg = m.normalize_config({"provider": "openai", "api_key": "sk-x"})
+    pub = m.public_config(cfg)
+    assert pub["has_api_key"] is True and pub["api_key"] == ""
+    # 空提示词/无key报清晰错误（不抛 Traceback 穿透）
+    with pytest.raises(ValueError, match="为空"):
+        m.optimize_once({"mode": "api", "provider": "openai", "api_key": "sk-x"}, {"prompt": "  "})
+    with pytest.raises(ValueError, match="API Key"):
+        m.optimize_once({"mode": "api", "provider": "openai", "api_key": ""}, {"prompt": "hi"})
+    # 系统提示词双模式
+    assert "subject_definitions" in m.build_system_prompt("Ref2VA", 5.0, [], "中文")
+    assert "integrated_multimodal_description" in m.build_system_prompt("T2VA", 5.0, [], "中文")
+
+
+def test_optimizer_routes_mount(routes):
+    r = _Router()
+    routes.add_routes(r)
+    for p in ["/h3chain/prompt-rules", "/h3chain/optimizer-config", "/h3chain/optimize"]:
+        assert ("GET", p) in r.paths or ("POST", p) in r.paths
+        assert ("GET", "/api" + p) in r.paths or ("POST", "/api" + p) in r.paths
+
+
+def test_segment_tabs_and_optimizer_ui():
+    d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    a = open(os.path.join(ROOT, "web", "h3_api.js"), encoding="utf-8").read()
+    # 切换式三页
+    assert "h3d-tabs" in d and "paneMain" in d and "paneV2" in d and "paneSet" in d
+    assert "_segTab" in d
+    # 旧四框 UI 已删（后端仍兼容旧键，仅前端不编辑）
+    assert "场景提示词" not in d and "角色提示词" not in d
+    # 段片瘦身：无大 thumb 网格，全屏入口保留
+    assert "segMediaInfo" in d and "openSegViewer" in d and "h3d-viewer" in d
+    assert "▶ 预览" in d
+    assert "grid-template-columns:minmax(0,1fr)" in d
+    # 双写同步
+    assert "同步到主框" in d and "从v2同步" in d
+    # AI优化条（自研后端）
+    for sym in ["paintOptbar", "runOptForSegment", "openOptSettings", "opt_hist",
+                "optimizer-config", "/h3chain/optimize"]:
+        assert sym in d or sym in a, sym
+    assert "optimize:" in a and "getOptimizerConfig" in a and "getPromptRules" in a

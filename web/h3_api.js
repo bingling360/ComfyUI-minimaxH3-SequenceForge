@@ -56,6 +56,9 @@
     trim: (dir, src, start_s, end_s, save_name, base_revision) =>
       _json("POST", "/h3chain/trim", { dir, src, start_s, end_s, save_name, base_revision }),
     merge: (dir, items) => _json("POST", "/h3chain/merge", { dir, items }),
+    getPromptRules: () => _call("/h3chain/prompt-rules"),
+    getOptimizerConfig: () => _call("/h3chain/optimizer-config"),
+    optimize: (payload) => _json("POST", "/h3chain/optimize", payload),
     isConflict,
     errText,
   };

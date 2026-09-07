@@ -41,6 +41,9 @@ ROUTES = [
     ("GET", "/h3chain/project"),
     ("GET", "/h3chain/upscale_models"),
     ("GET", "/h3chain/experiments"),
+    ("GET", "/h3chain/prompt-rules"),
+    ("GET", "/h3chain/optimizer-config"),
+    ("POST", "/h3chain/optimize"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
     ("POST", "/h3chain/compile"),
@@ -333,6 +336,47 @@ def add_routes(routes):
         return web.json_response({"ok": True, "manifest": manifest,
                                   "file": (manifest.get("clips") or [{}])[-1].get("file")})
 
+    async def prompt_rules(request):
+        """提示词撰写规则下发（只读）：prompt/*.txt，供优化时注入 LLM。"""
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+        return web.json_response({"ok": True, "files": _opt.load_rule_files()})
+
+    async def optimizer_config(request):
+        """优化器配置（脱敏）+ 本地模型扫描，供设置面板使用。"""
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+        try:
+            cfg = _opt.public_config(_opt.normalize_config(None))
+        except Exception:
+            cfg = {"ok": False}
+        return web.json_response({"ok": True, **cfg})
+
+    async def optimize(request):
+        """提示词优化（长耗时，放线程池）：自研后端，云/本地双通道。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+        try:
+            text = await asyncio.get_event_loop().run_in_executor(
+                None, _opt.optimize_once, data.get("config"), data)
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="OPTIMIZE_FAILED", status=502)
+        except Exception as e:
+            return _err(f"优化失败：{e}", code="OPTIMIZE_FAILED", status=500)
+        return web.json_response({"ok": True, "prompt": text})
+
     async def compile_prompt(request):
         """结构化 prompt 编译预览（不落盘）：返回官方英文 + 校验，供段卡分组调用。"""
         try:
@@ -370,6 +414,9 @@ def add_routes(routes):
         ("GET", "/h3chain/project", project_detail),
         ("GET", "/h3chain/upscale_models", upscale_models),
         ("GET", "/h3chain/experiments", experiment_defs),
+        ("GET", "/h3chain/prompt-rules", prompt_rules),
+        ("GET", "/h3chain/optimizer-config", optimizer_config),
+        ("POST", "/h3chain/optimize", optimize),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),
         ("POST", "/h3chain/compile", compile_prompt),

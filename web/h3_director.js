@@ -651,6 +651,9 @@ function getDs(node) {
                 .map((x) => ({ slot: Number(x.slot), mode: REDO_MODES.some((r) => r[0] === x.mode) ? x.mode : "双锚" })),
             upscale,
             experiments: normalizeExperiments(raw.experiments),
+            /* AI优化配置与历史（自研后端）：透存，不进后端指纹 */
+            optimizer: (raw.optimizer && typeof raw.optimizer === "object") ? raw.optimizer : null,
+            opt_hist: (raw.opt_hist && typeof raw.opt_hist === "object") ? raw.opt_hist : null,
         };
     } catch (e) {
         return defaultDs();
@@ -1039,10 +1042,7 @@ function exportMasterPrompt(node) {
     for (let i = 0; i < prompts.length; i++) {
         const seg = (i < segs.length && segs[i] && typeof segs[i] === "object") ? segs[i] : {};
         const rows = [`【段${i + 1}】`];
-        if (seg.scene_prompt) rows.push(`场景：${seg.scene_prompt}`);
-        if (seg.character_prompt) rows.push(`角色：${seg.character_prompt}`);
-        if (seg.soundscape) rows.push(`环境音：${seg.soundscape}`);
-        if (seg.music) rows.push(`配乐：${seg.music}`);
+        /* 旧四框已下线：导出不再写场景/角色/环境音/配乐（解析仍兼容旧文本，见 parseMasterPrompt） */
         if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`时长：${seg.seconds}`);
         if (seg.unlink) rows.push("独立镜头：是");
         if (Array.isArray(seg.refs) && seg.refs.length) rows.push(`参考：${seg.refs.join("，")}`);
@@ -1468,6 +1468,7 @@ async function doMergeExport(btn) {
 /* ---- 提示词写回防抖 ---- */
 
 const _taTimers = new Map();
+const _segTab = new Map();   // segIdx -> 'main'|'v2'|'set'（切换式段卡记忆，不持久化）
 
 function debouncePromptWrite(node, idx, text) {
     const key = `p${idx}`;
@@ -1529,6 +1530,326 @@ function debouncePromptV2Write(node, idx, key, value) {
         _taTimers.delete(tkey);
         setPromptV2Field(node, idx, (pv) => { pv[key] = value; });
     }, 350));
+}
+
+/* ---- AI提示词优化（自研后端 /h3chain/optimize，轻量移植测试分支能力） ----
+ * 主框=最终文本；优化结果双写主框+回填v2（可解析字段才回填，失败只写主框）。
+ * 配置存 ds.optimizer，历史存 ds.opt_hist（原稿/优化稿可切），与测试分支键名一致。 */
+const _optBefore = new Map();
+const _optAfter = new Map();
+const _optShown = new Map();
+let _optBusy = null;
+const _optRulesCache = { loaded: false, files: {} };
+
+function optDefaultSettings() {
+    return {
+        mode: "api", provider: "runninghub",
+        api_url: "https://www.runninghub.cn/openapi/v2", api_key: "", api_keys: {},
+        model: "openai/gpt-5.6-sol", provider_models: {}, protocol: "openai",
+        read_media: true, output_language: "中文",
+        local_model: "", local_mmproj: "", local_device: "cuda",
+        max_tokens: 4096, auto_optimize: false, rule_file: "auto",
+    };
+}
+
+function optGetSettings(node) {
+    const ds = getDs(node);
+    const saved = ds && ds.optimizer && typeof ds.optimizer === "object" ? ds.optimizer : null;
+    return Object.assign(optDefaultSettings(), saved || {});
+}
+
+function optSaveSettings(node, settings) {
+    const ds = getDs(node);
+    ds.optimizer = Object.assign({}, settings);
+    setDs(node, ds);
+}
+
+function optTaskForMode(mode) {
+    if (mode === "首帧视频") return "FL2VA";
+    if (mode === "多参视频") return "Ref2VA";
+    return "T2VA";
+}
+
+async function optImageToDataUrl(url) {
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        if (!blob.type.startsWith("image/")) return null;
+        return await new Promise((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onload = () => resolve(String(fr.result || ""));
+            fr.onerror = () => reject(fr.error);
+            fr.readAsDataURL(blob);
+        });
+    } catch (e) { return null; }
+}
+
+async function optFetchRuleFiles() {
+    if (_optRulesCache.loaded) return _optRulesCache.files;
+    try {
+        if (!window.H3Api?.getPromptRules) return {};
+        const r = await window.H3Api.getPromptRules();
+        _optRulesCache.files = (r.body?.files && typeof r.body.files === "object") ? r.body.files : {};
+    } catch (e) { _optRulesCache.files = {}; }
+    _optRulesCache.loaded = true;
+    return _optRulesCache.files;
+}
+
+/* AI输出字段回填v2（宽松解析四/六字段，解析失败返回false，调用方只写主框） */
+function applyAiToV2(node, idx, text) {
+    try {
+        const t = String(text || "");
+        if (!t.trim()) return false;
+        const getField = (name) => {
+            const m = t.match(new RegExp("(?:^|\\n)" + name + "\\s*:\\s*\\n([\\s\\S]*?)(?=\\n[a-z_]+\\s*:\\s*\\n|\\n*$)"));
+            return m ? m[1].trim() : "";
+        };
+        const detailed = getField("detailed_description") || getField("integrated_multimodal_description");
+        const soundscape = getField("overall_soundscape");
+        const music = getField("non_diegetic_music");
+        const summary = getField("summary");
+        if (!detailed && !soundscape && !music) return false;
+        return setPromptV2Field(node, idx, (pv) => {
+            if (detailed) {
+                pv.shots = pv.shots || [];
+                if (!pv.shots[0]) pv.shots[0] = {};
+                pv.shots[0].description = detailed.slice(0, 2000);
+            }
+            if (soundscape) pv.soundscape = soundscape.slice(0, 2000);
+            if (music) pv.non_diegetic_music = music.slice(0, 500);
+            if (summary) pv.summary_override = summary.slice(0, 500);
+        });
+    } catch (e) { return false; }
+}
+
+function optPersist(node, idx, shown) {
+    try {
+        const ds = getDs(node);
+        if (!ds.opt_hist || typeof ds.opt_hist !== "object") ds.opt_hist = {};
+        const key = `${node.id}:${idx}`;
+        ds.opt_hist[String(idx)] = {
+            before: _optBefore.get(key) ?? null,
+            after: _optAfter.get(key) ?? null,
+            shown: shown || "after",
+        };
+        setDs(node, ds);
+    } catch (e) { /* 持久失败不阻断 */ }
+}
+
+function optRestoreMaps(node, ds) {
+    try {
+        const hist = (ds || {}).opt_hist || {};
+        for (const [k, h] of Object.entries(hist)) {
+            if (!h || typeof h !== "object") continue;
+            const key = `${node.id}:${k}`;
+            if (!_optBefore.has(key) && h.before != null) _optBefore.set(key, h.before);
+            if (!_optAfter.has(key) && h.after != null) _optAfter.set(key, h.after);
+            if (!_optShown.has(key) && h.shown) _optShown.set(key, h.shown);
+        }
+    } catch (e) { /* 忽略 */ }
+}
+
+async function runOptForSegment(node, idx, ta, ui) {
+    if (_optBusy && _optBusy.node === node && _optBusy.idx === idx) return;
+    const before = ta ? ta.value : "";
+    if (!before || !before.trim()) { alert("提示词为空，无需优化"); return; }
+    let settings;
+    try { settings = optGetSettings(node); }
+    catch (e) { alert(`加载优化配置失败：${e.message}`); return; }
+    if (settings.mode === "local" && !settings.local_model) { openOptSettings(node); return; }
+    if (settings.mode !== "local" && !settings.api_key) { openOptSettings(node); return; }
+    _optBusy = { node, idx };
+    if (ui.btn) { ui.btn.textContent = "优化中…"; ui.btn.disabled = true; }
+    const clearBusy = () => {
+        if (ui.btn) { ui.btn.textContent = "✨ 优化"; ui.btn.disabled = false; }
+        if (_optBusy && _optBusy.node === node && _optBusy.idx === idx) _optBusy = null;
+    };
+    try {
+        const ds = getDs(node);
+        const seg = (ds.segments || [])[idx] || {};
+        const secs = seg.seconds || 5;
+        const refs = Array.isArray(seg.refs) ? seg.refs : [];
+        const media = [];
+        if (settings.read_media !== false) {
+            const poolList = ds.ref_assets || [];
+            for (const label of refs.slice(0, 8)) {
+                const asset = poolList.find((a) => a && a.label === label);
+                if (!asset || asset.kind !== "image") continue;
+                const dataUrl = await optImageToDataUrl(inputViewUrl(asset.file));
+                media.push({ kind: "image", label: `<picture>`, images: dataUrl ? [dataUrl] : [] });
+            }
+        }
+        await optFetchRuleFiles();
+        const body = {
+            prompt: before, task: optTaskForMode(ds.mode), duration: Number(secs) || 5,
+            media, context: { main_mode: ds.mode }, config: settings,
+        };
+        if (!window.H3Api?.optimize) throw new Error("h3_api.js 未更新（缺 optimize）");
+        const r = await window.H3Api.optimize(body);
+        if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "优化失败"));
+        const result = String(r.body.prompt || "").trim() || before;
+        const key = `${node.id}:${idx}`;
+        _optBefore.set(key, before);
+        _optAfter.set(key, result);
+        _optShown.set(key, "after");
+        optPersist(node, idx, "after");
+        if (ta) ta.value = result;
+        setPromptText(node, idx, result);
+        applyAiToV2(node, idx, result);
+        if (ui.reset) { ui.reset.style.display = ""; ui.reset.textContent = "原稿"; }
+        if (ui.name) ui.name.textContent = settings.mode === "local"
+            ? `本地: ${String(settings.local_model || "").split(/[\\/]/).pop() || "未选"}`
+            : (settings.model || "").split("/").pop() || "API";
+        setLed("done", "优化已回填主框+v2（可在v2页微调，再一键同步）");
+        scheduleRefresh(200);
+    } catch (e) {
+        alert(`提示词优化失败：${e.message || e}`);
+    } finally { clearBusy(); }
+}
+
+function optToggle(node, idx, ta, ui) {
+    const key = `${node.id}:${idx}`;
+    const shown = _optShown.get(key);
+    if (shown === "after") {
+        const before = _optBefore.get(key);
+        if (before == null) return;
+        if (ta) ta.value = before;
+        setPromptText(node, idx, before);
+        _optShown.set(key, "before");
+        optPersist(node, idx, "before");
+        if (ui.reset) ui.reset.textContent = "优化稿";
+    } else if (shown === "before") {
+        const after = _optAfter.get(key);
+        if (after == null) return;
+        if (ta) ta.value = after;
+        setPromptText(node, idx, after);
+        _optShown.set(key, "after");
+        optPersist(node, idx, "after");
+        if (ui.reset) ui.reset.textContent = "原稿";
+    }
+}
+
+async function openOptSettings(node, onSaved) {
+    let current;
+    try { current = optGetSettings(node); }
+    catch (e) { current = optDefaultSettings(); }
+    try {
+        if (window.H3Api?.getOptimizerConfig) {
+            const r = await window.H3Api.getOptimizerConfig();
+            if (r.body?.ok) {
+                current = Object.assign({}, current);
+                if (Array.isArray(r.body.models)) current._models = r.body.models;
+                if (Array.isArray(r.body.mmproj_models)) current._mmproj = r.body.mmproj_models;
+            }
+        }
+    } catch (e) { /* 用本地值 */ }
+    if (document.querySelector(".h3d-overlay")) return;
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog");
+    dialog.innerHTML = `<h3>提示词优化 · 设置</h3>
+        <p class="h3d-lead">自研后端（云API/本地模型双通道）+ prompt/*.txt 规则注入。Key 随导演台状态保存，分享前请清空。</p>`;
+    const mkRow = (label, input) => {
+        const w = el("label", "h3d-opt-row");
+        w.append(el("span", "", label), input);
+        dialog.append(w);
+        return input;
+    };
+    const mode = document.createElement("select");
+    mode.append(new Option("在线 API", "api"), new Option("本地模型", "local"));
+    mode.value = current.mode || "api";
+    const provider = document.createElement("select");
+    for (const [v, l] of [["runninghub", "RunningHub"], ["openai", "OpenAI"], ["gemini", "Gemini"],
+        ["openrouter", "OpenRouter"], ["dashscope", "阿里百炼"], ["siliconflow", "SiliconFlow"], ["custom", "自定义"]])
+        provider.append(new Option(l, v));
+    provider.value = current.provider || "runninghub";
+    const key = document.createElement("input"); key.type = "password"; key.value = current.api_key || "";
+    const url = document.createElement("input"); url.type = "text"; url.value = current.api_url || "";
+    const model = document.createElement("input"); model.type = "text"; model.value = current.model || "";
+    const lang = document.createElement("select");
+    lang.append(new Option("中文", "中文"), new Option("English", "English"));
+    lang.value = current.output_language || "中文";
+    const rule = document.createElement("select");
+    for (const [v, l] of [["auto", "自动"], ["minimaxh3_custom_ref2v_prompt_writing_zh.txt", "自定义中文"],
+        ["minimaxh3_custom_ref2v_prompt_writing.txt", "自定义英文"],
+        ["minimaxh3_official_ref2v_prompt_writing.txt", "官方六字段"], ["none", "不注入"]])
+        rule.append(new Option(l, v));
+    rule.value = current.rule_file || "auto";
+    const localModel = document.createElement("select");
+    const models = Array.isArray(current._models) ? current._models : [];
+    if (!models.length) localModel.append(new Option("无可用本地模型（改用API）", ""));
+    for (const m of models) localModel.append(new Option(m.name || m.relative_path, m.relative_path));
+    if ([...localModel.options].some((o) => o.value === current.local_model)) localModel.value = current.local_model;
+    const maxT = document.createElement("input"); maxT.type = "number";
+    maxT.min = "512"; maxT.max = "8192"; maxT.step = "512"; maxT.value = String(current.max_tokens || 4096);
+    const readM = document.createElement("input"); readM.type = "checkbox"; readM.checked = current.read_media !== false;
+    mkRow("模式", mode); mkRow("服务商", provider); mkRow("API Key", key);
+    mkRow("API URL", url); mkRow("模型", model); mkRow("输出语言", lang);
+    mkRow("规则文件", rule); mkRow("本地模型", localModel); mkRow("最大token", maxT);
+    const chkW = el("label", "h3d-check");
+    chkW.append(readM, document.createTextNode(" 读取视觉参考（图片转dataURL，最多8张）"));
+    dialog.append(chkW);
+    const err = el("div", "h3d-err", "");
+    const row = el("div", "h3d-dialog-row");
+    const cancel = el("button", "h3d-btn", "取消");
+    const save = el("button", "h3d-btn h3d-btn-cta", "保存");
+    row.append(cancel, save);
+    dialog.append(err, row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.append(overlay);
+    cancel.onclick = () => overlay.remove();
+    save.onclick = () => {
+        const next = Object.assign({}, current, {
+            mode: mode.value, provider: provider.value, api_key: key.value.trim(),
+            api_url: url.value.trim(), model: model.value.trim(),
+            output_language: lang.value, rule_file: rule.value,
+            local_model: localModel.value, max_tokens: Number(maxT.value) || 4096,
+            read_media: readM.checked,
+        });
+        optSaveSettings(node, next);
+        overlay.remove();
+        if (onSaved) onSaved(next);
+        scheduleRefresh(120);
+    };
+}
+
+/* 主框工具条：优化/设置/原稿切换/从v2同步（双写入口） */
+function paintOptbar(optbar, node, data, idx, ta) {
+    try {
+        optbar.replaceChildren();
+        optRestoreMaps(node, data.ds);
+        const key = node ? `${node.id}:${idx}` : "";
+        const shown = key ? _optShown.get(key) : null;
+        const bOpt = el("button", "h3d-btn h3d-btn-cyan", "✨ 优化");
+        bOpt.title = "自研后端优化：当前主框文本+段引用图 → 官方结构，回填主框+v2";
+        const bSet = el("button", "h3d-btn", "⚙");
+        bSet.title = "提示词优化设置";
+        const bReset = el("button", "h3d-btn", shown === "before" ? "优化稿" : "原稿");
+        bReset.title = "原稿 ⇄ 优化稿切换";
+        bReset.style.display = shown ? "" : "none";
+        const bFromV2 = el("button", "h3d-btn", "从v2同步");
+        bFromV2.title = "把v2分组编译成官方文本覆盖主框";
+        const ui = { btn: bOpt, reset: bReset, name: null };
+        bOpt.onclick = () => runOptForSegment(node, idx, ta, ui);
+        bSet.onclick = () => openOptSettings(node);
+        bReset.onclick = () => optToggle(node, idx, ta, ui);
+        bFromV2.onclick = async () => {
+            try {
+                const ds = getDs(node);
+                const fseg = (ds.segments || [])[idx] || {};
+                const pv = fseg.prompt_v2;
+                if (!pv) { alert("本段尚未启用 v2，先到具象化v2页点启用"); return; }
+                const r = await window.H3Api.compilePreview({
+                    prompt: pv, seconds: Number(fseg.seconds) || 5.0, has_start: false, has_end: false });
+                if (!r.body?.compiled?.prompt_text) throw new Error(window.H3Api.errText(r, "编译无文本"));
+                ta.value = r.body.compiled.prompt_text;
+                setPromptText(node, idx, ta.value);
+                scheduleRefresh(200);
+            } catch (e) { alert(`同步失败：${e.message || e}`); }
+        };
+        optbar.append(bOpt, bSet, bReset, bFromV2);
+    } catch (e) { console.warn("[h3-director] paintOptbar failed:", e); }
 }
 
 /* ---- 段落计划（状态驱动：提示词段 + 插入视频段按链位混排，不含序章） ---- */
@@ -2329,6 +2650,59 @@ function segMediaHtml(state, mf, idx) {
     return null;
 }
 
+/* 段片轻量信息（瘦身卡片用）：只回 URL，不在卡内嵌大播放器，点击走全屏浮层 */
+function segMediaInfo(state, mf, idx) {
+    const done = mf?.done ?? 0;
+    const g = idx + planOff(mf);
+    if (g >= done || !state?.dir) return null;
+    const sub = `h3_projects/${state.dir}`;
+    const videoFile = (mf.videos || [])[g];
+    const thumbFile = (mf.thumbs || [])[g];
+    if (!videoFile && !thumbFile) return null;
+    return {
+        videoUrl: videoFile ? viewUrl(sub, videoFile) : "",
+        thumbUrl: thumbFile ? viewUrl(sub, thumbFile) : "",
+        file: videoFile || thumbFile || "",
+    };
+}
+
+/* 全屏浮层浏览段片（视频/图片二选一，Esc/点背景关） */
+function openSegViewer(info, title) {
+    try {
+        if (!info || (!info.videoUrl && !info.thumbUrl)) return;
+        const overlay = el("div", "h3d-viewer");
+        const box = el("div", "h3d-viewer-box");
+        const head = el("div", "h3d-viewer-head");
+        head.append(el("span", "", escapeHtml(title || "段片预览")));
+        const close = el("button", "h3d-close", "✕");
+        close.title = "关闭（Esc）";
+        close.onclick = () => overlay.remove();
+        head.append(close);
+        box.append(head);
+        if (info.videoUrl) {
+            const v = document.createElement("video");
+            v.controls = true; v.autoplay = true; v.preload = "metadata";
+            v.src = info.videoUrl;
+            if (info.thumbUrl) v.poster = info.thumbUrl;
+            box.append(v);
+            const foot = el("div", "h3d-viewer-foot");
+            const dl = el("a", "h3d-dl", "⬇ 下载视频");
+            dl.href = info.videoUrl; dl.download = info.file || "segment.mp4";
+            foot.append(dl);
+            box.append(foot);
+        } else {
+            const im = document.createElement("img");
+            im.src = info.thumbUrl; im.alt = title || "";
+            box.append(im);
+        }
+        overlay.append(box);
+        overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+        overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+        document.body.append(overlay);
+        close.focus();
+    } catch (e) { console.warn("[h3-director] openSegViewer failed:", e); }
+}
+
 /* ---------- 样式（参照一体化总控导演台，前缀 h3d-） ---------- */
 
 const STYLE_ID = "h3-director-style";
@@ -2426,10 +2800,10 @@ function injectStyles() {
     .h3d-rail span.unlink{background:repeating-linear-gradient(135deg,#e0823d 0 4px,#444c56 4px 8px)}
     .h3d-rail span.offchain{background:repeating-linear-gradient(90deg,#3a414c 0 3px,#22272e 3px 6px)}
     .h3d-cards{display:grid;gap:10px}
-    .h3d-card{display:grid;grid-template-columns:150px minmax(0,1fr);gap:11px;padding:10px;border:1px solid #3f4854;border-radius:9px;background:#262c36}
+    .h3d-card{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;padding:10px;border:1px solid #3f4854;border-radius:9px;background:#262c36}
     .h3d-card.todo{opacity:.72}
     .h3d-card.todo:hover{opacity:1}
-    .h3d-card.mergeable{grid-template-columns:auto 150px minmax(0,1fr);align-items:start}
+    .h3d-card.mergeable{grid-template-columns:auto minmax(0,1fr);align-items:start}
     .h3d-card.mergeable-off{opacity:.4}
     /* 拖拽调序：把手 / 拖动中的源卡 / 插入线（线画在目标位卡片的上沿或链尾卡的下沿） */
     .h3d-grip{flex:none;width:18px;height:20px;display:inline-grid;place-items:center;border-radius:5px;color:#8794a3;font-size:13px;letter-spacing:-1px;cursor:grab;user-select:none}
@@ -2671,6 +3045,20 @@ function injectStyles() {
     .h3d-v2out.ok{border:1px solid #2f6e57;color:#7ee2a8}
     .h3d-verr{color:#f0a0a4;font-size:11px;line-height:1.6}
     .h3d-vwarn{color:#e9c07a;font-size:11px;line-height:1.6}
+
+    /* ---- 切换式段卡（瘦身）：头一行 + Tab页，主框默认，设置收起 ---- */
+    .h3d-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 6px}
+    .h3d-tab{padding:3px 10px;border:1px solid #3a352c;border-radius:12px;background:#1b1a16;color:#a8a294;cursor:pointer;font-size:11.5px;font-family:inherit}
+    .h3d-tab.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
+    .h3d-tabpane{display:grid;gap:7px}
+    .h3d-previewbtn{padding:2px 8px;font-size:11px}
+    /* ---- 全屏段片浮层 ---- */
+    .h3d-viewer{position:fixed;z-index:1000003;inset:0;display:grid;place-items:center;padding:24px;background:#0a0906d0;backdrop-filter:blur(10px)}
+    .h3d-viewer-box{width:min(960px,calc(100vw - 40px));max-height:calc(100vh - 40px);overflow:auto;border:1px solid #464033;border-radius:12px;background:#191712;padding:14px}
+    .h3d-viewer-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-weight:700}
+    .h3d-viewer-box video{width:100%;max-height:70vh;background:#000;border-radius:8px}
+    .h3d-viewer-box img{width:100%;border-radius:8px}
+    .h3d-viewer-foot{margin-top:8px;display:flex;gap:8px;justify-content:flex-end}
 
     @media(max-width:1200px){.h3d-sub{display:none}}
     @media(max-width:1050px){.h3d-stage{grid-template-columns:240px minmax(0,1fr)}.h3d-col.right{grid-column:1/-1;max-height:260px}}
@@ -3783,26 +4171,29 @@ function renderPromptV2Panel(body, node, data, segIdx) {
             schedulePromptFlush();
             scheduleRefresh(60);
         };
-        const bSync = el("button", "h3d-btn", "从旧字段同步");
-        bSync.title = "用旧三字段（场景/角色/环境音/配乐）+主提示词覆盖 v2 的 environment/characters/soundscape/music/shots[0]，其余分组保留";
-        bSync.onclick = () => {
-            if (!hasV2) { alert("本段尚未启用 v2，先点「启用v2」"); return; }
-            if (!confirm("用旧字段覆盖 v2 对应项？分组其余手工内容保留。")) return;
-            const ds = getDs(node);
-            const s = ds.segments[segIdx] || {};
-            const main = String((ds.prompts || [])[segIdx] || "");
-            setPromptV2Field(node, segIdx, (pv) => {
-                pv.environment = s.scene_prompt || pv.environment || "";
-                pv.characters = s.character_prompt || pv.characters || "";
-                pv.soundscape = s.soundscape || pv.soundscape || "";
-                pv.non_diegetic_music = s.music || pv.non_diegetic_music || "";
-                if (main) {
-                    pv.shots = pv.shots || [];
-                    if (!pv.shots[0]) pv.shots[0] = { description: main };
-                    else if (!String(pv.shots[0].description || "").trim()) pv.shots[0].description = main;
+        const bSync = el("button", "h3d-btn h3d-btn-cyan", "同步到主框");
+        bSync.title = "把当前v2分组编译成官方文本，覆盖写回主提示词框（主框=最终进模型文本，可再手工微调）";
+        bSync.onclick = async () => {
+            try {
+                if (!window.H3Api) { say("h3_api.js 未加载", "err"); return; }
+                const fresh = getDs(node);
+                const fseg = (fresh.segments || [])[segIdx] || {};
+                const pv = (fseg.prompt_v2 && typeof fseg.prompt_v2 === "object")
+                    ? fseg.prompt_v2 : (HP.ensurePromptV2 ? HP.ensurePromptV2(fseg) : null);
+                if (!pv) { say("本段尚未启用 v2", "err"); return; }
+                say("编译同步中…", "");
+                const r = await window.H3Api.compilePreview({
+                    prompt: pv, seconds: Number(fseg.seconds) || 5.0,
+                    has_start: hasStart, has_end: hasEnd,
+                });
+                if (!r.body?.compiled?.prompt_text) {
+                    say(`同步失败：${window.H3Api.errText(r, "编译无文本")}`, "err");
+                    return;
                 }
-            });
-            scheduleRefresh(60);
+                setPromptText(node, segIdx, r.body.compiled.prompt_text);
+                say(`已同步到主框 [${r.body.compiled.mode}] errors=${(r.body.errors || []).length}`, r.body.ok ? "ok" : "err");
+                scheduleRefresh(200);
+            } catch (e) { say(`同步失败：${e?.message || e}`, "err"); }
         };
         row.append(bPrev, bTog, bSync);
         vbody.append(row);
@@ -3842,37 +4233,8 @@ function buildCards(data) {
             ? (data.ds.segments[it.idx] || defaultSegment()) : null;
         const isDisabled = !isInsert && !!segData0?.disabled;
         const card = el("div", "h3d-card" + (isDone ? "" : " todo") + (isDisabled ? " offchain" : ""));
-        const media = segMediaHtml(state, mf, idx);
-        const thumb = el("div", "h3d-thumb");
-        thumb.innerHTML = media
-            ?? `<div>${isDone ? "…" : isInsert ? "插入段" : "待生成"}</div>`;
-        const img = thumb.querySelector("img");
-        if (img) img.onerror = () => { img.replaceWith(el("div", "", "⚠ 加载失败")); };
-
-        /* 缩略图视频：竖屏段换竖版盒；任何画幅都提供悬浮「全屏 / 下载」，
-           不再依赖原生控制栏右下角 ⋮ 菜单（小尺寸元素下浏览器会隐藏它） */
-        const segVid = thumb.querySelector("video");
-        if (segVid) {
-            const markPortrait = () => {
-                if (segVid.videoHeight > segVid.videoWidth) thumb.classList.add("portrait");
-            };
-            if (segVid.readyState >= 1) markPortrait();
-            else segVid.addEventListener("loadedmetadata", markPortrait, { once: true });
-            const vidUrl = segVid.getAttribute("src") || "";
-            const acts = el("div", "h3d-thumb-acts");
-            const fsBtn = el("button", "h3d-tact", "⛶");
-            fsBtn.title = "全屏播放本段";
-            fsBtn.onclick = () => {
-                const p = segVid.requestFullscreen ? segVid.requestFullscreen() : null;
-                if (p && p.catch) p.catch(() => { window.open(vidUrl, "_blank"); });
-            };
-            const dl = el("a", "h3d-tact", "⬇");
-            dl.href = vidUrl;
-            dl.download = (mf?.videos || [])[idx] || "segment.mp4";
-            dl.title = "下载本段视频";
-            acts.append(fsBtn, dl);
-            thumb.append(acts);
-        }
+        /* 瘦身：卡内不再嵌大播放器，只留全屏入口（segMediaInfo → openSegViewer） */
+        const mediaInfo = segMediaInfo(state, mf, idx);
 
         const body = el("div", "h3d-cbody");
         const segData = segData0;
@@ -3890,6 +4252,13 @@ function buildCards(data) {
             ? badge(`二采${upRec.size?.length ? ` ${upRec.size[0]}×${upRec.size[1]}` : "✓"}`, "cyan") : "";
         const title = el("div", "h3d-ctitle",
             `<span>段 ${idx + 1}${isInsert ? `（位置 ${it.pos}）` : ""}</span>${stateChip}${offChip}${unlinkChip}${redoChip}${upChip}`);
+        /* 段片全屏入口（瘦身后唯一浏览口）：有成片才显示 */
+        if (mediaInfo && (mediaInfo.videoUrl || mediaInfo.thumbUrl)) {
+            const pv = el("button", "h3d-btn h3d-previewbtn", mediaInfo.videoUrl ? "▶ 预览" : "🖼 查看");
+            pv.title = "全屏浏览本段成片（视频/缩略图），不占卡片空间";
+            pv.onclick = () => openSegViewer(mediaInfo, `段 ${idx + 1} 成片`);
+            title.append(pv);
+        }
         /* 拖拽调序把手（仅提示词段；插入段位置固定由 pos 决定，不参与拖拽） */
         if (!isInsert && node && !mergeSel.on && it.idx !== undefined) {
             const grip = el("span", "h3d-grip", "⠿");
@@ -3989,13 +4358,13 @@ function buildCards(data) {
         const meta = [seedTxt, seamTxt, bridgeTxt].filter(Boolean).join(" · ");
         if (meta) body.append(el("div", "h3d-cmeta", escapeHtml(meta)));
 
-        /* 提示词：常驻 textarea（插入段显示文件名只读）—— 直接在台内编辑，实时写回 JSON 状态 */
+        /* 提示词：切换式段卡（主提示词/v2/设置三页，省纵向空间；主框=最终进模型文本） */
         if (isInsert) {
             body.append(el("div", "h3d-cprompt", escapeHtml(it.file)));
         } else {
             const ta = document.createElement("textarea");
             ta.className = "h3d-ta";
-            ta.rows = 4;
+            ta.rows = 3;
             ta.value = it.text || "";
             const pool = (data.ds.ref_assets || []);
             const poolHint = pool.length
@@ -4017,7 +4386,35 @@ function buildCards(data) {
                     scheduleRefresh(200);
                 });
             }
-            body.append(ta);
+            /* 三页容器：主框 / v2分组 / 设置（时长在标题行，设置页只放引用+开关） */
+            const tabbar = el("div", "h3d-tabs");
+            const paneMain = el("div", "h3d-tabpane");
+            const paneV2 = el("div", "h3d-tabpane");
+            const paneSet = el("div", "h3d-tabpane");
+            const tabKey = `seg${it.idx}`;
+            let curTab = _segTab.get(tabKey) || "main";
+            const tabs = [["main", "主提示词"], ["v2", "具象化v2"], ["set", "设置"]];
+            const panes = { main: paneMain, v2: paneV2, set: paneSet };
+            const paintTabs = () => {
+                for (const [k, label] of tabs) {
+                    const b = tabbar.querySelector(`[data-tab="${k}"]`);
+                    if (b) b.classList.toggle("on", curTab === k);
+                }
+                for (const [k, pane] of Object.entries(panes)) pane.style.display = curTab === k ? "" : "none";
+            };
+            for (const [k, label] of tabs) {
+                const b = el("button", "h3d-tab" + (curTab === k ? " on" : ""), label);
+                b.type = "button"; b.dataset.tab = k;
+                b.onclick = () => { curTab = k; _segTab.set(tabKey, k); paintTabs(); };
+                tabbar.append(b);
+            }
+            body.append(tabbar);
+            paneMain.append(ta);
+            /* AI优化工具条：优化/设置/原稿切换/从v2同步（双写入口） */
+            const optbar = el("div", "h3d-actions");
+            optbar.dataset.optbar = String(it.idx);
+            paneMain.append(optbar);
+            try { paintOptbar(optbar, node, data, it.idx, ta); } catch (e) {}
 
             /* 引用素材：勾选本段用哪些（图/视/音混排，后端按类别独立编号压实 token） */
             if (node && it.idx !== undefined && data.ds.mode === "多参视频" && pool.length) {
@@ -4090,7 +4487,7 @@ function buildCards(data) {
                     scheduleRefresh(150);
                 };
                 row.append(tpl);
-                body.append(row);
+                paneSet.append(row);
             }
 
             /* 首尾帧图段级引用（仅首帧模式）：勾选本段是否参考首帧/尾帧图。
@@ -4128,87 +4525,41 @@ function buildCards(data) {
                 if (!Array.isArray(seg.frame_refs)) {
                     row.insertAdjacentHTML("beforeend", '<span class="h3d-secs-hint">未设置=默认</span>');
                 }
-                body.append(row);
+                paneSet.append(row);
             }
 
-            /* 分段处理中心：场景/角色提示词（可展开折叠） */
+            /* 设置页：旧四框已删（场景/角色/环境音/配乐走v2），只留开关类（后端仍兼容读旧键） */
             if (node && it.idx !== undefined) {
                 const seg = (data.ds.segments && data.ds.segments[it.idx]) || defaultSegment();
-                const hasSeg = !!(seg.scene_prompt || seg.character_prompt || seg.soundscape
-                    || seg.music || seg.unlink || seg.disabled);
-                const det = el("details", "h3d-seg-panel" + (hasSeg ? " has-content" : ""));
-                det.open = hasSeg;
-                det.innerHTML = `<summary>分段处理 · 场景 / 角色 / 声音${hasSeg ? ' <span class="h3d-chip cyan">已填写</span>' : ""}</summary>`;
-                const segBody = el("div", "h3d-seg-body");
-
-                const segFields = [
-                    ["scene_prompt", "场景提示词",
-                        "本段场景（风格+环境+光照），如：实景电影感，雨夜的东京小巷，霓虹灯反射在湿柏油路上。留空省略"],
-                    ["character_prompt", "角色提示词",
-                        "本段角色（外观+服饰+位置），如：米色风衣短发女主，坐在便利店门口台阶上。留空省略"],
-                    ["soundscape", "环境音",
-                        "环境音+动作音（1-4句，官方 overall_soundscape），如：雨点敲打柏油路，远处车流，伞面撑开的轻响。留空=不约束"],
-                    ["music", "配乐",
-                        "背景配乐（乐器+节奏+动态，角色听不到的；官方 non_diegetic_music），如：慢速钢琴单音，弦乐渐强后淡出。留空=不约束"],
-                ];
-                for (const [field, label, ph] of segFields) {
-                    const lab = el("label", "h3d-seg-label", label);
-                    const ta = document.createElement("textarea");
-                    ta.className = "h3d-ta h3d-seg-ta";
-                    ta.rows = 2;
-                    ta.value = seg[field] || "";
-                    ta.placeholder = ph;
-                    ta.addEventListener("input", () => debounceSegmentWrite(node, it.idx, field, ta.value));
-                    ta.addEventListener("blur", () => {
-                        const key = `s${it.idx}_${field}`;
-                        const t = _taTimers.get(key);
-                        if (t) { clearTimeout(t); _taTimers.delete(key); }
-                        setSegmentField(node, it.idx, field, ta.value);
-                        scheduleRefresh(200);
-                    });
-                    segBody.append(lab, ta);
-                }
-
-                /* 独立镜头：一键断开与上段的全部长视频衔接（硬切转场） */
                 const unlinkRow = el("label", "h3d-unlink");
                 const unlinkCb = document.createElement("input");
                 unlinkCb.type = "checkbox";
                 unlinkCb.checked = !!seg.unlink;
                 unlinkRow.append(unlinkCb, document.createTextNode("🔗 独立镜头（与上段断链）"));
-                unlinkRow.title = "本段与上一段完全断开衔接：不注入上段尾帧引导桥、不裁头、"
-                    + "不做接缝精修/像素混合/接缝测量/响度对齐，上段也不做桥帧门控回退——段间硬切转场。"
-                    + "适用于与上一镜头毫无关联的独立画面。本段每段尾帧锚定与素材引用不受影响；"
-                    + "切换此开关会使该段起重跑（指纹语义正确）";
+                unlinkRow.title = "本段与上一段完全断开衔接：不注入上段尾帧引导桥、不裁头、不做接缝处理——段间硬切。切换后该段起重跑";
                 unlinkCb.onchange = () => {
                     setSegmentField(node, it.idx, "unlink", unlinkCb.checked);
                     scheduleRefresh(60);
                 };
-                segBody.append(unlinkRow);
-
-                /* 不上链（段禁用）：勾选框即状态——点选立即生效并当场反映，
-                   取代旧版「⏸ 不上链」按钮（点击后界面无反馈的问题根源） */
+                paneSet.append(unlinkRow);
                 const offRow = el("label", "h3d-unlink h3d-offrow");
                 const offCb = document.createElement("input");
                 offCb.type = "checkbox";
                 offCb.checked = !!seg.disabled;
                 offRow.append(offCb, document.createTextNode("⏸ 不上链（本段跳过执行）"));
-                offRow.title = "本段保留在链上但跳过执行：不采样不解码不进成片，"
-                    + "槽位与存档记录原样保留（取消勾选即零成本恢复，已完成段直接沿用存档），"
-                    + "下段锚定自动跨接到本段之前最近一个已执行段的尾帧；"
-                    + "若本段尚未生成，恢复后会正常采样";
+                offRow.title = "本段保留但跳过执行，不进成片；取消即恢复，已完成段沿用存档";
                 offCb.onchange = () => {
                     setSegmentField(node, it.idx, "disabled", offCb.checked);
                     scheduleRefresh(60);
                 };
-                segBody.append(offRow);
-
-                det.append(segBody);
-                body.append(det);
+                paneSet.append(offRow);
             }
-            /* 具象化提示词 v2 分组（5.1，纯增量）：旧三框不动，下方另起折叠分组 */
+            /* v2分组进Tab（主框=最终文本，v2可改+一键同步回主框） */
             if (node && it.idx !== undefined) {
-                renderPromptV2Panel(body, node, data, it.idx);
+                renderPromptV2Panel(paneV2, node, data, it.idx);
             }
+            paintTabs();
+            body.append(paneMain, paneV2, paneSet);
         }
 
         const actions = el("div", "h3d-actions");
@@ -4280,7 +4631,7 @@ function buildCards(data) {
         }
         body.append(actions);
 
-        card.append(thumb, body);
+        card.append(body);
         wrap.append(card);
     });
 

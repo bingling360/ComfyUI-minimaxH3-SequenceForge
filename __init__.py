@@ -21,8 +21,10 @@ try:
                 _add_routes(routes)
                 print("[ComfyUI_H3_SeamlessChain] 路由已注册（扩展钩子，含 /api 前缀副本）："
                       "GET /h3chain/ping, /h3chain/projects, /h3chain/project, "
-                      "/h3chain/upscale_models, /h3chain/experiments, "
+                      "/h3chain/upscale_models, /h3chain/experiments, /h3chain/prompt-rules, "
+                      "/h3chain/optimizer-config, "
                       "POST /h3chain/create_project, /h3chain/save_prompts, /h3chain/compile, "
+                      "/h3chain/optimize, "
                       "/h3chain/assets, /h3chain/asset_check, /h3chain/latent_slice, "
                       "/h3chain/latent_delete, /h3chain/trim, "
                       "/h3chain/delete_project, /h3chain/delete_file, /h3chain/merge, "

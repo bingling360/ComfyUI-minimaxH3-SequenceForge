@@ -42,6 +42,42 @@
     return p;
   }
 
+  // 官方运镜词表（镜像 prompts.py CAMERA_MOVES，前端下拉用）
+  const CAMERA_MOVES = ["Zoom In", "Zoom Out", "Push In", "Pull Out", "Pan Left",
+    "Pan Right", "Truck Left", "Truck Right", "Tilt Up", "Tilt Down",
+    "Pedestal Up", "Pedestal Down", "Arc Shot", "Tracking Shot", "Static Shot",
+    "Shake Slightly", "Shake Strongly", "POV", "Roll Clockwise", "Roll Counterclockwise"];
+  const CAMERA_AMPS = ["", "small", "large"];
+  const CAMERA_SPEEDS = ["", "slow", "fast"];
+  const RETENTION_MARKERS = ["fully_preserved", "partially_preserved",
+    "attribute_transfer", "weak_reference", "fully_copy", "partially_copy", "reference"];
+
+  // seg.prompt_v2 有则返回（浅拷贝防直接改引用），无则从旧三字段迁移出一个可用副本
+  // 注意：调用方改完须经导演台 setPromptV2Field 写回 ds.segments，不直接改 ds。
+  function ensurePromptV2(seg) {
+    const pv = seg && typeof seg.prompt_v2 === "object" && seg.prompt_v2
+      ? JSON.parse(JSON.stringify(seg.prompt_v2)) : migrateLegacySeg(seg || {});
+    if (!Array.isArray(pv.shots) || !pv.shots.length) pv.shots = [defaultShot(1)];
+    return pv;
+  }
+
+  function hasPromptV2(seg) {
+    return !!(seg && typeof seg.prompt_v2 === "object" && seg.prompt_v2);
+  }
+
+  // 前端模式徽（镜像 prompts.detect_mode）：有参考/主体即 Ref2VA，否则按首尾帧
+  function detectMode(pv, opts) {
+    opts = opts || {};
+    const refs = (pv && pv.references) || [];
+    const subs = (pv && pv.subjects) || [];
+    if ((Array.isArray(refs) && refs.length) || (Array.isArray(subs) && subs.length)) return "Ref2VA";
+    const hs = !!opts.has_start, he = !!opts.has_end;
+    if (hs && he) return "FL2VA";
+    if (hs) return "I2VA";
+    if (he) return "L2VA";
+    return "T2VA";
+  }
+
   // 段卡 -> /h3chain/compile 载荷；prompt_v2 有则直用，无则现场迁移
   function compilePayload(seg, opts) {
     opts = opts || {};
@@ -70,7 +106,8 @@
   if (typeof window !== "undefined") {
     window.H3Prompts = {
       defaultShot, defaultPromptV2, migrateLegacySeg, compilePayload,
-      defaultLatentSave, cleanLatentSave,
+      defaultLatentSave, cleanLatentSave, ensurePromptV2, hasPromptV2,
+      detectMode, CAMERA_MOVES, CAMERA_AMPS, CAMERA_SPEEDS, RETENTION_MARKERS,
     };
   }
 })();

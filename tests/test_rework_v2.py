@@ -322,3 +322,58 @@ def test_expander_offline():
                         os.path.join(ROOT, "tools", "h3_prompt_expander", "examples", "envelope_ok.json")],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and json.loads(r.stdout)["ok"] is True
+
+
+# ---- 5.1 prompt_v2 分组表单 ----
+def test_v2_group_form_wired():
+    d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    p = open(os.path.join(ROOT, "web", "h3_prompts.js"), encoding="utf-8").read()
+    # helper 存在且挂载
+    for sym in ["ensurePromptV2", "hasPromptV2", "detectMode", "CAMERA_MOVES",
+                "CAMERA_AMPS", "CAMERA_SPEEDS", "RETENTION_MARKERS"]:
+        assert sym in p, sym
+    # 数据链路：默认/还原/归一/落盘/签名全部透存 prompt_v2（防洗掉）
+    assert "prompt_v2: null" in d
+    assert "prompt_v2: (s.prompt_v2" in d or "prompt_v2: (raw.prompt_v2" in d
+    assert "prompt_v2: (s.prompt_v2" in d
+    assert "prompt_v2: (s.prompt_v2" in d and "latent_save" in d
+    assert "JSON.stringify(s.prompt_v2)" in d
+    assert "function renderPromptV2Panel(body, node, data, segIdx)" in d
+    assert "renderPromptV2Panel(body, node, data, it.idx)" in d
+    assert "function setPromptV2Field(node, idx, mutate" in d
+    assert "function debouncePromptV2Write" in d
+    assert "function getSegPromptV2" in d
+    # 五组中文标题齐全
+    for g in ["画面 · 媒介/构图/环境/光照/角色/道具", "镜头 Shots", "声音 · 环境音",
+              "参考 · 素材引用", "高级 · 源码覆盖"]:
+        assert g in d, g
+    # 校验入口：编译预览+模式徽
+    assert "编译预览+校验" in d and "detectMode" in d
+    # 5.3 最小接线：AI扩写复制命令行
+    assert "AI扩写" in d and "h3_prompt_expander" in d
+    # 焦点守卫：v2 输入聚焦不重建（防丢焦）
+    assert "input:focus, select:focus" in d
+
+
+def test_prompts_full_groups(prompts):
+    pv = prompts.default_prompt()
+    pv.update({"intent_zh": "雨夜独行", "medium_style": "Live-action",
+               "composition": "medium shot", "environment": "rainy alley",
+               "lighting": "neon", "characters": "a woman", "props": "umbrella",
+               "soundscape": "Rain falls.", "non_diegetic_music": "N/A"})
+    pv["shots"] = [
+        {"index": 1, "start_seconds": None, "description": "she opens umbrella",
+         "camera_move": "Push In", "camera_amplitude": "small", "camera_speed": "slow",
+         "dialogues": [{"speaker": "S1", "language": "Chinese", "text": "走吧",
+                        "delivery": "", "voiceover": False}],
+         "screen_texts": ["OPEN 24H"], "diegetic_music": "", "ref_usage": []},
+        {"index": 2, "start_seconds": 2.5, "description": "she walks away",
+         "camera_move": "Tracking Shot", "camera_amplitude": "", "camera_speed": "",
+         "dialogues": [], "screen_texts": [], "diegetic_music": "", "ref_usage": []},
+    ]
+    c = prompts.compile_segment(pv, seconds=5.0)
+    assert c["mode"] == "T2VA"
+    assert prompts.validate_compiled(c)["ok"] is True
+    # 非法运镜词被清洗为空，不炸链
+    pv["shots"][0]["camera_move"] = "乱写"
+    assert prompts.clean_prompt(pv)["shots"][0]["camera_move"] == ""

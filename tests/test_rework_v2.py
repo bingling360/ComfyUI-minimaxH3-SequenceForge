@@ -146,6 +146,49 @@ def test_total_unlimited_seg_cap(asset_hub):
     assert bad["ok"] is False and bad["errors"][0]["code"] == "E_MEDIA_LIMIT"
     ok9 = asset_hub.validate_pack(big, [{"refs": [f"图{i}" for i in range(9)]}])
     assert ok9["ok"] is True
+    # roles 标注透传（非法 role 丢弃）
+    items, _w = asset_hub.normalize_pack([
+        {"label": "H", "kind": "image", "file": "h.png", "roles": ["首帧图", "野标注"]},
+        {"label": "T", "kind": "image", "file": "t.png", "roles": ["尾帧图"]},
+    ])
+    assert items[0]["roles"] == ["首帧图"] and items[1]["roles"] == ["尾帧图"]
+
+
+def test_seg_tail_src_passthrough(projects):
+    m = projects.create_project("t_tail")
+    m2 = projects.save_prompts("t_tail", ["p1"], [{
+        "scene_prompt": "", "character_prompt": "", "seconds": 5, "refs": [],
+        "tail_src": {"asset": "角色1"}}], base_revision=m["revision"])
+    assert m2["seg_fields"][0]["tail_src"] == {"asset": "角色1"}
+    m3 = projects.save_prompts("t_tail", ["p1"], [{
+        "scene_prompt": "", "character_prompt": "", "seconds": 5, "refs": [],
+        "tail_src": {"latent": "latent/x.pt"}}], base_revision=m2["revision"])
+    assert m3["seg_fields"][0]["tail_src"] == {"latent": "latent/x.pt"}
+    # 非法 tail_src 丢弃
+    m4 = projects.save_prompts("t_tail", ["p1"], [{
+        "scene_prompt": "", "character_prompt": "", "seconds": 5, "refs": [],
+        "tail_src": {"latent": "../evil.pt"}}], base_revision=m3["revision"])
+    assert "tail_src" not in m4["seg_fields"][0]
+
+
+def test_import_asset_roundtrip(projects):
+    import folder_paths
+    _mkfile("imp_src.png")
+    m = projects.create_project("t_imp")
+    res = projects.import_asset("t_imp", "imp_src.png", label="入1", kind="image")
+    assert res["file"] == "assets/imp_src.png"
+    assert res["label"] == "入1"
+    root = os.path.join(folder_paths.get_output_directory(), "h3_projects", "t_imp")
+    assert os.path.isfile(os.path.join(root, "assets", "imp_src.png"))
+    mf = projects.read_project("t_imp")
+    assert any(a["file"] == "assets/imp_src.png" for a in mf["assets"])
+    # 同名再入 → _2 后缀不覆盖
+    res2 = projects.import_asset("t_imp", "imp_src.png", label="入1", kind="image")
+    assert res2["file"] == "assets/imp_src_2.png"
+    assert res2["label"] == "入12"
+    # 非法路径拒绝
+    with pytest.raises(ValueError):
+        projects.import_asset("t_imp", "../evil.png")
 
 
 def test_unknown_and_missing(asset_hub):
@@ -169,7 +212,10 @@ def test_nodes_wiring():
     src = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
     assert "资产包" in src and "总量不限" in src
     assert "引用了未知素材标签" in src and "加载失败" in src
-    assert "请在该段卡片勾选本段要用的素材" in src
+    # 总量不限：库再大也不逼每段显式勾选（缺省=文本[[标签]]驱动），只卡单段上限
+    assert "该段图片没选" not in src and "素材库共" not in src
+    assert "总量不限、按段按需" in src
+    assert "超过官方单段上限" in src
 
 
 # ---- M2.5 ----
@@ -204,7 +250,8 @@ def test_prompts_passthrough(projects):
         base_revision=m["revision"])
     sf = m2["seg_fields"][0]
     assert sf["prompt_v2"]["environment"] == "E"
-    assert sf["latent_save"] == {"mode": "range", "start_f": 0, "end_f": 48, "tail_f": 0}
+    assert sf["latent_save"] == {"mode": "range", "start_f": 0, "end_f": 48, "tail_f": 0,
+                                 "split_av": False, "save_seg": True, "save_all": True}
 
 
 # ---- M3 ----
@@ -270,9 +317,12 @@ def test_routes_mount_and_handlers(routes, projects):
     routes.add_routes(r)
     for p in ["/h3chain/create_project", "/h3chain/compile", "/h3chain/assets",
               "/h3chain/asset_check", "/h3chain/latent_slice", "/h3chain/latent_delete",
-              "/h3chain/trim", "/h3chain/merge"]:
+              "/h3chain/trim", "/h3chain/probe", "/h3chain/move_media", "/h3chain/split_av",
+              "/h3chain/import_asset", "/h3chain/merge"]:
         assert ("POST", p) in r.paths and ("POST", "/api" + p) in r.paths
     assert ("GET", "/h3chain/ping") in r.paths
+    assert ("GET", "/h3chain/busy") in r.paths
+    assert ("GET", "/api/h3chain/busy") in r.paths
     # handler 冒烟：ping + create + assets + asset_check + compile
     h = {}
     r2 = types.SimpleNamespace(

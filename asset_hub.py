@@ -1,7 +1,7 @@
 """H3 资产总闸（AssetHub）：单节点素材分发与早爆校验。
 
 M2 新增，与 H3SeamlessChainSampler 配套：
-- 输入：资产包 JSON（导演台资产库 [{label,kind,file}]，总量不限 999 封顶）
+- 输入：资产包 JSON（导演台资产库 [{label,kind,file}]，总量不限）
 - 输出： validated 规范包 JSON + 人读报告
 - 职责：标签归一/去重、防穿越、input 目录存在性预检、单段上限不在此卡
   （执行期按段卡），缺文件/重标签在排队前就报错并点名，不等主节点跑一半才炸。
@@ -18,11 +18,14 @@ _KINDS = ("image", "video", "audio")
 _KIND_CN = {"image": "图片", "video": "视频", "audio": "音频"}
 _REF_CAPS = {"image": 9, "video": 3, "audio": 3}
 _LABEL_MAX = 24
-_TOTAL_MAX = 999
 
 
 def normalize_pack(raw) -> tuple:
-    """资产包 -> (规范列表, warnings)。未知键剔除，label 去重（首个为准）。"""
+    """资产包 -> (规范列表, warnings)。未知键剔除，label 去重（首个为准）。
+
+    资产库总量不限：只做形态校验与去重，不截断；单段 9/3/3 上限由
+    check_segment_refs（执行期按段）与主节点组装期按段卡。
+    """
     items = []
     warns = []
     if isinstance(raw, str):
@@ -55,15 +58,21 @@ def normalize_pack(raw) -> tuple:
             warns.append({"code": "W_PACK_DUP", "message": f"重复标签只保留首个：{label!r}"})
             continue
         seen.add(label)
-        items.append({"label": label, "kind": kind, "file": "/".join(parts)})
-        if len(items) >= _TOTAL_MAX:
-            warns.append({"code": "W_PACK_MAX", "message": f"资产超过 {_TOTAL_MAX} 已截断"})
-            break
+        ent = {"label": label, "kind": kind, "file": "/".join(parts)}
+        if isinstance(entry.get("roles"), list):
+            kept = [str(r).strip() for r in entry["roles"] if str(r).strip() in ("首帧图", "尾帧图")]
+            if kept:
+                ent["roles"] = kept[:2]
+        items.append(ent)
     return items, warns
 
 
-def check_files(items: list) -> list:
-    """存在性预检 -> errors（点名标签+文件名）。无 ComfyUI 时跳过文件检查只查形态。"""
+def check_files(items: list, project_root=None) -> list:
+    """存在性预检 -> errors（点名标签+文件名）。无 ComfyUI 时跳过文件检查只查形态。
+
+    project_root：项目文件夹绝对路径（给了就认 assets/finals/latent/texts/ 前缀，
+    去项目内找；不给或非项目文件走 input 目录）。路径含空格括号均合法。
+    """
     errors = []
     try:
         import folder_paths
@@ -71,13 +80,22 @@ def check_files(items: list) -> list:
     except Exception:
         return errors
     for a in items:
-        try:
-            p = folder_paths.get_annotated_filepath(a["file"])
-        except Exception:
-            p = os.path.join(in_dir, a["file"])
-        if not os.path.isfile(p):
+        rel = str(a["file"] or "").strip().replace("\\", "/")
+        parts = [p for p in rel.split("/") if p and p != "."]
+        where = "input 目录"
+        p = None
+        if project_root and len(parts) == 2 and parts[0] in (
+                "assets", "finals", "latent", "texts"):
+            p = os.path.join(project_root, parts[0], parts[1])
+            where = "项目文件夹"
+        else:
+            try:
+                p = folder_paths.get_annotated_filepath(rel)
+            except Exception:
+                p = os.path.join(in_dir, rel)
+        if not p or not os.path.isfile(p):
             errors.append({"code": "E_FILE_MISSING", "label": a["label"],
-                           "message": f"素材「{a['label']}」文件缺失：{a['file']}（请确认仍在 input 目录）"})
+                           "message": f"素材「{a['label']}」文件缺失：{a['file']}（请确认仍在{where}）"})
     return errors
 
 
@@ -105,10 +123,10 @@ def check_segment_refs(items: list, refs: list, seg_no: int = 1) -> list:
     return errors
 
 
-def validate_pack(raw, segments=None) -> dict:
+def validate_pack(raw, segments=None, project_root=None) -> dict:
     """资产包 + 可选分段引用 -> {ok, items, errors, warnings}。"""
     items, warns = normalize_pack(raw)
-    errors = check_files(items)
+    errors = check_files(items, project_root)
     if isinstance(segments, list):
         for i, seg in enumerate(segments):
             if not isinstance(seg, dict):
@@ -118,7 +136,7 @@ def validate_pack(raw, segments=None) -> dict:
                 errors.extend(check_segment_refs(items, refs, i + 1))
     counts = {k: sum(1 for a in items if a["kind"] == k) for k in _KINDS}
     report = (f"资产总闸：共 {len(items)}（图{counts['image']}/视{counts['video']}/"
-              f"音{counts['audio']}），总量不限、单段 9/3/3。")
+              f"音{counts['audio']}），总量不限、单段 9/3/3（按段按需加载）。")
     if errors:
         report += f"错误 {len(errors)}（首错：{errors[0]['message']}）"
     elif warns:
@@ -146,7 +164,7 @@ try:
                 inputs=[
                     io.String.Input("资产包", multiline=True, default="[]",
                                     tooltip="导演台资产库 JSON：[{label,kind:image/video/audio,file}]，"
-                                            "总量不限（999封顶），单段上限执行期按段卡"),
+                                            "总量不限，单段上限执行期按段卡"),
                 ],
                 outputs=[
                     io.String.Output("规范包", tooltip="校验后的规范资产包 JSON，连主节点「资产包」"),

@@ -18,8 +18,38 @@ import json
 import os
 import re
 import tempfile
+import threading
 
 SCHEMA = "h3seamless/ckpt-v3"
+
+# ---- 生成互斥锁（剪辑/转码与采样不能同时执行） ----
+# nodes.execute 进入时 +1、退出时 -1；trim/slice/move/split 等路由遇忙回 423，
+# 前端据此置灰按钮。进程内计数（单 Comfy 进程单队列，够用；多进程部署时
+# 前端再以 Comfy /queue 运行态做第二道 pre-check）。
+_BUSY = 0
+_BUSY_LOCK = threading.Lock()
+
+
+def mark_busy() -> int:
+    """标记一次生成开始，返回当前忙计数。"""
+    global _BUSY
+    with _BUSY_LOCK:
+        _BUSY += 1
+        return _BUSY
+
+
+def unmark_busy() -> int:
+    """标记一次生成结束，返回当前忙计数（防负）。"""
+    global _BUSY
+    with _BUSY_LOCK:
+        _BUSY = max(0, _BUSY - 1)
+        return _BUSY
+
+
+def is_busy() -> bool:
+    """是否正在生成（剪辑/转码/移动入口用，遇忙回 423）。"""
+    with _BUSY_LOCK:
+        return _BUSY > 0
 
 
 def fingerprint(params: dict) -> str:
@@ -119,15 +149,25 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     thumb_pat = re.compile(r"thumb_(\d{3,})\.png$")
     up_pat = re.compile(r"upseg_(\d{3,})\.(?:pt|mp4)$")
     up_thumb_pat = re.compile(r"up(?:thumb|last)_(\d{3,})\.png$")
-    for name in os.listdir(root):
-        m = pat.match(name) or thumb_pat.match(name) or up_pat.match(name) or up_thumb_pat.match(name)
-        if m and int(m.group(1)) >= start:
-            os.remove(os.path.join(root, name))
+    for sub in ("", "finals"):
+        d = root if sub == "" else os.path.join(root, sub)
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            m = pat.match(name) or thumb_pat.match(name) or up_pat.match(name) or up_thumb_pat.match(name)
+            if m and int(m.group(1)) >= start:
+                try:
+                    os.remove(os.path.join(d, name))
+                except OSError:
+                    pass
     return out
 
 
 def ckpt_dir(params: dict, custom: str = "") -> str:
-    """项目根目录：output/h3_projects/<自定义名> 或按参数指纹自动命名。"""
+    """项目根目录：output/h3_projects/<自定义名> 或按参数指纹自动命名。
+
+    四库规范：顺手建好 assets/finals/latent/texts（幂等，旧项目懒建）。
+    """
     from folder_paths import get_output_directory
 
     if custom:
@@ -137,6 +177,7 @@ def ckpt_dir(params: dict, custom: str = "") -> str:
                 f"_{params['length']}f_ctx{params['ctx']}_{fingerprint(params)}")
         root = os.path.join(get_output_directory(), "h3_projects", name)
     os.makedirs(root, exist_ok=True)
+    ensure_project_dirs(root)
     return root
 
 
@@ -304,13 +345,14 @@ def load_memory_anchor(root: str):
 def upscale_files(idx: int) -> dict:
     """二采渲染产物文件名（与基础段同名合并存储，不再有 upseg_* 副本族）。
 
-    mp4=seg_NNN.mp4（高清直接覆盖基础分段名——段视频就是二采结果）；
-    thumb=thumb_NNN.png；last=uplast_NNN.png（尾帧锚，下一段高清接缝平滑用）。
+    四库规范：mp4=finals/seg_NNN.mp4（高清直接覆盖基础分段名——段视频就是
+    二采结果）；thumb=finals/thumb_NNN.png；last=finals/uplast_NNN.png
+    （尾帧锚，下一段高清接缝平滑用）。旧根目录裸名读走 resolve 双兼容。
     """
     return {
-        "mp4": f"seg_{idx:03d}.mp4",
-        "thumb": f"thumb_{idx:03d}.png",
-        "last": f"uplast_{idx:03d}.png",
+        "mp4": f"finals/seg_{idx:03d}.mp4",
+        "thumb": f"finals/thumb_{idx:03d}.png",
+        "last": f"finals/uplast_{idx:03d}.png",
     }
 
 
@@ -323,6 +365,70 @@ def projects_root() -> str:
     from folder_paths import get_output_directory
 
     return os.path.join(get_output_directory(), "h3_projects")
+
+
+# ---- 四库文件夹规范（资产库/成片库/latent库/文本库，物理子文件夹） ----
+PROJECT_SUBDIRS = ("assets", "finals", "latent", "texts")
+
+
+def ensure_project_dirs(root: str) -> dict:
+    """建好 assets/finals/latent/texts 四个子文件夹，返回 {名: 绝对路径}。
+
+    幂等；旧项目缺目录时懒建，不搬旧文件（读走双路径兼容，写走新路径）。
+    """
+    out = {}
+    for name in PROJECT_SUBDIRS:
+        p = os.path.join(root, name)
+        os.makedirs(p, exist_ok=True)
+        out[name] = p
+    return out
+
+
+def assets_dir(root: str) -> str:
+    p = os.path.join(root, "assets")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def finals_dir(root: str) -> str:
+    p = os.path.join(root, "finals")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def texts_dir(root: str) -> str:
+    p = os.path.join(root, "texts")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def resolve_project_file(root: str, filename: str) -> str:
+    """项目内媒体文件名 -> 实际存在的绝对路径（双路径兼容）。
+
+    查找序：原样（含子目录前缀）> finals/<basename> > 根目录 > assets/<basename>。
+    都不存在时返回新规范路径（finals/<basename>，调用方按需新建）。
+    filename 允许 "seg_000.mp4"（旧）或 "finals/seg_000.mp4"（新）。
+    """
+    norm = str(filename or "").strip().replace("\\", "/")
+    parts = [p for p in norm.split("/") if p and p != "."]
+    if not parts:
+        return os.path.join(finals_dir(root), "")
+    if len(parts) >= 2:
+        cand = os.path.join(root, *parts)
+        if os.path.isfile(cand):
+            return cand
+        # 前缀目录不对时回退按 basename 找
+        base = parts[-1]
+    else:
+        base = parts[0]
+        cand = os.path.join(root, base)
+        if os.path.isfile(cand):
+            return cand
+    for d in ("finals", "assets"):
+        cand2 = os.path.join(root, d, base)
+        if os.path.isfile(cand2):
+            return cand2
+    return os.path.join(finals_dir(root), base)
 
 
 def save_state(state: dict):
@@ -348,8 +454,13 @@ def load_state():
 
 
 def save_thumb(seg_dir: str, idx: int, frame) -> str:
-    """段可见首帧 -> thumb_NNN.png（长边 256）。Pillow 缺失时返回空串（面板降级占位）。"""
+    """段可见首帧 -> finals/thumb_NNN.png（长边 256）。Pillow 缺失时返回空串（面板降级占位）。
+
+    四库规范：新文件一律写 finals/，返回 "finals/thumb_NNN.png"；
+    旧根目录文件读走 resolve_project_file 双路径兼容，不主动搬。
+    """
     name = f"thumb_{idx:03d}.png"
+    rel = f"finals/{name}"
     try:
         from PIL import Image
 
@@ -359,8 +470,8 @@ def save_thumb(seg_dir: str, idx: int, frame) -> str:
         scale = 256.0 / max(w, h)
         if scale < 1.0:
             img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
-        img.save(os.path.join(seg_dir, name))
-        return name
+        img.save(os.path.join(finals_dir(seg_dir), name))
+        return rel
     except Exception:
         return ""
 
@@ -375,11 +486,17 @@ def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
 
     缺失或编码失败返回空串（上游回退为缩略图，不影响主流程）。
     fresh=False（存档回放）且文件已存在时直接沿用，避免每次续跑全链重编码。
+
+    四库规范：新文件写 finals/seg_NNN.mp4，返回 "finals/seg_NNN.mp4"；
+    fresh=False 时 finals/ 与旧根目录双路径命中即沿用（返回实际命中的相对路径）。
     """
     name = f"seg_{idx:03d}.mp4"
-    path = os.path.join(seg_dir, name)
-    if not fresh and os.path.exists(path):
-        return name
+    rel = f"finals/{name}"
+    path = os.path.join(finals_dir(seg_dir), name)
+    if not fresh:
+        hit = resolve_project_file(seg_dir, name)
+        if os.path.isfile(hit):
+            return os.path.relpath(hit, seg_dir).replace("\\", "/")
     try:
         from .media import save_av_mp4    # 包内（ComfyUI 运行时）
     except ImportError:

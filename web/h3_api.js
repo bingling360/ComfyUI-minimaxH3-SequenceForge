@@ -32,8 +32,13 @@
     return res && (res.status === 409 || res.body?.code === "REVISION_CONFLICT");
   }
 
+  function isBusy(res) {
+    return res && (res.status === 423 || res.body?.code === "BUSY");
+  }
+
   function errText(res, fallback) {
     if (!res) return fallback || "网络异常";
+    if (isBusy(res)) return "正在生成中，剪辑/转码入口已锁定（完成后自动解锁）";
     if (res.body?.message) return res.body.message;
     if (res.body?.error) return res.body.error;
     return (fallback || "请求失败") + `（HTTP ${res.status}）`;
@@ -48,18 +53,27 @@
     compilePreview: (payload) => _json("POST", "/h3chain/compile", payload),
     saveAssets: (dir, assets, base_revision) =>
       _json("POST", "/h3chain/assets", { dir, assets, base_revision }),
-    assetCheck: (assets, segments) => _json("POST", "/h3chain/asset_check", { assets, segments }),
-    latentSlice: (dir, src, start_f, end_f, save_name, base_revision) =>
-      _json("POST", "/h3chain/latent_slice", { dir, src, start_f, end_f, save_name, base_revision }),
+    assetCheck: (assets, segments, dir) => _json("POST", "/h3chain/asset_check", { assets, segments, dir }),
+    latentSlice: (dir, src, start_f, end_f, save_name, base_revision, kind) =>
+      _json("POST", "/h3chain/latent_slice", { dir, src, start_f, end_f, save_name, base_revision, kind: kind || "av" }),
     latentDelete: (dir, file, base_revision) =>
       _json("POST", "/h3chain/latent_delete", { dir, file, base_revision }),
     trim: (dir, src, start_s, end_s, save_name, base_revision) =>
       _json("POST", "/h3chain/trim", { dir, src, start_s, end_s, save_name, base_revision }),
+    probe: (dir, src) => _json("POST", "/h3chain/probe", { dir, src }),
+    moveMedia: (dir, src, dest, opts) =>
+      _json("POST", "/h3chain/move_media", Object.assign({ dir, src, dest }, opts || {})),
+    importAsset: (dir, src, opts) =>
+      _json("POST", "/h3chain/import_asset", Object.assign({ dir, src }, opts || {})),
+    splitAv: (dir, src, opts) =>
+      _json("POST", "/h3chain/split_av", Object.assign({ dir, src }, opts || {})),
+    busy: () => _call("/h3chain/busy"),
     merge: (dir, items) => _json("POST", "/h3chain/merge", { dir, items }),
     getPromptRules: () => _call("/h3chain/prompt-rules"),
     getOptimizerConfig: () => _call("/h3chain/optimizer-config"),
     optimize: (payload) => _json("POST", "/h3chain/optimize", payload),
     isConflict,
+    isBusy,
     errText,
   };
 

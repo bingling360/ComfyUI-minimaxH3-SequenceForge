@@ -15,16 +15,20 @@ import time
 from . import checkpoint
 
 
-MANIFEST_SCHEMA = "h3seamless/manifest-v2.1"
+MANIFEST_SCHEMA = "h3seamless/manifest-v2.2"
 
 
 def _ensure_revision(manifest: dict) -> dict:
-    """老 manifest 懒迁移：缺 revision/schema_version 则补 1，不重写 ID。"""
+    """老 manifest 懒迁移：缺 revision/schema_version 则补 1，不重写 ID。
+
+    v2.2（四库规范）：manifest_schema 统一前滚到 v2.2；旧裸文件名
+    （seg_000.mp4 / thumb_000.png）不改写，读写走双路径兼容。
+    """
     if not isinstance(manifest, dict):
         return manifest
     if not isinstance(manifest.get("revision"), int):
         manifest["revision"] = 1
-    if not manifest.get("manifest_schema"):
+    if manifest.get("manifest_schema") != MANIFEST_SCHEMA:
         manifest["manifest_schema"] = MANIFEST_SCHEMA
     return manifest
 
@@ -38,9 +42,20 @@ def safe_name(name) -> str:
 
 
 def _cover(root: str, manifest: dict) -> str:
-    """第一张实际存在的段缩略图文件名（列表里可能有空串占位）。"""
+    """第一张实际存在的段缩略图文件名（列表里可能有空串占位）。
+
+    四库兼容：裸名与 finals/ 前缀双路径查找，返回 manifest 原值（前端按原值取图）。
+    """
     for name in (manifest.get("thumbs") or []):
-        if name and os.path.isfile(os.path.join(root, name)):
+        if not name:
+            continue
+        norm = str(name).strip().replace("\\", "/")
+        if os.path.isfile(os.path.join(root, norm)):
+            return name
+        base = norm.split("/")[-1]
+        if os.path.isfile(os.path.join(root, "finals", base)):
+            return name
+        if os.path.isfile(os.path.join(root, base)):
             return name
     return ""
 
@@ -127,11 +142,10 @@ def read_project(name: str):
 
 _ASSET_KINDS = ("image", "video", "audio")
 _ASSET_LABEL_MAX = 24
-_ASSET_TOTAL_MAX = 999
 
 
 def _clean_asset(raw) -> dict | None:
-    """资产条目白名单清洗：{label,kind,file}；总量不限（999封顶防膨胀），单段上限执行期卡。"""
+    """资产条目白名单清洗：{label,kind,file}；总量不限，单段上限执行期按段卡。"""
     if not isinstance(raw, dict):
         return None
     kind = str(raw.get("kind") or "image").strip()
@@ -147,11 +161,18 @@ def _clean_asset(raw) -> dict | None:
         return None
     if not os.path.splitext(parts[-1])[1]:
         return None
-    return {"label": label, "kind": kind, "file": "/".join(parts)}
+    ent = {"label": label, "kind": kind, "file": "/".join(parts)}
+    # 资产标注 roles 白名单透存（首帧图/尾帧图；单张冲突校验在执行期做）
+    rl = raw.get("roles")
+    if isinstance(rl, list):
+        kept = [str(r).strip() for r in rl if str(r).strip() in ("首帧图", "尾帧图")]
+        if kept:
+            ent["roles"] = kept[:2]
+    return ent
 
 
 def _dedupe_assets(items: list) -> list:
-    """按 label 去重（首个为准），保持入库顺序。"""
+    """按 label 去重（首个为准），保持入库顺序。总量不限。"""
     seen, out = set(), []
     for a in items:
         c = _clean_asset(a)
@@ -159,13 +180,13 @@ def _dedupe_assets(items: list) -> list:
             continue
         seen.add(c["label"])
         out.append(c)
-    return out[:_ASSET_TOTAL_MAX]
+    return out
 
 
 def save_assets(name: str, assets, base_revision=None):
     """资产库持久化：manifest["assets"] 全量覆盖写，revision+1，乐观锁可选。
 
-    总量不限（999封顶），单段 9/3/3 不在这里卡（执行期按段卡）。
+    总量不限；单段 9/3/3 不在这里卡（执行期按段卡，主节点按段按需加载）。
     目录或 manifest 不存在返回 None；base_revision 不一致抛 ValueError(REVISION_CONFLICT)。
     """
     name = safe_name(name)
@@ -205,8 +226,23 @@ def _clean_seg_field(raw) -> dict | None:
     out = {k: (str(raw[k]) if isinstance(raw.get(k), str) else "") for k in _SEG_STR_FIELDS}
     sec = raw.get("seconds")
     out["seconds"] = float(sec) if isinstance(sec, (int, float)) and sec > 0 else None
-    out["unlink"] = bool(raw.get("unlink"))
-    out["disabled"] = bool(raw.get("disabled"))
+    # 新双按钮（分段优先，null=跟随全局默认 true）：auto_ref=false 即旧 unlink=true；
+    # auto_seq=false 即旧 disabled=true。旧键仍兼容读入并回填新键。
+    def _tri(v):
+        if v is None:
+            return None
+        return bool(v)
+    auto_ref = _tri(raw.get("auto_ref")) if "auto_ref" in raw else None
+    auto_seq = _tri(raw.get("auto_seq")) if "auto_seq" in raw else None
+    if auto_ref is None and isinstance(raw.get("unlink"), bool):
+        auto_ref = not bool(raw.get("unlink"))
+    if auto_seq is None and isinstance(raw.get("disabled"), bool):
+        auto_seq = not bool(raw.get("disabled"))
+    # 旧调用只传 unlink/disabled（无新键）时保持旧键语义，避免老前端被洗成 null
+    out["unlink"] = (not auto_ref) if auto_ref is not None else bool(raw.get("unlink"))
+    out["disabled"] = (not auto_seq) if auto_seq is not None else bool(raw.get("disabled"))
+    out["auto_ref"] = auto_ref
+    out["auto_seq"] = auto_seq
     refs = raw.get("refs")
     out["refs"] = [str(x) for x in refs if isinstance(x, (str, int))][:64] \
         if isinstance(refs, list) else []
@@ -227,26 +263,60 @@ def _clean_seg_field(raw) -> dict | None:
     vm = raw.get("v2mode")
     out["v2mode"] = vm if isinstance(vm, str) and vm in (
         "T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA") else None
-    # M3：每段 latent 保存策略透存 {mode: all|range|tail|off, start_f, end_f, tail_f}
+    # M3：每段 latent 保存策略透存 {mode: all|range|tail|off, start_f, end_f, tail_f,
+    # split_av, save_seg, save_all}；latent 引用策略 {on, frames, video, audio}
+    # （null=跟随全局，默认尾部 N 帧钉下段首）。
     ls = raw.get("latent_save")
     if isinstance(ls, dict):
         mode = str(ls.get("mode") or "all").strip()
         if mode not in ("all", "range", "tail", "off"):
             mode = "all"
-        try:
-            sf = int(ls.get("start_f", 0))
-        except (TypeError, ValueError):
-            sf = 0
-        try:
-            ef = int(ls.get("end_f", 0))
-        except (TypeError, ValueError):
-            ef = 0
-        try:
-            tf = int(ls.get("tail_f", 0))
-        except (TypeError, ValueError):
-            tf = 0
-        out["latent_save"] = {"mode": mode, "start_f": max(0, sf),
-                              "end_f": max(0, ef), "tail_f": max(0, tf)}
+
+        def _i(v):
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                return 0
+        out["latent_save"] = {"mode": mode, "start_f": _i(ls.get("start_f", 0)),
+                              "end_f": _i(ls.get("end_f", 0)), "tail_f": _i(ls.get("tail_f", 0)),
+                              "split_av": bool(ls.get("split_av", False)),
+                              "save_seg": ls.get("save_seg", True) is not False,
+                              "save_all": ls.get("save_all", True) is not False}
+    lr = raw.get("latent_ref")
+    if isinstance(lr, dict):
+        def _i2(v):
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                return 0
+        on = lr.get("on")
+        ent = {"on": None if on is None else bool(on),
+               "frames": _i2(lr.get("frames", 0)),
+               "video": lr.get("video", True) is not False,
+               "audio": lr.get("audio", True) is not False}
+        # 外源 keyframe：只认 latent/<名>.pt（防穿越；文件存在性执行期校验）
+        src = lr.get("src")
+        if isinstance(src, dict) and src.get("file"):
+            f = str(src["file"]).strip().replace("\\", "/")
+            parts = [p for p in f.split("/") if p and p != "."]
+            if len(parts) == 2 and parts[0] == "latent" and safe_name(parts[1]) \
+                    and parts[1].endswith(".pt"):
+                ent["src"] = {"file": "/".join(parts)}
+        out["latent_ref"] = ent
+    # 段尾锚来源（替代旧全局每段尾帧锚定）：{asset: 标签} | {latent: latent/x.pt}，
+    # 非法值丢弃（执行期按未知标签/缺文件报错点名）
+    ts = raw.get("tail_src")
+    if isinstance(ts, dict):
+        if ts.get("asset"):
+            lbl = str(ts["asset"]).strip()[:24]
+            if lbl:
+                out["tail_src"] = {"asset": lbl}
+        elif ts.get("latent"):
+            f = str(ts["latent"]).strip().replace("\\", "/")
+            parts = [p for p in f.split("/") if p and p != "."]
+            if len(parts) == 2 and parts[0] == "latent" and safe_name(parts[1]) \
+                    and parts[1].endswith(".pt"):
+                out["tail_src"] = {"latent": "/".join(parts)}
     return out
 
 
@@ -265,13 +335,15 @@ def _clean_latent_name(name) -> str:
     return s
 
 
-def slice_latent(name, src, start_f, end_f, save_name, base_revision=None):
+def slice_latent(name, src, start_f, end_f, save_name, base_revision=None, kind="av"):
     """latent-to-latent 剪辑：段存档 .pt / 已登记 latent 按像素帧窗切片 -> latent/<save_name>.pt。
 
     M3 三源之一（段范围/尾帧/已存 latent 再剪），纯 torch 无需 VAE：
     video [B,C,T,H,W] 按 frames_to_latent_t 换算 token 窗整 token 切，
     audio [1,32,2,T] 按 audio_tokens_for_frames 比例切。越界/切空抛 ValueError。
     src: {"seg": 0-based段文件号} | {"file": "latent/x.pt"}。登记 manifest["latents"] 并 revision+1。
+    kind: "av"（默认，图像+音频）| "video"（只留图像分支）| "audio"（只留音频分支，
+    图像/音频分开保存时用；audio 产物无 video 键，注入时只走音频锚）。
     """
     import torch
     try:
@@ -323,35 +395,55 @@ def slice_latent(name, src, start_f, end_f, save_name, base_revision=None):
     clean = _clean_latent_name(save_name)
     if not clean:
         raise ValueError(f"非法保存名：{save_name!r}")
+    kind = str(kind or "av").strip().lower()
+    if kind not in ("av", "video", "audio"):
+        raise ValueError(f"非法 kind：{kind!r}（须为 av/video/audio）")
     with open(src_path, "rb") as fh:
         payload = torch.load(fh, map_location="cpu", weights_only=True)
     video, audio = payload.get("video"), payload.get("audio")
-    if video is None or getattr(video, "dim", lambda: 0)() != 5:
+    if kind == "audio" and (audio is None or getattr(audio, "dim", lambda: 0)() != 4):
+        raise ValueError("源 latent 无音频分支，无法只取音频（该 latent 可能是纯图像产物）")
+    if kind != "audio" and (video is None or getattr(video, "dim", lambda: 0)() != 5):
         raise ValueError("源 latent 视频张量形态异常（须 5 维 [B,C,T,H,W]）")
-    total_t = int(video.shape[2])
-    total_frames = latent_t_to_frames(total_t)
-    if sf >= total_frames:
-        raise ValueError(f"start_f {sf} 越界（源共约 {total_frames} 帧）")
-    ef = min(ef, total_frames)
-    t0 = max(0, frames_to_latent_t(sf, up=False))
-    t1 = min(total_t, frames_to_latent_t(ef, up=True))
-    if t1 <= t0:
-        # 帧窗落在同一 token 内：按整 token 取 1 个（含目标帧），不返回空
-        t0 = max(0, min(total_t - 1, frames_to_latent_t(sf, up=True) - 1))
-        t1 = min(total_t, t0 + 1)
-    cut_v = video[:, :, t0:t1].contiguous().clone()
-    cut_a = None
-    if audio is not None and getattr(audio, "dim", lambda: 0)() == 4:
+    if kind == "audio":
         a_total = int(audio.shape[-1])
+        # 纯音频切：按 latent 音频 token 等比映射帧窗
+        total_frames = max(1, int(round(a_total / audio_tokens_for_frames(1)))) \
+            if audio_tokens_for_frames(1) else a_total
+        if sf >= total_frames:
+            raise ValueError(f"start_f {sf} 越界（源音频约 {total_frames} 帧）")
+        ef = min(ef, total_frames)
         a0 = max(0, int(round(sf / max(1, total_frames) * a_total)))
         a1 = max(a0 + 1, min(a_total, int(round(ef / max(1, total_frames) * a_total))))
-        cut_a = audio[..., a0:a1].contiguous().clone()
-    _ = audio_tokens_for_frames(ef - sf)  # 换算自检（比例异常时不断言，只记录）
-    out_payload = {"video": cut_v}
-    if cut_a is not None:
-        out_payload["audio"] = cut_a
-    elif audio is not None:
-        out_payload["audio"] = audio
+        out_payload = {"audio": audio[..., a0:a1].contiguous().clone()}
+        t0, t1 = 0, 0
+    else:
+        total_t = int(video.shape[2])
+        total_frames = latent_t_to_frames(total_t)
+        if sf >= total_frames:
+            raise ValueError(f"start_f {sf} 越界（源共约 {total_frames} 帧）")
+        ef = min(ef, total_frames)
+        t0 = max(0, frames_to_latent_t(sf, up=False))
+        t1 = min(total_t, frames_to_latent_t(ef, up=True))
+        if t1 <= t0:
+            # 帧窗落在同一 token 内：按整 token 取 1 个（含目标帧），不返回空
+            t0 = max(0, min(total_t - 1, frames_to_latent_t(sf, up=True) - 1))
+            t1 = min(total_t, t0 + 1)
+        cut_v = video[:, :, t0:t1].contiguous().clone()
+        cut_a = None
+        if audio is not None and getattr(audio, "dim", lambda: 0)() == 4:
+            a_total = int(audio.shape[-1])
+            a0 = max(0, int(round(sf / max(1, total_frames) * a_total)))
+            a1 = max(a0 + 1, min(a_total, int(round(ef / max(1, total_frames) * a_total))))
+            cut_a = audio[..., a0:a1].contiguous().clone()
+        _ = audio_tokens_for_frames(ef - sf)  # 换算自检（比例异常时不断言，只记录）
+        out_payload = {"video": cut_v}
+        if kind == "av":
+            if cut_a is not None:
+                out_payload["audio"] = cut_a
+            elif audio is not None:
+                out_payload["audio"] = audio
+        # kind == "video": 故意不带 audio 键（图像单独保存）
     ldir = _latent_dir(root)
     tmp_path = os.path.join(ldir, clean + ".part")
     final_path = os.path.join(ldir, clean)
@@ -367,7 +459,7 @@ def slice_latent(name, src, start_f, end_f, save_name, base_revision=None):
     manifest["latents"] = [x for x in manifest["latents"]
                            if isinstance(x, dict) and x.get("file") != f"latent/{clean}"]
     manifest["latents"].append({"file": f"latent/{clean}", "src": src_desc,
-                                "start_f": sf, "end_f": ef,
+                                "start_f": sf, "end_f": ef, "kind": kind,
                                 "tokens": [t0, t1], "updated_at": time.time()})
     manifest["updated_at"] = time.time()
     manifest["revision"] = int(manifest.get("revision") or 1) + 1
@@ -408,13 +500,25 @@ def delete_latent(name, file, base_revision=None):
     return manifest
 
 
+def _library_of_relpath(root: str, rel: str) -> str:
+    """相对路径 -> 所属库目录名（assets/finals/根）。"""
+    norm = str(rel or "").replace("\\", "/")
+    if norm.startswith("assets/"):
+        return "assets"
+    if norm.startswith("finals/"):
+        return "finals"
+    return "finals"
+
+
 def trim_asset(name, src_file, start_s, end_s, save_name=None, base_revision=None,
                fps=24, crf=20):
     """资产/成片入出点裁剪：项目内 mp4 [start_s, end_s) -> 新文件（重编码）。
 
     M3 最小剪辑集：资产库行内剪 + 成片库片段截取共用。长耗时放调用方线程池。
-    src_file 须为项目内 mp4（seg_/final_/merged_/clip_*.mp4）；save_name 缺省
-    clip_<stamp>.mp4。登记 manifest["clips"] 并 revision+1。失败抛 ValueError/RuntimeError。
+    src_file 须为项目内 mp4（seg_/final_/merged_/clip_*.mp4，裸名/finals//assets/
+    前缀双兼容）；save_name 缺省 clip_<stamp>.mp4。产物落源文件同库目录
+    （资产剪进 assets/，成片剪进 finals/），登记 manifest["clips"] 并 revision+1。
+    失败抛 ValueError/RuntimeError。
     """
     name = safe_name(name)
     if not name:
@@ -434,17 +538,27 @@ def trim_asset(name, src_file, start_s, end_s, save_name=None, base_revision=Non
                 f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
     f = str(src_file or "").strip().replace("\\", "/")
     parts = [p for p in f.split("/") if p and p != "."]
-    if len(parts) != 1 or not safe_name(parts[0]) or not parts[0].endswith(".mp4"):
+    if not parts or len(parts) > 2 or not all(safe_name(p) for p in parts) \
+            or not parts[-1].endswith(".mp4"):
         raise ValueError(f"非法源文件：{src_file!r}（须为项目内 xxx.mp4）")
-    src_path = os.path.join(root, parts[0])
+    src_rel = "/".join(parts)
+    src_path = checkpoint.resolve_project_file(root, src_rel)
     if not os.path.isfile(src_path):
-        raise ValueError(f"源文件不存在：{parts[0]}")
+        raise ValueError(f"源文件不存在：{src_rel}")
+    # 实际命中的相对路径（用于 clips 登记与同库落盘判定）
+    try:
+        src_hit = os.path.relpath(src_path, root).replace("\\", "/")
+    except ValueError:
+        src_hit = src_rel
     try:
         ss, es = float(start_s), float(end_s)
     except (TypeError, ValueError):
         raise ValueError("start_s/end_s 须为数字秒") from None
     if es <= ss or ss < 0:
         raise ValueError(f"裁剪区间为空（[{ss}s, {es}s)，须 0 <= start < end）")
+    lib = _library_of_relpath(root, src_hit)
+    out_dir = os.path.join(root, lib)
+    os.makedirs(out_dir, exist_ok=True)
     if save_name:
         clean = str(save_name).strip().replace("\\", "/").split("/")[-1]
         if not safe_name(clean):
@@ -454,14 +568,15 @@ def trim_asset(name, src_file, start_s, end_s, save_name=None, base_revision=Non
     else:
         clean = f"clip_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         k = 2
-        while os.path.exists(os.path.join(root, clean)):
+        while os.path.exists(os.path.join(out_dir, clean)):
             clean = f"clip_{time.strftime('%Y%m%d_%H%M%S')}_{k}.mp4"
             k += 1
+    out_rel = f"{lib}/{clean}" if lib in ("assets", "finals") else clean
     try:
         from . import media
     except ImportError:
         import media
-    ok = media.trim_av_mp4(src_path, os.path.join(root, clean), ss, es,
+    ok = media.trim_av_mp4(src_path, os.path.join(out_dir, clean), ss, es,
                            fps=fps, crf=crf)
     if not ok:
         raise RuntimeError(f"裁剪编码失败：{media.last_error}")
@@ -469,7 +584,7 @@ def trim_asset(name, src_file, start_s, end_s, save_name=None, base_revision=Non
     if isinstance(fresh, dict):
         manifest = fresh
         _ensure_revision(manifest)
-    manifest.setdefault("clips", []).append({"file": clean, "src": parts[0],
+    manifest.setdefault("clips", []).append({"file": out_rel, "src": src_hit,
                                              "start_s": ss, "end_s": es,
                                              "updated_at": time.time()})
     manifest["updated_at"] = time.time()
@@ -477,6 +592,321 @@ def trim_asset(name, src_file, start_s, end_s, save_name=None, base_revision=Non
     manifest["manifest_schema"] = MANIFEST_SCHEMA
     checkpoint.save_manifest(root, manifest)
     return manifest
+
+
+def _rewrite_media_refs(manifest: dict, old_rel: str, new_rel: str) -> int:
+    """manifest 内全部媒体引用 old->new 改写，返回改动条数。
+
+    覆盖 videos/thumbs/finals/merges.file/merges.items[].file/clips
+    .file/.src/inserts[].file（链路一致性：移动成片库文件不断链）。
+    """
+    n = 0
+    for key in ("videos", "thumbs", "finals"):
+        seq = manifest.get(key)
+        if isinstance(seq, list):
+            for i, v in enumerate(seq):
+                if v == old_rel:
+                    seq[i] = new_rel
+                    n += 1
+    for m in (manifest.get("merges") or []):
+        if isinstance(m, dict):
+            if m.get("file") == old_rel:
+                m["file"] = new_rel
+                n += 1
+            for it in (m.get("items") or []):
+                if isinstance(it, dict) and it.get("file") == old_rel:
+                    it["file"] = new_rel
+                    n += 1
+    for c in (manifest.get("clips") or []):
+        if isinstance(c, dict):
+            if c.get("file") == old_rel:
+                c["file"] = new_rel
+                n += 1
+            if c.get("src") == old_rel:
+                c["src"] = new_rel
+                n += 1
+    for x in (manifest.get("inserts") or []):
+        if isinstance(x, dict) and x.get("file") == old_rel:
+            x["file"] = new_rel
+            n += 1
+    return n
+
+
+def move_media(name, src_file, dest_lib, save_name=None, base_revision=None,
+               register_asset=False, label="", kind="video"):
+    """成片库 <-> 资产库互调：项目内媒体文件在 assets/finals 间搬家。
+
+    - src_file：项目内相对路径（裸名/finals//assets/ 前缀双兼容；mp4/png/wav）。
+    - dest_lib：目标库 "assets" | "finals"。
+    - save_name：目标文件名（缺省=同名；同名已存在自动 _2 后缀）。
+    - manifest 内 videos/thumbs/finals/merges/clips/inserts 引用同步改写，不断链；
+      seg_*.pt（链路 latent 存档）禁止移动（抛 ValueError）。
+    - register_asset=true 且 dest=assets 时追加 manifest["assets"] 条目
+      {label, kind, file}（label 缺省=文件名去扩展名，供提示词 [[标签]] 引用）。
+    生成中调用由路由层以 423 拦截（见 checkpoint.is_busy），此处不重复判定以便单测。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    if dest_lib not in ("assets", "finals"):
+        raise ValueError(f"非法目标库：{dest_lib!r}（须为 assets/finals）")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    f = str(src_file or "").strip().replace("\\", "/")
+    parts = [p for p in f.split("/") if p and p != "."]
+    if not parts or len(parts) > 2 or not all(safe_name(p) for p in parts) \
+            or not os.path.splitext(parts[-1])[1]:
+        raise ValueError(f"非法源文件：{src_file!r}")
+    src_rel = "/".join(parts)
+    src_path = checkpoint.resolve_project_file(root, src_rel)
+    if not os.path.isfile(src_path):
+        raise ValueError(f"源文件不存在：{src_rel}")
+    try:
+        src_hit = os.path.relpath(src_path, root).replace("\\", "/")
+    except ValueError:
+        src_hit = src_rel
+    if src_hit.endswith(".pt") or os.path.basename(src_hit).startswith("seg_") \
+            and src_hit.endswith(".pt"):
+        raise ValueError("段 latent 存档（seg_*.pt）禁止移动（断链风险）；请用 latent 切片另存")
+    if save_name:
+        clean = str(save_name).strip().replace("\\", "/").split("/")[-1]
+        if not safe_name(clean) or not os.path.splitext(clean)[1]:
+            raise ValueError(f"非法保存名：{save_name!r}")
+    else:
+        clean = os.path.basename(src_hit)
+    dest_dir = os.path.join(root, dest_lib)
+    os.makedirs(dest_dir, exist_ok=True)
+    base, ext = os.path.splitext(clean)
+    cand, k = clean, 2
+    while os.path.exists(os.path.join(dest_dir, cand)):
+        cand = f"{base}_{k}{ext}"
+        k += 1
+    dest_path = os.path.join(dest_dir, cand)
+    dest_rel = f"{dest_lib}/{cand}"
+    if os.path.realpath(src_path) == os.path.realpath(dest_path):
+        raise ValueError("源与目标是同一文件，无需移动")
+    os.replace(src_path, dest_path)
+    # 旧 manifest 可能记的是裸名：新旧两种写法都改写
+    _rewrite_media_refs(manifest, src_hit, dest_rel)
+    _rewrite_media_refs(manifest, os.path.basename(src_hit), dest_rel)
+    _rewrite_media_refs(manifest, src_rel, dest_rel)
+    if register_asset and dest_lib == "assets":
+        lbl = str(label or "").strip()[:24] or os.path.splitext(cand)[0][:24]
+        kk = str(kind or "video").strip()
+        if kk not in ("image", "video", "audio"):
+            kk = "video"
+        manifest.setdefault("assets", [])
+        if all(not (isinstance(a, dict) and a.get("label") == lbl) for a in manifest["assets"]):
+            manifest["assets"] = _dedupe_assets(
+                list(manifest.get("assets") or []) + [{"label": lbl, "kind": kk, "file": dest_rel}])
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def split_av(name, src_file, save_video=None, save_audio=None, base_revision=None,
+             fps=24, crf=20):
+    """音画分离：项目内 mp4 -> 画面 mp4 + 音频 wav（PyAV 解码，无 VAE）。
+
+    - save_video 缺省 <stem>_v.mp4（落源文件同库），save_audio 缺省 <stem>_a.wav。
+    - 无音轨源：只产出画面文件并在 clips 登记 note=no-audio。
+    - 登记 manifest["clips"]（两条，src 同指源文件）并 revision+1。
+    供“只编码图像 / 只编码音频进 latent”前一步：分离后再分别走
+    H3MediaToLatent 节点（队列内拿 VAE 编码）或 latent 切片 kind 过滤。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    f = str(src_file or "").strip().replace("\\", "/")
+    parts = [p for p in f.split("/") if p and p != "."]
+    if not parts or len(parts) > 2 or not all(safe_name(p) for p in parts) \
+            or not parts[-1].endswith(".mp4"):
+        raise ValueError(f"非法源文件：{src_file!r}（须为项目内 xxx.mp4）")
+    src_path = checkpoint.resolve_project_file(root, "/".join(parts))
+    if not os.path.isfile(src_path):
+        raise ValueError(f"源文件不存在：{'/'.join(parts)}")
+    try:
+        src_hit = os.path.relpath(src_path, root).replace("\\", "/")
+    except ValueError:
+        src_hit = "/".join(parts)
+    lib = _library_of_relpath(root, src_hit)
+    out_dir = os.path.join(root, lib)
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(src_hit))[0]
+
+    def _clean(v, default):
+        if v:
+            c = str(v).strip().replace("\\", "/").split("/")[-1]
+            if not safe_name(c):
+                raise ValueError(f"非法保存名：{v!r}")
+            return c
+        c, k = default, 2
+        while os.path.exists(os.path.join(out_dir, c)):
+            b, e = os.path.splitext(default)
+            c = f"{b}_{k}{e}"
+            k += 1
+        return c
+    v_name = _clean(save_video, f"{stem}_v.mp4")
+    if not v_name.endswith(".mp4"):
+        v_name += ".mp4"
+    a_name = _clean(save_audio, f"{stem}_a.wav")
+    if not a_name.endswith(".wav"):
+        a_name += ".wav"
+    try:
+        from . import media
+    except ImportError:
+        import media
+    try:
+        frames, wav, sr = media.decode_av(src_path)
+    except Exception as e:
+        raise RuntimeError(f"解码失败：{e}") from e
+    import torch
+    v_rel = f"{lib}/{v_name}"
+    if wav is None or getattr(wav, "numel", lambda: 0)() == 0:
+        ok = media.save_av_mp4(os.path.join(out_dir, v_name), frames,
+                               torch.zeros(1, 0), int(sr or 44100), fps=fps,
+                               crf=crf)
+        if not ok:
+            raise RuntimeError(f"画面保存失败：{media.last_error}")
+        note = "no-audio"
+        a_rel = ""
+    else:
+        ok = media.save_av_mp4(os.path.join(out_dir, v_name), frames,
+                               torch.zeros(1, max(0, int(wav.shape[-1]))), int(sr or 44100),
+                               fps=fps, crf=crf)
+        if not ok:
+            raise RuntimeError(f"画面保存失败：{media.last_error}")
+        # 音频 wav：标准 PCM16（wave 模块，零新依赖）
+        import wave
+        a_path = os.path.join(out_dir, a_name)
+        pcm = wav.detach().float().cpu().clamp(-1.0, 1.0)
+        if pcm.dim() == 3:
+            pcm = pcm[0]
+        ch = int(pcm.shape[0]) if pcm.dim() == 2 else 1
+        import numpy as np
+        arr = (pcm.numpy().transpose(1, 0) * 32767.0).clip(-32768, 32767).astype("<i2")
+        with wave.open(a_path, "wb") as wf:
+            wf.setnchannels(min(2, ch))
+            wf.setsampwidth(2)
+            wf.setframerate(int(sr or 44100))
+            wf.writeframes(arr.tobytes())
+        a_rel = f"{lib}/{a_name}"
+        note = ""
+    fresh = checkpoint.load_manifest(root)
+    if isinstance(fresh, dict):
+        manifest = fresh
+        _ensure_revision(manifest)
+    now = time.time()
+    manifest.setdefault("clips", []).append({"file": v_rel, "src": src_hit,
+                                             "op": "split-v", "note": note,
+                                             "updated_at": now})
+    if a_rel:
+        manifest["clips"].append({"file": a_rel, "src": src_hit,
+                                  "op": "split-a", "updated_at": now})
+    manifest["updated_at"] = now
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def import_asset(name, src_file, label="", kind="image", roles=None, base_revision=None):
+    """入库：input 目录文件拷贝进项目 assets/，返回 {"file": "assets/<名>", ...}。
+
+    - src_file：input 内相对路径（至多两级子目录，防穿越；realpath 复核不出 input）。
+    - 同名已存在则加 _2 后缀，不覆盖。
+    - 同时登记 manifest["assets"]（label 去重：重复 label 自动加后缀）。
+    - 剪辑/转码统一在入库后的项目文件上做，项目自包含、删项目连带走。
+    """
+    import shutil
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    f = str(src_file or "").strip().replace("\\", "/")
+    parts = [p for p in f.split("/") if p and p != "."]
+    if not parts or len(parts) > 2 or not all(safe_name(p) for p in parts) \
+            or not os.path.splitext(parts[-1])[1]:
+        raise ValueError(f"非法源文件：{src_file!r}")
+    try:
+        from folder_paths import get_input_directory
+        in_root = os.path.realpath(get_input_directory())
+    except Exception:
+        in_root = None
+    if not in_root:
+        raise ValueError("无法定位 input 目录")
+    src_abs = os.path.realpath(os.path.join(in_root, *parts))
+    if not src_abs.startswith(in_root + os.sep) or not os.path.isfile(src_abs):
+        raise ValueError(f"源文件不存在（input 目录没有）：{'/'.join(parts)}")
+    kk = str(kind or "image").strip()
+    if kk not in _ASSET_KINDS:
+        kk = "image"
+    adir = os.path.join(root, "assets")
+    os.makedirs(adir, exist_ok=True)
+    base, ext = os.path.splitext(parts[-1])
+    cand, k = parts[-1], 2
+    while os.path.exists(os.path.join(adir, cand)):
+        cand = f"{base}_{k}{ext}"
+        k += 1
+    shutil.copy2(src_abs, os.path.join(adir, cand))
+    dest_rel = f"assets/{cand}"
+    taken = {a["label"] for a in (manifest.get("assets") or [])
+             if isinstance(a, dict) and a.get("label")}
+    lbl = str(label or "").strip()[:24] or os.path.splitext(cand)[0][:24]
+    _b, _n = lbl, 2
+    while lbl in taken:
+        lbl = f"{_b}{_n}"[:24]
+        _n += 1
+    ent = {"label": lbl, "kind": kk, "file": dest_rel}
+    if isinstance(roles, list):
+        kept = [str(r).strip() for r in roles if str(r).strip() in ("首帧图", "尾帧图")]
+        if kept:
+            ent["roles"] = kept[:2]
+    manifest["assets"] = _dedupe_assets(list(manifest.get("assets") or []) + [ent])
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return {"file": dest_rel, "label": lbl, "kind": kk,
+            "roles": ent.get("roles", []), "manifest": manifest}
 
 
 def save_prompts(name: str, prompts, segments=None, base_revision=None):
@@ -549,6 +979,17 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
     manifest["revision"] = int(manifest.get("revision") or 1) + 1
     manifest["manifest_schema"] = MANIFEST_SCHEMA
     checkpoint.save_manifest(root, manifest)
+    # 文本库镜像：提示词快照同步一份到 texts/（项目文本文件夹，报告/日志同目录）
+    try:
+        tdir = checkpoint.texts_dir(root)
+        snap = {"dir": safe_name(name), "revision": manifest.get("revision"),
+                "updated_at": manifest.get("updated_at"),
+                "prompts": list(manifest.get("prompts") or []),
+                "seg_fields": list(manifest.get("seg_fields") or [])}
+        with open(os.path.join(tdir, "prompts_latest.json"), "w", encoding="utf-8") as fh:
+            json.dump(snap, fh, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
     return manifest
 
 
@@ -567,8 +1008,10 @@ def create_project(name: str):
     root = os.path.join(checkpoint.projects_root(), name)
     manifest = checkpoint.load_manifest(root)
     if manifest is not None:
+        checkpoint.ensure_project_dirs(root)
         return _ensure_revision(manifest)
     os.makedirs(root, exist_ok=True)
+    checkpoint.ensure_project_dirs(root)
     now = time.time()
     manifest = {
         "schema": checkpoint.SCHEMA, "manifest_schema": MANIFEST_SCHEMA,
@@ -638,10 +1081,14 @@ def upscale_reset(name, seg):
     manifest["updated_at"] = time.time()
     checkpoint.save_manifest(root, manifest)
     for f in (*checkpoint.upscale_files(g).values(), *checkpoint.upscale_legacy_files(g)):
-        try:
-            os.remove(os.path.join(root, f))
-        except OSError:
-            pass
+        # 四库兼容：finals/ 前缀与旧根目录裸名双路径都清
+        for cand in (os.path.join(root, f),
+                     os.path.join(root, "finals", os.path.basename(f)),
+                     os.path.join(root, os.path.basename(f))):
+            try:
+                os.remove(cand)
+            except OSError:
+                pass
     return manifest
 
 
@@ -684,8 +1131,9 @@ def _merge_sources(root: str, manifest: dict, items):
     """合并清单 -> 按序绝对路径列表。非法/缺失抛 ValueError。
 
     - {"seg": n}：n 为 1-based 全局槽位（含序章/插入视频段），映射
-      manifest.videos[n-1]（seg_NNN.mp4 文件名）——前端段落卡片链位即此编号。
-    - {"file": f}：先查项目目录（final_* / merged_* / 任意 mp4），
+      manifest.videos[n-1]（seg_NNN.mp4 文件名，裸名/finals/ 前缀双兼容）——
+      前端段落卡片链位即此编号。
+    - {"file": f}：先查项目目录（final_* / merged_* / 任意 mp4，finals/优先），
       再查 input 目录（上传外部素材）。f 允许至多两级子目录，
       每段过 safe_name 防穿越；input 命中再以 realpath+startswith 复核。
     """
@@ -706,7 +1154,7 @@ def _merge_sources(root: str, manifest: dict, items):
             fname = videos[n - 1]
             if not fname:
                 raise ValueError(f"段 {n} 还没有生成视频文件（先跑完该段）")
-            path = os.path.join(root, fname)
+            path = checkpoint.resolve_project_file(root, fname)
             if not os.path.isfile(path):
                 raise ValueError(f"段 {n} 的视频文件缺失：{fname}")
             sources.append(path)
@@ -717,7 +1165,7 @@ def _merge_sources(root: str, manifest: dict, items):
             raise ValueError(f"非法文件名：{f!r}")
         if not os.path.splitext(parts[-1])[1]:
             raise ValueError(f"文件名缺少扩展名：{f!r}")
-        cand = os.path.join(root, *parts)
+        cand = checkpoint.resolve_project_file(root, "/".join(parts))
         if os.path.isfile(cand):
             sources.append(cand)
             continue
@@ -756,7 +1204,8 @@ def merge_project(name, items, fps=24, crf=20):
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out_name = f"merged_{stamp}.mp4"
     k = 2
-    while os.path.exists(os.path.join(root, out_name)):
+    fdir = checkpoint.finals_dir(root)
+    while os.path.exists(os.path.join(fdir, out_name)):
         out_name = f"merged_{stamp}_{k}.mp4"
         k += 1
     params = manifest.get("params") or {}
@@ -764,7 +1213,7 @@ def merge_project(name, items, fps=24, crf=20):
         from . import media                  # 包内（ComfyUI 运行时）
     except ImportError:
         import media                         # 顶层导入（无 ComfyUI 的单测环境）
-    ok = media.concat_av_mp4(sources, os.path.join(root, out_name),
+    ok = media.concat_av_mp4(sources, os.path.join(fdir, out_name),
                              width=params.get("width"), height=params.get("height"),
                              fps=fps, crf=crf)
     if not ok:
@@ -776,7 +1225,7 @@ def merge_project(name, items, fps=24, crf=20):
     if isinstance(fresh, dict):
         manifest = fresh
     manifest.setdefault("merges", []).append({
-        "file": out_name, "items": items, "updated_at": time.time()})
+        "file": f"finals/{out_name}", "items": items, "updated_at": time.time()})
     manifest["updated_at"] = time.time()
     checkpoint.save_manifest(root, manifest)
     return manifest

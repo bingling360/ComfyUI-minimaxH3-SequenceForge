@@ -37,6 +37,7 @@ _mounted = []  # [(目标对象, {(method, path)})]：按对象身份防重复�
 
 ROUTES = [
     ("GET", "/h3chain/ping"),
+    ("GET", "/h3chain/busy"),
     ("GET", "/h3chain/projects"),
     ("GET", "/h3chain/project"),
     ("GET", "/h3chain/upscale_models"),
@@ -50,6 +51,10 @@ ROUTES = [
     ("POST", "/h3chain/latent_slice"),
     ("POST", "/h3chain/latent_delete"),
     ("POST", "/h3chain/trim"),
+    ("POST", "/h3chain/probe"),
+    ("POST", "/h3chain/move_media"),
+    ("POST", "/h3chain/split_av"),
+    ("POST", "/h3chain/import_asset"),
     ("POST", "/h3chain/assets"),
     ("POST", "/h3chain/asset_check"),
     ("POST", "/h3chain/delete_project"),
@@ -83,7 +88,7 @@ def add_routes(routes):
     """
 
     async def ping(request):
-        return web.json_response({"ok": True, "version": "v4-manifest-v2.1", "routes": _routes_desc()})
+        return web.json_response({"ok": True, "version": "v4-manifest-v2.2", "routes": _routes_desc()})
 
     async def list_projects(request):
         # ?summary=1 走轻量分页（M1 新增）；默认保持旧 {ok,projects} 兼容
@@ -159,11 +164,17 @@ def add_routes(routes):
             return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
         rel = str(data.get("path") or "").strip().replace("\\", "/")
         parts = rel.split("/")
-        if (len(parts) != 3 or parts[0] != "h3_projects"
-                or not projects.safe_name(parts[1])
-                or not projects.safe_name(parts[2])
-                or not os.path.splitext(parts[2])[1]):
-            return _err("路径必须是 h3_projects/<项目>/<文件名>",
+        # 四库兼容：h3_projects/<项目>/<文件名>（旧）或
+        # h3_projects/<项目>/<库>/<文件名>（新，库=assets/finals/latent/texts）
+        if not (3 <= len(parts) <= 4 and parts[0] == "h3_projects"
+                and projects.safe_name(parts[1])
+                and all(projects.safe_name(p) for p in parts[2:])
+                and os.path.splitext(parts[-1])[1]):
+            return _err("路径必须是 h3_projects/<项目>/<文件名> 或 h3_projects/<项目>/<库>/<文件名>",
+                        code="BAD_PATH", status=400)
+        if len(parts) == 4 and parts[2] not in ("assets", "finals", "latent", "texts",
+                                                "keyframes"):
+            return _err("未知子文件夹（须为 assets/finals/latent/texts）",
                         code="BAD_PATH", status=400)
         root = os.path.realpath(get_output_directory())
         target = os.path.realpath(os.path.join(root, *parts))
@@ -258,7 +269,11 @@ def add_routes(routes):
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def asset_check(request):
-        """资产包校验（不落盘）：缺文件/重标签/单段上限早爆，点名标签。"""
+        """资产包校验（不落盘）：缺文件/重标签/单段上限早爆，点名标签。
+
+        可选传 dir：给了就按项目解析 assets/finals/latent/texts/ 前缀（output 可用）；
+        不给则全部按 input 目录校验（画布 Hub 节点口径）。
+        """
         try:
             data = await request.json()
         except Exception:
@@ -267,7 +282,16 @@ def add_routes(routes):
             from . import asset_hub
         except ImportError:
             import asset_hub
-        res = asset_hub.validate_pack(data.get("assets"), data.get("segments"))
+        proot = None
+        if isinstance(data.get("dir"), str) and projects.safe_name(data["dir"]):
+            try:
+                from folder_paths import get_output_directory
+                cand = os.path.join(get_output_directory(), "h3_projects", data["dir"])
+                if os.path.isdir(cand):
+                    proot = cand
+            except Exception:
+                proot = None
+        res = asset_hub.validate_pack(data.get("assets"), data.get("segments"), proot)
         status = 200 if res["ok"] else 422
         return web.json_response({"ok": res["ok"], **res}, status=status)
 
@@ -279,17 +303,36 @@ def add_routes(routes):
             srv = 0
         return _err(msg, code="REVISION_CONFLICT", status=409, server_revision=srv)
 
+    def _busy():
+        try:
+            from . import checkpoint as _ckpt
+        except ImportError:
+            import checkpoint as _ckpt
+        return _ckpt.is_busy()
+
+    async def busy_state(request):
+        """生成互斥状态：{busy}——剪辑/转码/移动入口遇忙回 423，前端据此置灰。"""
+        return web.json_response({"ok": True, "busy": _busy()})
+
     async def latent_slice(request):
-        """latent 切片：段存档/已登记 latent 按帧窗 -> latent/<save>.pt（无 VAE）。"""
+        """latent 切片：段存档/已登记 latent 按帧窗 -> latent/<save>.pt（无 VAE）。
+
+        kind: av（默认）| video（只留图像）| audio（只留音频）。
+        生成中 423（与采样互斥，按钮置灰）。
+        """
         try:
             data = await request.json()
         except Exception:
             return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        if _busy():
+            return _err("正在生成中，剪辑/转码入口已锁定（完成后自动解锁）",
+                        code="BUSY", status=423)
         try:
             manifest = projects.slice_latent(
                 str(data.get("dir") or ""), data.get("src"),
                 data.get("start_f"), data.get("end_f"),
-                data.get("save_name"), data.get("base_revision"))
+                data.get("save_name"), data.get("base_revision"),
+                data.get("kind") or "av")
         except ValueError as e:
             msg = str(e)
             if msg.startswith("REVISION_CONFLICT"):
@@ -316,11 +359,14 @@ def add_routes(routes):
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def trim(request):
-        """入出点裁剪：项目内 mp4 -> 新文件（线程池重编码）。"""
+        """入出点裁剪：项目内 mp4 -> 新文件（线程池重编码）。生成中 423。"""
         try:
             data = await request.json()
         except Exception:
             return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        if _busy():
+            return _err("正在生成中，剪辑/转码入口已锁定（完成后自动解锁）",
+                        code="BUSY", status=423)
         try:
             manifest = await asyncio.get_event_loop().run_in_executor(
                 None, projects.trim_asset, str(data.get("dir") or ""),
@@ -335,6 +381,41 @@ def add_routes(routes):
             return _err(str(e), code="TRIM_FAILED", status=500)
         return web.json_response({"ok": True, "manifest": manifest,
                                   "file": (manifest.get("clips") or [{}])[-1].get("file")})
+
+    async def probe(request):
+        """媒体探针：项目内 mp4 -> {fps, frames, duration_s, width, height, has_audio}。
+
+        只读元数据（不解码），供裁剪子面板填帧窗。不受生成锁影响。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        name = projects.safe_name(str(data.get("dir") or ""))
+        if not name:
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        f = str(data.get("src") or "").strip().replace("\\", "/")
+        parts = [p for p in f.split("/") if p and p != "."]
+        if not parts or len(parts) > 2 or not all(projects.safe_name(p) for p in parts):
+            return _err(f"非法源文件：{data.get('src')!r}", code="BAD_REQUEST", status=400)
+        try:
+            from . import checkpoint as _ckpt
+        except ImportError:
+            import checkpoint as _ckpt
+        root = os.path.join(_ckpt.projects_root(), name)
+        src_path = _ckpt.resolve_project_file(root, "/".join(parts))
+        if not os.path.isfile(src_path):
+            return _err(f"源文件不存在：{'/'.join(parts)}", code="NOT_FOUND", status=404)
+        try:
+            from . import media as _media
+        except ImportError:
+            import media as _media
+        try:
+            info = await asyncio.get_event_loop().run_in_executor(
+                None, _media.probe_media, src_path)
+        except RuntimeError as e:
+            return _err(str(e), code="PROBE_FAILED", status=500)
+        return web.json_response({"ok": True, **info})
 
     async def prompt_rules(request):
         """提示词撰写规则下发（只读）：prompt/*.txt，供优化时注入 LLM。"""
@@ -411,8 +492,77 @@ def add_routes(routes):
                                   "errors": verdict["errors"],
                                   "warnings": verdict["warnings"]}, status=status)
 
+    async def move_media(request):
+        """库间互调：assets <-> finals 搬家 + manifest 引用改写。生成中 423。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        if _busy():
+            return _err("正在生成中，剪辑/转码入口已锁定（完成后自动解锁）",
+                        code="BUSY", status=423)
+        try:
+            manifest = projects.move_media(
+                str(data.get("dir") or ""), data.get("src"),
+                str(data.get("dest") or ""), data.get("save_name"),
+                data.get("base_revision"), bool(data.get("register_asset")),
+                str(data.get("label") or ""), str(data.get("kind") or "video"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(str(data.get("dir") or ""), msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        return web.json_response({"ok": True, "manifest": manifest})
+
+    async def split_av(request):
+        """音画分离：项目内 mp4 -> 画面 mp4 + 音频 wav（线程池）。生成中 423。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        if _busy():
+            return _err("正在生成中，剪辑/转码入口已锁定（完成后自动解锁）",
+                        code="BUSY", status=423)
+        try:
+            manifest = await asyncio.get_event_loop().run_in_executor(
+                None, projects.split_av, str(data.get("dir") or ""),
+                data.get("src"), data.get("save_video"), data.get("save_audio"),
+                data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(str(data.get("dir") or ""), msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="SPLIT_FAILED", status=500)
+        return web.json_response({"ok": True, "manifest": manifest,
+                                  "files": [(manifest.get("clips") or [{}])[-2:]]})
+
+    async def import_asset(request):
+        """入库：input 文件拷贝进项目 assets/ + 登记 manifest["assets"]。
+
+        纯文件拷贝（无 GPU），生成中也可用；revision 冲突回 409 前端刷新重试。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            res = projects.import_asset(
+                str(data.get("dir") or ""), data.get("src"),
+                str(data.get("label") or ""), str(data.get("kind") or "image"),
+                data.get("roles"), data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(str(data.get("dir") or ""), msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        return web.json_response({"ok": True, **{k: v for k, v in res.items() if k != "manifest"},
+                                  "manifest": res["manifest"]})
+
     handlers = [
         ("GET", "/h3chain/ping", ping),
+        ("GET", "/h3chain/busy", busy_state),
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),
         ("GET", "/h3chain/upscale_models", upscale_models),
@@ -426,6 +576,10 @@ def add_routes(routes):
         ("POST", "/h3chain/latent_slice", latent_slice),
         ("POST", "/h3chain/latent_delete", latent_delete),
         ("POST", "/h3chain/trim", trim),
+        ("POST", "/h3chain/probe", probe),
+        ("POST", "/h3chain/move_media", move_media),
+        ("POST", "/h3chain/split_av", split_av),
+        ("POST", "/h3chain/import_asset", import_asset),
         ("POST", "/h3chain/assets", save_assets),
         ("POST", "/h3chain/asset_check", asset_check),
         ("POST", "/h3chain/delete_project", delete_project),

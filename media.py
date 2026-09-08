@@ -155,12 +155,17 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
         return False
 
 
-def decode_av(path):
+def decode_av(path, start_f=None, end_f=None, fps=None):
     """上传视频 -> (帧 tensor[N,H,W,3] float 0-1, 波形[C,T] float32, 采样率 int|None)。
 
     不做音频重采样：采样器 _encode_audio_latent 会按音频 VAE 采样率重采样。
     无音频轨时返回 (帧, zeros(1,0), None)。文件无视频轨或 PyAV 缺失抛
     RuntimeError——序章上传路径失败应明确报错而非静默降级。
+
+    帧窗（可选）：start_f/end_f 为像素帧号（end_f=None/<=0 表到片尾），fps 为
+    该视频帧率（缺省按 24 计）。给出后 seek 到窗起点附近再解码，收到 end_f
+    即早停——长文件只转一小段时不再全片解码（转 latent 卡死的根因之一）。
+    音频仍整轨解码（AAC 解码快一个量级），由调用方按帧窗切片。
     """
     try:
         import av
@@ -168,13 +173,56 @@ def decode_av(path):
         import torch
     except Exception as e:
         raise RuntimeError("解码上传视频需要 PyAV（ComfyUI 新视频栈自带）；缺失请安装 av 后重试") from e
+    try:
+        s0 = max(0, int(start_f)) if start_f else 0
+    except (TypeError, ValueError):
+        s0 = 0
+    try:
+        s1 = int(end_f) if end_f and int(end_f) > 0 else None
+    except (TypeError, ValueError):
+        s1 = None
+    if s1 is not None and s1 <= s0:
+        raise RuntimeError(f"解码帧窗为空（[{s0}, {s1})）")
+    try:
+        rate = float(fps) if fps and float(fps) > 0 else 24.0
+    except (TypeError, ValueError):
+        rate = 24.0
     with av.open(path) as container:
         vstream = next((s for s in container.streams if s.type == "video"), None)
         if vstream is None:
             raise RuntimeError("上传的文件里没有视频轨")
-        frames = [f.to_ndarray(format="rgb24") for f in container.decode(vstream)]
+        # 窗起点较深时先 seek（微秒级时间戳，关键帧对齐），再用帧 pts 精确定位——
+        # seek 落点只保证"附近"，逐帧计数在 seek 后会整体错位，必须按 pts 换算帧号
+        sought = False
+        if s0 > 240:
+            try:
+                container.seek(int(s0 / rate * 1000000), stream=vstream)
+                sought = True
+            except Exception:
+                sought = False
+        try:
+            tb = float(vstream.time_base)
+        except Exception:
+            tb = 0.0
+        frames = []
+        idx = -1
+        for f in container.decode(vstream):
+            pts = getattr(f, "pts", None)
+            if pts is not None and tb > 0:
+                fno = int(round(pts * tb * rate))
+            elif sought:
+                fno = s0  # 无 pts 又 seek 过：无法定位，按窗内收（罕见，直接计入）
+            else:
+                idx += 1
+                fno = idx
+            if fno < s0:
+                continue
+            frames.append(f.to_ndarray(format="rgb24"))
+            if s1 is not None and fno + 1 >= s1:
+                break
         if not frames:
-            raise RuntimeError("上传的视频里没有可解码的帧")
+            raise RuntimeError("上传的视频里没有可解码的帧"
+                               + (f"（帧窗 [{s0}, {s1 if s1 is not None else '尾'}）超出片长？）" if s0 else ""))
         astream = next((s for s in container.streams if s.type == "audio"), None)
         chunks, sample_rate = [], None
         if astream is not None:
@@ -357,6 +405,53 @@ def probe_fps(path, default=24.0):
     except Exception:
         pass
     return float(default)
+
+
+def probe_media(path):
+    """媒体探针 -> {fps, frames, duration_s, width, height, has_audio}。
+
+    frames 为估算（时长×帧率取整；变帧率/元数据缺失时可能偏差，供裁剪窗参考，
+    精确值以解码为准）。失败抛 RuntimeError。
+    """
+    try:
+        import av
+    except Exception as e:
+        raise RuntimeError("探测需要 PyAV（ComfyUI 新视频栈自带）") from e
+    with av.open(path) as c:
+        vs = next((s for s in c.streams if s.type == "video"), None)
+        if vs is None:
+            raise RuntimeError("文件里没有视频轨")
+        fps = 24.0
+        try:
+            if getattr(vs, "average_rate", None):
+                fps = float(vs.average_rate)
+        except Exception:
+            pass
+        n = None
+        try:
+            if getattr(vs, "frames", 0):
+                n = int(vs.frames)
+        except Exception:
+            n = None
+        dur = None
+        try:
+            if getattr(vs, "duration", None) and getattr(vs, "time_base", None):
+                dur = float(vs.duration * vs.time_base)
+        except Exception:
+            dur = None
+        if n is None and dur:
+            n = max(0, int(round(dur * fps)))
+        if n is None:
+            n = 0
+        w = h = 0
+        try:
+            w, h = int(vs.codec_context.width or 0), int(vs.codec_context.height or 0)
+        except Exception:
+            pass
+        has_audio = any(s.type == "audio" for s in c.streams)
+    return {"fps": round(fps, 3), "frames": n,
+            "duration_s": round(n / fps, 3) if fps > 0 else 0.0,
+            "width": w, "height": h, "has_audio": bool(has_audio)}
 
 
 def trim_av_mp4(src_path, out_path, start_s, end_s, fps=24, crf=20,

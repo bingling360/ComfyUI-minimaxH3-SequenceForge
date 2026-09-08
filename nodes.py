@@ -375,13 +375,17 @@ def _seam_tail_kf(video_t, skip_frames):
 
 def _autosave_final(root, frames, wav, sample_rate, fps=24, crf=20, preset="veryfast",
                     aq_mode=None, dither=False):
-    """完整链（或审片已确认部分）PyAV 编码成片到项目文件夹，成功返回路径。
+    """完整链（或审片已确认部分）PyAV 编码成片到项目文件夹 finals/，成功返回路径。
 
     失败时返回 (None, error_msg) 供调用方写入报告；成功返回 (path, None)。
     """
     from . import media
     try:
-        path = os.path.join(root, f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+        from . import checkpoint as _ckpt
+    except ImportError:
+        import checkpoint as _ckpt
+    try:
+        path = os.path.join(_ckpt.finals_dir(root), f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
         print(f"[H3自动保存] 编码完整成片：{int(frames.shape[0])} 帧 → {path}（编码期间 CPU 升高属正常）")
         t0 = time.time()
         ok = media.save_av_mp4(path, frames, wav, sample_rate, fps,
@@ -429,11 +433,34 @@ def _autogrow_items(group, prefix):
     return {f"{prefix}{i}": v for i, v in enumerate(vals)}
 
 
-def _load_input_image(filename):
-    """从 ComfyUI input 目录加载图片为 IMAGE 张量（与 LoadImage 节点同格式：[1,H,W,C] float32 0-1）。"""
+def _resolve_media_path(filename):
+    """素材文件 -> 绝对路径：assets/... 走项目文件夹（入库拷贝），其余走 input 目录。
+
+    project_root_fn 为可选回调 () -> 项目根目录绝对路径（无项目时返回 None，
+    此时 assets/... 解析失败并报清晰错误）。
+    """
+    norm = str(filename or "").strip().replace("\\", "/")
+    parts = [p for p in norm.split("/") if p and p != "."]
+    if parts and parts[0] == "assets":
+        return ("project", "/".join(parts))
+    return ("input", norm)
+
+
+def _load_input_image(filename, _project_root=None):
+    """图片 -> IMAGE 张量（与 LoadImage 节点同格式：[1,H,W,C] float32 0-1）。
+
+    filename 为 assets/... 时从项目文件夹取（_project_root 必给），否则走 input 目录。
+    """
     from PIL import Image, ImageOps
     import numpy as np
-    image_path = folder_paths.get_annotated_filepath(str(filename))
+    scope, norm = _resolve_media_path(filename)
+    if scope == "project":
+        if not _project_root:
+            raise ValueError(f"素材「{filename}」在项目资产库内，但当前无法定位项目文件夹："
+                             "请开启自动保存/审片/自动存档之一，或在「存档目录」填写项目名")
+        image_path = os.path.join(_project_root, norm)
+    else:
+        image_path = folder_paths.get_annotated_filepath(norm)
     img = node_helpers.pillow(Image.open, image_path)
     img = node_helpers.pillow(ImageOps.exif_transpose, img)
     if img.mode != 'RGB':
@@ -441,13 +468,21 @@ def _load_input_image(filename):
     return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
 
 
-def _load_input_video(filename):
-    """input 目录视频 -> (帧张量, 音轨)：与 LoadVideo+GetVideoComponents 画布链同格式。
+def _load_input_video(filename, _project_root=None):
+    """视频 -> (帧张量, 音轨)：与 LoadVideo+GetVideoComponents 画布链同格式。
 
     音轨与帧同源自同一文件，即「参考视频音轨」自动配对，无需单独上传。
+    assets/... 走项目文件夹（需 _project_root），其余走 input 目录。
     """
     from comfy_api.latest import InputImpl
-    video_path = folder_paths.get_annotated_filepath(str(filename))
+    scope, norm = _resolve_media_path(filename)
+    if scope == "project":
+        if not _project_root:
+            raise ValueError(f"素材「{filename}」在项目资产库内，但当前无法定位项目文件夹："
+                             "请开启自动保存/审片/自动存档之一，或在「存档目录」填写项目名")
+        video_path = os.path.join(_project_root, norm)
+    else:
+        video_path = folder_paths.get_annotated_filepath(norm)
     comps = InputImpl.VideoFromFile(video_path).get_components()
     if comps.images is None or not getattr(comps.images, "shape", None):
         raise ValueError(f"参考视频「{filename}」解不出画面帧：请确认是可解码的 24fps 视频（2-15 秒）")
@@ -457,10 +492,17 @@ def _load_input_video(filename):
     return comps.images, comps.audio
 
 
-def _load_input_audio(filename):
-    """input 目录音频 -> AUDIO dict（与 LoadAudio 节点输出同格式）。"""
+def _load_input_audio(filename, _project_root=None):
+    """音频 -> AUDIO dict（与 LoadAudio 节点输出同格式）。assets/... 走项目文件夹。"""
     from comfy_extras.nodes_audio import load
-    audio_path = folder_paths.get_annotated_filepath(str(filename))
+    scope, norm = _resolve_media_path(filename)
+    if scope == "project":
+        if not _project_root:
+            raise ValueError(f"素材「{filename}」在项目资产库内，但当前无法定位项目文件夹："
+                             "请开启自动保存/审片/自动存档之一，或在「存档目录」填写项目名")
+        audio_path = os.path.join(_project_root, norm)
+    else:
+        audio_path = folder_paths.get_annotated_filepath(norm)
     waveform, sample_rate = load(audio_path)
     return {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
 
@@ -689,11 +731,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "→ 完全消失（自由生成）。数值=递减占总步数比例（0.3=前30%步数递减完毕）。"
                                        "开启后「锚定加噪」的值作为递减起点，终点为 0（锚定消失）"),
                 io.Combo.Input("生成模式", options=["文生视频", "首帧视频", "多参视频"], default="文生视频",
-                               tooltip="导演台一体化控制用：文生=纯文本（fl2va UNET，不接任何图片）；"
-                                       "首帧=首帧图片起手（fl2va UNET，仅接「首帧图片」）；"
-                                       "多参=参考图片（ref2va UNET，仅接「参考图片」组）。"
-                                       "UI 据此互斥首帧/参考图；后端校验模式与素材一致性，不匹配时报错。"
-                                       "实际 UNET 由「模型」输入决定，本控件只做模式声明与素材互斥。"),
+                               tooltip="已废弃占位（旧工作流兼容保留）：链路改由后端按实际引用自动推导——"
+                                       "有段引用素材即走 ref conditioning，首帧标注即首段起手，首帧可与引用共存。"
+                                       "实际 UNET 由「模型」输入决定；权重混用机械可跑，效果看权重本身。"),
                 # 注意：新控件一律加在「生成模式」之后（widgets_values 末尾），
                 # 旧工作流值不足时按默认值补齐，绝不插入中间破坏既有顺序（见 example_workflows）
                 io.Combo.Input("自动成片", options=["关闭", "开启"], default="开启", advanced=True,
@@ -709,7 +749,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "ref_assets 为标签素材池 [{file,label}]；segments 数组为每段提供 "
                                        "scene_prompt / character_prompt / soundscape（环境音）/"
                                        "music（配乐，均留空省略）/ seconds（本段秒数）/"
-                                       "refs（本段引用的素材标签，缺省=全部）/ frame_refs（段级首尾帧图引用："
+                                        "refs（本段引用的素材标签，缺省=只用提示词文本[[标签]]出现的）/ frame_refs（段级首尾帧图引用："
                                        "首帧图/尾帧图，缺省=首段参考首帧、末段参考尾帧；中段勾首帧图=头部身份锚，"
                                        "任意段勾尾帧图=该段尾锚），提示词用 [[标签]] 引用素材，"
                                        "后端按官方 h3-prompt-writing 三字段结构组装（含对白「」→<d> 自动转换）。"
@@ -777,7 +817,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽高比, 百万像素, 宽度, 高度, 每段时长, 引导帧数,
+    def _execute_inner(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽高比, 百万像素, 宽度, 高度, 每段时长, 引导帧数,
                 种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 尾帧图片=None, 每段尾帧锚定=None, 起始视频=None, 起始视频音轨=None,
                 提示词组=None,
                 参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
@@ -809,6 +849,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 实验性功能开关：从 ds.experiments 归一化；全关/FORCE_DISABLED => 空 context，
         # 后续所有实验分支以 exp.has(...) 包裹，关闭时逐字节走现状路径
         exp = experiments.resolve(ds if isinstance(ds, dict) else None)
+        # ---- 内联转码任务（资产库"转latent"）：ds.transcode_jobs 非空则只跑转码，
+        # 不跑链、不耗种子。任务由资产库面板写入 ds，前端提示用户按一次开始生成；
+        # 队列中断在任务间隙生效（见 run_transcode_job 的 _interrupted）。
+        # 完成后前端凭 manifest.latents 证据自动清理已完成任务。
+        _jobs = [j for j in (ds.get("transcode_jobs") or [])
+                 if isinstance(j, dict) and j.get("status", "queued") == "queued"]
+        if _jobs:
+            return cls._execute_transcode_only(
+                ds, _jobs, 视频VAE, 音频VAE, 存档目录)
         if ds.get("mode"):
             _m = str(ds["mode"])
             if _m not in ("文生视频", "首帧视频", "多参视频"):
@@ -823,8 +872,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if not seg_prompts:
             raise ValueError("提示词不能为空：请在导演台填写提示词，或在「提示词组」里每段添加一个输入框并填写内容")
 
-        # 素材池（标签->文件，分 图/视/音 三类）：ref_assets 为 v2 真源；旧 ref_images 视为图片
-        pool_files = []   # [(kind, label, file)]
+        # 素材池（标签->文件，分 图/视/音 三类）：ref_assets 为 v2 真源；旧 ref_images 视为图片。
+        # 资产库无模式门槛：总量不限；每条目可带 roles 标注（首帧图/尾帧图，见下校验）。
+        # 文件定位：assets/... 走项目文件夹（入库拷贝），其余走 ComfyUI input 目录（兼容旧链）。
+        _ASSET_ROLES = ("首帧图", "尾帧图")
+        pool_files = []   # [(kind, label, file, roles)]
         _kind_n = {"image": 0, "video": 0, "audio": 0}
         if isinstance(ds.get("ref_assets"), list) and ds["ref_assets"]:
             for item in ds["ref_assets"]:
@@ -838,20 +890,34 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 缺省标签只对未命名素材按类别计数（与前端 getDs 一致）
                     _kind_n[_k] += 1
                     label = f"{_KIND_NAME[_k]}{_kind_n[_k]}"
-                pool_files.append((_k, label[:24], str(item["file"])))
+                _roles = [str(r).strip() for r in (item.get("roles") or [])
+                          if str(r).strip() in _ASSET_ROLES] if isinstance(item.get("roles"), list) else []
+                pool_files.append((_k, label[:24], str(item["file"]), _roles))
         elif ds.get("ref_images") and isinstance(ds["ref_images"], list):
-            pool_files = [("image", f"图片{i + 1}", str(fn)) for i, fn in enumerate(ds["ref_images"]) if fn]
+            pool_files = [("image", f"图片{i + 1}", str(fn), []) for i, fn in enumerate(ds["ref_images"]) if fn]
         _seen = set()
-        for _i, (_k, _lbl, _fn) in enumerate(pool_files):
+        for _i, (_k, _lbl, _fn, _rl) in enumerate(pool_files):
             _base, _n = _lbl, 2
             while _lbl in _seen:
                 _lbl = f"{_base}{_n}"
                 _n += 1
             _seen.add(_lbl)
-            pool_files[_i] = (_k, _lbl, _fn)
-        pool_labels = [lbl for _, lbl, _ in pool_files]
-        pool_kind = {lbl: k for k, lbl, _ in pool_files}
-        pool_file_of = {lbl: fn for _, lbl, fn in pool_files}
+            pool_files[_i] = (_k, _lbl, _fn, _rl)
+        pool_labels = [lbl for _, lbl, _, _ in pool_files]
+        pool_kind = {lbl: k for k, lbl, _, _ in pool_files}
+        pool_file_of = {lbl: fn for _, lbl, fn, _ in pool_files}
+        pool_roles_of = {lbl: list(rl) for _, lbl, _, rl in pool_files}
+        # roles 校验：首帧图/尾帧图各只允许一张（多标即报错点名，不静默取首张）；
+        # 且只收图片素材（视频/音频不可做帧锚）。
+        for _role in _ASSET_ROLES:
+            _holders = [lbl for lbl in pool_labels if _role in pool_roles_of.get(lbl, [])]
+            if len(_holders) > 1:
+                raise ValueError(f"资产标注「{_role}」标了 {len(_holders)} 张（{ '、'.join(_holders) }）：请只保留一张")
+            for _h in _holders:
+                if pool_kind.get(_h) != "image":
+                    raise ValueError(f"资产标注「{_role}」落在非图片素材「{_h}」上：首尾帧标注只收图片")
+        chain_head_label = next((lbl for lbl in pool_labels if "首帧图" in pool_roles_of.get(lbl, [])), None)
+        chain_tail_label = next((lbl for lbl in pool_labels if "尾帧图" in pool_roles_of.get(lbl, [])), None)
 
         segments = ds.get("segments") if isinstance(ds.get("segments"), list) else []
 
@@ -890,19 +956,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
                             order.append((pool_kind[lbl], lbl))
                 else:
-                    # M2：refs 缺省 = 引用全部（兼容旧链），但总量超单段上限时不再硬套全部，
-                    # 而是要求该段显式勾选（否则全段都会超限报错，总量永远被卡在 9/3/3）
-                    _pool_count = {}
-                    for k, _, _ in pool_files:
-                        _pool_count[k] = _pool_count.get(k, 0) + 1
-                    _over = [(k, _pool_count.get(k, 0), REF_CAPS[k])
-                             for k in REF_CAPS if _pool_count.get(k, 0) > REF_CAPS[k]]
-                    if _over:
-                        _detail = "、".join(f"{_KIND_NAME[k]}{n}个（单段上限{cap}）" for k, n, cap in _over)
-                        raise ValueError(
-                            f"段{i + 1} 未勾选素材，但素材库共 {_detail}：请在该段卡片勾选本段要用的素材"
-                            f"（单段最多 9图3视3音），总量不限、单段限选")
-                    order = [(k, lbl) for k, lbl, _ in pool_files]
+                    # 缺省 = 只用提示词文本 [[标签]] 里出现的素材（按出现顺序）；
+                    # 没出现 = 本段无引用（纯文本段）。资产库总量不限，只卡单段上
+                    # 限——库再大也不会逼每段显式勾选。
+                    for tok in _LABEL_TOKEN.findall(full):
+                        lbl = tok.strip()
+                        if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
+                            order.append((pool_kind[lbl], lbl))
                 # 官方单段上限：图 9 / 视 3 / 音 3（超了报错并指出勾选明细）
                 for _k, _cap in REF_CAPS.items():
                     _picked = [lbl for k, lbl in order if k == _k]
@@ -928,20 +988,71 @@ class H3SeamlessChainSampler(io.ComfyNode):
             except (TypeError, ValueError):
                 seg_secs.append(None)
 
-        # 段级独立镜头（断链）：与上段毫无关联的镜头一键全断——不接上段桥、不裁头、
-        # 独立镜头（硬切转场）：不注入上段尾帧引导桥、不做桥帧门控/接缝测量/响度对齐
-        seg_unlink = []
+        # 段级双按钮（分段优先，null=跟随全局默认 true）：
+        # - 自动引用上段（auto_ref=false 即旧 unlink=true）：与上段毫无关联的镜头
+        #   一键全断——不接上段桥、不裁头、不做桥帧门控/接缝测量/响度对齐（硬切）。
+        # - 自动按序生成（auto_seq=false 即旧 disabled=true）：槽位稳定跳过——
+        #   不采样/不解码/不进成片，下段锚定跨接到最近已执行段尾帧。
+        # 旧键 unlink/disabled 仍兼容（projects._clean_seg_field 已回填新键）。
+        def _seg_auto(seg, new_key, old_key):
+            if isinstance(seg, dict) and seg.get(new_key) is not None:
+                return bool(seg.get(new_key))
+            if isinstance(seg, dict) and seg.get(old_key) is not None:
+                return not bool(seg.get(old_key))
+            return True
+        seg_auto_ref, seg_auto_seq = [], []
         for i in range(len(seg_prompts)):
             seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
-            seg_unlink.append(bool(seg.get("unlink")))
+            seg_auto_ref.append(_seg_auto(seg, "auto_ref", "unlink"))
+            seg_auto_seq.append(_seg_auto(seg, "auto_seq", "disabled"))
+        seg_unlink = [not v for v in seg_auto_ref]
+        seg_disabled = [not v for v in seg_auto_seq]
 
-        # 段级禁用（不上链）：槽位稳定方案——禁用段保留在执行序列与哈希序列中
-        # （禁用/启用不触发任何重做），仅执行时跳过：不采样/不解码/不进成片；
-        # 下段锚定跨接到最近一个已执行段的尾帧。插入段不可禁用（有专用移除操作）。
-        seg_disabled = []
+        # 段级 latent 引用（null=跟随全局）：默认尾部 ctx 帧钉下段首（视频+音频双流）。
+        # latent_ref {on, frames, video, audio}：on=false=本段不接桥（轻量断桥，
+        # 不触发裁头/精修豁免——与 auto_ref=false 的全断链区分）；frames>0 覆盖
+        # 全局引导帧数；video/audio 分开关控制 keyframe 双分支。
+        seg_latent_ref = []
         for i in range(len(seg_prompts)):
             seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
-            seg_disabled.append(bool(seg.get("disabled")))
+            lr = seg.get("latent_ref") if isinstance(seg.get("latent_ref"), dict) else {}
+            try:
+                _fr = int(lr.get("frames", 0) or 0)
+            except (TypeError, ValueError):
+                _fr = 0
+            seg_latent_ref.append({
+                "on": None if lr.get("on") is None else bool(lr.get("on")),
+                "frames": max(0, _fr),
+                "video": lr.get("video", True) is not False,
+                "audio": lr.get("audio", True) is not False,
+            })
+
+        # 段级 latent 保存（保存策略透存，分段优先）：mode all|range|tail|off +
+        # split_av（图像/音频分开存）+ save_seg（本段总开关）。主循环采样定稿后
+        # 自动切片落盘（见 _auto_latent_save），manual 切片走 /h3chain/latent_slice。
+        seg_latent_save = []
+        for i in range(len(seg_prompts)):
+            seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+            ls = seg.get("latent_save") if isinstance(seg.get("latent_save"), dict) else None
+            seg_latent_save.append(dict(ls) if ls else None)
+
+        # 段尾锚来源统一（替代旧全局「每段尾帧锚定」单图）：
+        # tail_src null=无尾锚 | {asset: <库标签>} 图片资产 | {latent: "latent/x.pt"} latent 文件。
+        # 旧 ds.last_frame 槽位仍兼容（见锚解析处回退）。改动进该段哈希。
+        seg_tail_src = []
+        for i in range(len(seg_prompts)):
+            seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+            ts = seg.get("tail_src")
+            ent = None
+            if isinstance(ts, dict):
+                if ts.get("asset"):
+                    ent = {"asset": str(ts["asset"]).strip()[:24]}
+                elif ts.get("latent"):
+                    f = str(ts["latent"]).strip().replace("\\", "/")
+                    parts = [p for p in f.split("/") if p and p != "."]
+                    if len(parts) == 2 and parts[0] == "latent" and parts[1].endswith(".pt"):
+                        ent = {"latent": "/".join(parts)}
+            seg_tail_src.append(ent)
 
         # 潜空间放大二采（导演台面板控制）：每段采样定稿后立即「神经放大 latent →
         # 低强度重采样 → 解码」，分段视频与成片直接保存二采结果（同名覆盖，不再
@@ -1006,70 +1117,80 @@ class H3SeamlessChainSampler(io.ComfyNode):
             尾帧图片 = _load_input_image(ds["end_frame"])
 
         # 每段尾帧锚定（身份锚点，任意模式可用）：导演台 JSON 优先，空则用画布连接
+        # （旧槽位，兼容保留；新链请用资产标注 + 段 tail_src，本槽缺省即跟随标注）
         if ds.get("last_frame"):
             每段尾帧锚定 = _load_input_image(ds["last_frame"])
+
+        # 资产标注来源：库内标「首帧图」/「尾帧图」的资产即链首/链尾锚来源
+        # （旧三槽位为空时生效；三槽位有值则旧槽位优先，保证旧链零变化）。
+        # 张量在 _ensure_pool_tensors 里随池子一起加载（可能需要项目目录），
+        # 此处只定布尔语义供下文排布。
+        _head_lib = chain_head_label if (首帧图片 is None and chain_head_label) else None
+        _tail_lib = chain_tail_label if (尾帧图片 is None and chain_tail_label) else None
+        has_first_eff = 首帧图片 is not None or _head_lib is not None
+        has_end_eff = 尾帧图片 is not None or _tail_lib is not None
 
         # 段级首尾帧图引用（类似多参段级素材勾选）：决定每段是否参考首帧/尾帧图片。
         # 缺省=旧行为（首段 i2v 参考首帧图、末段参考尾帧图终点锚）；显式勾选可为
         # 中段注入首帧图头部身份锚 / 任意段注入尾帧图尾部锚，也可关闭首末段默认参考
         seg_frame_refs, seg_fr_explicit = _parse_frame_refs(
-            segments, len(seg_prompts), 首帧图片 is not None, 尾帧图片 is not None)
+            segments, len(seg_prompts), has_first_eff, has_end_eff)
         seg_first_on = ["首帧图" in fr for fr in seg_frame_refs]
         seg_end_on = ["尾帧图" in fr for fr in seg_frame_refs]
 
-        # i2v 首段官方指令行（官方 I2VA 固定格式：声明首帧 = <Picture 1> 锚）；
-        # 已是官方格式的段不注入（用户自管的完整结构里可能自带指令行）
-        if 首帧图片 is not None and seg_first_on[0] and seg_prompts \
-                and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
-            seg_prompts[0] = ("For the target video, at 0.00 seconds into the target video, "
-                              "<Picture 1> (from [Shot 1]) is fully referenced.\n" + seg_prompts[0])
-
-        # 素材池张量（按类别）：JSON 池各类别独立加载；图片池空时回退画布 autogrow（全段共用）
-        # M2：总量不限（JSON 资产库可上百），单段 9/3/3 执行期按段卡；缺文件早爆并点名标签
+        # 素材池：决策期只算引用集合，張量加载推迟到项目目录确定后
+        # （_ensure_pool_tensors，见 root 确定后）。只加载各段实际引用的标签
+        # （每标签全链只解码一次）；库内未被引用的文件本次不碰（不校验存在性、
+        # 不占显存）。资产库总量不限，只卡官方单段上限（组装期已按段卡）。
+        # 缺文件/坏文件只对真正引用它的段早爆，并点名标签。
+        _needed = set()
+        for _order in seg_label_orders:
+            _needed.update(_order)
+        _needed_kinds = {k for k, _ in _needed}
+        _pool_skipped = len(pool_files) - len(_needed)
+        # 张量占位：画布回退分支直接填，其余由 _ensure_pool_tensors 填充
         pool_tensors = {"image": {}, "video": {}, "audio": {}}
-        for _k, _lbl, _fn in pool_files:
-            try:
-                if _k == "image":
-                    pool_tensors["image"][_lbl] = _load_input_image(_fn)
-                elif _k == "video":
-                    pool_tensors["video"][_lbl] = _load_input_video(_fn)   # (帧张量, 同源音轨)
-                else:
-                    pool_tensors["audio"][_lbl] = _load_input_audio(_fn)
-            except ValueError:
-                raise
-            except Exception as e:
-                raise ValueError(f"素材「{_lbl}」加载失败（文件 {_fn}）：{e}——请确认文件仍在 ComfyUI input 目录且可解码")
+        _pool_loaded = set()   # 已加载标签（_ensure_pool_tensors 幂等守卫）
         refs = {
             "ref_videos": _autogrow_items(参考视频组, "ref_video_"),
             "ref_video_audios": _autogrow_items(参考视频音轨组, "ref_video_audio_"),
             "ref_audios": _autogrow_items(参考音频组, "ref_audio_"),
         }
-        if not pool_tensors["image"]:
+        _pool_has_image = any(k == "image" for k, _, _, _ in pool_files)
+        _canvas_fallback = False
+        if not _pool_has_image:
             _canvas_imgs = _autogrow_items(参考图片组, "ref_image_")
-            pool_tensors["image"] = {f"图片{j + 1}": v for j, v in enumerate(_canvas_imgs.values())}
-            if pool_tensors["image"]:
+            if _canvas_imgs:
+                pool_tensors["image"] = {f"图片{j + 1}": v for j, v in enumerate(_canvas_imgs.values())}
                 pool_labels = list(pool_tensors["image"].keys())
                 seg_label_orders = [[("image", l) for l in pool_labels] for _ in seg_prompts]
-        # 状态池某类非空时该类覆盖画布接线（视频/音频与图片同规则），另一类画布接线仍生效
-        if pool_tensors["video"]:
+                _needed = set()
+                for _order in seg_label_orders:
+                    _needed.update(_order)
+                _needed_kinds = {k for k, _ in _needed}
+                _canvas_fallback = True
+        # i2v 首段官方指令行（官方 I2VA 固定格式：声明首帧 = <Picture 1> 锚）；
+        # 已是官方格式的段不注入（用户自管的完整结构里可能自带指令行）。
+        # 纯 i2v 起手（首段无素材引用，引用集合已最终确定）才写指令行；
+        # 首段同时有引用时走 r2v + 头锚 keyframe（_apply_guide 叠加），
+        # 此处不写指令行避免编号错位。
+        _seg0_has_refs = bool(seg_label_orders[0]) if seg_label_orders else False
+        if has_first_eff and seg_first_on[0] and not _seg0_has_refs and seg_prompts \
+                and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
+            seg_prompts[0] = ("For the target video, at 0.00 seconds into the target video, "
+                              "<Picture 1> (from [Shot 1]) is fully referenced.\n" + seg_prompts[0])
+        # 状态池某类被实际引用时该类覆盖画布接线（视频/音频与图片同规则），
+        # 未被引用的类别画布接线仍生效（库里躺着闲置素材不影响别的来源）
+        if "video" in _needed_kinds:
             refs["ref_videos"], refs["ref_video_audios"] = {}, {}
-        if pool_tensors["audio"]:
+        if "audio" in _needed_kinds:
             refs["ref_audios"] = {}
-        has_refs = any(pool_tensors.values()) or any(refs.values())
-        if 首帧图片 is not None and has_refs:
-            raise ValueError("首帧图片（i2v，fl2va UNET）与参考素材（r2v，ref2va UNET）不能同时使用")
-        if 起始视频 is not None and 首帧图片 is not None:
-            raise ValueError("起始视频（序章）与首帧图片（i2v）不能同时使用：两者都定义第 1 段的视觉起点")
-        # 生成模式一致性校验：导演台据此互斥首帧/参考图，后端复验，不匹配直接报错（避免跑废）
-        _mode = str(生成模式)
-        if _mode == "文生视频" and (首帧图片 is not None or has_refs):
-            raise ValueError("「文生视频」模式下不能接首帧图片或参考素材：请在导演台切到首帧/多参模式后再接图")
-        if _mode == "首帧视频" and has_refs:
-            raise ValueError("「首帧视频」模式下不能接参考素材（首帧与多参互斥）：请切到「多参视频」模式用参考图")
-        if _mode == "多参视频" and 首帧图片 is not None:
-            raise ValueError("「多参视频」模式下不能接首帧图片（多参与首帧互斥）：请切到「首帧视频」模式用首帧")
-        if 尾帧图片 is not None and _mode != "首帧视频":
-            raise ValueError("尾帧图片（FL2VA 官方首尾帧）只在「首帧视频」模式可用：请在导演台切到首帧模式")
+        has_refs = bool(_needed) or any(refs.values())
+        # 链路自动推导（无手动模式）：有有效引用即走 ref conditioning；首帧可与
+        # 引用共存（头锚 keyframe 叠加，不再互斥报错）。「生成模式」控件已废弃，
+        # 仅为旧工作流占位，后端不再读取。
+        if 起始视频 is not None and (首帧图片 is not None or chain_head_label is not None):
+            raise ValueError("起始视频（序章）与首帧图（i2v 起始）不能同时使用：两者都定义第 1 段的视觉起点")
 
         if str(宽高比) != "自定义":
             宽度, 高度 = _resolve_canvas(宽高比, 百万像素)
@@ -1080,23 +1201,101 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 时间点=末段时长；首尾都接时尾帧是 <Picture 2>，只接尾帧时为 <Picture 1>）；
         # 已是官方格式的段不注入。段级勾选关掉末段尾帧图时不注入；
         # 首段关掉首帧图时 <Picture> 编号前移
-        if 尾帧图片 is not None and seg_end_on[-1] and seg_prompts \
+        if has_end_eff and seg_end_on[-1] and seg_prompts \
                 and not _OFFICIAL_FIELD_RE.search(seg_prompts[-1]):
-            _pic = 2 if (首帧图片 is not None and seg_first_on[0]) else 1
+            _pic = 2 if (has_first_eff and seg_first_on[0]) else 1
             _end_s = seg_lengths[-1] / 24.0
             seg_prompts[-1] = (f"For the target video, at {_end_s:.2f} seconds into the target video, "
                                f"<Picture {_pic}> (from [Shot 1]) is fully referenced.\n" + seg_prompts[-1])
         ctx = int(引导帧数)
         gate_limit = max(0, int(回退上限) // 17 * 17)
+        full_bridge0 = full_bridge_supported()
+        # 段级注入解析（分段优先，null/0=跟随全局 ctx）：返回 (帧数, 含视频, 含音频)。
+        # snap 到 token 网格可达帧（grid.snap_frames_to_tokens 下取整，不超源）。
+        def _eff_inject(pi):
+            if 0 <= pi < len(seg_latent_ref):
+                lr = seg_latent_ref[pi]
+                if lr.get("on") is False:
+                    return 0, False, False
+                fr = int(lr.get("frames") or 0)
+                base = fr if fr > 0 else ctx
+                try:
+                    from .grid import snap_frames_to_tokens as _snap
+                except ImportError:
+                    from grid import snap_frames_to_tokens as _snap
+                return max(0, _snap(base, up=False)), bool(lr.get("video", True)), \
+                    bool(lr.get("audio", True))
+            return ctx, True, True
+        def _inject_guide(video_t, audio_t, for_pi, end_tokens=None):
+            fr, want_v, want_a = _eff_inject(for_pi)
+            if fr <= 0 or not want_v:
+                return None
+            # latent 库外源：seg_latent_ref[for_pi].src={file:"latent/x.pt"} 时
+            # 用库文件尾部做桥（替代上段尾）；加载/形状失败回落上段尾并注记
+            lr0 = seg_latent_ref[for_pi] if 0 <= for_pi < len(seg_latent_ref) else {}
+            src0 = lr0.get("src") if isinstance(lr0, dict) else None
+            if isinstance(src0, dict) and src0.get("file"):
+                ext = _load_library_latent(src0.get("file"), video_t)
+                if ext is not None:
+                    ev, ea = ext
+                    return _tail_keyframe(
+                        ev, ea, fr,
+                        bool(want_a) and ea is not None
+                        and KEYFRAME_AUDIO_SUPPORTED and full_bridge0,
+                        end_tokens=None, full_bridge=full_bridge0)
+            return _tail_keyframe(
+                video_t, audio_t, fr,
+                bool(want_a) and KEYFRAME_AUDIO_SUPPORTED and full_bridge0,
+                end_tokens=end_tokens, full_bridge=full_bridge0)
         from . import qc  # 桥帧打分 + 接缝测量共用（延迟导入：无 ComfyUI 环境下结构单测不触达）
         clip, video_vae, audio_vae = 文本编码器, 视频VAE, 音频VAE
+
+        def _load_library_latent(file, ref_video_t=None):
+            """latent 库文件 -> (video_dev, audio_dev|None)；失败回 None（调用方回落上段尾）。
+
+            只认 latent/*.pt（防穿越）；ref_video_t 给出时校验形状（C/H/W）须与
+            当前链一致，否则回落并写报告（PackedLayout 按行预留，形状不对会整链崩）；
+            ref 为 None（段尾锚等形状自洽场景）时跳过形状校验。
+            """
+            try:
+                f = str(file or "").strip().replace("\\", "/")
+                parts = [p for p in f.split("/") if p and p != "."]
+                if len(parts) != 2 or parts[0] != "latent":
+                    report.append(f"latent 外源跳过：非法路径 {f!r}（须为 latent/<名>.pt），回落上段尾桥")
+                    return None
+                cand = os.path.join(root, "latent", parts[1]) if root else None
+                if cand is None or not os.path.isfile(cand):
+                    report.append(f"latent 外源跳过：文件缺失 {f}，回落上段尾桥")
+                    return None
+                with open(cand, "rb") as fh:
+                    payload = torch.load(fh, map_location="cpu", weights_only=True)
+                ev = payload.get("video")
+                if ev is None or getattr(ev, "dim", lambda: 0)() != 5:
+                    report.append(f"latent 外源跳过：{f} 无视频分支，回落上段尾桥")
+                    return None
+                if ref_video_t is not None and (
+                        tuple(ev.shape[0:2]) != tuple(ref_video_t.shape[0:2]) or
+                        tuple(ev.shape[-2:]) != tuple(ref_video_t.shape[-2:])):
+                    report.append(f"latent 外源跳过：{f} 形状 {tuple(ev.shape)} 与本链 {tuple(ref_video_t.shape)} 不一致"
+                                  "（C/H/W 须一致），回落上段尾桥")
+                    return None
+                ea = payload.get("audio")
+                if ea is not None and getattr(ea, "dim", lambda: 0)() != 4:
+                    ea = None
+                return ev.to(video_vae.device), (ea.to(audio_vae.device) if ea is not None else None)
+            except Exception as e:
+                report.append(f"latent 外源跳过：{file} 加载失败（{type(e).__name__}），回落上段尾桥")
+                return None
+        # 链路自动推导（无手动模式）：有有效引用即走 ref conditioning；
+        # 首帧可与引用共存（头锚 keyframe 叠加）。均匀链的推导值与旧版逐字一致，
+        # 旧存档续跑指纹不受影响。
         if has_refs:
             chain = "r2v（ref2va UNET）"
-        elif 首帧图片 is not None and 尾帧图片 is not None:
+        elif has_first_eff and has_end_eff:
             chain = "FL2VA 首尾帧（首帧开场 → 尾帧终点，fl2va UNET）"
-        elif 尾帧图片 is not None:
+        elif has_end_eff:
             chain = "L2VA 尾帧终点（fl2va UNET）"
-        elif 首帧图片 is not None:
+        elif has_first_eff:
             chain = "i2v 首段 + t2v 续段（fl2va UNET）"
         else:
             chain = "t2v（fl2va UNET）"
@@ -1108,7 +1307,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         clip = CachedClipProxy(clip)
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
-        report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}，模式 {_mode}，上下文 {ctx} 帧"]
+        _mode = str(生成模式)   # 旧控件占位：后端不再读取，仅报告回显
+        report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}（按实际引用自动推导），上下文 {ctx} 帧"]
         if experiments.FORCE_DISABLED:
             report.append("实验性功能：后端已强制关闭（H3_EXPERIMENTS=0）")
         elif exp.enabled:
@@ -1128,12 +1328,36 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _unlink_pos = [str(item_i + 1) for item_i, it in enumerate(exec_items)
                        if it[0] == "prompt" and seg_unlink[it[1]]]
         if _unlink_pos:
-            report.append(f"独立镜头：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
+            report.append(f"关闭自动引用上段：{len(_unlink_pos)} 段与上段断链（无桥接/硬切，段 {'、'.join(_unlink_pos)}）")
         _off_pos = [str(item_i + 1) for item_i, it in enumerate(exec_items)
                     if it[0] == "prompt" and seg_disabled[it[1]]]
         if _off_pos:
-            report.append(f"段禁用：{len(_off_pos)} 段不上链（跳过执行不进成片，段 {'、'.join(_off_pos)}；"
-                          "已禁用段与启用段可混排，随时恢复零成本）")
+            report.append(f"关闭自动按序生成：{len(_off_pos)} 段跳过执行不进成片（段 {'、'.join(_off_pos)}；"
+                          "随时恢复零成本）")
+        _lr_off = [str(it[1] + 1) for it in exec_items if it[0] == "prompt"
+                   and 0 <= it[1] < len(seg_latent_ref)
+                   and seg_latent_ref[it[1]].get("on") is False]
+        if _lr_off:
+            report.append(f"本段关闭 latent 注入：{len(_lr_off)} 段不接上段桥（段 {'、'.join(_lr_off)}）")
+        _lr_custom = []
+        for it in exec_items:
+            if it[0] != "prompt" or not 0 <= it[1] < len(seg_latent_ref):
+                continue
+            _lrc = seg_latent_ref[it[1]]
+            _bits = []
+            if (_lrc.get("frames") or 0) > 0:
+                _bits.append(f"{_eff_inject(it[1])[0]}帧")
+            _src = _lrc.get("src") if isinstance(_lrc.get("src"), dict) else {}
+            if _src.get("file"):
+                _bits.append(f"源={_src.get('file')}")
+            if _lrc.get("video") is False:
+                _bits.append("无图像")
+            if _lrc.get("audio") is False:
+                _bits.append("无音频")
+            if _bits:
+                _lr_custom.append(f"段{it[1] + 1}({ '、'.join(_bits) })")
+        if _lr_custom:
+            report.append("分段注入覆盖：" + "、".join(_lr_custom) + f"（默认上段尾 {ctx} 帧）")
         if up_cfg:
             _tb = float(up_cfg.get("time_bias") or 0.0)
             _mix = float(up_cfg.get("mix") or 0.0)
@@ -1186,17 +1410,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _k_short = {"image": "图", "video": "视", "audio": "音"}
             _parts = []
             if pool_files:
-                _stat = "、".join(f"{_k_short[k]}×{sum(1 for kk, _, _ in pool_files if kk == k)}"
+                _stat = "、".join(f"{_k_short[k]}×{sum(1 for kk, _, _, _ in pool_files if kk == k)}"
                                   for k in ("image", "video", "audio")
-                                  if any(kk == k for kk, _, _ in pool_files))
+                                  if any(kk == k for kk, _, _, _ in pool_files))
                 _names = "、".join(f"{_k_short[k]}·{lbl}（{pool_file_of.get(lbl, '画布')}）"
-                                   for k, lbl, _f in pool_files)
+                                   for k, lbl, _f, _r in pool_files)
                 _parts.append(f"池 {_stat}（{_names}）")
             counts = " ".join(f"{k}={len(v)}" for k, v in refs.items() if v)
             if counts:
                 _parts.append(f"画布接线 {counts}")
             if seg_custom_refs:
                 _parts.append(f"段级子集 {seg_custom_refs}/{len(seg_prompts)} 段自定义")
+            if _pool_skipped > 0:
+                _parts.append(f"库内 {_pool_skipped} 个未引用素材本次未加载（总量不限、按段按需）")
             report.append("参考素材：" + " | ".join(_parts))
         if not KEYFRAME_AUDIO_SUPPORTED:
             report.append("注意：当前 ComfyUI 不含 PR #15439（Add Guide 协议），段间引导降级为仅视频锚定，音频不锚定"
@@ -1218,38 +1444,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"递减锚定：前 {fade_ratio*100:.0f}% 步数内锚定 {aug_start:.2f} → 0 递减消失"
                           + (f"（起点=锚定加噪 {aug:.2f}）" if aug > 0 else "（硬锚定起点）"))
 
+        # 身份锚张量占位：真实编码在 root 确定后（见 pbar 前「资产加载与锚解析」）。
+        # 旧三槽位（首帧/尾帧/每段尾帧图）与资产标注在此汇合：旧槽位优先，空则用标注。
         tail_anchor_latent = None
-        if 每段尾帧锚定 is not None:
-            tail_anchor_latent = video_vae.encode(_center_cover(每段尾帧锚定[:1], width, height))
-            report.append(f"每段尾帧锚定：身份锚点注入末帧 keyframe（{'视觉保真 ' + format(1.0 - aug, '.2f') if aug > 0 else '硬锚定'}）")
-
-        # 尾帧图片（FL2VA 剧情终点）：编码后注入勾选了尾帧图的段末帧 keyframe；
-        # 勾了尾帧图的段不再叠加每段尾帧锚定（同一位置只有一个锚，剧情终点优先）
         end_frame_latent = None
-        if 尾帧图片 is not None:
-            end_frame_latent = video_vae.encode(_center_cover(尾帧图片[:1], width, height))
-            _end_segs = [str(i + 1) for i in range(len(seg_prompts)) if seg_end_on[i]]
-            report.append(f"尾帧图片：FL2VA 剧情终点 → 段{'、'.join(_end_segs)} 末帧 keyframe"
-                          + ("（这些段不叠加每段尾帧锚定）" if tail_anchor_latent is not None else ""))
-
-        # 首帧图片（中段段级引用）：任一中段勾了首帧图时编码为头锚 latent——
-        # 注入段头 keyframe 作为身份锚（同 E2 记忆锚段首注入模式），抑制长链漂移
         head_frame_latent = None
-        if 首帧图片 is not None and any(seg_first_on[i] and i > 0
-                                         for i in range(len(seg_prompts))):
-            head_frame_latent = video_vae.encode(_center_cover(首帧图片[:1], width, height))
-
-        if any(seg_fr_explicit):
-            _fr_txt = []
-            if 首帧图片 is not None and any(seg_first_on):
-                _fr_txt.append("首帧图→段" + "、".join(
-                    str(i + 1) for i in range(len(seg_prompts)) if seg_first_on[i])
-                    + "（首段=i2v 起手，中段=头部身份锚）")
-            if 尾帧图片 is not None and any(seg_end_on):
-                _fr_txt.append("尾帧图→段" + "、".join(
-                    str(i + 1) for i in range(len(seg_prompts)) if seg_end_on[i]))
-            report.append("首尾帧图段级引用：" + " · ".join(_fr_txt)
-                          + "；未勾段尾部锚回落到每段尾帧锚定")
 
         # 存档指纹只覆盖共享参数（不含提示词、不含种子）：改某段提示词仍指向同一条链，
         # 重跑起点由逐段提示词哈希比对定位；种子控件开着 control_after_generate 每次运行
@@ -1305,10 +1504,40 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 tag = f"{','.join(lbl for _k, lbl in seg_label_orders[i])}|{tag}"
             if seg_unlink[i]:
                 tag = f"unlink|{tag}"
+            # 注意：seg_disabled（自动按序生成=false）故意不进哈希——跳过/恢复
+            # 零重做成本（旧语义保留）；只有引用/保存策略变更才触发级联重做。
+            # 段级 latent 引用/保存：显式非默认才进哈希（默认=跟随全局，旧存档零影响）
+            _lr = seg_latent_ref[i] if 0 <= i < len(seg_latent_ref) else {}
+            _lr_src = _lr.get("src") if isinstance(_lr.get("src"), dict) else {}
+            _lr_src_f = str(_lr_src.get("file") or "")[:64]
+            if _lr.get("on") is False:
+                tag = f"lr-off|{tag}"
+            elif (_lr.get("frames") or 0) > 0 or _lr.get("video") is False \
+                    or _lr.get("audio") is False or _lr_src_f:
+                tag = (f"lr:{_lr.get('frames') or 0}:"
+                       f"{int(bool(_lr.get('video', True)))}"
+                       f"{int(bool(_lr.get('audio', True)))}"
+                       f":{_lr_src_f}|{tag}")
+            _ls = seg_latent_save[i] if 0 <= i < len(seg_latent_save) else None
+            if isinstance(_ls, dict) and (_ls.get("mode") not in (None, "all")
+                                         or (_ls.get("tail_f") or 0) > 0
+                                         or (_ls.get("start_f") or 0) > 0
+                                         or (_ls.get("end_f") or 0) > 0
+                                         or _ls.get("split_av") is True):
+                tag = (f"ls:{_ls.get('mode')}:{_ls.get('start_f')}-{_ls.get('end_f')}"
+                       f":{_ls.get('tail_f')}:{'s' if _ls.get('split_av') else 'a'}|{tag}")
+            # 段尾锚：显式 tail_src 进哈希（旧存档无该键零影响）
+            _ts = seg_tail_src[i] if 0 <= i < len(seg_tail_src) else None
+            if isinstance(_ts, dict):
+                if _ts.get("asset"):
+                    tag = f"tail:a:{_ts['asset']}|{tag}"
+                elif _ts.get("latent"):
+                    tag = f"tail:l:{_ts['latent']}|{tag}"
             # 段级首尾帧图引用：显式设置且与默认值不同才进哈希（显式但等于默认=行为
-            # 不变不重做；未设置段哈希不变，旧存档续跑零影响）
+            # 不变不重做；未设置段哈希不变，旧存档续跑零影响）。默认值按有效
+            # 首尾来源判定（含资产标注）。
             if seg_fr_explicit[i] and seg_frame_refs[i] != _default_frame_refs(
-                    i, len(seg_prompts), 首帧图片 is not None, 尾帧图片 is not None):
+                    i, len(seg_prompts), has_first_eff, has_end_eff):
                 tag = f"fr:{','.join(seg_frame_refs[i])}|{tag}"
             seg_hashes.append(checkpoint.prompt_hash(tag))
 
@@ -1422,6 +1651,121 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"审片：分段视频每段落盘 → output/h3_projects/{os.path.basename(root) or '…'}/seg_XXX.mp4，"
                           "成片为运行结束时的已确认部分")
 
+        # ---- 资产加载与锚解析（root 已确定）：引用集张量 + 标注锚 + 身份锚编码 ----
+        def _project_root_for_assets():
+            custom = 存档目录.strip()
+            if custom:
+                return os.path.join(checkpoint.projects_root(), custom)
+            if use_ckpt and root is not None:
+                return root
+            return None
+
+        def _ensure_pool_tensors():
+            """加载引用集张量（幂等：已加载标签跳过）。assets/ 文件需项目目录。"""
+            _proot = _project_root_for_assets()
+            for _k, _lbl in sorted(_needed):
+                if _lbl in _pool_loaded or _lbl in pool_tensors.get(_k, {}):
+                    _pool_loaded.add(_lbl)
+                    continue
+                _fn = pool_file_of.get(_lbl)
+                if _fn is None:
+                    continue   # 防御：组装期未知标签已报错，到这里不可能缺失
+                try:
+                    if _k == "image":
+                        pool_tensors["image"][_lbl] = _load_input_image(_fn, _proot)
+                    elif _k == "video":
+                        pool_tensors["video"][_lbl] = _load_input_video(_fn, _proot)
+                    else:
+                        pool_tensors["audio"][_lbl] = _load_input_audio(_fn, _proot)
+                except ValueError:
+                    raise
+                except Exception as e:
+                    raise ValueError(f"素材「{_lbl}」加载失败（文件 {_fn}）：{e}——请确认文件可解码"
+                                     + ("（项目资产库文件请确认项目名正确）" if str(_fn).startswith("assets/") else
+                                        "（input 目录文件请确认仍在原位）"))
+                _pool_loaded.add(_lbl)
+
+        def _load_anchor_image_file(fn):
+            return _load_input_image(fn, _project_root_for_assets())
+
+        _ensure_pool_tensors()
+        # 标注锚汇入旧槽位（旧槽位有值则优先，保证旧链零变化）
+        if 首帧图片 is None and _head_lib is not None:
+            首帧图片 = _load_anchor_image_file(pool_file_of[_head_lib])
+            report.append(f"资产标注「首帧图」→「{pool_file_of[_head_lib]}」（链首锚来源）")
+        if 尾帧图片 is None and _tail_lib is not None:
+            尾帧图片 = _load_anchor_image_file(pool_file_of[_tail_lib])
+            report.append(f"资产标注「尾帧图」→「{pool_file_of[_tail_lib]}」（链尾锚来源）")
+
+        if 每段尾帧锚定 is not None:
+            tail_anchor_latent = video_vae.encode(_center_cover(每段尾帧锚定[:1], width, height))
+            report.append(f"每段尾帧锚定：身份锚点注入末帧 keyframe（{'视觉保真 ' + format(1.0 - aug, '.2f') if aug > 0 else '硬锚定'}）")
+
+        # 尾帧图片（FL2VA 剧情终点）：编码后注入勾选了尾帧图的段末帧 keyframe；
+        # 勾了尾帧图的段不再叠加尾锚（同一位置只有一个锚，剧情终点优先）
+        if 尾帧图片 is not None:
+            end_frame_latent = video_vae.encode(_center_cover(尾帧图片[:1], width, height))
+            _end_segs = [str(i + 1) for i in range(len(seg_prompts)) if seg_end_on[i]]
+            report.append(f"尾帧图片：FL2VA 剧情终点 → 段{'、'.join(_end_segs)} 末帧 keyframe"
+                          + ("（这些段不叠加段尾锚）" if tail_anchor_latent is not None else ""))
+
+        # 首帧图片（中段段级引用）：任一中段勾了首帧图时编码为头锚 latent——
+        # 注入段头 keyframe 作为身份锚（同 E2 记忆锚段首注入模式），抑制长链漂移
+        if 首帧图片 is not None and any(seg_first_on[i] and i > 0
+                                        for i in range(len(seg_prompts))):
+            head_frame_latent = video_vae.encode(_center_cover(首帧图片[:1], width, height))
+
+        if any(seg_fr_explicit):
+            _fr_txt = []
+            if has_first_eff and any(seg_first_on):
+                _fr_txt.append("首帧图→段" + "、".join(
+                    str(i + 1) for i in range(len(seg_prompts)) if seg_first_on[i])
+                    + "（首段=i2v 起手，中段=头部身份锚）")
+            if has_end_eff and any(seg_end_on):
+                _fr_txt.append("尾帧图→段" + "、".join(
+                    str(i + 1) for i in range(len(seg_prompts)) if seg_end_on[i]))
+            report.append("首尾帧图段级引用：" + " · ".join(_fr_txt)
+                          + "；未勾段尾部锚回落段 tail_src/旧尾帧锚定")
+
+        # 段尾锚缓存：tail_src（资产图/latent 文件）按需编码/加载，各源只做一次
+        _tail_src_cache = {}
+
+        def _seg_tail_anchor(pi):
+            """段 pi 的尾锚 latent：tail_src 资产图/latent 优先，否则回退旧全局尾锚。
+
+            返回 latent 张量（device 上）或 None。失败抛 ValueError 点名段号。
+            """
+            ts = seg_tail_src[pi] if 0 <= pi < len(seg_tail_src) else None
+            if ts is None:
+                return tail_anchor_latent
+            if pi in _tail_src_cache:
+                return _tail_src_cache[pi]
+            out = None
+            if "asset" in ts:
+                lbl = ts["asset"]
+                if lbl not in pool_labels:
+                    raise ValueError(f"段{pi + 1} 尾锚引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
+                if pool_kind.get(lbl) != "image":
+                    raise ValueError(f"段{pi + 1} 尾锚「{lbl}」不是图片素材（尾锚只收图片/图像 latent）")
+                _ensure_pool_tensors()
+                img = pool_tensors["image"].get(lbl)
+                if img is None:
+                    # 未在引用集里（纯尾锚未出现在提示词/勾选）：现加载
+                    _fn = pool_file_of.get(lbl)
+                    if _fn is None:
+                        raise ValueError(f"段{pi + 1} 尾锚「{lbl}」找不到对应文件（画布回退标签不可做尾锚，请用资产库图片）")
+                    img = _load_input_image(_fn, _project_root_for_assets())
+                    pool_tensors["image"][lbl] = img
+                out = video_vae.encode(_center_cover(img[:1], width, height))
+            else:
+                lat = _load_library_latent(ts["latent"], None)
+                if lat is None:
+                    raise ValueError(f"段{pi + 1} 尾锚 latent 文件不可用（详见上方跳过注记）")
+                ev, _ea = lat
+                out = ev
+            _tail_src_cache[pi] = out
+            return out
+
         pbar = comfy.utils.ProgressBar(len(exec_items))
         total = len(exec_items) + off
         prompt_list = (["「序章（上传视频）」"] if off else []) + [
@@ -1456,6 +1800,92 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         prev_end_t = None   # 上一处理生成段的输出末端 token 边界（重摇 unlink 段上锚对齐用；序章/插入段重置 None）
 
+        # 三库携带：主循环的 manifest 全量覆写必须带上三库/文本键，否则一次运行
+        # 就把资产库/latent库/剪辑登记冲掉（旧 bug）。auto_latents 为本轮内存表。
+        _CARRY_KEYS = ("assets", "latents", "clips", "merges", "seg_fields")
+        _carry = {k: list((manifest.get(k) or []))
+                  for k in _CARRY_KEYS} if isinstance(manifest, dict) else \
+            {k: [] for k in _CARRY_KEYS}
+        auto_latents = list(_carry.get("latents") or [])
+
+        def _auto_latent_save(g, pi, video_t, audio_t):
+            """分段 latent 自动保存（内存切片直存，无需回读 seg .pt）。
+
+            策略 seg_latent_save[pi]：None=默认全存（mode=all）；mode=off 或
+            save_seg=false=跳过；range=[start_f,end_f) 钳到本段可见窗；
+            tail=可见窗尾部 tail_f 帧；split_av=true 落 _v/_a 两份。
+            幂等覆盖同名文件；登记进 auto_latents（主循环 manifest 写盘时带回）。
+            """
+            if not use_ckpt or root is None:
+                return
+            ls = seg_latent_save[pi] if 0 <= pi < len(seg_latent_save) else None
+            mode = str((ls or {}).get("mode") or "all")
+            if (ls or {}).get("save_seg") is False or mode == "off":
+                return
+            try:
+                import torch as _t
+            except Exception:
+                return
+            try:
+                total_t = int(video_t.shape[2])
+                sampled_fc = latent_t_to_frames(total_t)
+                # 本段可见窗（采样坐标系）：skip 与 vis 由调用方传入——此处重算
+                # 简化为全采样窗（调用方在裁剪后传 vis 起点？保持简单：全窗）。
+                # 精确窗由调用方参数给出，见下方调用点注释。
+                w0, w1 = 0, sampled_fc
+                if mode == "tail":
+                    try:
+                        tf = max(0, int((ls or {}).get("tail_f") or 0))
+                    except (TypeError, ValueError):
+                        tf = 0
+                    if tf > 0:
+                        w0 = max(0, w1 - tf)
+                elif mode == "range":
+                    try:
+                        rs = max(0, int((ls or {}).get("start_f") or 0))
+                        re = max(0, int((ls or {}).get("end_f") or 0))
+                    except (TypeError, ValueError):
+                        rs, re = 0, 0
+                    if re > rs:
+                        w0, w1 = max(0, rs), min(sampled_fc, re)
+                        if w1 <= w0:
+                            return
+                t0 = max(0, frames_to_latent_t(w0, up=False))
+                t1 = min(total_t, frames_to_latent_t(w1, up=True))
+                if t1 <= t0:
+                    t0 = max(0, min(total_t - 1, frames_to_latent_t(w0, up=True) - 1))
+                    t1 = min(total_t, t0 + 1)
+                cut_v = video_t[:, :, t0:t1].detach().cpu().contiguous().clone()
+                cut_a = None
+                if audio_t is not None and getattr(audio_t, "dim", lambda: 0)() == 4:
+                    a_total = int(audio_t.shape[-1])
+                    a0 = max(0, int(round(w0 / max(1, sampled_fc) * a_total)))
+                    a1 = max(a0 + 1, min(a_total, int(round(w1 / max(1, sampled_fc) * a_total))))
+                    cut_a = audio_t[..., a0:a1].detach().cpu().contiguous().clone()
+                split = bool((ls or {}).get("split_av"))
+                ldir = os.path.join(root, "latent")
+                os.makedirs(ldir, exist_ok=True)
+                stamps = []
+                if split and cut_a is not None:
+                    stamps = [(f"seg{g:03d}_auto_v.pt", {"video": cut_v}, "video"),
+                              (f"seg{g:03d}_auto_a.pt", {"audio": cut_a}, "audio")]
+                else:
+                    pay = {"video": cut_v}
+                    if cut_a is not None:
+                        pay["audio"] = cut_a
+                    stamps = [(f"seg{g:03d}_auto.pt", pay, "av")]
+                for fn, pay, kd in stamps:
+                    _t.save(pay, os.path.join(ldir, fn))
+                    auto_latents[:] = [x for x in auto_latents
+                                       if not (isinstance(x, dict)
+                                               and x.get("file") == f"latent/{fn}")]
+                    auto_latents.append({"file": f"latent/{fn}", "src": f"seg_{g:03d}.pt",
+                                         "start_f": w0, "end_f": w1, "kind": kd,
+                                         "tokens": [t0, t1], "auto": True,
+                                         "updated_at": time.time()})
+            except Exception as e:
+                report.append(f"段{g + 1} latent 自动保存跳过（{type(e).__name__}: {e}）")
+
         def _redo_prev_bridge(g):
             """重摇独立镜头段的上锚现算：前段（g-1）存档 latent 尾部切桥。
 
@@ -1473,9 +1903,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 pv, pa = checkpoint.load_segment(root, prev_g)
             except Exception:
                 return None
-            return _tail_keyframe(pv.to(video_vae.device), pa.to(audio_vae.device),
-                                  ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
-                                  end_tokens=prev_end_t, full_bridge=full_bridge)
+            # 重摇段本体的注入帧数（分段优先）：for_pi=g 对应的提示词段
+            _fpi = exec_items[g - off][1] if 0 <= g - off < len(exec_items) \
+                and exec_items[g - off][0] == "prompt" else -1
+            return _inject_guide(pv.to(video_vae.device), pa.to(audio_vae.device),
+                                 _fpi, end_tokens=prev_end_t)
 
         def _redo_next_anchor(g):
             """重摇段的下锚现算：下一段保留段存档 latent 裁头后首 token。
@@ -1494,7 +1926,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 nv, _na = checkpoint.load_segment(root, nxt_g)
             except Exception:
                 return None
-            skip2 = 0 if _is_fact_first(ni) else ctx
+            _nfr, _, _ = _eff_inject(idx)
+            skip2 = 0 if _is_fact_first(ni) else _nfr
             kf = _seam_tail_kf(nv, skip2)
             return kf.to(video_vae.device) if kf is not None else None
 
@@ -1591,7 +2024,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
                         "seam_metrics": [None], "seam_refine": seam_refine, "experiments": exp.describe(),
                         "inserts": list(proj_inserts), "upscale": proj_upscale,
-                        "redo_queue": list(redo_queue)})
+                        "redo_queue": list(redo_queue),
+                        "assets": list(_carry.get("assets") or []),
+                        "latents": list(auto_latents),
+                        "clips": list(_carry.get("clips") or []),
+                        "merges": list(_carry.get("merges") or []),
+                        "seg_fields": list(_carry.get("seg_fields") or [])})
                 report.append(f"序章：上传视频编码为段 1/{total}（{fc} 帧"
                               + ("，超长仅取前段" if raw_fc > fc else "")
                               + "，经一次 VAE 重编码，按 24fps 处理"
@@ -1625,8 +2063,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             prev_tail_clip = pframes[-24:].cpu()
             seam_n0 = max(1, int(sample_rate * 0.25))
             prev_tail_wav = pwav.cpu()[..., -seam_n0:]
-            guide = _tail_keyframe(pv, pa, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
-                                   full_bridge=full_bridge)
+            _profpi = exec_items[0][1] if exec_items and exec_items[0][0] == "prompt" else -1
+            guide = _inject_guide(pv, pa, _profpi)
             report.append(f"段1/{total}：{prologue_origin} 序章 留{pframes.shape[0]}帧 · 种子 — | guide=无（序章）")
 
         # 每段耗时账（⏱ 报告行数据源）：cond=一采条件构建（TE/参考编码）、
@@ -1695,9 +2133,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         def _next_wants_bridge(item_i):
             """混排序列中 item_i 的下一段是否接收本段尾帧桥：下段不存在/是插入段/
-            是独立镜头提示词段 → False（插入段不吃 guide，独立镜头不要桥）"""
+            关闭自动引用上段/关闭 latent 注入 → False（插入段不吃 guide，
+            独立镜头与 latent_ref.on=false 都不要桥）"""
             nxt = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
-            return bool(nxt) and nxt[0] == "prompt" and not seg_unlink[nxt[1]]
+            if not (nxt and nxt[0] == "prompt" and not seg_unlink[nxt[1]]):
+                return False
+            lr = seg_latent_ref[nxt[1]] if 0 <= nxt[1] < len(seg_latent_ref) else {}
+            if lr.get("on") is False:
+                return False
+            fr, want_v, _w = _eff_inject(nxt[1])
+            return bool(fr > 0 and want_v)
 
         # E2 记忆锚来源段：第一个启用的提示词段——段 0 禁用时锚从首个执行段取，
         # 否则全链无锚文件、E2 静默失效（禁用不触发重做，回放段不重落锚是设计内）
@@ -1768,8 +2213,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 prev_tail_clip = pframes[-24:].cpu()
                 _seam_n0 = max(1, int(sample_rate * 0.25))
                 prev_tail_wav = pwav.cpu()[..., -_seam_n0:]
-                guide = _tail_keyframe(pv, pa, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
-                                       full_bridge=full_bridge)
+                _ins_nxt = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
+                _ins_fpi = _ins_nxt[1] if _ins_nxt and _ins_nxt[0] == "prompt" else -1
+                guide = _inject_guide(pv, pa, _ins_fpi)
                 if not ins_replay:
                     proj_inserts.append({"slot": g, "file": ins_file})
                 pbar.update(1)
@@ -1788,6 +2234,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "updated_at": time.time(), "finals": list(proj_finals),
                         "upscale": proj_upscale,
                         "redo_queue": list(redo_queue),
+                        "assets": list(_carry.get("assets") or []),
+                        "latents": list(auto_latents),
+                        "clips": list(_carry.get("clips") or []),
+                        "merges": list(_carry.get("merges") or []),
+                        "seg_fields": list(_carry.get("seg_fields") or []),
                         **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
                                "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
                                "trims": trims}, done),
@@ -1835,7 +2286,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 桥区软着陆（实验）预检：段首钉住上段尾，只烧「钉住帧数」而不是整段 ctx 帧。
             # 预检必须放在 cond 构造之前——seg_len 一旦按某档定死就不能中途改，
             # 否则 cond 的帧数与裁剪量对不上。任一条件不满足即整段走现状路径。
-            _has_src = not (_is_fact_first(item_i) or seg_unlink[i])
+            _lr_cur = seg_latent_ref[i] if 0 <= i < len(seg_latent_ref) else {}
+            _has_src = not (_is_fact_first(item_i) or seg_unlink[i]) \
+                and _lr_cur.get("on") is not False
             _soft_hold = 0
             if (exp.has("soft_bridge") and _sb_level > 0 and _has_src
                     and guide is not None
@@ -1846,7 +2299,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     _soft_hold = _hf
             # skip_f 与采样额外帧数一次定死：回放分支与生成分支共用同一个值。
             # 软桥段存下的是「段长+hold」帧的 latent，回放时若按 ctx 裁会多裁帧。
-            skip_f, _seg_extra = bridge.resolve_crop(_soft_hold, ctx, _has_src)
+            # 分段优先：本段注入帧数（latent_ref.frames 覆盖全局 ctx）。
+            _eff_fr, _, _ = _eff_inject(i)
+            skip_f, _seg_extra = bridge.resolve_crop(_soft_hold, _eff_fr, _has_src)
             # 首帧图段级引用（中段）：头锚 latent——生成段注入 cond，回放段二采补渲染同用
             #（定义在 replay 分支之前：两路都消费；独立镜头段照常注入，本段主动锚）
             _head_kf = head_frame_latent \
@@ -1919,7 +2374,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 显式身份锚（尾帧图/每段尾帧锚定/首帧图）不受模式影响，模式只控制接缝锚
                 if _redo_mode is not None:
                     _user_tail = end_frame_latent \
-                        if (seg_end_on[i] and end_frame_latent is not None) else tail_anchor_latent
+                        if (seg_end_on[i] and end_frame_latent is not None) else _seg_tail_anchor(i)
                     if _redo_mode in ("双锚", "仅锚上段"):
                         # unlink 前段没为它留 guide（陈旧），需直读前段存档现算尾桥
                         eff_guide = _redo_prev_bridge(g) if seg_unlink[i] else guide
@@ -1936,9 +2391,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 设定的本段结尾身份锚点，与段间衔接无关，不受断链影响
                     eff_guide = None if seg_unlink[i] else guide
                     # 尾帧图片（FL2VA 剧情终点/段级尾锚）：勾了尾帧图的段末帧 keyframe
-                    # = 尾帧图 latent（同位置唯一锚，优先于每段尾帧锚定）；未勾段回落尾锚
+                    # = 尾帧图 latent（同位置唯一锚，优先于段尾锚）；未勾段回落
+                    # 段 tail_src（资产图/latent），再回退旧全局尾帧锚定
                     _tail_kf = end_frame_latent if (seg_end_on[i] and end_frame_latent is not None) \
-                        else tail_anchor_latent
+                        else _seg_tail_anchor(i)
                 if eff_guide is not None or _tail_kf is not None or _head_kf is not None:
                     # 实验 E1：强化引导桥——把单桥展开为滑窗/重叠 keyframe 序列。
                     # 全关时 e1_kfs=None，_apply_guide 走现状单桥路径（零影响）。
@@ -2179,6 +2635,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     seeds.append(cur_seed)
                 if use_ckpt:
                     checkpoint.save_segment(root, g, video_t, audio_t)
+                    if not replay:
+                        _auto_latent_save(g, i, video_t, audio_t)
             report.extend(gate_lines)
             bridge_scores.append(seg_bridge_score)
             trims.append(seg_lengths[i] - vis_len)
@@ -2260,7 +2718,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     _up_guide_kf = None if seg_unlink[i] else guide
                     _up_tail_kf = end_frame_latent \
                         if (seg_end_on[i] and end_frame_latent is not None) \
-                        else tail_anchor_latent
+                        else _seg_tail_anchor(i)
                 hi_ready, hi_tried = _up_hi(g, video_t, audio_t, "prompt", i,
                                             _up_guide_kf, _up_tail_kf, _head_kf,
                                             cur_seed, skip_f, frames.shape[0],
@@ -2280,12 +2738,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 videos.append("")
 
             if guide is not None:
-                note = (f"guide=上段尾{ctx}帧" if full_bridge else "guide=单帧桥(旧协议降级)") \
+                note = (f"guide=上段尾{_eff_fr}帧" if full_bridge else "guide=单帧桥(旧协议降级)") \
                     + ("+音频" if "audio_latent" in guide else "")
             else:
                 note = "guide=无（首段）"
             if seg_unlink[i]:
-                note = "guide=无（独立镜头断链）"
+                note = "guide=无（关闭自动引用上段·断链）"
+            elif _lr_cur.get("on") is False:
+                note = "guide=无（本段关闭 latent 注入）"
             if _redo_mode is not None:
                 note = f"重摇（{_redo_mode}）：首锚{'上段尾帧桥' if eff_guide is not None else '无'}" \
                        f" · 尾锚{'接下段' if _tail_kf is not None else '无'} · 其余段保留存档"
@@ -2293,7 +2753,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seed_txt = cur_seed if cur_seed is not None else "—"
             report.append(f"段{g + 1}/{total}：{origin} 裁头{skip_f}帧 留{frames.shape[0]}帧({frames.shape[0] / 24:.1f}s)"
                           f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {_seg_t['sample']:.0f}s") + f" | {note}"
-                          + (" · 独立镜头（断链）" if seg_unlink[i] else "")
+                          + (" · 关闭自动引用上段（断链）" if seg_unlink[i] else "")
                           + (" · 首帧图头锚" if _head_kf is not None else "")
                           + (" · 尾帧图尾锚" if (seg_end_on[i] and end_frame_latent is not None) else "")
                           + _soft_note)
@@ -2305,9 +2765,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             prev_end_t = end_t
 
             if next_wants_bridge:
-                # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）
-                guide = _tail_keyframe(video_t, audio_t, ctx, KEYFRAME_AUDIO_SUPPORTED and full_bridge,
-                                       end_tokens=end_t, full_bridge=full_bridge)
+                # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）。
+                # 分段优先：按下段的 latent_ref.frames/分支取桥。
+                _nxt2 = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
+                _nxt_pi = _nxt2[1] if _nxt2 and _nxt2[0] == "prompt" else -1
+                guide = _inject_guide(video_t, audio_t, _nxt_pi, end_tokens=end_t)
 
             if use_ckpt and not replay:
                 # 选择性重做不倒退进度：重摇段完成后 done 保持全链完成数
@@ -2331,6 +2793,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "updated_at": time.time(), "finals": list(proj_finals),
                     "upscale": proj_upscale,
                     "redo_queue": list(redo_queue),
+                    "assets": list(_carry.get("assets") or []),
+                    "latents": list(auto_latents),
+                    "clips": list(_carry.get("clips") or []),
+                    "merges": list(_carry.get("merges") or []),
+                    "seg_fields": list(_carry.get("seg_fields") or []),
                     **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
                            "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
                            "trims": trims}, done),
@@ -2372,6 +2839,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "updated_at": time.time(), "finals": list(proj_finals),
                 "upscale": proj_upscale,
                 "redo_queue": list(redo_queue),
+                "assets": list(_carry.get("assets") or []),
+                "latents": list(auto_latents),
+                "clips": list(_carry.get("clips") or []),
+                "merges": list(_carry.get("merges") or []),
+                "seg_fields": list(_carry.get("seg_fields") or []),
                 **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
                        "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
                        "trims": trims}, done),
@@ -2412,7 +2884,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                                    crf=_bcrf, preset=_bpreset, aq_mode=_baq,
                                                    dither=_bdith)
                     if final_name:
-                        proj_finals.append(os.path.basename(final_name))
+                        try:
+                            _frel = os.path.relpath(final_name, root).replace("\\", "/")
+                        except ValueError:
+                            _frel = os.path.basename(final_name)
+                        proj_finals.append(_frel)
                         mf = checkpoint.load_manifest(root) or {}
                         mf["finals"] = list(proj_finals)
                         checkpoint.save_manifest(root, mf)
@@ -2462,6 +2938,86 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 or 自动保存 in ("分段", "分段+成片"):   # 旧三态「分段+成片」也强制重跑（读档兼容）
             return float("nan")   # 存档/审片/自动保存激活时输入不变也强制真正执行（重读最新 manifest）
         return ""
+
+    @classmethod
+    def execute(cls, *args, **kwargs):
+        """生成互斥外壳：采样期间剪辑/转码/移动路由遇忙回 423，前端置灰。
+
+        内层为 _execute_inner（原 execute 本体，零改动）；异常也必解忙。
+        """
+        try:
+            from . import checkpoint as _ckpt
+        except ImportError:
+            import checkpoint as _ckpt
+        _ckpt.mark_busy()
+        try:
+            return cls._execute_inner(*args, **kwargs)
+        finally:
+            _ckpt.unmark_busy()
+
+    @classmethod
+    def _execute_transcode_only(cls, ds, jobs, 视频VAE, 音频VAE, 存档目录):
+        """内联转码专跑：ds.transcode_jobs 非空时只跑转码（有 VAE 上下文），不跑链。
+
+        资产库"转latent"写入 ds 任务，前端提示用户按一次开始生成即执行；
+        任务间隙响应队列取消；结果登记进 manifest.latents，前端凭证据自动清理。
+        """
+        try:
+            from .latent_tools import run_transcode_job
+        except ImportError:
+            from latent_tools import run_transcode_job
+        try:
+            import comfy.model_management as _mm
+            _interrupted = _mm.processing_interrupted
+        except Exception:
+            _interrupted = None
+        try:
+            import comfy.utils as _cu
+            _pbar = _cu.ProgressBar(len(jobs))
+        except Exception:
+            _pbar = None
+        proj_default = str(存档目录 or "").strip()
+        lines = [f"H3 内联转码：{len(jobs)} 个任务（只跑转码，不跑链、不耗种子）"]
+        done = 0
+        for k, job in enumerate(jobs):
+            if callable(_interrupted):
+                try:
+                    if _interrupted():
+                        lines.append(f"任务 {k + 1} 起中断：剩余 {len(jobs) - k} 个任务保留排队")
+                        break
+                except Exception:
+                    pass
+            proj = str(job.get("project") or proj_default).strip()
+            if proj_default and proj != proj_default:
+                lines.append(f"任务 {k + 1} 跳过：任务项目「{proj}」与当前存档目录「{proj_default}」"
+                             "不一致（请切换项目后重排，或清空任务）")
+                continue
+            if not proj:
+                lines.append(f"任务 {k + 1} 跳过：无项目名（请填写存档目录）")
+                continue
+            try:
+                rep = run_transcode_job(
+                    proj, job.get("src"), 视频VAE, 音频VAE,
+                    job.get("start_s", 0.0), job.get("end_s", 0.0),
+                    job.get("branch", "图像+音频"), job.get("split", "否"),
+                    job.get("save_name", ""), _pbar=None,
+                    _interrupted=_interrupted)
+                lines.append(f"任务 {k + 1} 完成：{rep}")
+                done += 1
+            except Exception as e:
+                if type(e).__name__ in ("InterruptProcessingException", "_Interrupted"):
+                    raise
+                lines.append(f"任务 {k + 1} 失败：{type(e).__name__}: {e}")
+            if _pbar is not None:
+                try:
+                    _pbar.update(1)
+                except Exception:
+                    pass
+        lines.append(f"转码结束：{done}/{len(jobs)} 完成。latent 库已登记，面板自动清理已完成任务。")
+        print("[H3内联转码] " + " | ".join(lines), flush=True)
+        images = torch.zeros(1, 64, 64, 3)
+        silence = {"waveform": torch.zeros(1, 1, 0), "sample_rate": 24000}
+        return io.NodeOutput(images, silence, 24, "\n".join(lines), [], [])
 
     @staticmethod
     def _apply_guide(cond, guide, sampled_fc, tail_kf_latent=None, e1_windows=None,

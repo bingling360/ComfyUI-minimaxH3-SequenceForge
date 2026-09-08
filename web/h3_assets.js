@@ -1,5 +1,5 @@
 /* H3 资产库前端 helper（M4）：资产增删改查 + 校验早爆 + 存盘（带 revision）。
- * 只挂 window.H3Assets，不注册入口。总量不限（999封顶），单段 9/3/3 执行期卡。
+ * 只挂 window.H3Assets，不注册入口。总量不限；单段 9/3/3 在段引用处卡（执行期同口径）。
  */
 (function () {
   "use strict";
@@ -26,7 +26,6 @@
       if (!c || seen.has(c.label)) continue;
       seen.add(c.label);
       out.push(c);
-      if (out.length >= 999) break;
     }
     return out;
   }

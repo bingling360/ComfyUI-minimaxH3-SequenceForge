@@ -557,7 +557,10 @@ def _records(manifest):
 
 
 def _record_valid(segs, root, g, ph, bh):
-    """记录有效 = hash/base_hash 匹配且产物文件齐全（高清分段 mp4 + 缩略图 + 尾帧锚）。"""
+    """记录有效 = hash/base_hash 匹配且产物文件齐全（高清分段 mp4 + 缩略图 + 尾帧锚）。
+
+    四库兼容：files 里的 finals/ 前缀与旧根目录裸名双路径查找。
+    """
     rec = segs[g] if g < len(segs) else None
     if not (isinstance(rec, dict) and rec.get("done")):
         return False
@@ -566,7 +569,7 @@ def _record_valid(segs, root, g, ph, bh):
     files = rec.get("files") or checkpoint.upscale_files(g)
     for key in ("mp4", "thumb", "last"):
         f = files.get(key)
-        if not f or not os.path.isfile(os.path.join(root, f)):
+        if not f or not os.path.isfile(checkpoint.resolve_project_file(root, f)):
             return False
     return True
 
@@ -1833,14 +1836,14 @@ def try_final(root, cfg, report, skip_slots=None):
     sources, rec_sizes, first_rec = [], [], -1
     for g in use:
         if g < len(segs) and _record_valid(segs, root, g, ph, base_hash(mf, g)):
-            sources.append(os.path.join(root, segs[g]["files"]["mp4"]))
+            sources.append(checkpoint.resolve_project_file(root, segs[g]["files"]["mp4"]))
             rec_sizes.append(segs[g].get("size") or [None, None])
             if first_rec < 0:
                 first_rec = len(sources) - 1
         elif g in ins_slots:
-            # 外部素材段直通：高清产物与基础分段同名（seg_NNN.mp4），
-            # 无有效记录时该文件就是基础分辨率版本
-            basic = os.path.join(root, f"seg_{g:03d}.mp4")
+            # 外部素材段直通：高清产物与基础分段同名（finals/seg_NNN.mp4），
+            # 无有效记录时该文件就是基础分辨率版本（旧根目录裸名双兼容）
+            basic = checkpoint.resolve_project_file(root, f"seg_{g:03d}.mp4")
             if not os.path.isfile(basic):
                 report.append(f"二采成片：段{g + 1} 基础分段缺失（seg_{g:03d}.mp4），"
                               "成片按基础分辨率编码")
@@ -1853,6 +1856,7 @@ def try_final(root, cfg, report, skip_slots=None):
         report.append("二采成片：分段高清尺寸不一致，成片按基础分辨率编码")
         return False
     out_name = f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    out_rel = f"finals/{out_name}"
     try:
         from . import media
     except ImportError:
@@ -1863,15 +1867,15 @@ def try_final(root, cfg, report, skip_slots=None):
     target_wh = media.probe_video_size(sources[first_rec]) if first_rec >= 0 else None
     _crf, _preset, _aq, _dither = _ENCODE_SETTINGS.get(
         str(cfg.get("encode") or "标准"), _ENCODE_SETTINGS["标准"])
-    if media.concat_av_mp4(sources, os.path.join(root, out_name),
+    if media.concat_av_mp4(sources, os.path.join(checkpoint.finals_dir(root), out_name),
                            width=target_wh[0] if target_wh else None,
                            height=target_wh[1] if target_wh else None,
                            crf=_crf, preset=_preset, aq_mode=_aq,
                            dither=_dither):
         fresh = checkpoint.load_manifest(root) or dict(mf)
-        fresh.setdefault("finals", []).append(out_name)
+        fresh.setdefault("finals", []).append(out_rel)
         up_state = dict(fresh.get("upscale") or {})
-        up_state.setdefault("finals", []).append(out_name)
+        up_state.setdefault("finals", []).append(out_rel)
         fresh["upscale"] = up_state
         fresh["updated_at"] = time.time()
         checkpoint.save_manifest(root, fresh)

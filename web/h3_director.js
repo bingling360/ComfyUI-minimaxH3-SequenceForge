@@ -690,6 +690,21 @@ function getDs(node) {
                 .map((x) => ({ slot: Number(x.slot), mode: REDO_MODES.some((r) => r[0] === x.mode) ? x.mode : "双锚" })),
             upscale,
             experiments: normalizeExperiments(raw.experiments),
+            /* 转码任务队列：白名单归一化（畸形条目直接丢弃，防脏数据常驻 widget） */
+            transcode_jobs: (Array.isArray(raw.transcode_jobs) ? raw.transcode_jobs : [])
+                .filter((j) => j && typeof j === "object" && typeof j.src === "string" && j.src.trim()
+                    && typeof j.save_name === "string" && j.save_name.trim())
+                .map((j) => ({
+                    project: typeof j.project === "string" ? j.project : "",
+                    src: String(j.src).trim(),
+                    start_s: Number.isFinite(Number(j.start_s)) ? Math.max(0, Number(j.start_s)) : 0,
+                    end_s: Number.isFinite(Number(j.end_s)) && Number(j.end_s) > 0 ? Number(j.end_s) : 0,
+                    branch: ["图像+音频", "仅图像", "仅音频"].includes(j.branch) ? j.branch : "图像+音频",
+                    split: j.split === "是" ? "是" : "否",
+                    save_name: String(j.save_name).trim(),
+                    status: "queued",
+                }))
+                .slice(0, 32),
             /* AI优化配置与历史（自研后端）：透存，不进后端指纹 */
             optimizer: (raw.optimizer && typeof raw.optimizer === "object") ? raw.optimizer : null,
             opt_hist: (raw.opt_hist && typeof raw.opt_hist === "object") ? raw.opt_hist : null,

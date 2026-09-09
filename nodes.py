@@ -1020,12 +1020,25 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _fr = int(lr.get("frames", 0) or 0)
             except (TypeError, ValueError):
                 _fr = 0
-            seg_latent_ref.append({
+            _lr_src0 = lr.get("src") if isinstance(lr.get("src"), dict) else {}
+            _src_file = str(_lr_src0.get("file") or "").strip().replace("\\", "/")
+            _src_parts = [_p for _p in _src_file.split("/") if _p and _p != "."]
+            # 与 projects._clean_seg_field 同口径：latent/<名>.pt，文件名须合法
+            # （防穿越；文件存在性由 _load_library_latent 在执行期校验）
+            _src_name = _src_parts[1] if len(_src_parts) == 2 else ""
+            _src_ok = (len(_src_parts) == 2 and _src_parts[0] == "latent"
+                       and bool(_src_name) and not _src_name.startswith(".")
+                       and ":" not in _src_name and ".." not in _src_name
+                       and _src_name.endswith(".pt"))
+            _ent = {
                 "on": None if lr.get("on") is None else bool(lr.get("on")),
                 "frames": max(0, _fr),
                 "video": lr.get("video", True) is not False,
                 "audio": lr.get("audio", True) is not False,
-            })
+            }
+            if _src_ok:
+                _ent["src"] = {"file": "/".join(_src_parts)}
+            seg_latent_ref.append(_ent)
 
         # 段级 latent 保存（保存策略透存，分段优先）：mode all|range|tail|off +
         # split_av（图像/音频分开存）+ save_seg（本段总开关）。主循环采样定稿后

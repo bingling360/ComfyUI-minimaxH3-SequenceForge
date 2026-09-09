@@ -171,6 +171,22 @@ def test_seg_tail_src_passthrough(projects):
     assert "tail_src" not in m4["seg_fields"][0]
 
 
+def test_seg_latent_ref_src_passthrough(projects):
+    m = projects.create_project("t_lrsrc")
+    m2 = projects.save_prompts("t_lrsrc", ["p1"], [{
+        "scene_prompt": "", "character_prompt": "", "seconds": 5, "refs": [],
+        "latent_ref": {"on": True, "frames": 22, "src": {"file": "latent/bridge.pt"}}}],
+        base_revision=m["revision"])
+    assert m2["seg_fields"][0]["latent_ref"]["src"] == {"file": "latent/bridge.pt"}
+    # 非法 src 丢弃（其余字段保留）
+    m3 = projects.save_prompts("t_lrsrc", ["p1"], [{
+        "scene_prompt": "", "character_prompt": "", "seconds": 5, "refs": [],
+        "latent_ref": {"frames": 5, "src": {"file": "../evil.pt"}}}],
+        base_revision=m2["revision"])
+    assert "src" not in m3["seg_fields"][0]["latent_ref"]
+    assert m3["seg_fields"][0]["latent_ref"]["frames"] == 5
+
+
 def test_import_asset_roundtrip(projects):
     import folder_paths
     _mkfile("imp_src.png")
@@ -216,6 +232,8 @@ def test_nodes_wiring():
     assert "该段图片没选" not in src and "素材库共" not in src
     assert "总量不限、按段按需" in src
     assert "超过官方单段上限" in src
+    # 段 latent_ref.src 外源桥必须透传进 seg_latent_ref（否则 _inject_guide 外源分支不可达）
+    assert '_ent["src"] = {"file": "/".join(_src_parts)}' in src
 
 
 # ---- M2.5 ----
@@ -365,6 +383,15 @@ def test_v2_section_wired():
         assert ep in d or ep.replace("_", "/") in d or ep in open(
             os.path.join(ROOT, "web", "h3_latent.js" if "latent" in ep or ep == "trim" else "h3_api.js"),
             encoding="utf-8").read()
+
+
+def test_transcode_jobs_normalized():
+    d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    # getDs 必须白名单归一化 transcode_jobs（畸形条目丢弃，防脏数据常驻 widget）
+    assert "transcode_jobs: (Array.isArray(raw.transcode_jobs)" in d
+    assert '.slice(0, 32)' in d
+    for branch in ['"图像+音频"', '"仅图像"', '"仅音频"']:
+        assert branch in d
 
 
 def test_expander_offline():

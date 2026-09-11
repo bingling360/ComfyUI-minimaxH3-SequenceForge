@@ -18,6 +18,50 @@ D_TAG_RE = re.compile(r"<d>\[(.+?)\](.*?)</d>", re.S)
 SPEAKER_RE = re.compile(r"\(S\d+(?:,S\d+)*\)")
 QUOTED_RE = re.compile(r'"([^"]+)"')
 
+# ---- 官方结构契约（对齐 MiniMax-AI/MiniMax-H3/skills/h3-prompt-writing） ----
+BASE_FIELD = "integrated_multimodal_description"
+REF_MAIN_FIELD = "detailed_description"
+REF_SECTIONS = ("subject_definitions", "summary", "retention_analysis",
+                "detailed_description", "overall_soundscape", "non_diegetic_music")
+REF_MARK_VIS = ("fully_preserved", "partially_preserved", "attribute_transfer", "weak_reference")
+REF_MARK_AUD = ("fully_copy", "partially_copy", "reference", "weak_reference")
+# 官方对齐指令整句；N = 实际末镜号，S.SS = 有效时长（恰好两位小数），编译时必须替换
+# 在 _norm_align 归一化后的文本上匹配
+ALIGN_I2VA = re.compile(
+    r"^For the target video, at 0\.00 seconds into the target video,\s*"
+    r"<Picture 1> \(from \[Shot 1\]\) is fully referenced\.$")
+ALIGN_FL2VA = re.compile(
+    r"^How the reference pictures align with the target video - "
+    r"Picture 1 \(from Shot 1\) aligns with the 0\.00-second mark of the target video;\s*"
+    r"Picture 2 \(from Shot (?P<n>\d+)\) aligns with the (?P<t>\d+\.\d{2})-second mark of the target video\.$")
+ALIGN_L2VA = re.compile(
+    r"^How the reference pictures align with the target video - "
+    r"<Picture 1> \(from \[Shot (?P<n>\d+)\]\) aligns with the (?P<t>\d+\.\d{2})-second mark of the target video\.$")
+ALIGN_BY_MODE = {"I2VA": ("I2VA", ALIGN_I2VA), "FL2VA": ("FL2VA", ALIGN_FL2VA),
+                 "L2VA": ("L2VA", ALIGN_L2VA)}
+REF_TASK_TYPES = ("keyframe completion", "reference generation", "video editing",
+                  "video continuation", "audio reuse", "audio reference")
+
+
+def _align_blocks(text):
+    """取对齐指令块：首个空行之前的内容（FL2VA/L2VA 的模板句本身可换行）。
+    返回 (指令块, 三字段正文)。无空行时按行首 'integrated_…' 或 'detailed_…' 切分。"""
+    t = str(text or "").strip()
+    head, sep, tail = t.partition("\n\n")
+    if not sep:
+        # 无空行：找三字段中第一个字段名的行首位置作为正文起点
+        m = re.search(r"(?m)^(?:integrated_multimodal_description|detailed_description)\s*:", t)
+        if m:
+            return t[:m.start()].strip(), t[m.start():]
+        return t, ""
+    return head.strip(), tail.strip()
+
+
+def _norm_align(s):
+    """对齐指令比较用归一化：压空白、统破折号。"""
+    s = re.sub(r"[—–-]", "-", str(s or ""))
+    return re.sub(r"\s+", " ", s).strip()
+
 # 裸抽象词：单独出现≈无效，必须配具体光/镜/动作；这里只告警不报错
 ABSTRACT_WORDS = ["cinematic", "beautiful", "epic", "masterpiece", "8k", "ultra cinematic", "氛围感", "大片感"]
 # 中文否定：唯一保留“画面干净无字幕无水印”
@@ -91,8 +135,66 @@ def validate_envelope(obj):
                 r"fully_preserved|partially_preserved|attribute_transfer|weak_reference|fully_copy|partially_copy",
                 ret, re.I):
             warn("W_REF_MARKER", "retention_analysis 未见保留标记（fully_preserved 等）：H3 不知道脸和衣服谁该留谁可变")
+        # 六段齐全 + 顺序（官方 §1：顺序固定）
+        missing_sec = [s for s in REF_SECTIONS if not str(pe.get(s) or "").strip()]
+        if missing_sec:
+            err("E_REF_SECTION", f"Ref2VA 六段不全，缺：{missing_sec}（顺序固定：{list(REF_SECTIONS)}）")
+        # summary 必须以方括号任务类型前缀开头
+        if summ.strip() and not re.match(r"^\[\s*[a-z][a-z ]*(?:\s*\+\s*[a-z][a-z ]*)*\s*\]", summ.strip()):
+            err("E_REF_SUMMARY_PREFIX",
+                "summary 须以方括号任务类型前缀开头，如 [reference generation] / [video editing + audio reuse]")
+        elif summ.strip():
+            inner = re.match(r"^\[([^\]]+)\]", summ.strip()).group(1)
+            bad = [t.strip() for t in inner.split("+") if t.strip() not in REF_TASK_TYPES]
+            if bad:
+                warn("W_REF_TASK_TYPE", f"summary 任务类型非常规：{bad}（官方表：{list(REF_TASK_TYPES)}）")
+        # retention_analysis 不许出现 (Sx)；音频行须用音频标记
+        if ret.strip() and SPEAKER_RE.search(ret):
+            err("E_REF_SPEAKER_IN_RET", "retention_analysis 里不许写 (Sx) 说话人 ID（官方 §5.4）")
+        aud_lines = [l for l in ret.splitlines() if l.strip().startswith("<Audio")]
+        if aud_lines and not any(any(m in l for m in REF_MARK_AUD) for l in aud_lines):
+            warn("W_REF_AUDIO_MARK", "retention_analysis 的 <Audio N> 行未见音频标记（fully_copy / partially_copy / reference / weak_reference）")
+        # detailed_description：风格须在 [Shot 1] 之前先立
+        if desc.strip() and desc.lstrip().startswith("[Shot 1]"):
+            warn("W_REF_STYLE_AFTER_SHOT", "Ref2VA 风格应在 [Shot 1] 之前用一到两句先立，当前直接从 [Shot 1] 开始")
+        if words_ref := len(re.findall(r"[A-Za-z']+", desc)):
+            if words_ref and not (200 <= words_ref <= 700):
+                warn("W_REF_LENGTH", f"detailed_description 约 {words_ref} 词，官方生成任务参考区间 350-500 词")
+        # 标签一致性补充：subject_definitions 里 <Audio N> 绑定时须复用 (Sx)
+        for m in re.finditer(r"<Audio\s+\d+>[^\n]*<Subject\s+\d+>", subj, re.I):
+            line = m.group(0)
+            if not SPEAKER_RE.search(line):
+                warn("W_REF_AUDIO_SX", "subject_definitions 里 <Audio N> 绑定到 <Subject N> 时应复用其 (Sx)，如 <Audio 1> is the voice-timbre reference for <Subject 1> (S1).")
+                break
     else:
         desc = pe.get("integrated_multimodal_description") or ""
+        # 对齐指令：I2VA/FL2VA/L2VA 必须为首块且整句正确；T2VA 不得有
+        if mode in ALIGN_BY_MODE:
+            head, body = _align_blocks(desc)
+            am = ALIGN_BY_MODE[mode][1].match(_norm_align(head))
+            if not am:
+                err("E_ALIGN", f"{mode} 缺少正确的关键帧对齐指令：必须为最终提示词第一块（空行前），"
+                               f"整句照抄官方模板、并把 N/S.SS 替换成真实值（当前首块：{head[:70]!r}）")
+            elif not body:
+                warn("W_ALIGN_BLANK", "对齐指令与三字段之间应有空行（官方 §2.1）")
+            else:
+                # S.SS 必须等于有效时长（恰好两位小数）；N 必须等于实际末镜号
+                gd = am.groupdict()
+                if gd.get("t") is not None and isinstance(duration, (int, float)):
+                    if abs(float(gd["t"]) - float(duration)) > 1e-9:
+                        err("E_ALIGN_TIME", f"对齐指令里的时长 {gd['t']}s 与 duration {duration}s 不一致"
+                                            "（官方：S.SS 为有效时长，恰好两位小数）")
+                if gd.get("n") is not None:
+                    shots_in_body = re.findall(r"\[Shot\s+(\d+)\]", body)
+                    if shots_in_body and int(gd["n"]) != max(int(x) for x in shots_in_body):
+                        err("E_ALIGN_SHOT", f"对齐指令里的末镜号 Shot {gd['n']} 与实际最后一镜 "
+                                            f"Shot {max(int(x) for x in shots_in_body)} 不一致")
+        elif mode == "T2VA" and re.match(
+                r"^(For the target video, at 0\.00|How the reference pictures align)",
+                _norm_align(desc)):
+            err("E_ALIGN_T2VA", "T2VA 不应有关键帧对齐指令（官方 §2.1：无图对齐指令，直接从三字段开始）")
+        # 对齐指令块不参与镜头/长度统计（其 [Shot N] 是模板占位，不是真实镜头）
+        desc = _align_blocks(desc)[1] or desc
     soundscape = pe.get("overall_soundscape")
     music = pe.get("non_diegetic_music")
     if mode not in VALID_MODES:

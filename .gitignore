@@ -9,6 +9,11 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+
+# 编辑器/手工备份（不留双轨）
+*.bak-*
+*.orig
 
 # 系统杂物
 Thumbs.db

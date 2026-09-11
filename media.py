@@ -456,48 +456,332 @@ def probe_media(path):
 
 def trim_av_mp4(src_path, out_path, start_s, end_s, fps=24, crf=20,
                 preset="veryfast", aq_mode=None, dither=False):
-    """入出点裁剪：[start_s, end_s) 秒 -> 新 mp4（重编码，与 save_av_mp4 同档）。
+    """入出点裁剪：[start_s, end_s) 秒窗口转码（流式）。
 
-    M3 最小剪辑集：资产库行内设入出点、成片库片段截取共用。短素材（2-15s）
-    全量解码后切片，内存可控；先写 .part 再原子改名；失败存 last_error。
-    start_s < 0 钳 0；end_s <= start_s 或超长按实际钳制；切空返回 False。
+    旧版先整片解码再切片（长片直接 19GB 级 OOM 卡死整机）；现 seek 到窗起点、
+    只解码窗口帧并逐帧编码落盘，内存 O(在途帧) 与片长无关。
+    行为对齐旧版：输出从 0 计时、帧率取源实际帧率、crf/preset/aq/dither 同档、
+    无音轨照样带空 aac 轨、先写 .part 再原子改名、失败 False + last_error。
+    通道数/采样率以容器头为准（与解码值一致）；中途变径的坏包跳过
+    （旧版整片解码会直接炸维度），中途变采样率的音频包丢弃。
     """
     global last_error
     try:
-        import torch
+        import av
+        import numpy
     except Exception as e:
-        last_error = f"torch 导入失败：{type(e).__name__}: {e}"
+        last_error = f"PyAV/numpy 导入失败：{type(e).__name__}: {e}"
         return False
     try:
-        real_fps = probe_fps(src_path, fps)
-        frames, wav, sr = decode_av(src_path)
-    except Exception as e:
-        last_error = f"解码失败：{type(e).__name__}: {e}"
+        ss, es = float(start_s), float(end_s)
+    except (TypeError, ValueError):
+        last_error = "start_s/end_s 须为数字秒"
         return False
-    n = int(frames.shape[0])
-    if n <= 0:
-        last_error = "源视频无帧"
+    if es <= ss or ss < 0:
+        last_error = f"裁剪区间为空（[{ss}s, {es}s)，须 0 <= start < end）"
         return False
-    s0 = max(0, int(round(float(start_s) * real_fps)))
-    s1 = min(n, int(round(float(end_s) * real_fps)))
+    real_fps = probe_fps(src_path, fps)
+    s0 = max(0, int(round(ss * real_fps)))
+    s1 = int(round(es * real_fps))
     if s1 <= s0:
-        last_error = (f"裁剪区间为空（[{start_s}s, {end_s}s) -> 帧[{s0}, {s1})，"
-                      f"源共{n}帧@{real_fps:.2f}fps）")
-        return False
-    cut = frames[s0:s1]
-    rate = int(sr or 44100)
-    if wav is not None and getattr(wav, "numel", lambda: 0)() > 0:
-        a0 = max(0, int(round(s0 / real_fps * rate)))
-        a1 = max(a0, int(round(s1 / real_fps * rate)))
         try:
-            cut_wav = wav[..., a0:a1]
+            n_est = (probe_media(src_path) or {}).get("frames") or 0
         except Exception:
-            cut_wav = wav
-    else:
-        cut_wav = torch.zeros(1, 0)
-        rate = int(sr or 44100)
-    ok = save_av_mp4(out_path, cut, cut_wav, rate, fps=int(round(real_fps)) or 24,
-                     crf=crf, preset=preset, aq_mode=aq_mode, dither=dither)
-    if not ok and not last_error:
-        last_error = "重编码失败（见 save_av_mp4 日志）"
-    return ok
+            n_est = 0
+        last_error = (f"裁剪区间为空（[{ss}s, {es}s) -> 帧[{s0}, {s1})，"
+                      f"源共{n_est}帧@{real_fps:.2f}fps）")
+        return False
+    out_fps = int(round(real_fps)) or 24
+    tmp = out_path + ".part"
+    try:
+        with av.open(src_path) as inp:
+            vs = next((s for s in inp.streams if s.type == "video"), None)
+            if vs is None:
+                raise RuntimeError("文件里没有视频轨")
+            au = next((s for s in inp.streams if s.type == "audio"), None)
+            try:
+                vw, vh = int(vs.codec_context.width or 0), int(vs.codec_context.height or 0)
+            except Exception:
+                vw = vh = 0
+            if not vw or not vh:
+                vw, vh = probe_video_size(src_path) or (0, 0)
+            if not vw or not vh:
+                raise RuntimeError("无法识别视频尺寸")
+            vw, vh = vw - vw % 2, vh - vh % 2  # yuv420p 要求偶数尺寸
+            try:
+                au_ch0 = int(au.codec_context.channels or 0) if au is not None else 0
+            except Exception:
+                au_ch0 = 0
+            try:
+                au_sr0 = int(au.codec_context.sample_rate or 0) if au is not None else 0
+            except Exception:
+                au_sr0 = 0
+            if not au_ch0:
+                au_ch0 = 2  # 通道数缺失时按立体声开轨（与旧版多数源一致），不匹配的包逐个丢弃
+            sr = au_sr0 or 44100
+            a0, a1 = max(0, int(round(s0 / real_fps * sr))), int(round(s1 / real_fps * sr))
+            if s0 > 240:
+                try:
+                    inp.seek(int(s0 / real_fps * 1000000), stream=vs)
+                    sought = True
+                except Exception:
+                    sought = False
+            else:
+                sought = False
+            try:
+                tb = float(vs.time_base)
+            except Exception:
+                tb = 0.0
+            out = av.open(tmp, mode="w", format="mp4")
+            try:
+                vo = out.add_stream("libx264", rate=out_fps)
+                vo.width, vo.height = vw, vh
+                vo.pix_fmt = "yuv420p"
+                vo.options = {"crf": str(int(crf)), "preset": str(preset),
+                              "threads": "4"}
+                if aq_mode:
+                    vo.options["aq-mode"] = str(int(aq_mode))
+                ao = out.add_stream(
+                    "aac", rate=int(sr),
+                    layout="stereo" if au_ch0 >= 2 else "mono")
+                ao_ch = 2 if au_ch0 >= 2 else 1
+                v_pts = a_pts = a_off = v_idx = kept_v = 0
+                audio_chunks = []
+                audio_bytes = 0
+                v_done = False
+                streams = [vs] + ([au] if au is not None else [])
+                for packet in inp.demux(*streams):
+                    try:
+                        is_v = packet.stream.index == vs.index
+                    except Exception:
+                        is_v = getattr(packet.stream, "type", "") == "video"
+                    if is_v:
+                        if v_done:
+                            continue
+                        for frame in packet.decode():
+                            pts = getattr(frame, "pts", None)
+                            if pts is not None and tb > 0:
+                                fno = int(round(pts * tb * real_fps))
+                            elif sought:
+                                fno = s0
+                            else:
+                                v_idx += 1
+                                fno = v_idx
+                            if fno < s0:
+                                continue
+                            if fno >= s1:
+                                v_done = True
+                                break
+                            arr = frame.to_ndarray(format="rgb24")
+                            if arr.shape[0] != vh or arr.shape[1] != vw:
+                                continue
+                            enc = dither_quantize(arr) if dither \
+                                else numpy.ascontiguousarray(arr)
+                            vframe = av.VideoFrame.from_ndarray(enc, format="rgb24")
+                            vframe.pts = v_pts
+                            v_pts += 1
+                            kept_v += 1
+                            for pkt in vo.encode(vframe):
+                                out.mux(pkt)
+                    elif au is not None:
+                        try:
+                            is_a = packet.stream.index == au.index
+                        except Exception:
+                            is_a = getattr(packet.stream, "type", "") == "audio"
+                        if not is_a:
+                            continue
+                        for frame in packet.decode():
+                            try:
+                                arr = frame.to_ndarray()
+                            except Exception:
+                                continue
+                            if getattr(arr, "ndim", 0) != 2 or not arr.shape[0]:
+                                continue
+                            if int(getattr(frame, "sample_rate", 0) or 0) not in (0, sr):
+                                continue  # 中途变采样率：编码器改不了率，丢包
+                            if arr.shape[0] < ao_ch:
+                                continue
+                            arr = arr[:ao_ch]
+                            n_samp = int(arr.shape[1])
+                            f0, f1 = a_off, a_off + n_samp
+                            a_off = f1
+                            lo, hi = max(f0, a0), min(f1, a1)
+                            if hi > lo:
+                                cut = numpy.ascontiguousarray(arr[:, lo - f0:hi - f0])
+                                audio_chunks.append(cut)
+                                audio_bytes += cut.nbytes
+                                if audio_bytes > (1 << 30):
+                                    raise RuntimeError(
+                                        "音频窗口超过 1GB（超长裁剪区间），请缩小区间分多次裁剪")
+                    if v_done and (au is None or a_off >= a1):
+                        break
+                if kept_v <= 0:
+                    raise RuntimeError(
+                        f"窗口内无可解码帧（[{ss}s, {es}s) -> 帧[{s0}, {s1})，超出片长？）")
+                if audio_chunks:
+                    import numpy as _np
+                    pcm = _np.concatenate(audio_chunks, axis=1)
+                else:
+                    import numpy as _np
+                    pcm = _np.zeros((ao_ch, 0), dtype=_np.float32)
+                for start in range(0, pcm.shape[1], 1024):
+                    aframe = av.AudioFrame.from_ndarray(
+                        pcm[:, start:start + 1024], format="fltp",
+                        layout="stereo" if ao_ch >= 2 else "mono")
+                    aframe.sample_rate = int(sr)
+                    aframe.pts = a_pts
+                    a_pts += aframe.samples
+                    for pkt in ao.encode(aframe):
+                        out.mux(pkt)
+                for pkt in vo.encode():
+                    out.mux(pkt)
+                for pkt in ao.encode():
+                    out.mux(pkt)
+            finally:
+                out.close()
+        os.replace(tmp, out_path)
+        last_error = None
+        return True
+    except Exception as e:
+        last_error = f"{type(e).__name__}: {e}"
+        print(f"[trim_av_mp4] 裁剪异常：{last_error}")
+        import traceback
+        traceback.print_exc()
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def save_wav_pcm16(path, pcm, sample_rate):
+    """[C,T]/[1,C,T] float32 -1..1（torch 或 numpy）-> 标准 PCM16 wav。
+
+    成功 True；失败 False（last_error）。供 split_av_stream 与调用方共用。
+    """
+    global last_error
+    try:
+        import wave
+        import numpy as _np
+        a = pcm.detach().float().cpu().numpy() if hasattr(pcm, "detach") else _np.asarray(pcm)
+        a = _np.ascontiguousarray(a, dtype=_np.float32).clip(-1.0, 1.0)
+        if a.ndim == 3:
+            a = a[0]
+        ch = int(a.shape[0]) if a.ndim == 2 else 1
+        if a.ndim != 2:
+            a = a.reshape(1, -1)
+            ch = 1
+        arr = (a.transpose(1, 0) * 32767.0).clip(-32768, 32767).astype("<i2")
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(min(2, ch))
+            wf.setsampwidth(2)
+            wf.setframerate(int(sample_rate or 44100))
+            wf.writeframes(arr.tobytes())
+        last_error = None
+        return True
+    except Exception as e:
+        last_error = f"{type(e).__name__}: {e}"
+        return False
+
+
+def split_av_stream(src_path, video_out_path, wav_out_path):
+    """单遍 demux 音画分离（流式）：视频轨 packet 级 remux（零解码零重编码），
+    音频轨解码收 PCM 写 wav。内存 O(音频)（约 350KB/s），视频零内存。
+
+    旧版先整片解码（长片 19GB 级 OOM 卡死整机）；现视频不碰像素。
+    无音频轨时只产出视频（audio=False，调用方记 note=no-audio，与旧行为一致）。
+    返回 {"video": True, "audio": bool, "sample_rate": int|None,
+            "width": int, "height": int, "fps": float}，
+    失败返回 None（last_error）。
+    """
+    global last_error
+    try:
+        import av
+        import numpy
+    except Exception as e:
+        last_error = f"PyAV/numpy 导入失败：{type(e).__name__}: {e}"
+        return None
+    tmp_v = video_out_path + ".part"
+    try:
+        with av.open(src_path) as inp:
+            vs = next((s for s in inp.streams if s.type == "video"), None)
+            if vs is None:
+                raise RuntimeError("文件里没有视频轨")
+            au = next((s for s in inp.streams if s.type == "audio"), None)
+            try:
+                vw, vh = int(vs.codec_context.width or 0), int(vs.codec_context.height or 0)
+            except Exception:
+                vw = vh = 0
+            out = av.open(tmp_v, mode="w", format="mp4")
+            try:
+                out_v = out.add_stream(template=vs)
+                chunks = []
+                audio_bytes = 0
+                sr = None
+                ch = 0
+                streams = [vs] + ([au] if au is not None else [])
+                for packet in inp.demux(*streams):
+                    try:
+                        is_v = packet.stream.index == vs.index
+                    except Exception:
+                        is_v = getattr(packet.stream, "type", "") == "video"
+                    if is_v:
+                        packet.stream = out_v
+                        out.mux(packet)
+                        continue
+                    if au is None:
+                        continue
+                    try:
+                        is_a = packet.stream.index == au.index
+                    except Exception:
+                        is_a = getattr(packet.stream, "type", "") == "audio"
+                    if not is_a:
+                        continue
+                    for frame in packet.decode():
+                        try:
+                            arr = frame.to_ndarray()
+                        except Exception:
+                            continue
+                        if getattr(arr, "ndim", 0) != 2 or not arr.shape[0]:
+                            continue
+                        if sr is None:
+                            sr = int(getattr(frame, "sample_rate", 0) or 0) or None
+                            ch = int(arr.shape[0])
+                        if arr.shape[0] < ch:
+                            continue
+                        cut = arr[:ch]
+                        chunks.append(numpy.ascontiguousarray(cut))
+                        audio_bytes += cut.nbytes
+                        if audio_bytes > (1 << 30):
+                            raise RuntimeError(
+                                "音轨超过 1GB（超长文件），请先裁剪再分离")
+            finally:
+                out.close()
+        os.replace(tmp_v, video_out_path)
+        has_audio = bool(chunks)
+        if has_audio:
+            import numpy as _np
+            pcm = _np.concatenate(chunks, axis=1)
+            if not save_wav_pcm16(wav_out_path, pcm, sr or 44100):
+                raise RuntimeError(f"wav 写入失败：{last_error}")
+        try:
+            fps = float(probe_fps(src_path, 24.0))
+        except Exception:
+            fps = 24.0
+        last_error = None
+        return {"video": True, "audio": has_audio,
+                "sample_rate": (int(sr) if has_audio and sr else None),
+                "width": vw, "height": vh, "fps": fps}
+    except Exception as e:
+        last_error = f"{type(e).__name__}: {e}"
+        print(f"[split_av_stream] 分离异常：{last_error}")
+        import traceback
+        traceback.print_exc()
+        for p in (tmp_v,):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+        return None

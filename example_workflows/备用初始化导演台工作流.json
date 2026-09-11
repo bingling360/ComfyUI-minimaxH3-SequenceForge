@@ -1,8 +1,8 @@
 {
   "id": "h3-chain-director-default",
   "revision": 2,
-  "last_node_id": 54,
-  "last_link_id": 36,
+  "last_node_id": 59,
+  "last_link_id": 44,
   "nodes": [
     {
       "id": 3,
@@ -24,7 +24,8 @@
           "name": "VAE",
           "type": "VAE",
           "links": [
-            3
+            3,
+            41
           ]
         }
       ],
@@ -58,7 +59,8 @@
           "name": "VAE",
           "type": "VAE",
           "links": [
-            4
+            4,
+            42
           ]
         }
       ],
@@ -70,1008 +72,6 @@
       },
       "widgets_values": [
         "minimax_h3_audio_vae_fp32.safetensors"
-      ]
-    },
-    {
-      "id": 50,
-      "type": "PrimitiveStringMultiline",
-      "pos": [
-        40,
-        1330
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 2,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "STRING",
-          "type": "STRING",
-          "links": [
-            7
-          ]
-        }
-      ],
-      "title": "提示词·1",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "PrimitiveStringMultiline"
-      },
-      "widgets_values": [
-        "示例段落：黄昏的海边小镇，海浪轻拍礁石，镜头缓缓推近灯塔"
-      ]
-    },
-    {
-      "id": 51,
-      "type": "PrimitiveStringMultiline",
-      "pos": [
-        370,
-        1330
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 3,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "STRING",
-          "type": "STRING",
-          "links": [
-            8
-          ]
-        }
-      ],
-      "title": "提示词·2",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "PrimitiveStringMultiline"
-      },
-      "widgets_values": [
-        ""
-      ]
-    },
-    {
-      "id": 52,
-      "type": "PrimitiveStringMultiline",
-      "pos": [
-        700,
-        1330
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 4,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "STRING",
-          "type": "STRING",
-          "links": [
-            9
-          ]
-        }
-      ],
-      "title": "提示词·3",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "PrimitiveStringMultiline"
-      },
-      "widgets_values": [
-        ""
-      ]
-    },
-    {
-      "id": 20,
-      "type": "LoadImage",
-      "pos": [
-        40,
-        1660
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 5,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            10
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "首帧图",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 6,
-      "type": "LoadImage",
-      "pos": [
-        40,
-        2000
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 6,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            11
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "目标尾帧图",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 5,
-      "type": "LoadImage",
-      "pos": [
-        380,
-        1660
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 7,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            12
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "尾帧图",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 21,
-      "type": "LoadImage",
-      "pos": [
-        720,
-        1660
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 8,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            13
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·1",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 22,
-      "type": "LoadImage",
-      "pos": [
-        1040,
-        1660
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 9,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            14
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·2",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 23,
-      "type": "LoadImage",
-      "pos": [
-        1360,
-        1660
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 10,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            15
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·3",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 24,
-      "type": "LoadImage",
-      "pos": [
-        720,
-        2000
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 11,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            16
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·4",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 25,
-      "type": "LoadImage",
-      "pos": [
-        1040,
-        2000
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 12,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            17
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·5",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 26,
-      "type": "LoadImage",
-      "pos": [
-        1360,
-        2000
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 13,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            18
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·6",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 27,
-      "type": "LoadImage",
-      "pos": [
-        720,
-        2340
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 14,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            19
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·7",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 28,
-      "type": "LoadImage",
-      "pos": [
-        1040,
-        2340
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 15,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            20
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·8",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 29,
-      "type": "LoadImage",
-      "pos": [
-        1360,
-        2340
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 16,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            21
-          ]
-        },
-        {
-          "name": "MASK",
-          "type": "MASK"
-        }
-      ],
-      "title": "参考图·9",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadImage"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 30,
-      "type": "LoadVideo",
-      "pos": [
-        1380,
-        1660
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 17,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "VIDEO",
-          "type": "VIDEO",
-          "links": [
-            24
-          ]
-        }
-      ],
-      "title": "参考视频·1",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadVideo"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 33,
-      "type": "GetVideoComponents",
-      "pos": [
-        1700,
-        1660
-      ],
-      "size": [
-        280,
-        150
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 26,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "video",
-          "type": "VIDEO",
-          "link": 24
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": [
-            22
-          ]
-        },
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "links": [
-            23
-          ]
-        },
-        {
-          "name": "fps",
-          "type": "FLOAT"
-        },
-        {
-          "name": "bit_depth",
-          "type": "INT"
-        }
-      ],
-      "title": "拆分视频·1",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "GetVideoComponents"
-      },
-      "widgets_values": []
-    },
-    {
-      "id": 31,
-      "type": "LoadVideo",
-      "pos": [
-        1380,
-        1900
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 18,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "VIDEO",
-          "type": "VIDEO",
-          "links": [
-            27
-          ]
-        }
-      ],
-      "title": "参考视频·2",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadVideo"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 34,
-      "type": "GetVideoComponents",
-      "pos": [
-        1700,
-        1900
-      ],
-      "size": [
-        280,
-        150
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 27,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "video",
-          "type": "VIDEO",
-          "link": 27
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": [
-            25
-          ]
-        },
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "links": [
-            26
-          ]
-        },
-        {
-          "name": "fps",
-          "type": "FLOAT"
-        },
-        {
-          "name": "bit_depth",
-          "type": "INT"
-        }
-      ],
-      "title": "拆分视频·2",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "GetVideoComponents"
-      },
-      "widgets_values": []
-    },
-    {
-      "id": 32,
-      "type": "LoadVideo",
-      "pos": [
-        1380,
-        2140
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 19,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "VIDEO",
-          "type": "VIDEO",
-          "links": [
-            30
-          ]
-        }
-      ],
-      "title": "参考视频·3",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadVideo"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 35,
-      "type": "GetVideoComponents",
-      "pos": [
-        1700,
-        2140
-      ],
-      "size": [
-        280,
-        150
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 28,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "video",
-          "type": "VIDEO",
-          "link": 30
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": [
-            28
-          ]
-        },
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "links": [
-            29
-          ]
-        },
-        {
-          "name": "fps",
-          "type": "FLOAT"
-        },
-        {
-          "name": "bit_depth",
-          "type": "INT"
-        }
-      ],
-      "title": "拆分视频·3",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "GetVideoComponents"
-      },
-      "widgets_values": []
-    },
-    {
-      "id": 36,
-      "type": "LoadAudio",
-      "pos": [
-        2040,
-        1660
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 20,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "AUDIO",
-          "type": "AUDIO",
-          "links": [
-            31
-          ]
-        },
-        {
-          "name": "name",
-          "type": "STRING"
-        }
-      ],
-      "title": "参考音频·1",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadAudio"
-      },
-      "widgets_values": [
-        "",
-        null,
-        null
-      ]
-    },
-    {
-      "id": 37,
-      "type": "LoadAudio",
-      "pos": [
-        2040,
-        1900
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 21,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "AUDIO",
-          "type": "AUDIO",
-          "links": [
-            32
-          ]
-        },
-        {
-          "name": "name",
-          "type": "STRING"
-        }
-      ],
-      "title": "参考音频·2",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadAudio"
-      },
-      "widgets_values": [
-        "",
-        null,
-        null
-      ]
-    },
-    {
-      "id": 38,
-      "type": "LoadAudio",
-      "pos": [
-        2040,
-        2140
-      ],
-      "size": [
-        280,
-        300
-      ],
-      "flags": {
-        "collapsed": true
-      },
-      "order": 22,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "AUDIO",
-          "type": "AUDIO",
-          "links": [
-            33
-          ]
-        },
-        {
-          "name": "name",
-          "type": "STRING"
-        }
-      ],
-      "title": "参考音频·3",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadAudio"
-      },
-      "widgets_values": [
-        "",
-        null,
-        null
       ]
     },
     {
@@ -1149,24 +149,6 @@
           "link": 4
         },
         {
-          "name": "首帧图片",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 10
-        },
-        {
-          "name": "尾帧图片",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 11
-        },
-        {
-          "name": "每段尾帧锚定",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 12
-        },
-        {
           "name": "起始视频",
           "shape": 7,
           "type": "IMAGE",
@@ -1179,157 +161,9 @@
           "link": null
         },
         {
-          "label": "提示词_0",
-          "name": "提示词组.提示词_0",
+          "name": "资产包",
           "type": "STRING",
-          "link": 7
-        },
-        {
-          "label": "提示词_1",
-          "name": "提示词组.提示词_1",
-          "shape": 7,
-          "type": "STRING",
-          "link": 8
-        },
-        {
-          "label": "提示词_2",
-          "name": "提示词组.提示词_2",
-          "shape": 7,
-          "type": "STRING",
-          "link": 9
-        },
-        {
-          "label": "提示词_3",
-          "name": "提示词组.提示词_3",
-          "shape": 7,
-          "type": "STRING",
-          "link": null
-        },
-        {
-          "label": "参考图片_0",
-          "name": "参考图片组.参考图片_0",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 13
-        },
-        {
-          "label": "参考图片_1",
-          "name": "参考图片组.参考图片_1",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 14
-        },
-        {
-          "label": "参考图片_2",
-          "name": "参考图片组.参考图片_2",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 15
-        },
-        {
-          "label": "参考图片_3",
-          "name": "参考图片组.参考图片_3",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 16
-        },
-        {
-          "label": "参考图片_4",
-          "name": "参考图片组.参考图片_4",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 17
-        },
-        {
-          "label": "参考图片_5",
-          "name": "参考图片组.参考图片_5",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 18
-        },
-        {
-          "label": "参考图片_6",
-          "name": "参考图片组.参考图片_6",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 19
-        },
-        {
-          "label": "参考图片_7",
-          "name": "参考图片组.参考图片_7",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 20
-        },
-        {
-          "label": "参考图片_8",
-          "name": "参考图片组.参考图片_8",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 21
-        },
-        {
-          "label": "参考视频_0",
-          "name": "参考视频组.参考视频_0",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 22
-        },
-        {
-          "label": "参考视频_1",
-          "name": "参考视频组.参考视频_1",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 25
-        },
-        {
-          "label": "参考视频_2",
-          "name": "参考视频组.参考视频_2",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 28
-        },
-        {
-          "label": "参考视频音轨_0",
-          "name": "参考视频音轨组.参考视频音轨_0",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 23
-        },
-        {
-          "label": "参考视频音轨_1",
-          "name": "参考视频音轨组.参考视频音轨_1",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 26
-        },
-        {
-          "label": "参考视频音轨_2",
-          "name": "参考视频音轨组.参考视频音轨_2",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 29
-        },
-        {
-          "label": "参考音频_0",
-          "name": "参考音频组.参考音频_0",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 31
-        },
-        {
-          "label": "参考音频_1",
-          "name": "参考音频组.参考音频_1",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 32
-        },
-        {
-          "label": "参考音频_2",
-          "name": "参考音频组.参考音频_2",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 33
+          "link": 37
         }
       ],
       "outputs": [
@@ -1423,7 +257,8 @@
           "name": "CLIP",
           "type": "CLIP",
           "links": [
-            2
+            2,
+            44
           ]
         }
       ],
@@ -1458,7 +293,8 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            34
+            34,
+            43
           ]
         }
       ],
@@ -1527,10 +363,243 @@
       "title": "导演台使用说明",
       "properties": {},
       "widgets_values": [
-        "# H3 长片导演台 · 配套工作流\n\n- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，「提示词·1..3」隐藏节点只是画布镜像兼兜底，超过 3 段全在导演台管理\n- 「素材池 · 自动管理」组的节点由导演台按实际引用自动点亮/隐藏：**连线常驻，不用时只是隐藏**，请勿删除；「目标尾帧图」= 链尾锚（资产标注尾帧图）；「尾帧图」= 旧尾帧锚定槽（已并入段 tail_src）\n- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），导演台段卡片直接预览播放；需要另行导出可手动连「分段图像/分段音频」输出\n- 链路自动推导（无模式选择）：有段引用素材即走 ref conditioning；UNET 请按引用情况接 ref2va（或混用权重），纯文生链用 fl2va 也可\n- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」"
+        "# H3 长片导演台 · 配套工作流\n\n- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，提示词只走导演台状态（**1–64 段不限**，画布无任何提示词/素材外联）\n- 资产走 H3AssetBundle 单线：`H3 Asset Bundle` 节点填项目名，一条线连主节点「资产包」，连一次终身不动；增删素材全在导演台三库面板（瓦片拖放/@引用），画布不再拉线；旧 autogrow 拉线与 H3AssetHub 串口仍兼容保留\n- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），导演台段卡片直接预览播放；需要另行导出可手动连「分段图像/分段音频」输出\n- 链路自动推导（无模式选择）：有段引用素材即走 ref conditioning；UNET 请按引用情况接 ref2va（或混用权重），纯文生链用 fl2va 也可\n- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」\n- 工具节点已预连线并旁路休眠（零成本）：latent 库行点「⚡放大」一键放大；「现抽视频源」选视频后取消 H3LatentExtract 旁路即跑现抽。平时不占队列。"
       ],
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 55,
+      "type": "H3AssetBundle",
+      "title": "H3 Asset Bundle (资产包)",
+      "pos": [
+        380,
+        1660
+      ],
+      "size": [
+        360,
+        150
+      ],
+      "flags": {},
+      "order": 31,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "资产包",
+          "type": "STRING",
+          "links": [
+            37
+          ]
+        },
+        {
+          "name": "报告",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "widgets_values": [
+        ""
+      ],
+      "properties": {
+        "Node name for S&R": "H3AssetBundle"
+      }
+    },
+    {
+      "id": 56,
+      "type": "H3LatentExtract",
+      "title": "H3 Latent Extract (现抽存档)",
+      "pos": [
+        880,
+        40
+      ],
+      "size": [
+        360,
+        220
+      ],
+      "flags": {},
+      "order": 32,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "视频帧",
+          "type": "IMAGE",
+          "link": 39
+        },
+        {
+          "name": "视频VAE",
+          "type": "VAE",
+          "link": 41
+        },
+        {
+          "name": "音轨",
+          "type": "AUDIO",
+          "link": 40
+        },
+        {
+          "name": "音频VAE",
+          "type": "VAE",
+          "link": 42
+        }
+      ],
+      "outputs": [
+        {
+          "name": "报告",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "widgets_values": [
+        0,
+        0,
+        "",
+        ""
+      ],
+      "properties": {
+        "Node name for S&R": "H3LatentExtract"
+      }
+    },
+    {
+      "id": 57,
+      "type": "H3LatentUpscale",
+      "title": "H3 Latent Upscale (库内放大)",
+      "pos": [
+        880,
+        300
+      ],
+      "size": [
+        360,
+        320
+      ],
+      "flags": {},
+      "order": 33,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "模型",
+          "type": "MODEL",
+          "link": 43
+        },
+        {
+          "name": "文本编码器",
+          "type": "CLIP",
+          "link": 44
+        }
+      ],
+      "outputs": [
+        {
+          "name": "报告",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "widgets_values": [
+        "",
+        "",
+        "",
+        "auto",
+        2.0,
+        "fp16",
+        "关闭",
+        "",
+        0,
+        6,
+        0.35,
+        1.0,
+        ""
+      ],
+      "properties": {
+        "Node name for S&R": "H3LatentUpscale"
+      }
+    },
+    {
+      "id": 58,
+      "type": "LoadVideo",
+      "title": "现抽视频源",
+      "pos": [
+        880,
+        660
+      ],
+      "size": [
+        320,
+        120
+      ],
+      "flags": {},
+      "order": 34,
+      "mode": 2,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            38
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 59,
+      "type": "GetVideoComponents",
+      "title": "现抽拆分",
+      "pos": [
+        880,
+        800
+      ],
+      "size": [
+        240,
+        140
+      ],
+      "flags": {},
+      "order": 35,
+      "mode": 2,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 38
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            39
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            40
+          ]
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": null
+        },
+        {
+          "name": "bit_depth",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "GetVideoComponents"
+      }
     }
   ],
   "links": [
@@ -1559,222 +628,6 @@
       "VAE"
     ],
     [
-      7,
-      50,
-      0,
-      10,
-      9,
-      "STRING"
-    ],
-    [
-      8,
-      51,
-      0,
-      10,
-      10,
-      "STRING"
-    ],
-    [
-      9,
-      52,
-      0,
-      10,
-      11,
-      "STRING"
-    ],
-    [
-      10,
-      20,
-      0,
-      10,
-      4,
-      "IMAGE"
-    ],
-    [
-      11,
-      6,
-      0,
-      10,
-      5,
-      "IMAGE"
-    ],
-    [
-      12,
-      5,
-      0,
-      10,
-      6,
-      "IMAGE"
-    ],
-    [
-      13,
-      21,
-      0,
-      10,
-      13,
-      "IMAGE"
-    ],
-    [
-      14,
-      22,
-      0,
-      10,
-      14,
-      "IMAGE"
-    ],
-    [
-      15,
-      23,
-      0,
-      10,
-      15,
-      "IMAGE"
-    ],
-    [
-      16,
-      24,
-      0,
-      10,
-      16,
-      "IMAGE"
-    ],
-    [
-      17,
-      25,
-      0,
-      10,
-      17,
-      "IMAGE"
-    ],
-    [
-      18,
-      26,
-      0,
-      10,
-      18,
-      "IMAGE"
-    ],
-    [
-      19,
-      27,
-      0,
-      10,
-      19,
-      "IMAGE"
-    ],
-    [
-      20,
-      28,
-      0,
-      10,
-      20,
-      "IMAGE"
-    ],
-    [
-      21,
-      29,
-      0,
-      10,
-      21,
-      "IMAGE"
-    ],
-    [
-      22,
-      33,
-      0,
-      10,
-      22,
-      "IMAGE"
-    ],
-    [
-      23,
-      33,
-      1,
-      10,
-      25,
-      "AUDIO"
-    ],
-    [
-      24,
-      30,
-      0,
-      33,
-      0,
-      "VIDEO"
-    ],
-    [
-      25,
-      34,
-      0,
-      10,
-      23,
-      "IMAGE"
-    ],
-    [
-      26,
-      34,
-      1,
-      10,
-      26,
-      "AUDIO"
-    ],
-    [
-      27,
-      31,
-      0,
-      34,
-      0,
-      "VIDEO"
-    ],
-    [
-      28,
-      35,
-      0,
-      10,
-      24,
-      "IMAGE"
-    ],
-    [
-      29,
-      35,
-      1,
-      10,
-      27,
-      "AUDIO"
-    ],
-    [
-      30,
-      32,
-      0,
-      35,
-      0,
-      "VIDEO"
-    ],
-    [
-      31,
-      36,
-      0,
-      10,
-      28,
-      "AUDIO"
-    ],
-    [
-      32,
-      37,
-      0,
-      10,
-      29,
-      "AUDIO"
-    ],
-    [
-      33,
-      38,
-      0,
-      10,
-      30,
-      "AUDIO"
-    ],
-    [
       34,
       1,
       0,
@@ -1797,6 +650,70 @@
       54,
       0,
       "STRING"
+    ],
+    [
+      37,
+      55,
+      0,
+      10,
+      6,
+      "STRING"
+    ],
+    [
+      38,
+      58,
+      0,
+      59,
+      0,
+      "VIDEO"
+    ],
+    [
+      39,
+      59,
+      0,
+      56,
+      0,
+      "IMAGE"
+    ],
+    [
+      40,
+      59,
+      1,
+      56,
+      2,
+      "AUDIO"
+    ],
+    [
+      41,
+      3,
+      0,
+      56,
+      1,
+      "VAE"
+    ],
+    [
+      42,
+      4,
+      0,
+      56,
+      3,
+      "VAE"
+    ],
+    [
+      43,
+      1,
+      0,
+      57,
+      0,
+      "MODEL"
+    ],
+    [
+      44,
+      2,
+      0,
+      57,
+      1,
+      "CLIP"
     ]
   ],
   "groups": [

@@ -274,7 +274,9 @@ function matchCanvasCombo(w, h) {
 /* ---------- 素材标签工具 ---------- */
 
 function cleanLabel(text) {
-    return String(text ?? "").trim().replace(/[[\]]/g, "").slice(0, 12);
+    /* P3 修正：上限与后端 _ASSET_LABEL_MAX=24 对齐（旧 12 会在 widget 读写循环里
+     * 截断长别名，导致服务端链接别名与段引用对不上） */
+    return String(text ?? "").trim().replace(/[[\]]/g, "").slice(0, 24);
 }
 
 function uniqueLabelFrom(taken, base) {
@@ -294,6 +296,62 @@ function insertAtCursor(ta, text) {
     ta.focus();
     ta.setSelectionRange(pos, pos);
     return ta.value;
+}
+
+/* P3：@补全——提示词框内 @ 前缀弹出池别名，点选/回车插入 [[别名]]。
+ * 只改文本不调接口不重建面板（焦点守卫安全）；选中后派发 input 走既有防抖落盘。 */
+function attachAtComplete(ta, node) {
+    if (!ta || ta.dataset.h3at === "1") return;
+    ta.dataset.h3at = "1";
+    let pop = null, items = [], sel = 0;
+    const close = () => { if (pop) { pop.remove(); pop = null; } };
+    const current = () => {
+        const pos = ta.selectionStart ?? ta.value.length;
+        const m = /@([^\s@\[\]]*)$/.exec(ta.value.slice(0, pos));
+        return m ? { word: m[1], start: pos - m[0].length } : null;
+    };
+    const paint = () => {
+        close();
+        const c = current();
+        if (!c) return;
+        let pool = [];
+        try { pool = getDs(node).ref_assets || []; } catch (e) { pool = []; }
+        const w = c.word.toLowerCase();
+        items = pool.filter((a) => String(a.label || "").toLowerCase().includes(w)).slice(0, 8);
+        if (!items.length) return;
+        pop = el("div", "h3d-atpop");
+        items.forEach((a, idx) => {
+            const d = el("div", idx === sel ? "on" : "",
+                `${escapeHtml(a.label)}<small>${KIND_NAME[a.kind] || ""}</small>`);
+            d.onmousedown = (e) => { e.preventDefault(); pick(idx); };
+            pop.append(d);
+        });
+        const r = ta.getBoundingClientRect();
+        pop.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - 320))}px`;
+        pop.style.top = `${Math.min(r.bottom + 4, window.innerHeight - 260)}px`;
+        document.body.append(pop);
+    };
+    const pick = (idx) => {
+        const c = current();
+        const a = items[idx];
+        close();
+        if (!c || !a) return;
+        const pos = ta.selectionStart ?? ta.value.length;
+        ta.value = ta.value.slice(0, c.start) + `[[${a.label}]]` + ta.value.slice(pos);
+        const np = c.start + a.label.length + 4;
+        ta.focus();
+        ta.setSelectionRange(np, np);
+        ta.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    ta.addEventListener("input", () => { sel = 0; paint(); });
+    ta.addEventListener("keydown", (e) => {
+        if (!pop) return;
+        if (e.key === "ArrowDown") { e.preventDefault(); sel = (sel + 1) % items.length; paint(); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); sel = (sel - 1 + items.length) % items.length; paint(); }
+        else if (e.key === "Enter" && items.length) { e.preventDefault(); pick(sel); }
+        else if (e.key === "Escape") close();
+    });
+    ta.addEventListener("blur", () => setTimeout(close, 150));
 }
 
 function inputViewUrl(name) {
@@ -555,6 +613,8 @@ function getDs(node) {
                     file: String(a.file),
                     kind: KIND_LIST.includes(a.kind) ? a.kind : "image",
                     label: cleanLabel(a.label) || "",
+                    /* P3：全局库稳定 ID（空=旧本地条目；保存 manifest.assets 时剥离，住 asset_links） */
+                    asset_id: typeof a.asset_id === "string" ? a.asset_id.trim() : "",
                     roles: Array.isArray(a.roles)
                         ? a.roles.map(String).filter((r) => r === "首帧图" || r === "尾帧图")
                         : [],
@@ -578,6 +638,8 @@ function getDs(node) {
         while (segments.length < prompts.length) segments.push(defaultSegment());
         if (segments.length > prompts.length) segments = segments.slice(0, prompts.length);
         const validLabels = new Set(refAssets.map((a) => a.label));
+        /* P3：段引用同时接受 asset_id（后端 compile_refs 同口径；写回时保持原样） */
+        const validIds = new Set(refAssets.map((a) => a.asset_id).filter(Boolean));
         segments = segments.map((s) => {
             const sec = Number(s?.seconds);
             return {
@@ -586,7 +648,9 @@ function getDs(node) {
                 soundscape: typeof s?.soundscape === "string" ? s.soundscape : "",
                 music: typeof s?.music === "string" ? s.music : "",
                 seconds: (isFinite(sec) && sec > 0) ? Math.min(15, Math.max(0.5, sec)) : null,
-                refs: Array.isArray(s?.refs) ? s.refs.map(String).filter((l) => validLabels.has(l)) : [],
+                refs: Array.isArray(s?.refs)
+                    ? s.refs.map((r) => String((r && typeof r === "object") ? (r.asset || r.id || r.label || "") : r))
+                        .filter((l) => validLabels.has(l) || validIds.has(l)) : [],
                 unlink: !!s?.unlink,
                 disabled: !!s?.disabled,
                 auto_ref: (s?.auto_ref === null || s?.auto_ref === undefined) ? null : !!s.auto_ref,
@@ -830,7 +894,9 @@ function setSegmentSeconds(node, idx, v) {
 
 /** 勾选/取消本段引用的素材标签；全部取消 = 只用提示词文本 [[标签]] 出现的
  * （与后端约定一致：缺省文本驱动，不勾选也能跑）。
- *  勾选时按类别校验官方单段上限（图9/视3/音3），超限拦截并提示。 */
+ *  勾选时按类别校验官方单段上限（图9/视3/音3），超限拦截并提示。
+ *  P5 显性语义：勾选即在段正文末尾补可见 [[标签]]（取消勾选不删正文，防丢字）；
+ *  调用方 blur 先于 click 触发，主框未落盘的输入已先行 flush，无竞态。 */
 function toggleSegmentRef(node, idx, label) {
     const ds = getDs(node);
     if (idx < 0 || idx >= (ds.segments || []).length) return;
@@ -851,6 +917,11 @@ function toggleSegmentRef(node, idx, label) {
             return;
         }
         seg.refs.push(label);
+        const cur = String((ds.prompts || [])[idx] || "");
+        if (!cur.includes(`[[${label}]]`)) {
+            if (!Array.isArray(ds.prompts)) ds.prompts = [];
+            ds.prompts[idx] = cur + (cur && !/\s$/.test(cur) ? " " : "") + `[[${label}]]`;
+        }
     }
     setDs(node, ds);
 }
@@ -879,14 +950,16 @@ function toggleSegmentFrameRef(node, idx, name) {
  * 旧三槽位上传（setFirstFrame/setEndFrame/setLastFrame/addAsset）已删除：
  * 统一走 uploadPoolFile（上传即入库进项目 assets/）。 */
 
-/* 素材池改动直写项目 manifest["assets"]（读最新 revision 落盘，冲突返回 false 调手动保存） */
+/* 素材池改动直写项目 manifest["assets"]（读最新 revision 落盘，冲突返回 false 调手动保存）。
+ * P3：带 asset_id 的全局链接条目住 asset_links，不进 legacy assets（保存时剥离）。 */
 async function persistPool(node) {
     try {
         const dir = getDirValue(node);
         if (!dir || !window.H3Api) return false;
         const ds = getDs(node);
         const mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
-        const r = await window.H3Api.saveAssets(dir, ds.ref_assets || [], mf?.revision);
+        const legacy = (ds.ref_assets || []).filter((a) => a && !a.asset_id);
+        const r = await window.H3Api.saveAssets(dir, legacy, mf?.revision);
         if (r.body?.ok) { scheduleRefresh(400); return true; }
         return false;
     } catch (e) { return false; }
@@ -898,13 +971,24 @@ function removeRefImage(node, idx) {
     const gone = ds.ref_assets.splice(idx, 1)[0];
     if (gone && gone.label) {
         for (const s of ds.segments || []) {
-            if (Array.isArray(s.refs)) s.refs = s.refs.filter((l) => l !== gone.label);
+            if (Array.isArray(s.refs)) {
+                s.refs = s.refs.filter((l) => l !== gone.label
+                    && (!gone.asset_id || l !== gone.asset_id));
+            }
         }
     }
     setDs(node, ds);
     syncMirrors(node, ds);
     scheduleRefresh(120);
     persistPool(node);
+    /* P3：链接条目同步解链（幂等；失败只记控制台，widget 已是真相） */
+    if (gone && gone.asset_id && window.H3Api?.assetUnlink) {
+        const dir = getDirValue(node);
+        if (dir) {
+            window.H3Api.assetUnlink({ dir, asset_id: gone.asset_id })
+                .catch((e) => console.warn("[h3-director] assetUnlink failed:", e));
+        }
+    }
 }
 
 /** 重命名素材标签：唯一性自动加后缀；同步重命名所有段级引用 */
@@ -921,6 +1005,14 @@ function renameAssetLabel(node, idx, text) {
         for (const s of ds.segments || []) {
             if (Array.isArray(s.refs)) s.refs = s.refs.map((l) => (l === old ? asset.label : l));
         }
+        /* P3：链接条目改名同步服务端 alias（同 alias 重指向语义） */
+        if (asset.asset_id && window.H3Api?.assetLink) {
+            const dir = getDirValue(node);
+            if (dir) {
+                window.H3Api.assetLink({ dir, asset_id: asset.asset_id, alias: asset.label, kind: asset.kind })
+                    .catch((e) => console.warn("[h3-director] assetLink rename failed:", e));
+            }
+        }
     }
     setDs(node, ds);
     persistPool(node);
@@ -928,19 +1020,20 @@ function renameAssetLabel(node, idx, text) {
 }
 
 /* ---- 总提示词（多段一次性导入 / 导出）----
- * 格式（skill「h3-video-prompts」同一规范，AI 按此生成的全文可直接粘贴分配）：
+ * 格式（提示词正文按 H3 官方格式，见 tools/h3_prompt_expander/references/h3-dialect.md）：
  *   【段1】          ← 段头：【段1】/【第1段】/【段落1】等价；序号可省略，按出现顺序排段
- *   场景：…         → seg.scene_prompt（风格契约：媒介+质感+调色板+光照）
- *   角色：…         → seg.character_prompt（外观+服饰+位置；弱编码器下逐段原样复用）
- *   环境音：…       → seg.soundscape（overall_soundscape；写每個声音及其进入时间）
- *   配乐：…         → seg.music（non_diegetic_music；乐器+节奏+进入时间）
- *   时长：5         → seg.seconds（可选，秒；缺省=沿用全局「每段时长」）
+ *   时长：5         → seg.seconds（官方字段；缺省=沿用全局「每段时长」）
  *   独立镜头：是    → seg.unlink（是/否；是=断链不锚定上段尾帧，跳转/闪回/蒙太奇用）
  *   参考：角色1，图片2 → seg.refs（逗号/顿号分隔的素材标签；不存在的标签分配时剔除并提示）
- *   提示词：…       → 段主体（ds.prompts[i]），可多行（续行不写标签），官方 [2s-4s] 时间线写在这里
+ *   提示词：…       → 段主体（ds.prompts[i]），可多行（续行不写标签）。
+ *                     正文按 H3 官方格式写：三字段 integrated_multimodal_description /
+ *                     overall_soundscape / non_diegetic_music（字段间空行），Ref2VA 六段式；
+ *                     I2VA/FL2VA/L2VA 的关键帧对齐指令写在正文最前、空一行再接三字段。
  *   【完】          ← 结束标记（可选）：其后的所有内容（如 AI 的参考素材建议）不参与解析
- * 规则：段头后未带标签的正文行视为提示词内容；只认上述 8 个行首标签，其余文本原样进
- * 主体（官方字段标签 integrated_multimodal_description: 等不受影响）；某标签「写了即生效
+ * 兼容：旧「场景/角色/环境音/配乐」四标签解析仍认（落到 seg.scene_prompt 等旧字段），
+ *       但导出不再写——这两组旧字段已被具象化（prompt_v2）取代，仅保旧项目文本可粘回。
+ * 规则：段头后未带标签的正文行视为提示词内容；只认上述行首标签，其余文本原样进主体
+ * （官方字段标签 integrated_multimodal_description: 等不受影响）；某标签「写了即生效
  * （含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。
  * 容错：markdown 渲染界面复制常把段内换行合并成空格（软换行丢失），整段糊成一行；
  * 检测到段头不在行首独占即自动「重分行」（见 mpReflow）再按常规行解析。 */
@@ -984,11 +1077,22 @@ function parseMasterPrompt(text) {
     const lines = src.split(/\r\n|\r|\n/);
     let cur = null;          // 当前段对象
     let field = null;        // 当前续行归属字段（"main" 等）
+    let pendingBlank = 0;    // 段主体内待落实的空行数（官方三字段靠空行分隔，不能被吃掉）
     const stray = [];        // 首个段头之前的游离行（无段头时整体作单段主体）
-    const openSeg = () => { cur = newMasterSeg(); out.segs.push(cur); field = "main"; };
+    const openSeg = () => { cur = newMasterSeg(); out.segs.push(cur); field = "main"; pendingBlank = 0; };
+    /* 续行追加：把待落实的空行先补回正文，再追加本行（段头/标签切换时丢弃 pendingBlank） */
+    const pushBody = (key, text) => {
+        const gap = pendingBlank > 0 && cur[key] !== undefined ? "\n".repeat(pendingBlank + 1) : "";
+        pendingBlank = 0;
+        cur[key] = cur[key] === undefined ? text : `${cur[key]}${gap}${text}`;
+    };
     for (const raw of lines) {
         const line = raw.trim();
-        if (!line || /^```/.test(line)) continue;      // 空行与 markdown 代码围栏不参与解析
+        if (/^```/.test(line)) continue;               // markdown 代码围栏不参与解析
+        if (!line) {                                   // 空行：段主体内的先记账，别处直接忽略
+            if (cur && field) pendingBlank += 1;
+            continue;
+        }
         if (MP_END_RE.test(line)) break;               // 【完】：其后的建议/解说不参与解析
         const hm = line.match(MP_HEAD_RE);
         if (hm) {
@@ -1015,14 +1119,14 @@ function parseMasterPrompt(text) {
             } else if (key === "refs") {
                 cur.refs = fm[2].split(/[，,、;；]+/).map((s) => s.trim()).filter(Boolean);
             } else {
+                pendingBlank = 0;                       // 换标签：之前记的空行不跨字段
                 cur[key] = cur[key] === undefined ? fm[2].trim() : `${cur[key]}\n${fm[2].trim()}`;
             }
             field = key;
             continue;
         }
         if (!cur) { stray.push(line); continue; }       // 段头前的普通正文
-        cur[field || "main"] = cur[field || "main"] === undefined
-            ? line : `${cur[field || "main"]}\n${line}`;
+        pushBody(field || "main", line);
     }
     if (!out.segs.length && stray.length) {             // 无段头=单段（正文原样作主体）
         openSeg();
@@ -1046,8 +1150,10 @@ function exportMasterPrompt(node) {
         if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`时长：${seg.seconds}`);
         if (!segAutoRef(seg)) rows.push("独立镜头：是");
         if (Array.isArray(seg.refs) && seg.refs.length) rows.push(`参考：${seg.refs.join("，")}`);
+        /* 提示词正文按 H3 官方格式（三字段 / Ref2VA 六段），自身含空行——
+           标签独占一行、正文从下一行开始，贴回时按续行原样归入 main。 */
         const main = String(prompts[i] ?? "").trim();
-        rows.push(main ? `提示词：${main}` : "提示词：");
+        rows.push(main ? `提示词：\n${main}` : "提示词：");
         blocks.push(rows.join("\n"));
     }
     return blocks.join("\n\n") + "\n\n【完】";
@@ -1061,7 +1167,9 @@ function applyMasterPrompt(node, text) {
     if (!p.segs.length) return p;
     const ds = getDs(node);
     const old = Array.isArray(ds.segments) ? ds.segments : [];
-    const labels = new Set((Array.isArray(ds.ref_assets) ? ds.ref_assets : []).map((a) => a && a.label).filter(Boolean));
+    /* P3：粘贴的参考标签同时接受 alias 与 asset_id（与 getDs 白名单同口径） */
+    const poolList0 = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    const labels = new Set(poolList0.map((a) => a && (a.label || a.asset_id)).filter(Boolean));
     ds.prompts = p.segs.map((s) => (s.main === undefined ? "" : s.main));
     ds.segments = p.segs.map((s, i) => {
         const base = (i < old.length && old[i] && typeof old[i] === "object") ? { ...old[i] } : defaultSegment();
@@ -1285,11 +1393,13 @@ function setMirrorNode(title, value, widgetNames) {
  *  仅导演台素材/提示词操作时调用，不动手摆工作流（找不到同名节点=手摆，静默跳过）。 */
 function syncMirrors(node, ds) {
     if (!node || !ds) return;
-    const byKind = (k) => (Array.isArray(ds.ref_assets) ? ds.ref_assets.filter((a) => a.kind === k) : []);
+    /* P3：全局链接条目不进画布镜像（LoadImage 只认 input 目录，写 images/… 会挂红；
+     * 导演台面板经 library_file 正常预览，执行期走 store 寻址） */
+    const local = (Array.isArray(ds.ref_assets) ? ds.ref_assets : []).filter((a) => a && !a.asset_id);
+    const byKind = (k) => local.filter((a) => a.kind === k);
     // 去模式门控：镜像按数据点亮（标注资产优先于旧槽位，与后端汇合口径一致）
     const roleFile = (role) => {
-        const a = (Array.isArray(ds.ref_assets) ? ds.ref_assets : [])
-            .find((x) => Array.isArray(x.roles) && x.roles.includes(role));
+        const a = local.find((x) => Array.isArray(x.roles) && x.roles.includes(role));
         return a ? String(a.file || "") : "";
     };
     setMirrorNode("首帧图", ds.first_frame || roleFile("首帧图"), ["image"]);
@@ -1415,25 +1525,54 @@ async function doMergeExport(btn) {
 
 const _taTimers = new Map();
 const _segTab = new Map();   // segIdx -> 'main'|'v2'|'set'（切换式段卡记忆，不持久化）
+/* 待落盘写回（与 _taTimers 同 key）：切项目时同步 flush 进旧项目，
+ * 防止 350ms 窗内的按键写到新项目（跨项目污染）或丢失 */
+const _taPending = new Map();
+/* UI 代际：switchProject 每次 +1；跨代到期的 debounce 写回直接丢弃 */
+let _uiGen = 0;
 
 function debouncePromptWrite(node, idx, text) {
     const key = `p${idx}`;
     const old = _taTimers.get(key);
     if (old) clearTimeout(old);
+    const gen = _uiGen;
     _taTimers.set(key, setTimeout(() => {
         _taTimers.delete(key);
+        _taPending.delete(key);
+        if (gen !== _uiGen) return;   // 切项目后到期的写回直接丢弃（已 flush 过）
         setPromptText(node, idx, text);
     }, 350));
+    _taPending.set(key, () => setPromptText(node, idx, text));
 }
 
 function debounceSegmentWrite(node, idx, field, text) {
     const key = `s${idx}_${field}`;
     const old = _taTimers.get(key);
     if (old) clearTimeout(old);
+    const gen = _uiGen;
     _taTimers.set(key, setTimeout(() => {
         _taTimers.delete(key);
+        _taPending.delete(key);
+        if (gen !== _uiGen) return;
         setSegmentField(node, idx, field, text);
     }, 350));
+    _taPending.set(key, () => setSegmentField(node, idx, field, text));
+}
+
+/* 同步刷掉所有挂起的输入框写回（切项目前调用：按键进旧项目，一个不丢） */
+function flushPendingEdits() {
+    if (!_taPending.size && !_taTimers.size) return 0;
+    const jobs = [..._taPending.values()];
+    _taPending.clear();
+    for (const t of _taTimers.values()) {
+        try { clearTimeout(t); } catch (e) { /* 忽略 */ }
+    }
+    _taTimers.clear();
+    let n = 0;
+    for (const fire of jobs) {
+        try { fire(); n++; } catch (e) { /* 单条失败不阻断其余 */ }
+    }
+    return n;
 }
 
 /* ---- prompt_v2 分组写回（5.1）：段卡分组表单 -> ds.segments[idx].prompt_v2 ----
@@ -1472,10 +1611,14 @@ function debouncePromptV2Write(node, idx, key, value) {
     const tkey = `pv${idx}_${key}`;
     const old = _taTimers.get(tkey);
     if (old) clearTimeout(old);
+    const gen = _uiGen;
     _taTimers.set(tkey, setTimeout(() => {
         _taTimers.delete(tkey);
+        _taPending.delete(tkey);
+        if (gen !== _uiGen) return;
         setPromptV2Field(node, idx, (pv) => { pv[key] = value; });
     }, 350));
+    _taPending.set(tkey, () => setPromptV2Field(node, idx, (pv) => { pv[key] = value; }));
 }
 
 /* ---- 具象化两模式（FL2VA 首尾帧 / Ref2VA 全参考） ----
@@ -1722,10 +1865,11 @@ async function runOptForSegment(node, idx, ta, ui) {
         const media = [];
         if (settings.read_media !== false) {
             const poolList = ds.ref_assets || [];
-            for (const label of refs.slice(0, 8)) {
-                const asset = poolList.find((a) => a && a.label === label);
+            for (const key of refs.slice(0, 8)) {
+                const asset = poolList.find((a) => a && (a.label === key || a.asset_id === key));
                 if (!asset || asset.kind !== "image") continue;
-                const dataUrl = await optImageToDataUrl(assetPreviewUrl(getDirValue(node), asset.file));
+                const dataUrl = await optImageToDataUrl(
+                    assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
                 media.push({ kind: "image", label: `<picture>`, images: dataUrl ? [dataUrl] : [] });
             }
         }
@@ -2516,17 +2660,27 @@ function schedulePromptFlush() {
 }
 
 /** 读档：切换「存档目录」+ 载入该项目的提示词进导演台状态（后端续跑校验共享参数）。
- *  切走前先把当前提示词回写旧项目（否则覆盖即丢）；序章项目的 prompts[0]
- *  是「序章（上传视频）」占位（对应起始视频，不是提示词框），载入时跳过。 */
+ *  序章项目的 prompts[0] 是「序章（上传视频）」占位（对应起始视频，不是提示词框），
+ *  载入时跳过。切项目三件套：先把 350ms 窗内的按键同步刷进旧项目（防跨项目污染），
+ *  再回写旧项目，最后换代际（连续快切时过期流程直接退出，不互相覆盖）。 */
 async function switchProject(dir) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
-    clearTimeout(promptFlushTimer);                             // 取消挂起的防抖：防止迟到的回写打到新项目
+    const myGen = ++_uiGen;
+    const stale = () => myGen !== _uiGen;
+    flushPendingEdits();                                   // 按键先进旧项目，一个不丢
+    clearTimeout(promptFlushTimer);                        // 取消挂起的批量防抖（已同步刷过）
     const oldDir = getDirValue(node);
-    if (oldDir && oldDir !== dir) await flushPrompts(node, oldDir);
+    if (oldDir && oldDir !== dir) {
+        try { await flushPrompts(node, oldDir); } catch (e) {
+            console.warn("[h3-director] 切项目前回写旧项目失败：", e);
+        }
+    }
+    if (stale()) return;
     if (!setDirValue(node, dir)) { alert("节点上没有「存档目录/断点目录」控件"); return; }
     setWidgetValue(node, W_REROLL, 0);
     const r = await apiGet(`/h3chain/project?dir=${encodeURIComponent(dir)}`);
+    if (stale()) return;
     const mf = r.ok ? (r.data?.manifest || null) : null;
     if (mf) {
         const off = mf.has_prologue ? 1 : 0;
@@ -2569,15 +2723,61 @@ async function switchProject(dir) {
                     file: String(a.file),
                     kind: KIND_LIST.includes(a.kind) ? a.kind : "image",
                     label: String(a.label),
+                    asset_id: "",
                     roles: Array.isArray(a.roles) ? a.roles.filter(
                         (r) => r === "首帧图" || r === "尾帧图") : [],
                 }));
+            /* P3：合并服务端 asset_links（alias 与 legacy label 冲突时链接胜出，
+             * 与后端 by_alias 首胜口径一致；file 取全局库回填） */
+            try {
+                if (window.H3Api?.assetLinks) {
+                    const lr = await window.H3Api.assetLinks(dir);
+                    const links = (lr.body?.ok && lr.body.links) || [];
+                    if (links.length) {
+                        const byLabel = new Map(ds.ref_assets.map((a) => [a.label, a]));
+                        for (const L of links) {
+                            const alias = String(L.alias || "");
+                            if (!alias) continue;
+                            byLabel.set(alias, {
+                                file: String(L.file || ""),
+                                kind: KIND_LIST.includes(L.kind) ? L.kind : "image",
+                                label: alias,
+                                asset_id: String(L.asset_id || ""),
+                                roles: Array.isArray(L.roles) ? L.roles.filter(
+                                    (r) => r === "首帧图" || r === "尾帧图") : [],
+                            });
+                        }
+                        ds.ref_assets = [...byLabel.values()].filter((a) => a.file);
+                    }
+                }
+            } catch (e) { console.warn("[h3-director] assetLinks merge failed:", e); }
+            if (stale()) return;
+            // 槽位索引态必须清：重摇标记/二采勾选按槽位存，带到新项目会重做错段
+            ds.redo_segs = [];
+            if (ds.upscale) ds.upscale.include = [];
+            setDs(node, ds);
+        } else if (mf) {
+            // 空项目（无段落无提示词）：必须清空旧池，否则旧项目内容残留显示
+            const ds = getDs(node);
+            ds.prompts = [];
+            ds.segments = [];
+            ds.inserts = [];
+            ds.ref_assets = [];
+            ds.redo_segs = [];
+            if (ds.upscale) ds.upscale.include = [];
             setDs(node, ds);
         }
-        setLed("idle", `已读档「${mf.title || dir}」（${mf.total ? `${mf.done ?? 0}/${mf.total} 段` : "草稿，未配置段落"}）`);
+        if (stale()) return;
+        if (mf) {
+            setLed("idle", `已读档「${mf.title || dir}」（${mf.total ? `${mf.done ?? 0}/${mf.total} 段` : "草稿，未配置段落"}）`);
+        } else {
+            setLed("idle", `已指向 ${dir}`);
+        }
     } else {
         setLed("idle", `已指向 ${dir}`);
     }
+    // 直接全刷一次（不等 200ms 轮询，消灭“来不及更新”）
+    try { await refresh(); } catch (e) { /* refresh 内部已兜底 */ }
     scheduleRefresh(200);
 }
 
@@ -3129,12 +3329,12 @@ function injectStyles() {
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
     /* ---- 三库全屏子面板 ---- */
-    .h3d-libbox{width:min(1060px,96vw);max-height:92vh;display:flex;flex-direction:column;background:var(--h3d-panel);border:1px solid var(--h3d-line);border-radius:12px;overflow:hidden}
+    .h3d-libbox{width:min(1560px,100%);height:100%;max-height:100%;display:flex;flex-direction:column;background:var(--h3d-panel);border:1px solid var(--h3d-line);border-radius:14px;overflow:hidden}
     .h3d-libhead{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--h3d-line);background:#1b1a16;flex-wrap:wrap}
     .h3d-libhead strong{font-size:14px}
     .h3d-libtab{padding:5px 14px;border:1px solid #3a352c;border-radius:14px;background:#1b1a16;color:#a8a294;cursor:pointer;font-size:12px;font-family:inherit}
     .h3d-libtab.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
-    .h3d-libbody{padding:12px 14px;overflow:auto;display:grid;gap:10px}
+    .h3d-libbody{padding:16px 18px;overflow:auto;display:grid;gap:14px;align-content:start}
     .h3d-librow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;border:1px solid #37332b;border-radius:8px;background:#181712}
     .h3d-librow video{width:180px;max-height:100px;border-radius:6px;background:#000}
     .h3d-librow img{width:64px;height:64px;border-radius:6px;object-fit:cover;background:#000}
@@ -3157,6 +3357,52 @@ function injectStyles() {
     .h3d-quicklbl button{padding:2px 7px;border:1px solid #3a352c;border-radius:10px;background:#25221c;color:#a39d90;cursor:pointer;font-size:10px;font-family:inherit}
     .h3d-quicklbl button:hover{border-color:#46604f;color:#d9d4c9}
     .h3d-asset-usage{margin-top:5px;display:flex;gap:4px;flex-wrap:wrap}
+    /* ---- P5 全屏三库：大面板 + 大按钮 + 伸缩框 + 图视音分栏 ---- */
+    .h3d-libbox{width:min(1560px,100%);height:100%;max-height:100%;display:flex;flex-direction:column;background:var(--h3d-panel);border:1px solid var(--h3d-line);border-radius:14px;overflow:hidden}
+    .h3d-libbody{padding:16px 18px;overflow:auto;display:grid;gap:14px;align-content:start}
+    .h3d-libbox .h3d-btn{padding:9px 18px;font-size:13.5px}
+    .h3d-libbox .h3d-tbtns .h3d-btn{padding:5px 12px;font-size:12px}
+    .h3d-libbox .h3d-tseg{padding:3px 12px;font-size:11.5px}
+    .h3d-libfold{border:1px solid #37332b;border-radius:12px;background:#141310;overflow:hidden}
+    .h3d-libfold>summary.h3d-libfoldsum{cursor:pointer;padding:13px 16px;font-size:14.5px;font-weight:700;list-style:none;user-select:none}
+    .h3d-libfold>summary.h3d-libfoldsum::-webkit-details-marker{display:none}
+    .h3d-libfold>summary.h3d-libfoldsum::before{content:"▸ ";color:var(--h3d-muted)}
+    .h3d-libfold[open]>summary.h3d-libfoldsum::before{content:"▾ ";color:var(--h3d-cyan)}
+    .h3d-libfoldbody{padding:4px 14px 14px;display:grid;gap:12px}
+    .h3d-kindcols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+    @media (max-width:1000px){.h3d-kindcols{grid-template-columns:1fr}}
+    .h3d-kindcol{min-width:0;border:1px dashed #2e2a24;border-radius:10px;padding:10px;display:grid;gap:8px;align-content:start}
+    .h3d-kindcol>h4{margin:0;font-size:13px;color:var(--h3d-bone)}
+    .h3d-kindcol .h3d-tilegrid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+    /* ---- P3 资产瓦片网格 + @补全 + 任务进度 ---- */
+    .h3d-tilegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:8px}
+    .h3d-tile{display:flex;flex-direction:column;gap:5px;padding:7px;border:1px solid #37332b;border-radius:9px;background:#181712;min-width:0}
+    .h3d-tile.h3d-drop{border-color:var(--h3d-cyan);box-shadow:0 0 0 1px var(--h3d-cyan) inset}
+    .h3d-tile img{width:100%;height:96px;border-radius:6px;object-fit:cover;background:#000}
+    .h3d-tile video{width:100%;max-height:96px;border-radius:6px;background:#000}
+    .h3d-tile .h3d-ticon{font-size:30px;text-align:center;line-height:64px;background:#0d0c0a;border-radius:6px}
+    .h3d-tlabel{font:600 12px "Microsoft YaHei UI","Segoe UI",sans-serif;word-break:break-all}
+    .h3d-tmeta{font-size:10px;color:var(--h3d-muted);word-break:break-all}
+    .h3d-troles{font-size:10.5px;color:#7fd6a8}
+    .h3d-tuse{display:flex;gap:3px;flex-wrap:wrap}
+    .h3d-tseg{padding:1px 7px;border:1px solid #2f6e57;border-radius:9px;background:#12291f;color:#7fe0b0;cursor:pointer;font-size:10px;font-family:inherit}
+    .h3d-tseg:hover{filter:brightness(1.3)}
+    .h3d-tbtns{display:flex;gap:4px;flex-wrap:wrap}
+    .h3d-tbtns .h3d-btn{padding:2px 8px;font-size:11px}
+    .h3d-tsub{grid-column:1/-1}
+    .h3d-dropzone{border:1px dashed #46604f;border-radius:9px;padding:10px;text-align:center;color:var(--h3d-muted);font-size:11.5px;background:#1f2a23}
+    .h3d-dropzone.h3d-drop{border-color:var(--h3d-cyan);color:var(--h3d-cyan)}
+    .h3d-atpop{position:fixed;z-index:99999;min-width:180px;max-width:300px;max-height:240px;overflow:auto;background:#1b1a16;border:1px solid #46604f;border-radius:8px;padding:4px;box-shadow:0 6px 22px #000a}
+    .h3d-atpop div{padding:5px 8px;border-radius:5px;cursor:pointer;font-size:12px;color:#d9d4c9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .h3d-atpop div small{color:var(--h3d-muted);margin-left:6px}
+    .h3d-atpop div.on,.h3d-atpop div:hover{background:#24402f;color:#7fe0b0}
+    .h3d-prog{height:6px;border-radius:3px;background:#25221c;overflow:hidden;min-width:90px;flex:1}
+    .h3d-prog>i{display:block;height:100%;background:linear-gradient(90deg,#2f6e57,#7fe0b0);border-radius:3px}
+    .h3d-jstat{font-size:10.5px;padding:1px 8px;border-radius:9px;border:1px solid #3a352c;color:#a8a294}
+    .h3d-jstat.queued{border-color:#7a5f36;color:#e9c07a}
+    .h3d-jstat.running{border-color:#316dca;color:#9ecbff}
+    .h3d-jstat.done{border-color:#2f6e57;color:#7fe0b0}
+    .h3d-jstat.error,.h3d-jstat.cancelled{border-color:#9a4144;color:#f0a0a4}
 
     /* ---- 链参数：换算徽章 + 高级设置折叠 ---- */
     .h3d-convbadge{grid-column:1/-1;margin:-4px 0 0;padding:8px 10px;border:1px dashed #46604f;border-radius:7px;background:#1f2a23;color:#c2e0cd;font:11.5px ui-monospace,Consolas;word-break:break-all}
@@ -3267,6 +3513,7 @@ function injectStyles() {
     .h3d-mpta:focus{border-color:#a8d8bd}
     .h3d-mpinfo{color:var(--h3d-muted);font-size:12px;min-height:18px;margin-bottom:4px}
     .h3d-mpbtn{display:block;margin:8px 0 0}
+    .h3d-cardbox{max-height:min(40vh,360px);overflow:auto;white-space:pre-wrap;word-break:break-word;border:1px solid #3a352c;border-radius:6px;background:#1b1a16;color:var(--h3d-bone);padding:10px 12px;font:12px/1.7 ui-monospace,Consolas,monospace;margin-bottom:8px}
 
     .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #46604f;background:#1f2a23;color:#c2e0cd;cursor:pointer;font-size:17px}
     .h3d-fab:hover{filter:brightness(1.2)}
@@ -3420,7 +3667,7 @@ function openDesk() {
     const cHead = el("div", "h3d-sechead",
         "<strong>段落流水线</strong><small>顶部横向选段（点选看一段，＋ 加段，pill 可拖调序）；✏ 改词 · 🎲 重摇 · 🎬 分段设置</small>");
     const mpBtn = el("button", "h3d-btn h3d-mpbtn", "📋 总提示词");
-    mpBtn.title = "多段提示词一次性粘贴分配（段头+场景/角色/环境音/配乐/时长/提示词 六标签格式，可让 AI 按 skill 生成后直接贴入）";
+    mpBtn.title = "多段提示词一次性粘贴分配（段头 + 时长/独立镜头/参考/提示词 四标签；提示词正文按 H3 官方三字段格式写）";
     mpBtn.onclick = openMasterPromptModal;
     cHead.append(mpBtn);
     colC.append(cHead);
@@ -3632,7 +3879,11 @@ function renderLeftColumn(sec, data) {
         row.append(del);
         list.append(row);
     }
-    sec.append(list);
+    {
+        const { det, box } = foldBox("proj-list", `项目存档（${projects.length}）`, true);
+        box.append(list);
+        sec.append(det);
+    }
 
     const newrow = el("div", "h3d-newrow");
     const newBtn = el("button", "h3d-btn h3d-btn-cyan", "＋ 新建项目");
@@ -3739,7 +3990,12 @@ async function openLibraryHub(tab) {
             const mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
             // 凭 latent 登记证据自动清理已完成转码任务（只在有变化时写 ds）
             try { pruneDoneJobs(node, mf); } catch (e) { /* 忽略 */ }
-            const ds = getDs(node);
+            // hydration：服务端资产回填 widget（新开页面 widget 是工作流文件里的
+            // 旧池，不回填就一片空白；widget 优先、asset_id 对齐，不丢本地改动）
+            let ds = getDs(node);
+            try { ds = await mergeServerPool(node, dir, mf); } catch (e) {
+                console.warn("[h3-director] mergeServerPool failed:", e);
+            }
             const busy = window.H3Latent ? await window.H3Latent.isBusy() : false;
             body.replaceChildren();
             if (busy) body.append(el("div", "h3d-libbusy", "⏳ 正在生成中：剪辑/转码/移动入口已锁定，完成后自动解锁（本面板仅可浏览）。"));
@@ -3755,6 +4011,84 @@ async function openLibraryHub(tab) {
         await paintBody();
         close.focus();
     } catch (e) { alert("三库面板打开失败：" + (e?.message || e)); }
+}
+
+/* 服务端资产回填 widget（hydration）：manifest.assets + asset_links 并入池子。
+ * widget 优先：同 asset_id 只补 file；同 alias 链接覆盖 legacy（与后端首胜一致）；
+ * 两边都没有的追加。无 file 的链接跳过（无法预览也无法执行）。
+ * 新开页面/换浏览器时 widget 是工作流文件里的旧池，不回填则资产库空白。 */
+async function mergeServerPool(node, dir, mf) {
+    const ds = getDs(node);
+    const pool = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    const byId = new Map();
+    const byLabel = new Map();
+    for (const a of pool) {
+        if (!a) continue;
+        if (a.asset_id) byId.set(a.asset_id, a);
+        byLabel.set(a.label, a);
+    }
+    let changed = false;
+    const normKind = (k) => (KIND_LIST.includes(k) ? k : "image");
+    const normRoles = (r) => (Array.isArray(r)
+        ? r.map(String).filter((x) => x === "首帧图" || x === "尾帧图") : []);
+    for (const a of (mf?.assets || [])) {
+        if (!a || !a.file || !a.label || byLabel.has(String(a.label))) continue;
+        const ent = {
+            file: String(a.file), kind: normKind(a.kind),
+            label: String(a.label), asset_id: "", roles: normRoles(a.roles),
+        };
+        pool.push(ent);
+        byLabel.set(ent.label, ent);
+        changed = true;
+    }
+    try {
+        const lr = await window.H3Api?.assetLinks?.(dir);
+        const links = (lr?.body?.ok && lr.body.links) || [];
+        for (const L of links) {
+            const alias = String(L?.alias || "");
+            if (!alias) continue;
+            const aid = String(L?.asset_id || "");
+            const mine = (aid && byId.get(aid)) || null;
+            if (mine) {
+                if (!mine.file && L.file) { mine.file = String(L.file); changed = true; }
+                continue;
+            }
+            if (!L.file) continue;
+            const ent = {
+                file: String(L.file), kind: normKind(L.kind), label: alias,
+                asset_id: aid, roles: normRoles(L.roles),
+            };
+            const at = pool.findIndex((x) => x && x.label === alias);
+            if (at >= 0) pool[at] = ent;
+            else pool.push(ent);
+            byLabel.set(alias, ent);
+            if (aid) byId.set(aid, ent);
+            changed = true;
+        }
+    } catch (e) { console.warn("[h3-director] assetLinks fetch failed:", e); }
+    if (changed) setDs(node, ds);
+    return getDs(node);
+}
+
+/* P5 伸缩框（状态常驻内存，重绘不丢失折叠态） */
+const _foldState = {};
+function foldBox(id, title, defaultOpen) {
+    const det = document.createElement("details");
+    det.className = "h3d-libfold";
+    det.open = (_foldState[id] !== undefined) ? !!_foldState[id] : !!defaultOpen;
+    det.append(el("summary", "h3d-libfoldsum", title));
+    const box = el("div", "h3d-libfoldbody");
+    det.append(box);
+    det.addEventListener("toggle", () => { _foldState[id] = det.open; });
+    return { det, box };
+}
+
+function kindCol(title, gridEl, emptyTxt) {
+    const col = el("div", "h3d-kindcol");
+    col.append(el("h4", "", title));
+    if (gridEl.children.length) col.append(gridEl);
+    else col.append(el("div", "h3d-empty", emptyTxt));
+    return col;
 }
 
 /* 资产库：链路说明 + 旧槽迁移 + 素材池（标注/引用/移除/剪辑/转码/入库）+ 登记表
@@ -3792,21 +4126,62 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
         body.append(bar);
     }
     body.append(el("div", "h3d-libsec", `标签素材池（${pool.length}，总量不限）· 【引用】插入当前选中段提示词`));
-    if (!pool.length) body.append(el("div", "h3d-empty", "素材池为空：点下方 ＋图片/视频/音频 上传入库，标签 [[..]] 由后端按段压实为 Picture/Video/Audio"));
+    if (!pool.length) body.append(el("div", "h3d-empty", "素材池为空：把文件拖到下方网格直接入库，或点 ＋图片/视频/音频 上传；标签 [[..]] 由后端按段压实为 Picture/Video/Audio"));
+    /* P3 瓦片网格：缩略图 + 别名 + 来源 + 段引用徽标；拖放直接入库
+     * P5：按 全局/项目 × 图/视/音 六分栏装配（按钮逻辑零改动，只换挂载目标） */
+    const usage = (window.H3Assets?.segUsage) ? window.H3Assets.segUsage(ds) : {};
+    const grids = {};
+    const counts = {};
+    for (const scope of ["g", "p"]) {
+        for (const k of KIND_LIST) {
+            grids[`${scope}_${k}`] = el("div", "h3d-tilegrid");
+            counts[`${scope}_${k}`] = 0;
+        }
+    }
     for (let i = 0; i < pool.length; i++) {
         const a = pool[i];
-        const row = el("div", "h3d-librow");
+        const tile = el("div", "h3d-tile");
+        const prevUrl = assetPreviewUrl(dir, a.file, a.asset_id);
         if (a.kind === "image") {
             const im = document.createElement("img");
-            im.loading = "lazy"; im.src = assetPreviewUrl(dir, a.file);
+            im.loading = "lazy"; im.src = prevUrl;
             im.onerror = () => im.remove();
-            row.append(im);
+            tile.append(im);
+        } else if (a.kind === "video") {
+            const v = document.createElement("video");
+            v.muted = true; v.preload = "metadata"; v.src = prevUrl;
+            v.onerror = () => v.replaceWith(el("span", "h3d-ticon", "🎞"));
+            tile.append(v);
         } else {
-            row.append(el("span", "h3d-libmeta", a.kind === "video" ? "🎞" : "🎵"));
+            const au = document.createElement("audio");
+            au.controls = true; au.preload = "metadata"; au.src = prevUrl;
+            au.onerror = () => au.replaceWith(el("span", "h3d-ticon", "🎵"));
+            tile.append(au);
         }
         const roles = Array.isArray(a.roles) ? a.roles : [];
         const roleTxt = roles.length ? `【${roles.join("·")}】` : "";
-        row.append(el("span", "h3d-libname", `${a.label}${roleTxt}（${KIND_NAME[a.kind] || a.kind}）· ${a.file}`));
+        tile.append(el("div", "h3d-tlabel", `${escapeHtml(a.label)}${escapeHtml(roleTxt)}`));
+        const srcTxt = a.asset_id ? `全局库 · ${escapeHtml(String(a.file).split("/").pop())}` : escapeHtml(a.file);
+        tile.append(el("div", "h3d-tmeta", `${KIND_NAME[a.kind] || a.kind} · ${srcTxt}`));
+        /* 段引用徽标：点按跳到该段 */
+        const used = usage[a.label] || [];
+        if (used.length) {
+            const ub = el("div", "h3d-tuse");
+            for (const sn of used) {
+                const chip = el("button", "h3d-tseg", `段${sn}`);
+                chip.title = `跳到第 ${sn} 段`;
+                chip.dataset.seg = String(sn);
+                chip.dataset.label = a.label;
+                chip.onclick = () => {
+                    _selSeg = Math.max(0, sn - 1);
+                    scheduleRefresh(0);
+                    say(`已选中段 ${sn}`);
+                };
+                ub.append(chip);
+            }
+            tile.append(ub);
+        }
+        const btns = el("div", "h3d-tbtns");
         /* 标注切换（仅图片可标；首帧图/尾帧图各只留一张，改标自动让位） */
         if ((a.kind || "image") === "image") {
             for (const role of ["首帧图", "尾帧图"]) {
@@ -3817,10 +4192,8 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
                     scheduleRefresh(120);
                     refresh();
                 };
-                row.append(t);
+                btns.append(t);
             }
-        } else {
-            row.append(el("span", "h3d-libmeta", "标注仅图片"));
         }
         const ref = el("button", "h3d-btn h3d-btn-cyan", "引用");
         ref.title = "把 [[标签]] 插入当前选中段提示词末尾";
@@ -3835,15 +4208,16 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
                 scheduleRefresh(200);
             } catch (e) { say("引用失败：" + (e?.message || e)); }
         };
-        row.append(ref);
-        /* 库内剪辑/转码：仅项目文件（assets/…）可用；input 旧文件先点入库。
+        btns.append(ref);
+        /* 库内剪辑/转码：仅项目文件（assets/…）可用；全局库条目先调入项目；input 旧文件先点入库。
          * 点裁剪/转latent 展开行内子面板（帧数窗/秒窗+分支），执行时本行按钮
          * 置灰转圈，面板不锁死；转码走主节点队列，可随时按取消中断。 */
         const inLib = String(a.file || "").replace(/\\/g, "/").startsWith("assets/");
-        const sub = el("div", "h3d-libsub");
+        const inGlobal = !inLib && (!!a.asset_id || /^(images|videos|audios)\//.test(String(a.file || "")));
+        const sub = el("div", "h3d-libsub h3d-tsub");
         sub.style.display = "none";
         const setRowBusy = (on, txt) => {
-            row.querySelectorAll("button").forEach((b) => { b.disabled = !!on; });
+            tile.querySelectorAll("button").forEach((b) => { b.disabled = !!on; });
             if (on && txt) say(txt);
         };
         if ((a.kind === "video" || a.kind === "audio") && inLib) {
@@ -3851,7 +4225,7 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
             bTrim.title = "展开裁剪子面板（帧数窗），裁好回库为新文件";
             bTrim.disabled = busy;
             bTrim.onclick = () => openTrimSub(sub, dir, a.file, mf, busy, say, refresh, setRowBusy);
-            row.append(bTrim);
+            btns.append(bTrim);
             if (a.kind === "video") {
                 const bSplit = el("button", "h3d-btn", "分离");
                 bSplit.title = "音画分离为画面mp4+音频wav，回库为新文件";
@@ -3866,12 +4240,24 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
                     } catch (e) { say("分离失败：" + (e?.message || e)); }
                     finally { setRowBusy(false); }
                 };
-                row.append(bSplit);
+                btns.append(bSplit);
             }
             const bEnc = el("button", "h3d-btn h3d-btn-cyan", "转latent");
-            bEnc.title = "展开转码子面板，加入转码队列后按开始生成执行（内联主节点，可中断）";
+            bEnc.title = "展开转码子面板，提交即自动排队执行（内联主节点，可中断）";
             bEnc.onclick = () => openTranscodeSub(sub, node, dir, a.file, mf, say, refresh);
-            row.append(bEnc);
+            btns.append(bEnc);
+        } else if (inGlobal) {
+            const bMir = el("button", "h3d-btn h3d-btn-cyan", "⇩调入项目");
+            bMir.title = "拷贝进项目 assets/（剪辑/转码/旧链需要项目内文件）";
+            bMir.onclick = async () => {
+                try {
+                    await mirrorGlobalEntry(node, dir, i);
+                    say(`已调入项目：${a.label}`);
+                    scheduleRefresh(300);
+                    refresh();
+                } catch (e) { say("调入失败：" + (e?.message || e)); }
+            };
+            btns.append(bMir);
         } else if (!inLib) {
             const bImp = el("button", "h3d-btn h3d-btn-cyan", "入库");
             bImp.title = "拷贝进项目 assets/（项目自包含），之后可剪辑/转码";
@@ -3883,30 +4269,98 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
                     refresh();
                 } catch (e) { say("入库失败：" + (e?.message || e)); }
             };
-            row.append(bImp);
+            btns.append(bImp);
         }
         const rm = el("button", "h3d-btn h3d-btn-danger", "移出");
         rm.title = "从素材池移除（各段引用同步清理，不删文件）";
         rm.onclick = () => { removeRefImage(node, i); say(`已移出「${a.label}」`); scheduleRefresh(200); refresh(); };
-        row.append(rm);
-        body.append(row, sub);
+        btns.append(rm);
+        tile.append(btns);
+        const kk = KIND_LIST.includes(a.kind) ? a.kind : "image";
+        const scope = a.asset_id ? "g" : "p";
+        grids[scope + "_" + kk].append(tile, sub);
+        counts[scope + "_" + kk]++;
     }
+    /* P5：全局库 / 项目资产库分开展示，各自图视音三栏 */
+    const KIND_TITLE = { image: "🖼 图片", video: "🎞 视频", audio: "🎵 音频" };
+    const nG = counts.g_image + counts.g_video + counts.g_audio;
+    const nP = counts.p_image + counts.p_video + counts.p_audio;
+    {
+        const { det, box } = foldBox("lib-assets-global",
+            `🌍 全局资产库（${nG}）· 跨项目复用，删项目不丢`, true);
+        const cols = el("div", "h3d-kindcols");
+        for (const k of KIND_LIST) {
+            cols.append(kindCol(`${KIND_TITLE[k]}（${counts["g_" + k]}）`,
+                grids["g_" + k], "暂无，可拖文件到下方拖放区入库"));
+        }
+        box.append(cols);
+        if (!nG) box.append(el("div", "h3d-empty",
+            "全局库为空：人物/服装/场景等跨项目复用的素材放这里，一次入库多片复用。"));
+        body.append(det);
+    }
+    {
+        const { det, box } = foldBox("lib-assets-project",
+            `📁 项目资产库（${nP}）· 仅本项目可见，随项目删除`, true);
+        const cols = el("div", "h3d-kindcols");
+        for (const k of KIND_LIST) {
+            cols.append(kindCol(`${KIND_TITLE[k]}（${counts["p_" + k]}）`,
+                grids["p_" + k], "暂无"));
+        }
+        box.append(cols);
+        body.append(det);
+    }
+    for (const g of Object.values(grids)) upgradeTileTags(g, dir, ds);
+    /* 拖放区：文件拖进来直接走全局库入库 + 项目链接（单次往返） */
+    const dz = el("div", "h3d-dropzone", "把图片 / 视频 / 音频拖到这里，直接入库（全局库 + 本项目链接）");
+    dz.ondragover = (e) => { e.preventDefault(); dz.classList.add("h3d-drop"); };
+    dz.ondragleave = () => dz.classList.remove("h3d-drop");
+    dz.ondrop = async (e) => {
+        e.preventDefault();
+        dz.classList.remove("h3d-drop");
+        const files = [...(e.dataTransfer?.files || [])];
+        if (!files.length) return;
+        let ok = 0;
+        for (const f of files) {
+            try {
+                await uploadLibFile(node, dir, f, null);
+                ok++;
+            } catch (err) { say(`「${f.name}」入库失败：${err?.message || err}`); }
+        }
+        if (ok) say(`已入库 ${ok} 个（全局库 + 本项目链接）`);
+        scheduleRefresh(300);
+        refresh();
+    };
+    body.append(dz);
+    /* gridfix: removed stray duplicate upgradeTileTags(grid,...) — grids already handled above */
     const upRow = el("div", "h3d-libctl");
-    upRow.append(el("span", "h3d-libmeta", "上传入库（总量不限，直接进项目 assets/）："));
+    upRow.append(el("span", "h3d-libmeta", "上传入库（全局库 + 本项目链接，单次往返）："));
     for (const k of KIND_LIST) {
         const b = el("button", "h3d-btn", `＋ ${KIND_NAME[k]}`);
-        b.title = `上传${KIND_NAME[k]} → 拷贝进项目资产库（提示词写 [[标签]] → <${KIND_TOKEN[k]} k>；单段引用上限 图9/视3/音3 在调度时卡）`;
-        b.onclick = () => uploadPoolFile(node, dir, k, () => refresh());
+        b.title = `上传${KIND_NAME[k]} → 全局库入库并链接本项目（提示词写 [[标签]] → <${KIND_TOKEN[k]} k>；单段引用上限 图9/视3/音3 在调度时卡）`;
+        b.onclick = () => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = KIND_ACCEPT[k] || "image/*";
+            input.onchange = async () => {
+                const f = input.files && input.files[0];
+                if (!f) return;
+                try {
+                    await uploadLibFile(node, dir, f, k, () => refresh());
+                } catch (e) { say("入库失败：" + (e?.message || e)); }
+            };
+            input.click();
+        };
         upRow.append(b);
     }
     body.append(upRow);
     const bar = el("div", "h3d-libctl");
     const bSave = el("button", "h3d-btn", "保存资产库");
-    bSave.title = "素材池全量存入 manifest（revision 乐观锁）";
+    bSave.title = "素材池全量存入 manifest（revision 乐观锁；全局链接住 asset_links，不进本表）";
     bSave.disabled = busy;
     bSave.onclick = async () => {
         try {
-            const r = await window.H3Api.saveAssets(dir, pool, mf?.revision);
+            const legacy = pool.filter((a) => a && !a.asset_id);
+            const r = await window.H3Api.saveAssets(dir, legacy, mf?.revision);
             if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "保存失败"));
             say(`资产库已保存（revision=${r.body.manifest?.revision}）`);
             scheduleRefresh(600);
@@ -3923,12 +4377,19 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
     };
     bar.append(bSave, bCheck);
     body.append(bar);
-    renderTranscodeJobs(body, node, dir, mf, say, refresh);
+    {
+        // renderServerJobs 异步后填，不能按同步子节点判空
+        const { det, box } = foldBox("lib-assets-jobs", "⏳ 转码任务", true);
+        renderTranscodeJobs(box, node, dir, mf, say, refresh);
+        renderServerJobs(box, dir, say);
+        body.append(det);
+    }
     {
         const clipsA = (mf?.clips || []).filter((c) => c?.file
             && String(c.file).replace(/\\/g, "/").startsWith("assets/"));
         if (clipsA.length) {
-            body.append(el("div", "h3d-libsec", `本库剪辑片段（${clipsA.length}）`));
+            const { det, box } = foldBox("lib-assets-clips",
+                `✂ 本库剪辑片段（${clipsA.length}）`, true);
             for (const c of clipsA) {
                 const row = el("div", "h3d-librow");
                 const isWav = /\.wav$/i.test(c.file || "");
@@ -3942,23 +4403,27 @@ function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
                 }
                 row.append(el("span", "h3d-libname",
                     `${op} · ${c.file} ← ${c.src || "?"}${c.start_s != null ? ` [${c.start_s}s, ${c.end_s}s)` : ""}`));
-                body.append(row);
+                box.append(row);
             }
+            body.append(det);
         }
     }
     const reg = mf?.assets || [];
     if (reg.length) {
-        body.append(el("div", "h3d-libsec", `项目登记（${reg.length}）· 成片库调入的产物`));
+        const { det, box } = foldBox("lib-assets-reg",
+            `📋 项目登记（${reg.length}）· 成片库调入的产物`, false);
         for (const a of reg) {
             const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
-            body.append(el("div", "h3d-librow",
+            box.append(el("div", "h3d-librow",
                 `${escapeHtml(a.label || "?")}${escapeHtml(roles)}（${escapeHtml(a.kind || "")}）· ${escapeHtml(a.file || "")}`));
         }
+        body.append(det);
     }
 }
 
-/* 资产预览地址：assets/… 走项目 output，其余走 input */
-function assetPreviewUrl(dir, file) {
+/* 资产预览地址：asset_id（全局库）> assets/…（项目 output）> 其余（input） */
+function assetPreviewUrl(dir, file, asset_id) {
+    if (asset_id && window.H3Api?.libraryFileUrl) return window.H3Api.libraryFileUrl(asset_id);
     const f = String(file || "").replace(/\\/g, "/");
     if (f.startsWith("assets/")) return viewUrl(`h3_projects/${dir}`, f);
     return inputViewUrl(f);
@@ -3976,12 +4441,30 @@ function setAssetRoles(node, idx, role) {
         for (const x of (ds.ref_assets || [])) {
             if (Array.isArray(x.roles) && x.roles.includes(role)) {
                 x.roles = x.roles.filter((r) => r !== role);
+                /* P3：被让位的链接条目同步清标 */
+                if (x.asset_id && window.H3Api?.assetLink) {
+                    const dir0 = getDirValue(node);
+                    if (dir0) {
+                        window.H3Api.assetLink({ dir: dir0, asset_id: x.asset_id,
+                            alias: x.label, kind: x.kind, roles: x.roles })
+                            .catch((e) => console.warn("[h3-director] assetLink roles failed:", e));
+                    }
+                }
             }
         }
         a.roles = [...cur, role];
     }
     setDs(node, ds);
     persistPool(node);
+    /* P3：链接条目改标同步服务端（roles 显式覆盖，含取消） */
+    if (a.asset_id && window.H3Api?.assetLink) {
+        const dir = getDirValue(node);
+        if (dir) {
+            window.H3Api.assetLink({ dir, asset_id: a.asset_id,
+                alias: a.label, kind: a.kind, roles: a.roles })
+                .catch((e) => console.warn("[h3-director] assetLink roles failed:", e));
+        }
+    }
 }
 
 /* 上传并入库：input 上传 → 拷贝进项目 assets/ → 池条目 file 改写 */
@@ -4033,6 +4516,77 @@ async function importPoolFile(node, dir, idx) {
     }
     setDs(node, ds);
     syncMirrors(node, ds);
+}
+
+/* P3 上传即入库（单次往返）：文件 → 全局库 + 本项目链接 → 推池。
+ * 后端无 libraryUpload（旧版）时回落两步走（input 中转 + importAsset）。 */
+async function uploadLibFile(node, dir, file, forcedKind, done) {
+    const H3 = window.H3Assets;
+    const kind = forcedKind || (H3 ? H3.guessKind(file) : "image");
+    const ds0 = getDs(node);
+    const taken = new Set((ds0.ref_assets || []).map((x) => x.label));
+    const stem = String(file?.name || "素材").replace(/\.[A-Za-z0-9]+$/, "").slice(0, 24)
+        || `${KIND_NAME[kind]}${(ds0.ref_assets || []).filter((x) => x.kind === kind).length + 1}`;
+    const alias = uniqueLabelFrom(taken, stem);
+    if (H3?.uploadDirect && window.H3Api?.libraryUpload) {
+        const r = await H3.uploadDirect(file, { kind, link_dir: dir, alias });
+        const d2 = getDs(node);
+        d2.ref_assets.push({
+            label: r.alias || alias, kind, file: r.entry.file,
+            asset_id: r.entry.asset_id, roles: [],
+        });
+        setDs(node, d2);
+    } else {
+        const name = await uploadToInput(file);
+        const r = await window.H3Api.importAsset(dir, name, { label: alias, kind });
+        if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "入库失败"));
+        const d2 = getDs(node);
+        d2.ref_assets.push({
+            file: r.body.file, kind: r.body.kind || kind,
+            label: r.body.label || alias, roles: [],
+        });
+        setDs(node, d2);
+        syncMirrors(node, d2);
+    }
+    scheduleRefresh(200);
+    if (typeof done === "function") done();
+}
+
+/* P3 全局库调入项目：拷贝进 assets/ 并推 legacy 池条目（剪辑/转码/旧链用项目内文件） */
+async function mirrorGlobalEntry(node, dir, idx) {
+    const ds = getDs(node);
+    const a = (ds.ref_assets || [])[idx];
+    if (!a?.asset_id) throw new Error("该条目不在全局库");
+    const r = await window.H3Api.assetMirror({ dir, asset_id: a.asset_id });
+    if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "调入失败"));
+    const taken = new Set((ds.ref_assets || []).map((x) => x.label));
+    ds.ref_assets.push({
+        label: uniqueLabelFrom(taken, `${a.label}入库`),
+        kind: a.kind, file: r.body.file, roles: [],
+    });
+    setDs(node, ds);
+    persistPool(node);
+}
+
+/* P3 标签所见即所得：整包干跑一次，把每段真实 token 写回引用徽标（失败静默保留段号）。 */
+async function upgradeTileTags(grid, dir, ds) {
+    try {
+        const H3Api = window.H3Api;
+        if (!H3Api?.compileRefs || !grid.isConnected) return;
+        const segments = (ds?.segments || []).map((s) => ({ refs: s?.refs || [] }));
+        if (!segments.some((s) => s.refs.length)) return;
+        const r = await H3Api.compileRefs({ dir, segments });
+        if (!r.body?.ok || !grid.isConnected) return;
+        const short = (tok) => String(tok || "").replace("<Picture ", "P").replace("<Video ", "V")
+            .replace("<Audio ", "A").replace(">", "");
+        (r.body.segs || []).forEach((seg, i) => {
+            for (const b of seg?.blocks || []) {
+                const chip = grid.querySelector(
+                    `.h3d-tseg[data-seg="${i + 1}"][data-label="${CSS.escape(b.alias || "")}"]`);
+                if (chip) chip.textContent = `段${i + 1}·${short(b.token)}`;
+            }
+        });
+    } catch (e) { /* 静默：徽标保持段号 */ }
 }
 
 /* 旧三槽位迁移：first/end/last_frame → 入库打标；last_frame 另写各段 tail_src */
@@ -4114,7 +4668,92 @@ async function openTrimSub(sub, dir, file, mf, busy, say, refresh, setRowBusy) {
     sub.append(ctl);
 }
 
-/* 转码子面板：秒窗/分支/保存名 → 写入 ds.transcode_jobs，按开始生成内联执行 */
+/* 转码子面板：秒窗/分支/保存名 → ds 队列或后台任务，提交即自动排队执行 */
+
+/* P4f：转码最小图——双 VAELoader + 主节点短路，只加载 VAE（TE/DiT 碰都不碰）。
+ * VAE 文件名优先读画布 VAELoader（与链同款，保证 latent 空间一致），
+ * 无画布时回落服务端 models/vae 扫描自动配对。失败由调用方回落整图排队。 */
+async function transcodeVaeFiles() {
+    const found = { video: "", audio: "" };
+    try {
+        for (const n of (app.graph?._nodes || [])) {
+            if (!n || n.type !== "VAELoader") continue;
+            const v = String((n.widgets || [])[0]?.value || "");
+            if (!v) continue;
+            const low = v.toLowerCase();
+            if (!found.video && low.includes("video")) found.video = v;
+            else if (!found.audio && low.includes("audio")) found.audio = v;
+        }
+    } catch (e) { /* 无画布走回落 */ }
+    if (found.video && found.audio) return found;
+    const H3Api = window.H3Api;
+    if (!H3Api?.vaeFiles) throw new Error("H3Api.vaeFiles 不可用（请更新插件）");
+    const r = await H3Api.vaeFiles();
+    if (!r.body?.ok) throw new Error(H3Api.errText(r, "VAE 列表获取失败"));
+    const files = r.body.files || [];
+    const pick = (key) => files.find((f) => {
+            const l = String(f).toLowerCase();
+            return l.includes("minimax") && l.includes(key);
+        }) || files.find((f) => String(f).toLowerCase().includes(key)) || "";
+    return { video: found.video || pick("video"), audio: found.audio || pick("audio") };
+}
+
+async function queueTranscodeRun(dir, dsJobs) {
+    const { video, audio } = await transcodeVaeFiles();
+    if (!video || !audio) {
+        throw new Error("找不到视频/音频 VAE（画布 VAELoader 为空且 models/vae 无匹配）");
+    }
+    // 终端 PreviewAny：官方要求 prompt 至少含一个 OUTPUT_NODE 节点，
+    // 否则整包以 prompt_no_outputs 被拒（报告口径接主节点报告输出槽 3）。
+    // 注意：官方还会校验所有 widget 输入必须带值（有 schema 默认值也不行，
+    // 缺一个就 Required input is missing），所以 29 个控件全填（默认+覆盖）。
+    const prompt = {
+        "90": { class_type: "VAELoader", inputs: { vae_name: video } },
+        "91": { class_type: "VAELoader", inputs: { vae_name: audio } },
+        "92": { class_type: "H3SeamlessChainSampler", inputs: {
+            "视频VAE": ["90", 0],
+            "音频VAE": ["91", 0],
+            "宽高比": "16:9", "百万像素": 0.5, "宽度": 864, "高度": 480,
+            "每段时长": 5.0, "引导帧数": "22", "种子": 0, "步数": 25, "CFG": 1.0,
+            "采样器": "res_multistep", "调度器": "simple",
+            "自动存档": "关闭", "存档目录": dir,
+            "桥帧门控": "标注", "清晰度阈值": 30.0, "回退上限": 34,
+            "锚定加噪": 0.0, "审片模式": "关闭", "自动保存": "分段",
+            "重跑起始段": 0, "接缝重摇": "自动", "重摇阈值": 0.06, "重摇上限": 1,
+            "递减锚定": "关闭", "生成模式": "文生视频", "自动成片": "开启",
+            "导演台状态": JSON.stringify({ transcode_jobs: dsJobs || [] }),
+            "一采编码": "标准", "资产包": "",
+        } },
+        "93": { class_type: "PreviewAny", inputs: { source: ["92", 3] } },
+    };
+    const r = await api.fetchApi("/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+    });
+    if (!r.ok) {
+        let detail = "";
+        try {
+            const j = await r.json();
+            detail = j?.error?.message || JSON.stringify(j?.error || j).slice(0, 300);
+        } catch (e) { /* 非 JSON 错误体 */ }
+        throw new Error(`排队失败 HTTP ${r.status}${detail ? `：${detail}` : ""}`);
+    }
+    return r.json().catch(() => ({}));
+}
+
+async function autoQueueTranscode(dir, dsJobs, say, okText) {
+    try {
+        await queueTranscodeRun(dir, dsJobs);
+        say(okText || "转码已开始执行（仅加载 VAE），下方任务区可看进度。");
+    } catch (e) {
+        console.warn("[h3-director] 最小图排队失败，回落整图排队：", e);
+        try {
+            await app.queuePrompt();
+            say("最小图排队失败，已回落整图排队（会加载全模型），下方任务区可看进度。");
+        } catch (e2) { say("自动排队失败，请手动按一次开始生成。"); }
+    }
+}
 function openTranscodeSub(sub, node, dir, file, mf, say, refresh) {
     if (sub.style.display !== "none") { sub.style.display = "none"; sub.replaceChildren(); return; }
     sub.style.display = "";
@@ -4147,8 +4786,8 @@ function openTranscodeSub(sub, node, dir, file, mf, say, refresh) {
     inN.value = String(file.split("/").pop().split(".")[0] || "asset") + ".pt";
     inN.title = "保存名（须以 .pt 结尾）";
     const go = el("button", "h3d-btn h3d-btn-cyan", "加入转码队列");
-    go.title = "写入转码任务，按「开始生成」后在主节点内联执行（有进度条，可中断）";
-    go.onclick = () => {
+    go.title = "写入转码任务并自动排队执行（内联主节点，可中断）";
+    go.onclick = async () => {
         const ds = getDs(node);
         ds.transcode_jobs = Array.isArray(ds.transcode_jobs) ? ds.transcode_jobs : [];
         ds.transcode_jobs.push({
@@ -4158,15 +4797,31 @@ function openTranscodeSub(sub, node, dir, file, mf, say, refresh) {
             save_name: inN.value.trim(), status: "queued",
         });
         setDs(node, ds);
-        say(`已加入转码队列（共 ${ds.transcode_jobs.length} 个）：按「开始生成」执行，执行中可随时中断。`);
+        say(`已加入转码队列（共 ${ds.transcode_jobs.length} 个），正在自动排队执行…`);
         scheduleRefresh(200);
         refresh();
+        await autoQueueTranscode(dir, ds.transcode_jobs, say);
+    };
+    const goSrv = el("button", "h3d-btn h3d-btn-cyan", "提交后台任务");
+    goSrv.title = "直接提交后台转码任务并自动排队执行（下方任务区看进度/取消，无需手写队列）";
+    goSrv.onclick = async () => {
+        if (!window.H3Assets?.submitJob) { say("后台提交不可用（请更新插件）"); return; }
+        try {
+            const job = await window.H3Assets.submitJob(dir, file, {
+                start_s: parseFloat(inS.value) || 0, end_s: parseFloat(inE.value) || 0,
+                branch: brSel.value, split: spSel.value, save_name: inN.value.trim(),
+            });
+            say(`已提交后台任务（${job.id}），正在自动排队执行…`);
+            refresh();
+            await autoQueueTranscode(dir, [], say,
+                `后台任务（${job.id}）已开始执行（仅加载 VAE），下方任务区可看进度。`);
+        } catch (e) { say("提交失败：" + (e?.message || e)); }
     };
     const cancel = el("button", "h3d-btn", "收起");
     cancel.onclick = () => { sub.style.display = "none"; sub.replaceChildren(); };
     const ctl = el("div", "h3d-libctl");
     ctl.append(document.createTextNode("起秒"), inS, document.createTextNode("止秒"), inE,
-        brSel, spSel, inN, go, cancel);
+        brSel, spSel, inN, go, goSrv, cancel);
     sub.append(ctl);
 }
 
@@ -4221,8 +4876,65 @@ function renderTranscodeJobs(body, node, dir, mf, say, refresh) {
         } catch (e) { say("中断失败：" + (e?.message || e)); }
     };
     bar.append(bPrune, bClear, bInt,
-        el("span", "h3d-libmeta", "执行：按开始生成；中断：本按钮或Comfy原生停止"));
+        el("span", "h3d-libmeta", "提交即自动排队执行；中断：本按钮或Comfy原生停止"));
     body.append(bar);
+}
+
+/* P3 后台转码任务区（transcode_submit 进件）：状态/进度/取消，有活动任务时 3s 轮询。
+ * 与 ds 队列区并存：ds 队列走开始生成，Server 任务由转码专跑认领执行。 */
+function renderServerJobs(body, dir, say) {
+    const box = el("div", "h3d-libctl");
+    body.append(box);
+    const paint = async () => {
+        if (!box.isConnected || !window.H3Api?.transcodeJobs) return;
+        let jobs = [];
+        try {
+            const r = await window.H3Api.transcodeJobs(dir);
+            if (r.body?.ok) jobs = r.body.jobs || [];
+            else throw new Error(window.H3Api.errText(r, "读取失败"));
+        } catch (e) {
+            box.replaceChildren(el("span", "h3d-libmeta", "后台转码任务读取失败"));
+            return;
+        }
+        box.replaceChildren();
+        if (!jobs.length) {
+            box.append(el("span", "h3d-libmeta", "后台转码任务（0）· 转码子面板可提交"));
+            return;
+        }
+        box.append(el("div", "h3d-libsec", `后台转码任务（${jobs.length}）`));
+        let active = false;
+        for (const j of jobs) {
+            const row = el("div", "h3d-librow");
+            row.append(el("span", "h3d-jstat " + (j.status || ""), j.status || "?"));
+            row.append(el("span", "h3d-libname",
+                `${j.src || "?"} [${j.start_s ?? 0}s, ${j.end_s || "尾"}) → ${j.save_name || "?"}`));
+            if (j.status === "running") {
+                const bar = el("div", "h3d-prog");
+                const fill = el("i");
+                fill.style.width = `${Math.round((j.progress || 0) * 100)}%`;
+                bar.append(fill);
+                row.append(bar);
+            }
+            if (j.status === "queued" || j.status === "running") {
+                active = true;
+                const c = el("button", "h3d-btn h3d-btn-danger", "取消");
+                c.onclick = async () => {
+                    try {
+                        await window.H3Assets.cancelJob(j.id);
+                        say("已取消");
+                    } catch (e) { say("取消失败：" + (e?.message || e)); }
+                    paint();
+                };
+                row.append(c);
+            }
+            if (j.report) row.append(el("span", "h3d-libmeta", String(j.report).slice(0, 120)));
+            if (j.error) row.append(el("span", "h3d-libmeta", `失败：${j.error}`.slice(0, 160)));
+            else if (j.note) row.append(el("span", "h3d-libmeta", String(j.note).slice(0, 80)));
+            box.append(row);
+        }
+        if (active) setTimeout(paint, 3000);
+    };
+    paint();
 }
 
 /* 凭证据清理：save_name（含 _v/_a 分开存两种后缀）产物已在 manifest.latents
@@ -4263,8 +4975,9 @@ function renderLibFinals(body, node, dir, ds, mf, busy, say, repaint) {
     ];
     const sub = `h3_projects/${dir}`;
     for (const [title, items] of groups) {
-        body.append(el("div", "h3d-libsec", `${title}（${items.length}）`));
-        if (!items.length) body.append(el("div", "h3d-empty", "暂无"));
+        const { det, box } = foldBox(`lib-finals-${title}`, `${title}（${items.length}）`,
+            items.length > 0);
+        if (!items.length) box.append(el("div", "h3d-empty", "暂无"));
         for (const it of items) {
             const row = el("div", "h3d-librow");
             const isWav = /\.wav$/i.test(it.file || "");
@@ -4340,21 +5053,77 @@ function renderLibFinals(body, node, dir, ds, mf, busy, say, repaint) {
                 } catch (e) { say("删除失败：" + (e?.message || e)); }
             };
             row.append(bMove, bDel);
-            body.append(row, sub2);
+            box.append(row, sub2);
         }
+        body.append(det);
     }
     body.append(el("div", "h3d-foot", "资产库剪出的片段显示在资产库页；转 latent 在资产库点对应行，两处裁剪都是帧数窗子面板。"));}
 
 /* latent 库：已登记 latent（切片/删除）+ 手工切片表单 */
+/* P4e：latent 行一键放大——驱动画布 H3LatentUpscale（临时模式切换，finally 还原）。
+ * 只走神经 enlarge（×2 存回本库）；二次采样等高级参数去画布节点调。
+ * 放大模型下拉为空时拒绝（不排队，避免空跑报错）。 */
+async function runUpscaleTool(node, dir, file, say) {
+    const g = app.graph;
+    const up = ((g && g._nodes) || []).find((n) => n.type === "H3LatentUpscale") || null;
+    const main = findNode();
+    if (!up) { say("画布上没有 H3LatentUpscale 节点（请载入配套工作流）"); return; }
+    if (!main) { say("画布上没有主节点"); return; }
+    const W = (name) => (up.widgets || []).find((w) => w.name === name);
+    const setW = (name, value) => {
+        const w = W(name);
+        if (!w) return false;
+        w.value = value;
+        if (typeof w.callback === "function") { try { w.callback(value); } catch (e) { /* 可选 */ } }
+        return true;
+    };
+    const modelW = W("放大模型");
+    if (!modelW || !String(modelW.value || "").trim()) {
+        say("请先在画布 H3LatentUpscale 节点选择放大模型（models/latent_upscale_models/）");
+        return;
+    }
+    const stem = String(file).split("/").pop().replace(/\.pt$/i, "") || "latent";
+    const outName = `${stem}_up2x.pt`;
+    setW("项目名", dir);
+    setW("源文件", file);
+    setW("保存名", outName);
+    const prevUp = up.mode, prevMain = main.mode;
+    try {
+        up.mode = 0;
+        main.mode = 2;
+        await app.queuePrompt();
+        say(`已提交放大（${file} → ${outName}），完成后在 latent 库查看；主节点已恢复。`);
+    } catch (e) {
+        say("提交放大失败：" + (e?.message || e));
+    } finally {
+        try { up.mode = prevUp; } catch (e) { /* 恢复 */ }
+        try { main.mode = prevMain; } catch (e) { /* 恢复 */ }
+        try { if (up.setDirtyCanvas) up.setDirtyCanvas(true, true); } catch (e) {}
+        try { if (main.setDirtyCanvas) main.setDirtyCanvas(true, true); } catch (e) {}
+    }
+}
+
 function renderLibLatent(body, node, dir, ds, mf, busy, say, repaint) {
     const list = mf?.latents || [];
-    body.append(el("div", "h3d-libsec", `已登记 latent（${list.length}）· kind: av=图像+音频 / video=仅图像 / audio=仅音频`));
-    if (!list.length) body.append(el("div", "h3d-empty", "暂无：分段生成时自动保存（seg_NNN_auto.pt），或下方手工切片"));
+    const { det: detL, box: boxL } = foldBox("lib-latent-list",
+        `🧬 已登记 latent（${list.length}）· kind: av=图像+音频 / video=仅图像 / audio=仅音频`,
+        true);
+    if (!list.length) boxL.append(el("div", "h3d-empty", "暂无：分段生成时自动保存（seg_NNN_auto.pt），或下方手工切片"));
     for (const L of list) {
         if (!L?.file) continue;
         const row = el("div", "h3d-librow");
         row.append(el("span", "h3d-libname",
             `${L.file} · ${L.kind || "av"} · ←${L.src || "?"} [${L.start_f ?? "?"}, ${L.end_f ?? "?"})`));
+        const bUp = el("button", "h3d-btn h3d-btn-cyan", "⚡放大");
+        bUp.title = "驱动画布 H3LatentUpscale 神经放大×2 存回本库（主节点临时旁路，提交后自动恢复）";
+        bUp.onclick = async () => {
+            try {
+                await runUpscaleTool(node, dir, L.file, say);
+                scheduleRefresh(3000);
+                await repaint();
+            } catch (e) { say("放大失败：" + (e?.message || e)); }
+        };
+        row.append(bUp);
         const bDel = el("button", "h3d-btn h3d-btn-danger", "删");
         bDel.title = "删除该 latent 登记文件";
         bDel.onclick = async () => {
@@ -4364,9 +5133,11 @@ function renderLibLatent(body, node, dir, ds, mf, busy, say, repaint) {
             } catch (e) { say("删除失败：" + (e?.message || e)); }
         };
         row.append(bDel);
-        body.append(row);
+        boxL.append(row);
     }
-    body.append(el("div", "h3d-libsec", "手工切片（段存档/已登记 latent → 新 latent，无需 VAE）"));
+    body.append(detL);
+    const { det: detS, box: boxS } = foldBox("lib-latent-slice",
+        "✂ 手工切片（段存档/已登记 latent → 新 latent，无需 VAE）", true);
     const ctl = el("div", "h3d-libctl");
     const inSeg = document.createElement("input");
     inSeg.value = "0"; inSeg.title = "段文件号（0-based，对应 seg_000.pt；用 latent 源时填 -1）";
@@ -4405,8 +5176,9 @@ function renderLibLatent(body, node, dir, ds, mf, busy, say, repaint) {
     ctl.append(document.createTextNode("段"), inSeg, document.createTextNode("源"), inSrc,
         document.createTextNode("帧"), inS, document.createTextNode("~"), inE,
         inN, kindSel, bSlice);
-    body.append(ctl);
-    body.append(el("div", "h3d-foot", "分段设置里可选本段是否注入 latent（keyframe，桥来源下拉）、保存哪段 latent；库内任意 latent 可在画布用 H3LatentUpscale 节点放大+二次采样，产物可再选作桥来源。"));
+    boxS.append(ctl);
+    body.append(detS);
+    body.append(el("div", "h3d-foot", "分段设置里可选本段是否注入 latent（keyframe，桥来源下拉）、保存哪段 latent；库内任意 latent 点「⚡放大」一键神经放大×2（画布 H3LatentUpscale，需先选放大模型；二次采样等高级参数去画布调）。"));
 }
 
 
@@ -4711,28 +5483,15 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 });
             gPicBody.append(ta);
         }
-        // —— AI扩写行（5.3 最小接线，无 key 可用）：复制 intent_zh 的离线扩写命令，确认环在终端完成
+        // —— AI扩写行：直调 /h3chain/expand，先出确认卡，确认后才回填分组
         {
             const aiRow = el("div", "h3d-v2row");
-            const aiBtn = el("button", "h3d-btn", "［AI扩写］复制命令");
-            aiBtn.title = "复制 tools/h3_prompt_expander 离线命令（normalize + h3_expand full + confirm_card + validate），终端跑完把 shots/soundscape/music 贴回分组；无 key 时按 h3-dialect.md 手工 + validate.py，确认环强制";
-            aiBtn.onclick = async () => {
-                try {
-                    const fresh = getDs(node);
-                    const fpv = ((fresh.segments || [])[segIdx] || {}).prompt_v2 || pv0;
-                    const intent = String(fpv.intent_zh || (fresh.prompts || [])[segIdx] || "").trim() || "（先填中文意图）";
-                    const cmd = `python tools/h3_prompt_expander/normalize.py "${intent.replace(/"/g, "'").slice(0, 120)}"\n`
-                        + `python tools/h3_prompt_expander/h3_expand.py "${intent.replace(/"/g, "'").slice(0, 120)}" --output full > /tmp/h3env.json\n`
-                        + `python tools/h3_prompt_expander/confirm_card.py /tmp/h3env.json\n`
-                        + `# 确认后贴回 shots/soundscape/music，再点「编译预览+校验」；无 key 看 tools/h3_prompt_expander/references/h3-dialect.md 手工 + validate.py`;
-                    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(cmd);
-                    else prompt("复制扩写命令：", cmd);
-                    setLed("idle", "扩写命令已复制：终端确认后贴回分组");
-                } catch (e) { alert(`复制失败：${e?.message || e}`); }
-            };
-            const aiHint = el("span", "h3d-secs-hint", "中文意图 → 离线扩写 → 确认卡 → 贴回");
+            const aiBtn = el("button", "h3d-btn", "［AI扩写］中文意图 → 官方格式");
+            aiBtn.title = "按 MiniMax 官方 h3-prompt-writing 格式编译：先给意图确认卡，确认后回填镜头/环境音/配乐";
+            const aiHint = el("span", "h3d-secs-hint", "意图 → 确认卡 → 回填");
             aiRow.append(aiBtn, aiHint);
             gPicBody.append(aiRow);
+            aiBtn.onclick = () => openExpandModal(node, segIdx, pv0);
         }
         gPic.append(gPicBody);
         vbody.append(gPic);
@@ -4995,7 +5754,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
                     const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
                     chip.type = "button";
-                    chip.title = `${KIND_NAME[k]}素材${roles}：勾选后本段 conditioning 引用（同类按勾选顺序编号 <${KIND_TOKEN[k]} k>）；单段上限 图${KIND_CAPS.image}/视${KIND_CAPS.video}/音${KIND_CAPS.audio}`;
+                    chip.title = `${KIND_NAME[k]}素材${roles}：勾选后本段 conditioning 引用（同类按勾选顺序编号 <${KIND_TOKEN[k]} k>），正文自动补 [[标签]]；单段上限 图${KIND_CAPS.image}/视${KIND_CAPS.video}/音${KIND_CAPS.audio}`;
                     if (k === "image") {
                         const im = document.createElement("img");
                         im.loading = "lazy";
@@ -5420,6 +6179,7 @@ function buildCards(data) {
                     setPromptText(node, it.idx, ta.value);
                     scheduleRefresh(200);
                 });
+                attachAtComplete(ta, node);   // P3：@别名补全（只改文本，防抖落盘不变）
             }
             /* 三页容器：主框 / v2分组 / 设置（时长在标题行，设置页只放引用+开关） */
             const tabbar = el("div", "h3d-tabs");
@@ -7043,15 +7803,27 @@ function openNewProjectModal() {
 /* ---- 总提示词模态：多段一次性粘贴分配（格式与 skill「h3 总提示词」同规范） ---- */
 
 const MP_PLACEHOLDER = `【段1】
-场景：风格+环境+光照，如：日系动画风，黄昏教室，暖橘侧光
-角色：外观+服饰+位置，如：蓝白校服的短发少女，坐在窗边倒数第二排
-环境音：翻书声，远处操场喧闹
-配乐：钢琴独奏，慢板
-提示词：镜头缓慢推近。少女抬头望向窗外，轻声说「放学后见。」
+时长：5
+独立镜头：否
+提示词：
+integrated_multimodal_description: [Shot 1] 实拍、电影感，中景框住黄昏教室，短发少女坐在窗边。镜头缓慢推近。她抬起头，轻声说道：<d>[Chinese] 放学后见。</d>
+
+overall_soundscape: 翻书声与远处操场喧闹持续。
+
+non_diegetic_music: N/A
 
 【段2】
-场景：同上（保持世界观一致）
-提示词：校门口逆光剪影，两人并肩走出，镜头拉远。`;
+时长：8
+独立镜头：是
+参考：角色1，图片2
+提示词：
+integrated_multimodal_description: [Shot 1] 实拍、电影感，校门口逆光剪影。镜头缓慢拉远。
+
+overall_soundscape: 放学人潮与自行车铃。
+
+non_diegetic_music: N/A
+
+【完】`;
 
 function openMasterPromptModal() {
     const node = findNode();
@@ -7064,8 +7836,10 @@ function openMasterPromptModal() {
     const dialog = el("div", "h3d-dialog h3d-dialog-wide");
     dialog.innerHTML = `
         <h3>📋 总提示词 · 多段一次性分配</h3>
-        <p class="h3d-lead">按「段头 + 八标签」格式粘贴全文（可用 AI 按 skill「h3-video-prompts」生成），
-        一次分给所有段：<b>场景 / 角色 / 环境音 / 配乐 / 时长 / 独立镜头 / 参考 / 提示词</b>。
+        <p class="h3d-lead">按「段头 + 四标签」格式粘贴全文：<b>时长 / 独立镜头 / 参考 / 提示词</b>。
+        每条 <b>提示词：</b> 的正文请按 <b>H3 官方格式</b>写（三字段
+        <code>integrated_multimodal_description</code> / <code>overall_soundscape</code> /
+        <code>non_diegetic_music</code>，Ref2VA 用六段式）。
         标签<b>写了即生效（写空=清空），没写的字段不动</b>；段数按段头数量重排，
         各段的素材勾选/断链标记保留；「参考」只认「素材与参考」已有标签，
         未上传的会剔除并提示；<b>【完】</b>之后的内容（如 AI 的素材建议）不参与解析。
@@ -7116,6 +7890,162 @@ function openMasterPromptModal() {
         scheduleRefresh(60);
     };
     ok.onclick = submit;
+}
+
+/* ---------- AI 扩写确认卡（中文意图 → 官方格式 → 回填分组） ---------- */
+
+/** 把 h3_text 里的三/六字段正文拆出来，准备回填 prompt_v2。
+ *  官方格式：字段名独占一行 + 冒号；字段之间空一行；对齐指令在三字段之前（本函数忽略）。
+ *  返回 { field: text }，字段名用官方英文名。 */
+function splitH3Sections(h3Text) {
+    const out = {};
+    const lines = String(h3Text || "").split("\n");
+    let cur = null;
+    const buf = {};
+    for (const raw of lines) {
+        const m = raw.match(/^([a-z_]+)\s*:\s*(.*)$/);
+        if (m && H3_SECTION_KEYS.has(m[1])) {
+            cur = m[1];
+            buf[cur] = [m[2]];
+            continue;
+        }
+        if (cur) buf[cur].push(raw);
+    }
+    for (const k of Object.keys(buf)) {
+        const text = buf[k].join("\n").trim();
+        if (text) out[k] = text;
+    }
+    return out;
+}
+
+const H3_SECTION_KEYS = new Set([
+    "integrated_multimodal_description", "detailed_description",
+    "subject_definitions", "summary", "retention_analysis",
+    "overall_soundscape", "non_diegetic_music",
+]);
+
+/** 把官方格式正文回填到段的 prompt_v2：主字段拆成 shots，环境音/配乐直写。 */
+function applyH3TextToSeg(node, segIdx, h3Text) {
+    const secs = splitH3Sections(h3Text);
+    const main = secs.integrated_multimodal_description || secs.detailed_description || "";
+    if (!main && !secs.overall_soundscape && !secs.non_diegetic_music) return false;
+    setPromptV2Field(node, segIdx, (pv) => {
+        if (main) {
+            /* [Shot N] 开头的块切成多镜；无标记则整段作为单镜 */
+            const blocks = main.split(/(?=^\[Shot\s+\d+\])/m).map((s) => s.trim()).filter(Boolean);
+            pv.shots = (blocks.length ? blocks : [main]).map((text) => {
+                const head = text.match(/^\[Shot\s+(\d+)\](?:\s*At\s+\d{1,2}:\d{2}\.\d{3})?\s*/);
+                const desc = head ? text.slice(head[0].length).trim() : text;
+                const at = text.match(/^\[Shot\s+\d+\]\s*At\s+(\d{1,2}:\d{2}\.\d{3})/);
+                return { description: desc, at: at ? at[1] : "" };
+            });
+        }
+        if (secs.overall_soundscape) pv.soundscape = secs.overall_soundscape;
+        if (secs.non_diegetic_music) pv.non_diegetic_music = secs.non_diegetic_music;
+    });
+    return true;
+}
+
+/** AI 扩写弹窗：填中文意图 → 出确认卡 → 确认回填 / 提意见修订 / 换风格重来。 */
+function openExpandModal(node, segIdx, pv0) {
+    if (document.querySelector(".h3d-overlay")) return;
+    const ds = getDs(node);
+    const seg = (ds.segments || [])[segIdx] || {};
+    const pv = seg.prompt_v2 || pv0 || {};
+    const isRef = seg.v2mode === "Ref2VA";
+    const mode = seg.v2mode || (isRef ? "Ref2VA" : "FL2VA");
+    let envelope = null;          // 上一次返回的信封，修订时回传
+    let curH3 = "";
+
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog h3d-dialog-wide");
+    dialog.innerHTML = `
+        <h3>✨ AI 扩写 · 中文意图 → 官方格式</h3>
+        <p class="h3d-lead">按 <b>MiniMax 官方 h3-prompt-writing</b> 格式编译：格式骨架（字段名 / <code>[Shot N]</code> /
+        对齐指令 / retention 标记）用英文逐字，画面描述用中文。
+        先出<b>确认卡</b>核对理解，确认后才回填本段分组；也可直接提意见让它改。</p>`;
+    const ta = document.createElement("textarea");
+    ta.className = "h3d-mpta";
+    ta.spellcheck = false;
+    ta.placeholder = "一句话说清这段要什么：场景、人物、动作、情绪、镜头感觉。例：夜晚便利店门口，女孩撑伞等车，霓虹倒映在积水里，缓慢推近。";
+    ta.value = String(pv.intent_zh || "").trim();
+    const cardBox = el("pre", "h3d-cardbox", "");
+    cardBox.style.display = "none";
+    const info = el("div", "h3d-mpinfo", "");
+    const err = el("div", "h3d-err", "");
+    const row = el("div", "h3d-dialog-row");
+    const runBtn = el("button", "h3d-btn h3d-btn-cta", "生成确认卡");
+    const applyBtn = el("button", "h3d-btn", "确认并回填");
+    applyBtn.disabled = true;
+    const reviseBtn = el("button", "h3d-btn", "提意见重改");
+    reviseBtn.disabled = true;
+    const closeBtn = el("button", "h3d-btn", "关闭");
+    row.append(runBtn, applyBtn, reviseBtn, closeBtn);
+    dialog.append(ta, cardBox, info, err, row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.append(overlay);
+    ta.focus();
+
+    const setBusy = (on) => {
+        runBtn.disabled = on; applyBtn.disabled = on || !curH3;
+        reviseBtn.disabled = on || !envelope;
+        runBtn.textContent = on ? "编译中…" : "生成确认卡";
+    };
+
+    const callExpand = async (payload) => {
+        if (!window.H3Api?.expand) { err.textContent = "接口未就绪（h3_api.js 未加载）"; return; }
+        err.textContent = "";
+        setBusy(true);
+        try {
+            const duration = Number(seg.seconds) || 5;
+            const res = await window.H3Api.expand({
+                config: null,                       // null = 走服务端已保存的优化设置
+                prompt: String(ta.value || "").trim(),
+                duration,
+                mode,
+                two_step: true,
+                ...payload,
+            });
+            if (res.status >= 400 || res.body?.error) {
+                err.textContent = window.H3Api.errText(res, "扩写失败");
+                return;
+            }
+            const d = res.body || {};
+            envelope = d.envelope || null;
+            curH3 = String(d.h3_text || "");
+            cardBox.textContent = String(d.card_md || "（无确认卡）");
+            cardBox.style.display = "";
+            const v = d.validation || {};
+            const bad = (v.errors || []).length;
+            info.innerHTML = `模式 <b>${mode}</b> · 时长 <b>${duration}s</b> · 校验 ` +
+                (v.ok ? "✅ 通过" : `⚠ ${bad} 项待改`);
+            applyBtn.disabled = !curH3;
+            reviseBtn.disabled = !envelope;
+        } catch (e) {
+            err.textContent = `请求异常：${e?.message || e}`;
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    runBtn.onclick = () => callExpand({});
+    reviseBtn.onclick = () => {
+        const rev = window.prompt("想改哪里？（例：镜头太碎，合并成两镜；环境音再安静些）");
+        if (!rev || !rev.trim()) return;
+        callExpand({ from_envelope: envelope, revision: rev.trim() });
+    };
+    applyBtn.onclick = () => {
+        if (!curH3) return;
+        if (!applyH3TextToSeg(node, segIdx, curH3)) { err.textContent = "没解析出可回填的字段"; return; }
+        /* 意图也存回，方便下次续改 */
+        setPromptV2Field(node, segIdx, (p) => { p.intent_zh = String(ta.value || "").trim(); });
+        flushPrompts(node);
+        setLed("idle", `第 ${segIdx + 1} 段已按官方格式回填`);
+        overlay.remove();
+        scheduleRefresh(60);
+    };
+    closeBtn.onclick = () => overlay.remove();
 }
 
 /* ---------- 刷新 ---------- */

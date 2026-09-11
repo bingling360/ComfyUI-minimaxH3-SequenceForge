@@ -1,11 +1,13 @@
 ---
 name: h3-prompt-expand
-description: 把中文口语理解成意图并编译成 MiniMax H3 能稳定执行的英文三字段提示词。当用户说“转成H3能懂的/优化提示词/别让它念提示词/出烧录字幕了/胡编乱造”时使用。中文进、英文出，带确定性校验与有界修复。
+description: 把中文口语理解成意图并编译成 MiniMax H3 官方格式提示词（integrated_multimodal_description / overall_soundscape / non_diegetic_music 三字段，Ref2VA 六段式）。当用户说“转成H3能懂的/优化提示词/别让它念提示词/出烧录字幕了/胡编乱造”时使用。带确定性校验与有界修复。
 ---
 
 # H3 提示词理解+转译
 
-你不是格式套壳器。你是“理解用户真正想要什么，再翻译成 H3 方言”的人。
+你不是格式套壳器。你是“理解用户真正想要什么，再把格式对到 H3 官方规范”的人。
+格式基准是 MiniMax 官方 `skills/h3-prompt-writing`（`base-en.txt` / `ref-en.txt`），
+本工具是它的可执行落地：**骨架英文一字不改，主体内容按需中文**（对白与屏显保持原语言）。
 
 ## 何时用我
 
@@ -14,21 +16,24 @@ description: 把中文口语理解成意图并编译成 MiniMax H3 能稳定执�
 ## 调用方式（opencode bash 直调，优先）
 
 ```bash
-# 1. 先配 key（二选一，powershell 示例）
-$env:ZHIPU_API_KEY="sk-xxxx"            # 智谱 GLM（默认）
-# $env:OPENAI_BASE_URL="https://..."    # 其它 OpenAI 兼容网关可覆盖
+# 1. 准备配置 JSON（结构与 optimizer.DEFAULT_CONFIG 相同：服务商/协议/API Key/模型/本地模型）
+#    示例 cfg.json: {"mode":"api","provider":"runninghub","protocol":"openai","api_key":"sk-xxxx","model":"..."}
 
-# 2. 一句话转译（默认 glm-4-flash，强推理换 glm-4.6）
-python h3_prompt_expander/h3_expand.py "雨夜霓虹市场，一个女孩回头笑说跟上我" --duration 5
+# 2. 一句话转译（模型取配置里的 model，可用 --model 覆盖）
+python h3_prompt_expander/h3_expand.py "雨夜霓虹市场，一个女孩回头笑说跟上我" --duration 5 --config cfg.json
 
-# 输出即 H3 三字段英文，直接贴进 SequenceForge 总提示词框（官方直通语义）或 H3 API。
+# 输出即 H3 官方格式（三字段间空一行；I2VA/FL2VA/L2VA 前置关键帧对齐指令块），
+# 可直接贴进 SequenceForge 总提示词框（官方直通语义）或 H3 API。
 # 贵一倍但更稳的双跳：
-python h3_prompt_expander/h3_expand.py "……" --two-step --model glm-4.6
+python h3_prompt_expander/h3_expand.py "……" --two-step --model glm-4.6 --config cfg.json
 # 只校验不花钱：
 python h3_prompt_expander/h3_expand.py --validate-only h3_prompt_expander/examples/envelope_ok.json
 ```
 
-无 key / 离线时：照 `references/h3-dialect.md` 手工编译，并用 `validate.py` 自检。
+导演台内调用：路由 `POST /h3chain/expand`（走 `service.expand_via_config`），
+前端"AI扩写"按钮直接用它，产出信封 + 确认卡，不再复制命令到终端。
+
+离线时：照 `references/h3-dialect.md` 手工编译，并用 `validate.py` 自检。
 
 ## 四步流水线（第 2 步确认卡是强制的，不许跳过）
 
@@ -103,7 +108,7 @@ python h3_prompt_expander/confirm_card.py /tmp/h3env2.json   # 再确认一轮
 ## 泛化说明（与 T8 的关系）
 
 - T8 的泛化来自**案例库广度**（234 案例 + 8 官方场景）；本工具的泛化来自**原则兜底**：预处理规则层（一切输入先过）+ 场景包层（7 类高频模式）+ 确认环（剩下的问用户）。未知场景宁可问，不编。
-- 两者互补：T8 的案例机制描述可以直接贴进 `--style-note` 当风格参考，本工具负责把它压成 H3 可执行的英文并校验。
+- 两者互补：T8 的案例机制描述可以直接贴进 `--style-note` 当风格参考，本工具负责把它压成 H3 官方格式并校验。
 
 ## H3 翻车速查（见 bad_cases.md 全量）
 
@@ -116,6 +121,12 @@ python h3_prompt_expander/confirm_card.py /tmp/h3env2.json   # 再确认一轮
 | 人物/产品漂移 | 首镜钉死外观，ref 模式加 retention_analysis |
 | 碰撞/液体翻车 | 不拍瞬间：遮挡转场 + aftermath 静帧 + 音效补因果 |
 
-## 与现有八标签的关系
+## 与 SequenceForge「总提示词框」的关系
 
-本工具输出的是**单段 H3 英文执行版**。要进 SequenceForge 长链时，外层仍按 `总提示词框格式规范skill/SKILL.md` 的八标签+段头拼多段，把本工具的英文贴进对应段的 `提示词/环境音/配乐`语义位即可（英文直贴，后端官方直通不重包装）。
+总提示词框是**多段批量分配通道**，不是格式目标：它的标签只有
+`时长 / 独立镜头 / 参考 / 提示词` 四个，其中 `提示词：` 正文才是本工具的产物。
+
+- **单段**：把本工具输出的官方格式文本整段贴进该段的提示词框（后端官方直通，不重包装）。
+- **多段**：按段头 + 四标签拼总提示词，每段的 `提示词：` 正文放对应段的官方格式文本
+  （含三字段间空行；I2VA/FL2VA/L2VA 的对齐指令写在正文最前、空一行再接三字段）。
+- 旧「场景/角色/环境音/配乐」四标签解析仍兼容（仅旧文本可粘回），导出已不再写。

@@ -213,6 +213,128 @@ def save_assets(name: str, assets, base_revision=None):
     return manifest
 
 
+def _clean_asset_link(raw) -> dict | None:
+    """项目资产链接白名单清洗：{asset_id, alias, kind?, roles?}；非法丢弃。"""
+    import re as _re
+    if not isinstance(raw, dict):
+        return None
+    aid = str(raw.get("asset_id") or "").strip()
+    if not _re.fullmatch(r"a_[0-9a-f]{12}", aid):
+        return None
+    alias = str(raw.get("alias") or "").strip()[:_ASSET_LABEL_MAX]
+    if not alias:
+        return None
+    kind = str(raw.get("kind") or "image").strip()
+    if kind not in _ASSET_KINDS:
+        kind = "image"
+    ent = {"asset_id": aid, "alias": alias, "kind": kind}
+    # P3：标注透存（首帧图/尾帧图，与 _clean_asset 同口径；执行期 roles 仍以 ds 池为准）
+    rl = raw.get("roles")
+    if isinstance(rl, list):
+        kept = [str(r).strip() for r in rl if str(r).strip() in ("首帧图", "尾帧图")]
+        if kept:
+            ent["roles"] = kept[:2]
+    return ent
+
+
+def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision=None,
+               roles=None):
+    """全局库链接进项目：manifest["asset_links"] 增量追加/重指向，revision+1。
+
+    P1（双层存储）：全局 asset_id 一次入库，多项目链接引用不复制文件；
+    alias 是项目内显示别名（旧 label 命名空间，compile_refs 同口径解析）。
+    同 alias 已存在则重指向新 asset_id；同 asset_id 已存在则只改 alias。
+    roles：None=不动旧标注；列表（含空）=覆盖（含取消标注）。
+    目录或 manifest 不存在返回 None；base_revision 不一致抛
+    ValueError(REVISION_CONFLICT)。旧 manifest["assets"] 不动（转译层照读）。
+    """
+    name = safe_name(name)
+    ent = _clean_asset_link({"asset_id": asset_id, "alias": alias, "kind": kind,
+                             "roles": roles})
+    if not name or ent is None:
+        return None
+    # roles 三态：None=不动旧标注；列表（含空）=覆盖
+    role_override = ("__keep__" if roles is None else
+                     [str(r).strip() for r in roles
+                      if str(r).strip() in ("首帧图", "尾帧图")][:2])
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    links = [x for x in (manifest.get("asset_links") or []) if isinstance(x, dict)]
+    links = [x for x in (_clean_asset_link(x) for x in links) if x is not None]
+    hit = False
+    for x in links:
+        if x["alias"] == ent["alias"]:
+            x["asset_id"], x["kind"], hit = ent["asset_id"], ent["kind"], True
+            if role_override != "__keep__":
+                x["roles"] = role_override
+        elif x["asset_id"] == ent["asset_id"] and not hit:
+            x["alias"], x["kind"] = ent["alias"], ent["kind"]
+            if role_override != "__keep__":
+                x["roles"] = role_override
+    if not any(x["asset_id"] == ent["asset_id"] for x in links):
+        if role_override != "__keep__":
+            ent["roles"] = role_override
+        links.append(ent)
+    manifest["asset_links"] = links
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
+    """解链：按 asset_id 或 alias 移除 manifest["asset_links"] 条目，revision+1。
+
+    幂等：条目不存在同样成功（返回现 manifest）。目录或 manifest 不存在返回
+    None；base_revision 不一致抛 ValueError(REVISION_CONFLICT)。只动链接，
+    不删全局库文件与旧 assets。
+    """
+    name = safe_name(name)
+    if not name:
+        return None
+    aid = str(asset_id or "").strip()
+    als = str(alias or "").strip()[:_ASSET_LABEL_MAX]
+    if not aid and not als:
+        return None
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    links = [x for x in (manifest.get("asset_links") or []) if isinstance(x, dict)]
+    kept = [x for x in links
+            if not ((aid and str(x.get("asset_id") or "") == aid)
+                    or (als and str(x.get("alias") or "") == als))]
+    if len(kept) != len(links):
+        manifest["asset_links"] = [_clean_asset_link(x) or x for x in kept]
+        manifest["asset_links"] = [x for x in manifest["asset_links"] if x is not None]
+        manifest["updated_at"] = time.time()
+        manifest["revision"] = int(manifest.get("revision") or 1) + 1
+        manifest["manifest_schema"] = MANIFEST_SCHEMA
+        checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
 _SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music")
 
 
@@ -719,13 +841,16 @@ def move_media(name, src_file, dest_lib, save_name=None, base_revision=None,
 
 def split_av(name, src_file, save_video=None, save_audio=None, base_revision=None,
              fps=24, crf=20):
-    """音画分离：项目内 mp4 -> 画面 mp4 + 音频 wav（PyAV 解码，无 VAE）。
+    """音画分离：项目内 mp4 -> 画面 mp4 + 音频 wav（流式单遍 demux）。
 
     - save_video 缺省 <stem>_v.mp4（落源文件同库），save_audio 缺省 <stem>_a.wav。
+    - 视频轨 packet 级 remux（零解码零重编码、无损秒级）；音频轨解码收 PCM。
     - 无音轨源：只产出画面文件并在 clips 登记 note=no-audio。
     - 登记 manifest["clips"]（两条，src 同指源文件）并 revision+1。
+    旧版先整片解码（长片 19GB 级 OOM 卡死整机）；现视频零内存、内存 O(音频)。
+    fps/crf 参数保留兼容（remux 不重编码，不再使用）。
     供“只编码图像 / 只编码音频进 latent”前一步：分离后再分别走
-    H3MediaToLatent 节点（队列内拿 VAE 编码）或 latent 切片 kind 过滤。
+    主节点自动专跑转码（提交即执行）或 latent 切片 kind 过滤。
     """
     name = safe_name(name)
     if not name:
@@ -782,40 +907,15 @@ def split_av(name, src_file, save_video=None, save_audio=None, base_revision=Non
         from . import media
     except ImportError:
         import media
-    try:
-        frames, wav, sr = media.decode_av(src_path)
-    except Exception as e:
-        raise RuntimeError(f"解码失败：{e}") from e
-    import torch
+    info = media.split_av_stream(src_path, os.path.join(out_dir, v_name),
+                                 os.path.join(out_dir, a_name))
+    if info is None:
+        raise RuntimeError(f"音画分离失败：{media.last_error}")
     v_rel = f"{lib}/{v_name}"
-    if wav is None or getattr(wav, "numel", lambda: 0)() == 0:
-        ok = media.save_av_mp4(os.path.join(out_dir, v_name), frames,
-                               torch.zeros(1, 0), int(sr or 44100), fps=fps,
-                               crf=crf)
-        if not ok:
-            raise RuntimeError(f"画面保存失败：{media.last_error}")
-        note = "no-audio"
+    if not info.get("audio"):
         a_rel = ""
+        note = "no-audio"
     else:
-        ok = media.save_av_mp4(os.path.join(out_dir, v_name), frames,
-                               torch.zeros(1, max(0, int(wav.shape[-1]))), int(sr or 44100),
-                               fps=fps, crf=crf)
-        if not ok:
-            raise RuntimeError(f"画面保存失败：{media.last_error}")
-        # 音频 wav：标准 PCM16（wave 模块，零新依赖）
-        import wave
-        a_path = os.path.join(out_dir, a_name)
-        pcm = wav.detach().float().cpu().clamp(-1.0, 1.0)
-        if pcm.dim() == 3:
-            pcm = pcm[0]
-        ch = int(pcm.shape[0]) if pcm.dim() == 2 else 1
-        import numpy as np
-        arr = (pcm.numpy().transpose(1, 0) * 32767.0).clip(-32768, 32767).astype("<i2")
-        with wave.open(a_path, "wb") as wf:
-            wf.setnchannels(min(2, ch))
-            wf.setsampwidth(2)
-            wf.setframerate(int(sr or 44100))
-            wf.writeframes(arr.tobytes())
         a_rel = f"{lib}/{a_name}"
         note = ""
     fresh = checkpoint.load_manifest(root)

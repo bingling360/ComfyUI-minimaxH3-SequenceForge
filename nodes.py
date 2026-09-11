@@ -402,11 +402,16 @@ def _encode_audio_latent(audio_vae, audio, tokens):
     """AUDIO dict -> [1,32,2,T] latent，裁到与画面等长的 token 数。
 
     仿官方 _encode_ref_audio 语义：重采样到音频 VAE 采样率后整段编码。
+    输入归一到 [B,C,T]（LoadAudio 口径）：decode_av 给的是 [C,T]，
+    单声道文件可能是 [T]；缺 batch 维时 [:1] 会切到声道导致 VAE 内
+    tuple index out of range——此处先补齐（已是 3D 则零改动）。
     torchaudio 延迟导入（ComfyUI 自带，无 ComfyUI 的结构单测不触达）。
     """
     import torchaudio
 
     waveform = audio["waveform"]
+    while waveform.dim() < 3:
+        waveform = waveform.unsqueeze(0)
     sr = int(audio.get("sample_rate") or 0)
     vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
     if sr and sr != vae_sr:
@@ -415,22 +420,7 @@ def _encode_audio_latent(audio_vae, audio, tokens):
     return z[..., :tokens].clone()
 
 
-def _autogrow_items(group, prefix):
-    """autogrow dict -> 按序号排序的非 None 值，压实为从 0 连续编号的官方 ref_* 键名。
-
-    压实保证 <Picture 1>/<Video 1>/<Audio 1> 标签始终对应"按连接顺序的第 1 个"，
-    与官方 note 的 "in the exact order they were connected" 语义一致，
-    即使用户中间留了空输入框也不会错位。
-    """
-    if not group:
-        return {}
-    def num(k):
-        try:
-            return int(str(k).rsplit("_", 1)[-1])
-        except ValueError:
-            return 0
-    vals = [v for _, v in sorted(group.items(), key=lambda kv: num(kv[0])) if v is not None]
-    return {f"{prefix}{i}": v for i, v in enumerate(vals)}
+# P4d：_autogrow_items 已删除（画布 autogrow 入口全部下线，无调用方）。
 
 
 def _resolve_media_path(filename):
@@ -446,13 +436,24 @@ def _resolve_media_path(filename):
     return ("input", norm)
 
 
+def _decode_image_file(abs_path):
+    """绝对路径图片 -> IMAGE 张量（解码部分，与 _load_input_image 同格式）。"""
+    from PIL import Image, ImageOps
+    import numpy as np
+    img = node_helpers.pillow(Image.open, abs_path)
+    img = node_helpers.pillow(ImageOps.exif_transpose, img)
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
+
+
 def _load_input_image(filename, _project_root=None):
     """图片 -> IMAGE 张量（与 LoadImage 节点同格式：[1,H,W,C] float32 0-1）。
 
     filename 为 assets/... 时从项目文件夹取（_project_root 必给），否则走 input 目录。
+    P2：store 三级寻址命中的全局库文件由调用方经 _decode_image_file 直接解码，
+    本函数兼容路径不变。
     """
-    from PIL import Image, ImageOps
-    import numpy as np
     scope, norm = _resolve_media_path(filename)
     if scope == "project":
         if not _project_root:
@@ -461,11 +462,19 @@ def _load_input_image(filename, _project_root=None):
         image_path = os.path.join(_project_root, norm)
     else:
         image_path = folder_paths.get_annotated_filepath(norm)
-    img = node_helpers.pillow(Image.open, image_path)
-    img = node_helpers.pillow(ImageOps.exif_transpose, img)
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
+    return _decode_image_file(image_path)
+
+
+def _decode_video_file(abs_path, filename=""):
+    """绝对路径视频 -> (帧张量, 音轨)，与 _load_input_video 同格式（含静音兜底）。"""
+    from comfy_api.latest import InputImpl
+    comps = InputImpl.VideoFromFile(abs_path).get_components()
+    if comps.images is None or not getattr(comps.images, "shape", None):
+        raise ValueError(f"参考视频「{filename or abs_path}」解不出画面帧：请确认是可解码的 24fps 视频（2-15 秒）")
+    if comps.audio is None:
+        import torch as _t
+        comps.audio = {"waveform": _t.zeros(1, 1, 0), "sample_rate": 24000}
+    return comps.images, comps.audio
 
 
 def _load_input_video(filename, _project_root=None):
@@ -474,7 +483,6 @@ def _load_input_video(filename, _project_root=None):
     音轨与帧同源自同一文件，即「参考视频音轨」自动配对，无需单独上传。
     assets/... 走项目文件夹（需 _project_root），其余走 input 目录。
     """
-    from comfy_api.latest import InputImpl
     scope, norm = _resolve_media_path(filename)
     if scope == "project":
         if not _project_root:
@@ -483,18 +491,18 @@ def _load_input_video(filename, _project_root=None):
         video_path = os.path.join(_project_root, norm)
     else:
         video_path = folder_paths.get_annotated_filepath(norm)
-    comps = InputImpl.VideoFromFile(video_path).get_components()
-    if comps.images is None or not getattr(comps.images, "shape", None):
-        raise ValueError(f"参考视频「{filename}」解不出画面帧：请确认是可解码的 24fps 视频（2-15 秒）")
-    if comps.audio is None:
-        import torch as _t
-        comps.audio = {"waveform": _t.zeros(1, 1, 0), "sample_rate": 24000}
-    return comps.images, comps.audio
+    return _decode_video_file(video_path, filename)
+
+
+def _decode_audio_file(abs_path):
+    """绝对路径音频 -> AUDIO dict，与 _load_input_audio 同格式。"""
+    from comfy_extras.nodes_audio import load
+    waveform, sample_rate = load(abs_path)
+    return {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
 
 
 def _load_input_audio(filename, _project_root=None):
     """音频 -> AUDIO dict（与 LoadAudio 节点输出同格式）。assets/... 走项目文件夹。"""
-    from comfy_extras.nodes_audio import load
     scope, norm = _resolve_media_path(filename)
     if scope == "project":
         if not _project_root:
@@ -503,8 +511,7 @@ def _load_input_audio(filename, _project_root=None):
         audio_path = os.path.join(_project_root, norm)
     else:
         audio_path = folder_paths.get_annotated_filepath(norm)
-    waveform, sample_rate = load(audio_path)
-    return {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
+    return _decode_audio_file(audio_path)
 
 
 def _parse_director_state(raw):
@@ -586,14 +593,28 @@ def _apply_label_tokens(prompt, label_order):
     return out
 
 
-def _reference_header(label_order):
-    """段首自动注入的参考定义（官方 Ref2VA subject_definitions 风格），三类 token 各自编号。"""
+def _reference_tags_minimal(label_order):
+    """段首最小引用声明（接线语义）：每资源一行 token = 别名，不写散文。
+
+    H3 模型硬约束：软引用必须在文本里出现 <Picture k> 等 tag，模型才会真正
+    使用对应素材（官方模板亦然）。勾选了引用但正文没写 tag 时，只补这份映射表、
+    不再自动生成英文 subject_definitions 长文；写了 tag 的段保持原样直通。
+    无 ComfyUI 可单测（纯函数，仅依赖 _normalize_order/_kind_tokens）。
+    """
     mapping = _kind_tokens(_normalize_order(label_order))
-    role = {"Picture": "reference image", "Video": "reference video", "Audio": "reference audio"}
-    lines = [f"{tok} is the {role[tok.split()[0][1:].capitalize()]} for {lbl}, "
-             f"used as a generation anchor of this segment."
-             for lbl, tok in mapping.items()]
-    return "subject_definitions:\n" + "\n".join(lines)
+    lines = [f"{tok} = {lbl}" for lbl, tok in mapping.items()]
+    return "[References]\n" + "\n".join(lines)
+
+
+def _uncovered_tags(full, mapping):
+    """已写 tag 精确差集：mapping 中文本里没有的标签。
+
+    注：token 匹配必须精确（"<Picture 1>" 是 "<Picture 10>" 的子串，
+    直接 in 会误判覆盖），故用正则逐个提取已写 tag。纯函数可单测。
+    """
+    covered = {m.group(0) for m in
+               re.finditer(r"<(?:Picture|Video|Audio) \d+>", full or "")}
+    return [lbl for lbl in mapping if mapping[lbl] not in covered]
 
 
 # 官方 h3-prompt-writing 三字段标签：主提示词含任一即视为已是官方格式，直通不包装
@@ -658,8 +679,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "无缝续拍后裁剪拼接，输出完整视频+音频（可另出每段分镜）。"
                         "参考素材用法与官方 Reference to Video 一致：<Picture i> / <Video k> / <Audio j>。",
             inputs=[
-                io.Model.Input("模型"),
-                io.Clip.Input("文本编码器"),
+                # P4f：模型/文本编码器改为可选——转码专跑最小图（双 VAE + 本节点短路）
+                # 不需要它们；缺省不接不报错，生成链照常连线。
+                io.Model.Input("模型", optional=True,
+                               tooltip="生成用 UNET（转码专跑不需要，可空）"),
+                io.Clip.Input("文本编码器", optional=True,
+                              tooltip="生成用 CLIP（转码专跑不需要，可空）"),
                 io.Vae.Input("视频VAE"),
                 io.Vae.Input("音频VAE"),
                 io.Combo.Input("宽高比", options=["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"], default="16:9",
@@ -731,7 +756,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "→ 完全消失（自由生成）。数值=递减占总步数比例（0.3=前30%步数递减完毕）。"
                                        "开启后「锚定加噪」的值作为递减起点，终点为 0（锚定消失）"),
                 io.Combo.Input("生成模式", options=["文生视频", "首帧视频", "多参视频"], default="文生视频",
-                               tooltip="已废弃占位（旧工作流兼容保留）：链路改由后端按实际引用自动推导——"
+                               advanced=True,
+                               tooltip="已废弃占位（旧工作流兼容保留，已折叠隐藏）：链路改由后端按实际引用自动推导——"
                                        "有段引用素材即走 ref conditioning，首帧标注即首段起手，首帧可与引用共存。"
                                        "实际 UNET 由「模型」输入决定；权重混用机械可跑，效果看权重本身。"),
                 # 注意：新控件一律加在「生成模式」之后（widgets_values 末尾），
@@ -760,72 +786,38 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "标准=crf20 veryfast（现状兼容）；高清=crf16 medium + 暗部自适应量化 + Bayer 抖动；"
                                        "极致=crf13 slow + 同上（编码明显变慢）。二采开启时其高清产物同名覆盖，此档自动失效"),
                 io.String.Input("资产包", multiline=True, default="", advanced=True,
-                               tooltip="H3AssetHub「规范包」输出连这里：单线分发。非空时优先于「导演台状态」内 "
-                                       "ref_assets（总量不限，单段上限执行期按段卡）。空=走导演台状态/画布旧路径。"),
-                io.Image.Input("首帧图片", optional=True,
-                               tooltip="第一段的起始帧（i2v）。用了它请用 fl2va UNET，且不能同时用任何参考素材"),
-                io.Image.Input("尾帧图片", optional=True,
-                               tooltip="FL2VA 官方首尾帧：整链最后一段的末帧 keyframe（剧情终点画面）。"
-                                       "仅「首帧视频」模式；末段提示词写「如何走到这个画面」的过程，"
-                                       "不复述图内静态内容；设了它，末段不再叠加每段尾帧锚定"),
-                io.Image.Input("每段尾帧锚定", optional=True,
-                               tooltip="身份锚定帧（last_frame keyframe）：注入每段末尾位置作为人物/场景参考，"
-                                       "与段首引导桥形成「隧道」——模型去噪全程被首尾双锚点约束，过了桥窗口"
-                                       "（约2秒）也不会漂移。建议用角色正面清晰帧（导演台素材池可上传，"
-                                       "任意模式可用）。不传则不锚定尾帧（保持现状）"),
+                                tooltip="H3AssetBundle「资产包」输出连这里：单线分发，一次连好终身不动。"
+                                        "旧 H3AssetHub「规范包」同样兼容。非空时优先于「导演台状态」内 "
+                                        "ref_assets（总量不限，单段上限执行期按段卡）。空=走导演台状态/画布旧路径。"),
                 io.Image.Input("起始视频", optional=True,
                                tooltip="序章：上传视频（≥5 帧、24fps，超长只取前「每段时长」内）编码为第 1 段存入存档，"
-                                       "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图片同用"),
+                                       "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图同用"),
                 io.Audio.Input("起始视频音轨", optional=True,
                                tooltip="序章原声（与起始视频配对，建议同源 LoadVideo 拆出；不接则序章按静音处理）"),
-                io.Autogrow.Input("提示词组", optional=True,
-                                  template=io.Autogrow.TemplatePrefix(
-                                      input=io.String.Input("提示词", multiline=True,
-                                                            placeholder="这一段的画面描述，第 N 段会顺着第 N-1 段结尾继续"),
-                                      prefix="提示词_", min=1, max=64)),
-                io.Autogrow.Input("参考图片组", optional=True,
-                                  template=io.Autogrow.TemplatePrefix(
-                                      input=io.Image.Input("参考图片",
-                                                           tooltip="参考主体图，提示词用 <Picture i> 引用（i 从 1 开始按序号）。用了请接 ref2va UNET"),
-                                      prefix="参考图片_", min=0, max=9)),
-                io.Autogrow.Input("参考视频组", optional=True,
-                                  template=io.Autogrow.TemplatePrefix(
-                                      input=io.Image.Input("参考视频",
-                                                           tooltip="参考视频帧（24fps，2-15 秒），提示词用 <Video k> 引用"),
-                                      prefix="参考视频_", min=0, max=3)),
-                io.Autogrow.Input("参考视频音轨组", optional=True,
-                                  template=io.Autogrow.TemplatePrefix(
-                                      input=io.Audio.Input("参考视频音轨",
-                                                           tooltip="同号参考视频的原声（参考视频音轨_1 配 参考视频_1），自动获得 <Audio j> 标签"),
-                                      prefix="参考视频音轨_", min=0, max=3)),
-                io.Autogrow.Input("参考音频组", optional=True,
-                                  template=io.Autogrow.TemplatePrefix(
-                                      input=io.Audio.Input("参考音频",
-                                                           tooltip="独立参考音频（配乐/音效），提示词用 <Audio j> 引用"),
-                                      prefix="参考音频_", min=0, max=3)),
+                # P4d：画布媒体/提示词入口已删除（首帧/尾帧/尾锚图片、提示词组 autogrow）——
+                # 素材与提示词只走资产包/Bundle/导演台状态。起始视频（序章）是唯一的画布
+                # 媒体入口（无导演台等价字段，保留）。旧工作流残留连线加载时自动忽略。
             ],
             outputs=[
                 io.Image.Output("图像"),
                 io.Audio.Output("音频"),
                 io.Int.Output("帧率"),
                 io.String.Output("报告"),
-                io.Image.Output("分段图像", is_output_list=True,
-                                tooltip="每段裁剪后的可见帧（逐段展开，接 Create Video 可单独保存）"),
-                io.Audio.Output("分段音频", is_output_list=True,
-                                tooltip="与分段图像逐段配对的音轨"),
+                # P4d：分段图像/分段音频列表输出已删除（分段落盘由自动保存完成，
+                # 在项目文件夹直接看片）。旧工作流残留连线加载时自动忽略。
             ],
         )
 
     @classmethod
     def _execute_inner(cls, 模型, 文本编码器, 视频VAE, 音频VAE, 宽高比, 百万像素, 宽度, 高度, 每段时长, 引导帧数,
-                种子, 步数, CFG, 采样器, 调度器, 首帧图片=None, 尾帧图片=None, 每段尾帧锚定=None, 起始视频=None, 起始视频音轨=None,
-                提示词组=None,
-                参考图片组=None, 参考视频组=None, 参考视频音轨组=None, 参考音频组=None,
+                种子, 步数, CFG, 采样器, 调度器, 起始视频=None, 起始视频音轨=None,
                 自动存档="关闭", 存档目录="", 桥帧门控="标注", 清晰度阈值=30.0, 回退上限=34,
                 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
                 递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准", 资产包=""):
+        # P4d：画布媒体/提示词/参考入口已从 schema 删除，对应形参一并移除；
+        # 起始视频（序章）是唯一的画布媒体入口，保留。
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
         try:
             from .routes import ensure_registered
@@ -850,12 +842,28 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 后续所有实验分支以 exp.has(...) 包裹，关闭时逐字节走现状路径
         exp = experiments.resolve(ds if isinstance(ds, dict) else None)
         # ---- 内联转码任务（资产库"转latent"）：ds.transcode_jobs 非空则只跑转码，
-        # 不跑链、不耗种子。任务由资产库面板写入 ds，前端提示用户按一次开始生成；
+        # 不跑链、不耗种子。任务由资产库面板写入 ds，提交即自动排队执行；
         # 队列中断在任务间隙生效（见 run_transcode_job 的 _interrupted）。
         # 完成后前端凭 manifest.latents 证据自动清理已完成任务。
+        # P4+：后台表有本项目排队任务时同样进专跑（提交即自动排队执行，前端
+        # 提交后自动 queuePrompt，本条件负责接住执行，无需手写 ds 任务）。
         _jobs = [j for j in (ds.get("transcode_jobs") or [])
                  if isinstance(j, dict) and j.get("status", "queued") == "queued"]
-        if _jobs:
+        _server_pending = False
+        try:
+            from . import transcode_queue as _tq_entry
+        except ImportError:
+            try:
+                import transcode_queue as _tq_entry
+            except ImportError:
+                _tq_entry = None
+        if _tq_entry is not None:
+            try:
+                _hint = str(存档目录 or "").strip()
+                _server_pending = bool(_hint and _tq_entry.has_queued(_hint))
+            except Exception:
+                _server_pending = False
+        if _jobs or _server_pending:
             return cls._execute_transcode_only(
                 ds, _jobs, 视频VAE, 音频VAE, 存档目录)
         if ds.get("mode"):
@@ -863,20 +871,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if _m not in ("文生视频", "首帧视频", "多参视频"):
                 raise ValueError(f"导演台状态中的模式「{_m}」无效：必须是「文生视频」「首帧视频」或「多参视频」")
             生成模式 = _m
-        # 提示词：导演台 JSON 优先，空则回退画布 autogrow 输入
+        # 提示词：只走导演台 JSON（画布提示词组入口已删除）
         if ds.get("prompts") and isinstance(ds["prompts"], list):
             seg_prompts = [str(p).strip() for p in ds["prompts"] if str(p).strip()]
         else:
-            prompts = _autogrow_items(提示词组, "p")
-            seg_prompts = [str(v).strip() for v in prompts.values() if str(v).strip()]
+            seg_prompts = []
         if not seg_prompts:
-            raise ValueError("提示词不能为空：请在导演台填写提示词，或在「提示词组」里每段添加一个输入框并填写内容")
+            raise ValueError("提示词不能为空：请在导演台填写提示词后重试")
 
         # 素材池（标签->文件，分 图/视/音 三类）：ref_assets 为 v2 真源；旧 ref_images 视为图片。
         # 资产库无模式门槛：总量不限；每条目可带 roles 标注（首帧图/尾帧图，见下校验）。
         # 文件定位：assets/... 走项目文件夹（入库拷贝），其余走 ComfyUI input 目录（兼容旧链）。
         _ASSET_ROLES = ("首帧图", "尾帧图")
         pool_files = []   # [(kind, label, file, roles)]
+        pool_ids = []     # P3：与 pool_files 同下标的 asset_id（""=无，ds 活池自带）
         _kind_n = {"image": 0, "video": 0, "audio": 0}
         if isinstance(ds.get("ref_assets"), list) and ds["ref_assets"]:
             for item in ds["ref_assets"]:
@@ -893,8 +901,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _roles = [str(r).strip() for r in (item.get("roles") or [])
                           if str(r).strip() in _ASSET_ROLES] if isinstance(item.get("roles"), list) else []
                 pool_files.append((_k, label[:24], str(item["file"]), _roles))
+                pool_ids.append(str(item.get("asset_id") or "").strip())
         elif ds.get("ref_images") and isinstance(ds["ref_images"], list):
             pool_files = [("image", f"图片{i + 1}", str(fn), []) for i, fn in enumerate(ds["ref_images"]) if fn]
+            pool_ids = [""] * len(pool_files)
         _seen = set()
         for _i, (_k, _lbl, _fn, _rl) in enumerate(pool_files):
             _base, _n = _lbl, 2
@@ -907,6 +917,85 @@ class H3SeamlessChainSampler(io.ComfyNode):
         pool_kind = {lbl: k for k, lbl, _, _ in pool_files}
         pool_file_of = {lbl: fn for _, lbl, fn, _ in pool_files}
         pool_roles_of = {lbl: list(rl) for _, lbl, _, rl in pool_files}
+        # P3：活池 asset_id 随去重后的 label 对齐（去重只改名不换序，下标对齐天然保持）
+        pool_id_of = {lbl: aid for lbl, aid in zip(pool_labels, pool_ids) if aid}
+        # P2：执行期资产注册表（store 双层）：pool 转 legacy + 项目 asset_links + 全局库。
+        # refs 元素兼容四形态：旧 label / alias / asset_id / {asset,use} dict；
+        # 校验核走 compile_refs，报错文案映射回旧链逐字格式。best-effort：
+        # store 不可用时回落旧 inline 逻辑（行为与旧版一致）。
+        def _project_root_early():
+            """组装期项目根（仅自定义名；指纹自动命名根此时未知，见下注释）。"""
+            try:
+                _custom = str(存档目录 or "").strip()
+                if _custom:
+                    return os.path.join(checkpoint.projects_root(), _custom)
+            except Exception:
+                pass
+            # 已知边界：存档目录为空（指纹自动命名）且项目 manifest 里已有
+            # asset_links 时，组装期注册表带不上项目链接，asset_id 引用会报未知；
+            # label 引用不受影响（pool 自带）。导演台流程恒写存档目录，不触发。
+            return None
+
+        try:
+            from . import asset_store as _AS
+        except ImportError:
+            try:
+                import asset_store as _AS
+            except ImportError:
+                _AS = None
+        _asset_reg_cache = {}
+
+        def _asset_registry():
+            """(registry, libroot)：按当前项目根缓存；三源汇合，永不抛错。"""
+            _proot = _project_root_early()
+            if _proot in _asset_reg_cache:
+                return _asset_reg_cache[_proot]
+            _links, _lib, _libroot = [], [], None
+            if _AS is not None:
+                # P3：ds 活池自带的 asset_id 优先（未保存的新链接也能执行），
+                # 再叠 manifest 已存链接（旧 label 命名空间同口径）。
+                try:
+                    for _lbl, _aid in pool_id_of.items():
+                        _links.append({"asset_id": _aid, "alias": _lbl,
+                                       "kind": pool_kind.get(_lbl, "image")})
+                except Exception:
+                    pass
+                if _proot:
+                    try:
+                        _mf = checkpoint.load_manifest(_proot)
+                        if isinstance(_mf, dict) and isinstance(_mf.get("asset_links"), list):
+                            _links.extend(_mf["asset_links"])
+                    except Exception:
+                        pass
+                try:
+                    _libroot = _AS.try_library_root()
+                    if _libroot:
+                        _lib = _AS.load_library(_libroot).get("assets") or []
+                except Exception:
+                    _lib, _libroot = [], None
+                try:
+                    _reg = _AS.build_execution_registry(
+                        [(k, lbl, fn) for k, lbl, fn, _r in pool_files], _links, _lib)
+                except Exception:
+                    _reg = {"by_id": {}, "by_alias": {}, "warnings": {}}
+            else:
+                _reg = {"by_id": {}, "by_alias": {}, "warnings": {}}
+            _asset_reg_cache[_proot] = (_reg, _libroot)
+            return _reg, _libroot
+
+        def _store_short(lbl):
+            """报告用来源显示：pool 内走文件名，store 解析走全局库名，否则画布。"""
+            if lbl in pool_file_of:
+                return pool_file_of[lbl]
+            try:
+                _rg, _ = _asset_registry()
+                _rc = (_rg.get("by_id") or {}).get(lbl)
+                if _rc is not None:
+                    _f = _rc.get("file") or _rc.get("legacy_file") or ""
+                    return "全局库/" + str(_f).split("/")[-1] if _f else "全局库"
+            except Exception:
+                pass
+            return "画布"
         # roles 校验：首帧图/尾帧图各只允许一张（多标即报错点名，不静默取首张）；
         # 且只收图片素材（视频/音频不可做帧锚）。
         for _role in _ASSET_ROLES:
@@ -922,7 +1011,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         segments = ds.get("segments") if isinstance(ds.get("segments"), list) else []
 
         # 分段处理中心：官方三字段组装（场景/角色/环境音/配乐）；[[标签]] -> <Picture>/<Video>/<Audio>；
-        # 段首自动 subject_definitions。画布模式（无 JSON 状态）同样获得官方结构。
+        # 缺 tag 的引用只补最小映射行（_reference_tags_minimal，不写散文）。
         seg_composed = 0
         seg_custom_refs = 0
         seg_dialogues = 0
@@ -939,42 +1028,81 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if scene or char or soundscape or music:
                 seg_composed += 1
             if pool_files:
+                _reg, _ = _asset_registry()
                 refs_sel = seg.get("refs")
-                order = []
+                _keys = []   # 按序去重的引用键（label/alias/asset_id/dict 归一）
                 if isinstance(refs_sel, list) and refs_sel:
                     for r in refs_sel:
-                        lbl = str(r).strip()
-                        if lbl not in pool_labels:
-                            raise ValueError(f"段{i + 1} 引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
-                        item = (pool_kind[lbl], lbl)
-                        if item not in order:
-                            order.append(item)
+                        _kk = _AS.ref_key(r)[0] if _AS is not None else str(r).strip()
+                        if _kk and _kk not in _keys:
+                            _keys.append(_kk)
                     seg_custom_refs += 1
                     # 提示词里 [[标签]] 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
                     for tok in _LABEL_TOKEN.findall(full):
                         lbl = tok.strip()
-                        if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
-                            order.append((pool_kind[lbl], lbl))
+                        if lbl and lbl not in _keys:
+                            _keys.append(lbl)
                 else:
                     # 缺省 = 只用提示词文本 [[标签]] 里出现的素材（按出现顺序）；
                     # 没出现 = 本段无引用（纯文本段）。资产库总量不限，只卡单段上
                     # 限——库再大也不会逼每段显式勾选。
                     for tok in _LABEL_TOKEN.findall(full):
                         lbl = tok.strip()
-                        if lbl in pool_labels and (pool_kind[lbl], lbl) not in order:
-                            order.append((pool_kind[lbl], lbl))
-                # 官方单段上限：图 9 / 视 3 / 音 3（超了报错并指出勾选明细）
-                for _k, _cap in REF_CAPS.items():
-                    _picked = [lbl for k, lbl in order if k == _k]
-                    if len(_picked) > _cap:
-                        raise ValueError(f"段{i + 1} 引用{_KIND_NAME[_k]}素材 {len(_picked)} 个，"
-                                         f"超过官方单段上限 {_cap} 个（{_picked}）：请在段卡片少勾几个")
+                        if lbl and lbl not in _keys:
+                            _keys.append(lbl)
+                # P2 校验核：compile_refs（四形态统一），报错映射回旧链逐字格式；
+                # store 不可用时走旧 inline 逻辑（旧链行为逐字保留）。
+                order = []
+                if _AS is not None:
+                    try:
+                        _res = _AS.compile_refs(_reg, _keys, i + 1)
+                    except Exception:
+                        _res = {"ok": False, "errors": [{"code": "E_REF_UNKNOWN"}],
+                                "blocks": []}
+                    if not _res.get("ok"):
+                        _errs = _res.get("errors") or [{}]
+                        _code = _errs[0].get("code") if _errs else ""
+                        if _code == "E_MEDIA_LIMIT":
+                            for _k, _cap in REF_CAPS.items():
+                                _picked = [b["alias"] or b["asset_id"]
+                                           for b in _res.get("blocks", []) if b["kind"] == _k]
+                                if len(_picked) > _cap:
+                                    raise ValueError(
+                                        f"段{i + 1} 引用{_KIND_NAME[_k]}素材 {len(_picked)} 个，"
+                                        f"超过官方单段上限 {_cap} 个（{_picked}）：请在段卡片少勾几个")
+                            raise ValueError(_errs[0].get("message") or f"段{i + 1} 素材引用超限")
+                        _bad = None
+                        for _kk in _keys:
+                            if _kk not in _reg["by_id"] and _kk not in _reg["by_alias"]:
+                                _bad = _kk
+                                break
+                        raise ValueError(f"段{i + 1} 引用了未知素材标签「{_bad}」：可用标签 {pool_labels}")
+                    order = [(b["kind"], b["alias"] or b["asset_id"])
+                             for b in _res.get("blocks", [])]
+                else:
+                    for lbl in _keys:
+                        if lbl not in pool_labels:
+                            raise ValueError(f"段{i + 1} 引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
+                        item = (pool_kind[lbl], lbl)
+                        if item not in order:
+                            order.append(item)
+                    # 官方单段上限：图 9 / 视 3 / 音 3（超了报错并指出勾选明细）
+                    for _k, _cap in REF_CAPS.items():
+                        _picked = [lbl for k, lbl in order if k == _k]
+                        if len(_picked) > _cap:
+                            raise ValueError(f"段{i + 1} 引用{_KIND_NAME[_k]}素材 {len(_picked)} 个，"
+                                             f"超过官方单段上限 {_cap} 个（{_picked}）：请在段卡片少勾几个")
                 seg_label_orders[i] = order
                 if order:
-                    has_pic = "<Picture" in full or "<Video" in full or "<Audio" in full
+                    # 显性语义：tag 必须落进最终文本模型才用素材；正文已写 tag 则直通，
+                    # 缺的只补最小映射行（不写散文）。未知 [[..]] 由替换函数点名报错。
+                    mapping = _kind_tokens(_normalize_order(order))
                     full = _apply_label_tokens(full, order)
-                    if not has_pic:
-                        full = _reference_header(order) + "\n" + full
+                    uncovered = _uncovered_tags(full, mapping)
+                    if uncovered:
+                        sub = [(k, lbl) for k, lbl in _normalize_order(order)
+                               if lbl in uncovered]
+                        full = _reference_tags_minimal(sub) + "\n" + full
             composed_prompts.append(full)
         seg_prompts = composed_prompts
 
@@ -1121,16 +1249,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
             exec_items.append(("prompt", _pi))
             _pi += 1
 
-        # 首帧图片：导演台 JSON 优先，空则用画布连接
+        # 首帧/尾帧/尾锚：只走导演台 JSON 文件名（画布图片入口已删除）
+        首帧图片 = None
         if ds.get("first_frame"):
             首帧图片 = _load_input_image(ds["first_frame"])
 
-        # 尾帧图片（FL2VA 剧情终点，仅首帧模式）：导演台 JSON 优先，空则用画布连接
+        # 尾帧图片（FL2VA 剧情终点）：只走导演台 JSON 文件名
+        尾帧图片 = None
         if ds.get("end_frame"):
             尾帧图片 = _load_input_image(ds["end_frame"])
 
-        # 每段尾帧锚定（身份锚点，任意模式可用）：导演台 JSON 优先，空则用画布连接
+        # 每段尾帧锚定（身份锚点）：只走导演台 JSON 文件名
         # （旧槽位，兼容保留；新链请用资产标注 + 段 tail_src，本槽缺省即跟随标注）
+        每段尾帧锚定 = None
         if ds.get("last_frame"):
             每段尾帧锚定 = _load_input_image(ds["last_frame"])
 
@@ -1160,28 +1291,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
         for _order in seg_label_orders:
             _needed.update(_order)
         _needed_kinds = {k for k, _ in _needed}
-        _pool_skipped = len(pool_files) - len(_needed)
-        # 张量占位：画布回退分支直接填，其余由 _ensure_pool_tensors 填充
+        _pool_skipped = max(0, len(pool_files) - len(_needed))
+        _store_hits = []   # P2：经 store 三级寻址命中的标签（报告用，不进指纹）
+        # 张量占位：全部由 _ensure_pool_tensors 按引用集填充（P4d：画布回退分支已删除）
         pool_tensors = {"image": {}, "video": {}, "audio": {}}
         _pool_loaded = set()   # 已加载标签（_ensure_pool_tensors 幂等守卫）
-        refs = {
-            "ref_videos": _autogrow_items(参考视频组, "ref_video_"),
-            "ref_video_audios": _autogrow_items(参考视频音轨组, "ref_video_audio_"),
-            "ref_audios": _autogrow_items(参考音频组, "ref_audio_"),
-        }
-        _pool_has_image = any(k == "image" for k, _, _, _ in pool_files)
-        _canvas_fallback = False
-        if not _pool_has_image:
-            _canvas_imgs = _autogrow_items(参考图片组, "ref_image_")
-            if _canvas_imgs:
-                pool_tensors["image"] = {f"图片{j + 1}": v for j, v in enumerate(_canvas_imgs.values())}
-                pool_labels = list(pool_tensors["image"].keys())
-                seg_label_orders = [[("image", l) for l in pool_labels] for _ in seg_prompts]
-                _needed = set()
-                for _order in seg_label_orders:
-                    _needed.update(_order)
-                _needed_kinds = {k for k, _ in _needed}
-                _canvas_fallback = True
+        refs = {"ref_videos": {}, "ref_video_audios": {}, "ref_audios": {}}
         # i2v 首段官方指令行（官方 I2VA 固定格式：声明首帧 = <Picture 1> 锚）；
         # 已是官方格式的段不注入（用户自管的完整结构里可能自带指令行）。
         # 纯 i2v 起手（首段无素材引用，引用集合已最终确定）才写指令行；
@@ -1192,13 +1307,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
             seg_prompts[0] = ("For the target video, at 0.00 seconds into the target video, "
                               "<Picture 1> (from [Shot 1]) is fully referenced.\n" + seg_prompts[0])
-        # 状态池某类被实际引用时该类覆盖画布接线（视频/音频与图片同规则），
-        # 未被引用的类别画布接线仍生效（库里躺着闲置素材不影响别的来源）
-        if "video" in _needed_kinds:
-            refs["ref_videos"], refs["ref_video_audios"] = {}, {}
-        if "audio" in _needed_kinds:
-            refs["ref_audios"] = {}
-        has_refs = bool(_needed) or any(refs.values())
+        # 状态池是唯一的引用来源（P4d：画布接线已删除，无需覆盖逻辑）
+        has_refs = bool(_needed)
         # 链路自动推导（无手动模式）：有有效引用即走 ref conditioning；首帧可与
         # 引用共存（头锚 keyframe 叠加，不再互斥报错）。「生成模式」控件已废弃，
         # 仅为旧工作流占位，后端不再读取。
@@ -1426,16 +1536,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _stat = "、".join(f"{_k_short[k]}×{sum(1 for kk, _, _, _ in pool_files if kk == k)}"
                                   for k in ("image", "video", "audio")
                                   if any(kk == k for kk, _, _, _ in pool_files))
-                _names = "、".join(f"{_k_short[k]}·{lbl}（{pool_file_of.get(lbl, '画布')}）"
+                _names = "、".join(f"{_k_short[k]}·{lbl}（{_store_short(lbl)}）"
                                    for k, lbl, _f, _r in pool_files)
                 _parts.append(f"池 {_stat}（{_names}）")
-            counts = " ".join(f"{k}={len(v)}" for k, v in refs.items() if v)
-            if counts:
-                _parts.append(f"画布接线 {counts}")
             if seg_custom_refs:
                 _parts.append(f"段级子集 {seg_custom_refs}/{len(seg_prompts)} 段自定义")
             if _pool_skipped > 0:
                 _parts.append(f"库内 {_pool_skipped} 个未引用素材本次未加载（总量不限、按段按需）")
+            if _store_hits:
+                _parts.append(f"全局库×{len(_store_hits)}（{'、'.join(_store_hits)}）")
             report.append("参考素材：" + " | ".join(_parts))
         if not KEYFRAME_AUDIO_SUPPORTED:
             report.append("注意：当前 ComfyUI 不含 PR #15439（Add Guide 协议），段间引导降级为仅视频锚定，音频不锚定"
@@ -1674,17 +1783,39 @@ class H3SeamlessChainSampler(io.ComfyNode):
             return None
 
         def _ensure_pool_tensors():
-            """加载引用集张量（幂等：已加载标签跳过）。assets/ 文件需项目目录。"""
+            """加载引用集张量（幂等：已加载标签跳过）。assets/ 文件需项目目录。
+
+            P2 三级寻址 + P3 修正：注册表优先（by_id 命中 asset_id 标签、
+            by_alias 命中 label/alias），三级 resolve 命中则经 _decode_*_file
+            直接解码；未命中才走 pool 文件名旧路径。命中只影响文件来源，
+            不改变张量格式与报错点名。
+            """
             _proot = _project_root_for_assets()
+            _reg_ld, _libroot = _asset_registry()
             for _k, _lbl in sorted(_needed):
                 if _lbl in _pool_loaded or _lbl in pool_tensors.get(_k, {}):
                     _pool_loaded.add(_lbl)
                     continue
                 _fn = pool_file_of.get(_lbl)
-                if _fn is None:
+                _abs = None
+                if _AS is not None:
+                    _rec = ((_reg_ld.get("by_id") or {}).get(_lbl)
+                            or (_reg_ld.get("by_alias") or {}).get(_lbl))
+                    if _rec is not None:
+                        _abs = _AS.resolve_absolute(_rec, _proot, _libroot)
+                if _abs is None and _fn is None:
                     continue   # 防御：组装期未知标签已报错，到这里不可能缺失
                 try:
-                    if _k == "image":
+                    if _abs is not None:
+                        if _k == "image":
+                            pool_tensors["image"][_lbl] = _decode_image_file(_abs)
+                        elif _k == "video":
+                            pool_tensors["video"][_lbl] = _decode_video_file(_abs, _lbl)
+                        else:
+                            pool_tensors["audio"][_lbl] = _decode_audio_file(_abs)
+                        if _lbl not in _store_hits:
+                            _store_hits.append(_lbl)
+                    elif _k == "image":
                         pool_tensors["image"][_lbl] = _load_input_image(_fn, _proot)
                     elif _k == "video":
                         pool_tensors["video"][_lbl] = _load_input_video(_fn, _proot)
@@ -1693,22 +1824,38 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 except ValueError:
                     raise
                 except Exception as e:
-                    raise ValueError(f"素材「{_lbl}」加载失败（文件 {_fn}）：{e}——请确认文件可解码"
-                                     + ("（项目资产库文件请确认项目名正确）" if str(_fn).startswith("assets/") else
-                                        "（input 目录文件请确认仍在原位）"))
+                    _src_hint = "（全局库文件请确认仍在原位）" if _abs is not None else (
+                        "（项目资产库文件请确认项目名正确）" if str(_fn).startswith("assets/") else
+                        "（input 目录文件请确认仍在原位）")
+                    raise ValueError(f"素材「{_lbl}」加载失败（文件 {_abs or _fn}）：{e}——请确认文件可解码"
+                                     + _src_hint)
                 _pool_loaded.add(_lbl)
 
-        def _load_anchor_image_file(fn):
+        def _load_anchor_image_file(fn, lbl=""):
+            if lbl and _AS is not None:
+                try:
+                    _reg_a, _libroot_a = _asset_registry()
+                    _rec_a = ((_reg_a.get("by_alias") or {}).get(lbl)
+                              or (_reg_a.get("by_id") or {}).get(lbl))
+                    if _rec_a is not None:
+                        _abs_a = _AS.resolve_absolute(
+                            _rec_a, _project_root_for_assets(), _libroot_a)
+                        if _abs_a is not None:
+                            if lbl not in _store_hits:
+                                _store_hits.append(lbl)
+                            return _decode_image_file(_abs_a)
+                except Exception:
+                    pass
             return _load_input_image(fn, _project_root_for_assets())
 
         _ensure_pool_tensors()
         # 标注锚汇入旧槽位（旧槽位有值则优先，保证旧链零变化）
         if 首帧图片 is None and _head_lib is not None:
-            首帧图片 = _load_anchor_image_file(pool_file_of[_head_lib])
-            report.append(f"资产标注「首帧图」→「{pool_file_of[_head_lib]}」（链首锚来源）")
+            首帧图片 = _load_anchor_image_file(pool_file_of[_head_lib], _head_lib)
+            report.append(f"资产标注「首帧图」→「{_store_short(_head_lib)}」（链首锚来源）")
         if 尾帧图片 is None and _tail_lib is not None:
-            尾帧图片 = _load_anchor_image_file(pool_file_of[_tail_lib])
-            report.append(f"资产标注「尾帧图」→「{pool_file_of[_tail_lib]}」（链尾锚来源）")
+            尾帧图片 = _load_anchor_image_file(pool_file_of[_tail_lib], _tail_lib)
+            report.append(f"资产标注「尾帧图」→「{_store_short(_tail_lib)}」（链尾锚来源）")
 
         if 每段尾帧锚定 is not None:
             tail_anchor_latent = video_vae.encode(_center_cover(每段尾帧锚定[:1], width, height))
@@ -1756,19 +1903,47 @@ class H3SeamlessChainSampler(io.ComfyNode):
             out = None
             if "asset" in ts:
                 lbl = ts["asset"]
-                if lbl not in pool_labels:
+                _rec_ts = None
+                if lbl not in pool_labels and _AS is not None:
+                    try:
+                        _reg_ts, _ = _asset_registry()
+                        _rec_ts = ((_reg_ts.get("by_alias") or {}).get(lbl)
+                                   or (_reg_ts.get("by_id") or {}).get(lbl))
+                    except Exception:
+                        _rec_ts = None
+                if lbl not in pool_labels and _rec_ts is None:
                     raise ValueError(f"段{pi + 1} 尾锚引用了未知素材标签「{lbl}」：可用标签 {pool_labels}")
-                if pool_kind.get(lbl) != "image":
+                _tail_kind = pool_kind.get(lbl, (_rec_ts or {}).get("kind"))
+                if _tail_kind != "image":
                     raise ValueError(f"段{pi + 1} 尾锚「{lbl}」不是图片素材（尾锚只收图片/图像 latent）")
                 _ensure_pool_tensors()
                 img = pool_tensors["image"].get(lbl)
                 if img is None:
                     # 未在引用集里（纯尾锚未出现在提示词/勾选）：现加载
+                    # （P3 修正：store 全局库命中优先，旧路径兼容）
                     _fn = pool_file_of.get(lbl)
-                    if _fn is None:
-                        raise ValueError(f"段{pi + 1} 尾锚「{lbl}」找不到对应文件（画布回退标签不可做尾锚，请用资产库图片）")
-                    img = _load_input_image(_fn, _project_root_for_assets())
-                    pool_tensors["image"][lbl] = img
+                    if _AS is not None:
+                        try:
+                            _reg_t, _libroot_t = _asset_registry()
+                            _rec_t = ((_reg_t.get("by_alias") or {}).get(lbl)
+                                      or (_reg_t.get("by_id") or {}).get(lbl))
+                            _abs_t = _AS.resolve_absolute(
+                                _rec_t, _project_root_for_assets(), _libroot_t) \
+                                if _rec_t is not None else None
+                        except Exception:
+                            _abs_t = None
+                    else:
+                        _abs_t = None
+                    if _abs_t is not None:
+                        img = _decode_image_file(_abs_t)
+                        pool_tensors["image"][lbl] = img
+                        if lbl not in _store_hits:
+                            _store_hits.append(lbl)
+                    if img is None:
+                        if _fn is None:
+                            raise ValueError(f"段{pi + 1} 尾锚「{lbl}」找不到对应文件（画布回退标签不可做尾锚，请用资产库图片）")
+                        img = _load_input_image(_fn, _project_root_for_assets())
+                        pool_tensors["image"][lbl] = img
                 out = video_vae.encode(_center_cover(img[:1], width, height))
             else:
                 lat = _load_library_latent(ts["latent"], None)
@@ -2361,13 +2536,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         else:
                             seg_refs["ref_audios"][f"ref_audio_{_n['audio']}"] = pool_tensors["audio"][_lbl]
                         _n[_k] += 1
-                    # 未被状态池接管的画布接线类别：沿用旧行为全段共用，编号接在状态素材之后
-                    for j, v in enumerate(refs["ref_videos"].values()):
-                        seg_refs["ref_videos"][f"ref_video_{_n['video'] + j}"] = v
-                    for j, v in enumerate(refs["ref_video_audios"].values()):
-                        seg_refs["ref_video_audios"][f"ref_video_audio_{_n['video'] + j}"] = v
-                    for j, v in enumerate(refs["ref_audios"].values()):
-                        seg_refs["ref_audios"][f"ref_audio_{_n['audio'] + j}"] = v
+                    # P4d：画布接线已删除，无未被接管类别（旧合并循环已删）
                     _t = time.perf_counter()
                     out = MiniMaxH3ReferenceToVideo.execute(
                         clip=clip, vae=video_vae, audio_vae=audio_vae,
@@ -2941,8 +3110,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             {"waveform": all_wav, "sample_rate": sample_rate},
             24,
             "\n".join(report),
-            seg_frames,
-            seg_wavs,
+            # P4d：分段列表输出已删除（分段落盘由自动保存完成，去项目文件夹看片）
         )
 
     @classmethod
@@ -2964,6 +3132,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             import checkpoint as _ckpt
         _ckpt.mark_busy()
         try:
+            # P4f：转码最小图省略模型/文本编码器（optional），缺省补 None；
+            # 转码专跑不碰它们，生成链照常连线不受影响。
+            kwargs.setdefault("模型", None)
+            kwargs.setdefault("文本编码器", None)
             return cls._execute_inner(*args, **kwargs)
         finally:
             _ckpt.unmark_busy()
@@ -2974,11 +3146,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
 
         资产库"转latent"写入 ds 任务，前端提示用户按一次开始生成即执行；
         任务间隙响应队列取消；结果登记进 manifest.latents，前端凭证据自动清理。
+        P2：收尾排空后台队列（transcode_submit 进件）同项目任务，直连 job 表。
         """
         try:
             from .latent_tools import run_transcode_job
         except ImportError:
             from latent_tools import run_transcode_job
+        try:
+            from . import transcode_queue as _tq
+        except ImportError:
+            try:
+                import transcode_queue as _tq
+            except ImportError:
+                _tq = None
         try:
             import comfy.model_management as _mm
             _interrupted = _mm.processing_interrupted
@@ -2990,8 +3170,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         except Exception:
             _pbar = None
         proj_default = str(存档目录 or "").strip()
-        lines = [f"H3 内联转码：{len(jobs)} 个任务（只跑转码，不跑链、不耗种子）"]
+        lines = ["H3 内联转码（只跑转码，不跑链、不耗种子）"]
         done = 0
+        _drained = 0
         for k, job in enumerate(jobs):
             if callable(_interrupted):
                 try:
@@ -3009,28 +3190,164 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 lines.append(f"任务 {k + 1} 跳过：无项目名（请填写存档目录）")
                 continue
             try:
+                # P1：每段 ds 任务配一个后台 job，前端可轮询进度/取消（失败只记行）
+                _tjob = None
+                if _tq is not None:
+                    try:
+                        _tjob = _tq.submit(
+                            proj, job.get("src"), job.get("start_s", 0.0),
+                            job.get("end_s", 0.0), job.get("branch", "图像+音频"),
+                            job.get("split", "否"), job.get("save_name", ""))
+                        _tq.begin(_tjob["id"])
+                    except Exception:
+                        _tjob = None
+                _job_stop = (_tq.interrupted_checker(_tjob["id"])
+                             if (_tq is not None and _tjob) else None)
+
+                def _job_interrupted(_outer=_interrupted, _chk=_job_stop):
+                    if callable(_chk):
+                        try:
+                            if _chk():
+                                return True
+                        except Exception:
+                            pass
+                    if callable(_outer):
+                        try:
+                            return bool(_outer())
+                        except Exception:
+                            return False
+                    return False
+
+                class _JobPbar:
+                    def __init__(self):
+                        self.n = 0
+
+                    def update(self, kk=1):
+                        try:
+                            self.n += int(kk)
+                        except (TypeError, ValueError):
+                            self.n += 1
+                        if _tq is not None and _tjob:
+                            _tq.progress(_tjob["id"], min(0.99, self.n / 4.0))
+
                 rep = run_transcode_job(
                     proj, job.get("src"), 视频VAE, 音频VAE,
                     job.get("start_s", 0.0), job.get("end_s", 0.0),
                     job.get("branch", "图像+音频"), job.get("split", "否"),
-                    job.get("save_name", ""), _pbar=None,
-                    _interrupted=_interrupted)
+                    job.get("save_name", ""), _pbar=_JobPbar(),
+                    _interrupted=_job_interrupted)
+                if _tq is not None and _tjob:
+                    _tq.complete(_tjob["id"], rep)
                 lines.append(f"任务 {k + 1} 完成：{rep}")
                 done += 1
             except Exception as e:
                 if type(e).__name__ in ("InterruptProcessingException", "_Interrupted"):
                     raise
+                # 堆栈只打控制台（报告里只留一行，前端可读；定位靠这份堆栈）
+                try:
+                    import traceback as _tb
+                    _tb.print_exc()
+                except Exception:
+                    pass
+                if _tq is not None and _tjob:
+                    try:
+                        _tq.fail(_tjob["id"], f"{type(e).__name__}: {e}")
+                    except Exception:
+                        pass
                 lines.append(f"任务 {k + 1} 失败：{type(e).__name__}: {e}")
             if _pbar is not None:
                 try:
                     _pbar.update(1)
                 except Exception:
                     pass
-        lines.append(f"转码结束：{done}/{len(jobs)} 完成。latent 库已登记，面板自动清理已完成任务。")
+        # P2 直连：排空后台队列里同项目的已提交任务（/h3chain/transcode_submit 进件，
+        # 无需再写 ds.transcode_jobs）。proj_default 为空时全排空——本次本就是转码专跑。
+        if _tq is not None:
+            while True:
+                try:
+                    _claimed = _tq.claim(proj_default or None)
+                except Exception:
+                    break
+                if _claimed is None:
+                    break
+                _cid = _claimed["id"]
+                if _tq.is_cancel_requested(_cid):
+                    _tq.finish_cancelled(_cid, "执行前已取消")
+                    lines.append(f"队列任务 {_claimed.get('save_name') or _cid} 已取消，未执行")
+                    continue
+                if callable(_interrupted):
+                    try:
+                        if _interrupted():
+                            lines.append(f"队列任务起中断：剩余队列任务保留，下次转码专跑继续")
+                            break
+                    except Exception:
+                        pass
+                _chk_c = _tq.interrupted_checker(_cid)
+
+                def _interrupted_c(_outer=_interrupted, _chk=_chk_c):
+                    if callable(_chk):
+                        try:
+                            if _chk():
+                                return True
+                        except Exception:
+                            pass
+                    if callable(_outer):
+                        try:
+                            return bool(_outer())
+                        except Exception:
+                            return False
+                    return False
+
+                class _ClaimPbar:
+                    def __init__(self):
+                        self.n = 0
+
+                    def update(self, kk=1):
+                        try:
+                            self.n += int(kk)
+                        except (TypeError, ValueError):
+                            self.n += 1
+                        try:
+                            _tq.progress(_cid, min(0.99, self.n / 4.0))
+                        except Exception:
+                            pass
+
+                try:
+                    _rep_c = run_transcode_job(
+                        _claimed["project"], _claimed["src"], 视频VAE, 音频VAE,
+                        _claimed.get("start_s", 0.0), _claimed.get("end_s", 0.0),
+                        _claimed.get("branch", "图像+音频"), _claimed.get("split", "否"),
+                        _claimed.get("save_name", ""), _pbar=_ClaimPbar(),
+                        _interrupted=_interrupted_c)
+                    _tq.complete(_cid, _rep_c)
+                    lines.append(f"队列任务完成：{_rep_c}")
+                    _drained += 1
+                    done += 1
+                except Exception as e:
+                    if type(e).__name__ in ("InterruptProcessingException", "_Interrupted"):
+                        try:
+                            _tq.finish_cancelled(_cid, "队列中断")
+                        except Exception:
+                            pass
+                        raise
+                    try:
+                        import traceback as _tb
+                        _tb.print_exc()
+                    except Exception:
+                        pass
+                    try:
+                        _tq.fail(_cid, f"{type(e).__name__}: {e}")
+                    except Exception:
+                        pass
+                    lines.append(f"队列任务失败：{type(e).__name__}: {e}")
+            if _drained:
+                lines.append(f"后台队列排空：{_drained} 个提交任务已执行")
+        lines.append(f"转码结束：共完成 {done} 个（面板 {len(jobs)}＋后台 {_drained}）。"
+                     "latent 库已登记，面板自动清理已完成任务。")
         print("[H3内联转码] " + " | ".join(lines), flush=True)
         images = torch.zeros(1, 64, 64, 3)
         silence = {"waveform": torch.zeros(1, 1, 0), "sample_rate": 24000}
-        return io.NodeOutput(images, silence, 24, "\n".join(lines), [], [])
+        return io.NodeOutput(images, silence, 24, "\n".join(lines))
 
     @staticmethod
     def _apply_guide(cond, guide, sampled_fc, tail_kf_latent=None, e1_windows=None,

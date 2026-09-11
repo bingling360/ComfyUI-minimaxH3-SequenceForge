@@ -1,12 +1,28 @@
 """官方 MiniMaxH3AddGuide 锚点语义对齐（纯函数，无 torch / ComfyUI 依赖）。
 
-对齐 ComfyUI v0.34.0 新增的官方节点 `MiniMaxH3AddGuide`：
+对齐 ComfyUI 官方节点 `MiniMaxH3AddGuide`（PR #15439，`comfy_extras/nodes_minimax_h3.py`）：
 
 - `frame_idx` 任意帧锚定，负值自尾部计数（负索引 = frame_count + frame_idx）
 - 多帧片段按 17k+5 向下对齐；不足 5 帧只取首帧（1 帧锚）
 - 越界校验：`resolved_frame_index + guide_frames > frame_count` 即非法
 - 音频按剩余时长裁剪：`max_rt = floor(audio_t - FRAME_RESCALE * resolved_idx)`
 - 多个 AddGuide 串联 = `minimax_keyframes` 里多条 keyframe（多锚点）
+
+**17k+5 网格要求是否仍存在（2026-09 复核结论：仍然存在，未因插入 keyframe 而取消）**
+
+上游源码逐字核对（`nodes_minimax_h3.py` 的 `MiniMaxH3AddGuide`）：
+
+    guide_frames = image.shape[0]
+    if guide_frames < 5:
+        guide_frames = 1
+    else:
+        while guide_frames % 17 != 5:
+            guide_frames -= 1
+
+即多帧引导片段**无条件**向下取整到 `%17==5`（5/22/39…）——注意这比 latent token
+可达帧集合（1/5/9/13/17/18/22…，见 `grid.latent_t_to_frames`）**更窄**：17/18/26/30/34 等
+虽能整 token 表达，但作为**多帧引导片段**仍会被裁到 17（或 5/22/39）。单帧锚（1 帧）
+不要求落 17k+5，只校验 `0 <= idx` 且 `idx + 1 <= frame_count`。
 
 本模块把所有锚点构造收敛到同一套语义与守卫：插件内部无论是段首桥、段尾锚、
 记忆锚还是段中锚，都先过一遍校验再写进 conditioning，杜绝越界锚点把采样

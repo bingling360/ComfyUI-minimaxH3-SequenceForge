@@ -88,6 +88,21 @@ def check_files(items: list, project_root=None) -> list:
                 "assets", "finals", "latent", "texts"):
             p = os.path.join(project_root, parts[0], parts[1])
             where = "项目文件夹"
+        elif len(parts) == 2 and parts[0] in ("images", "videos", "audios"):
+            # P3：全局库文件（library_upload 入库），按内容寻址到 user 库
+            try:
+                try:
+                    from . import asset_store as _as
+                except ImportError:
+                    import asset_store as _as
+                _libroot = _as.try_library_root()
+                cand = os.path.join(_libroot, parts[0], parts[1]) if _libroot else None
+                if cand and os.path.isfile(cand):
+                    continue
+                where = "全局库"
+            except Exception:
+                where = "全局库"
+            p = None
         else:
             try:
                 p = folder_paths.get_annotated_filepath(rel)
@@ -147,37 +162,6 @@ def validate_pack(raw, segments=None, project_root=None) -> dict:
             "warnings": warns, "report": report}
 
 
-try:
-    from comfy_api.latest import io
+# P4d：H3AssetHub 节点类已删除（被 H3AssetBundle 取代；纯函数保留，
+# routes / bundle / 单测仍在用 normalize_pack / check_files / validate_pack）。
 
-    class H3AssetHub(io.ComfyNode):
-        """资产总闸节点：资产包 JSON 进，校验后出规范包给主节点（单线分发）。"""
-
-        @classmethod
-        def define_schema(cls):
-            return io.Schema(
-                node_id="H3AssetHub",
-                display_name="H3 Asset Hub (资产总闸)",
-                category="MiniMaxH3",
-                description="单总闸素材分发：资产包 JSON 校验（总量不限、缺文件早爆），"
-                            "输出规范包连主节点「资产包」。仍走 input 目录，与原生 Load 系列同源。",
-                inputs=[
-                    io.String.Input("资产包", multiline=True, default="[]",
-                                    tooltip="导演台资产库 JSON：[{label,kind:image/video/audio,file}]，"
-                                            "总量不限，单段上限执行期按段卡"),
-                ],
-                outputs=[
-                    io.String.Output("规范包", tooltip="校验后的规范资产包 JSON，连主节点「资产包」"),
-                    io.String.Output("报告", tooltip="校验结果人读报告"),
-                ],
-            )
-
-        @classmethod
-        def execute(cls, 资产包="[]"):
-            res = validate_pack(资产包 if isinstance(资产包, str) else "[]")
-            if not res["ok"]:
-                raise ValueError(res["errors"][0]["message"])
-            return (json.dumps(res["items"], ensure_ascii=False), res["report"])
-
-except ImportError:
-    pass

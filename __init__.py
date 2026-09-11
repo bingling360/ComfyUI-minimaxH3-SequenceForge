@@ -7,13 +7,14 @@ try:
 
     from .nodes import H3SeamlessChainSampler
     from .seam_doctor import H3SeamDoctor
-    from .asset_hub import H3AssetHub
-    from .latent_tools import H3LatentExtract, H3MediaToLatent, H3LatentUpscale
+    from .bundle import H3AssetBundle
+    from .latent_tools import H3LatentExtract, H3LatentUpscale
 
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SeamlessChainSampler, H3SeamDoctor, H3AssetHub,
-                    H3LatentExtract, H3MediaToLatent, H3LatentUpscale]
+            # P4d：H3AssetHub（被 Bundle 取代）、H3MediaToLatent（被自动专跑取代）已删除
+            return [H3SeamlessChainSampler, H3SeamDoctor, H3AssetBundle,
+                    H3LatentExtract, H3LatentUpscale]
 
         async def add_routes(self, routes):
             # 新版 ComfyUI / Comfy Desktop 官方路径：框架直接传入 routes 对象
@@ -25,8 +26,12 @@ try:
                       "/h3chain/upscale_models, /h3chain/experiments, /h3chain/prompt-rules, "
                       "/h3chain/optimizer-config, "
                       "POST /h3chain/create_project, /h3chain/save_prompts, /h3chain/compile, "
-                      "/h3chain/optimize, "
-                      "/h3chain/assets, /h3chain/asset_check, /h3chain/latent_slice, "
+                      "/h3chain/optimize, /h3chain/expand, /h3chain/expand_validate, "
+                       "/h3chain/assets, /h3chain/asset_check, /h3chain/compile_refs, "
+                       "/h3chain/transcode_submit|jobs|job|cancel, /h3chain/library_upload, "
+                       "GET /h3chain/library_file|asset_links, POST /h3chain/asset_link|unlink|mirror, "
+                       "GET /h3chain/vae_files, "
+                       "/h3chain/latent_slice, "
                       "/h3chain/latent_delete, /h3chain/trim, /h3chain/probe, "
                       "/h3chain/move_media, /h3chain/split_av, /h3chain/import_asset, "
                       "/h3chain/delete_project, /h3chain/delete_file, /h3chain/merge, "

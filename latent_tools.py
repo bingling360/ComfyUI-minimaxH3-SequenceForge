@@ -1,12 +1,9 @@
-"""H3 latent 现抽（LatentExtract / MediaToLatent）：输入视频/成片/库内媒体现抽 latent 存档。
+"""H3 latent 现抽与库内放大（LatentExtract / LatentUpscale）：输入视频/成片现抽 latent 存档。
 
 M3 三源之一（输入视频 + 完成视频现抽），需 ComfyUI 运行环境（videoVAE/audioVAE）：
 - H3LatentExtract：待抽视频帧（IMAGE [N,H,W,C]，接 LoadVideo/导演台成片）+ 可选音轨
   + VAE + 帧窗 -> 报告（落盘 latent/*.pt 并登记 manifest）
-- H3MediaToLatent（本轮新增）：项目内媒体文件（assets/finals 内 mp4，裸名/前缀双兼容）
-  + VAE + 秒窗 + 分支开关（图像/音频）-> 报告；队列内拿 VAE 编码，解决纯路由
-  无 VAE 做不了 mp4->latent 的问题；与 trim/slice 同受生成互斥（队列天然串行，
-  无需额外 BUSY 判定）。
+- 库内 mp4->latent 转码走主节点自动专跑（提交即执行），不再需要转码节点。
 - H3LatentUpscale：latent 库任意文件 -> 神经放大（LBH 放大网络，T 不变 H/W 放大）
   -> 可选低强度二次采样（接模型/文本编码器+提示词，denoise<1 补高频）-> 存回
   latent 库并登记。放大的 latent 可在分段设置里选作 keyframe 外源。
@@ -23,6 +20,41 @@ import time
 # 单次 VAE 编码帧数上限（H3 模型训练长度约 124–362 帧；序章同口径）。
 # 超限直接报错指引缩小窗口，而不是整窗单次前向把显存/内存顶爆（转码卡死根因）。
 MAX_ENCODE_FRAMES = 362
+
+
+def _transcode_env_note(videoVAE, frames):
+    """转码前诊断：只打印，不改行为。
+
+    H3 视频 VAE 约 5GB（fp32 口径）；6-8GB 显存卡只能逐层从内存串流，
+    24 帧也可能十几分钟。下次看到编码慢，先看这行判定是不是显存墙：
+    是 → 启动参数加 --fp16-vae（VAE 减半，全链同对象，结果一致），
+    而不是反复重试或调小窗口（24 帧已是最小可用窗）。
+    """
+    try:
+        import torch
+        shape = tuple(getattr(frames, "shape", ()))
+        dev = getattr(videoVAE, "device", None)
+        vram_gb, dtype_s = None, None
+        try:
+            if dev is not None and getattr(dev, "type", "") == "cuda":
+                vram_gb = torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
+        except Exception:
+            pass
+        try:
+            inner = getattr(videoVAE, "first_stage_model", videoVAE)
+            for p in inner.parameters():
+                dtype_s = str(getattr(p, "dtype", "")).replace("torch.", "")
+                break
+        except Exception:
+            pass
+        print(f"[H3库转存档] 输入 {shape} -> {dev}（VAE 精度 {dtype_s or '?'}"
+              + (f"，本机显存 {vram_gb:.1f}GB" if vram_gb else "") + "）", flush=True)
+        if vram_gb is not None and vram_gb < 8.0 and (dtype_s or "").startswith("float32"):
+            print("[H3库转存档] 提示：显存 <8GB 且 VAE 为 fp32，编码会逐层串流很慢；"
+                  "Comfy 启动参数加 --fp16-vae（VAE 减半、全链同对象，结果一致）可提速数倍。",
+                  flush=True)
+    except Exception:
+        pass
 
 
 def clamp_window(start_f, end_f, n):
@@ -160,59 +192,14 @@ try:
                    + (f"，已存 {saved}" if saved else "（未落盘：项目名/保存名为空）"))
             return (rep,)
 
-    class H3MediaToLatent(io.ComfyNode):
-        """库内转 latent：项目内 mp4（资产库/成片库）按秒窗编码进 latent 库。
-
-        队列内执行（拿 VAE）：画面走 videoVAE.encode，音频走 _encode_audio_latent；
-        分支开关支持只存图像 / 只存音频 / 两者分开存（split_av=true 时落
-        <名>_v.pt + <名>_a.pt 两份登记）。与序章同式，不碰主链指纹。
-        """
-
-        @classmethod
-        def define_schema(cls):
-            return io.Schema(
-                node_id="H3MediaToLatent",
-                display_name="H3 Media To Latent (库转存档)",
-                category="MiniMaxH3",
-                description="项目内媒体转 latent：assets/finals 内 mp4 按秒窗编码存 "
-                            "latent/*.pt 并登记 manifest（资产/成片随时转 keyframe 素材）。"
-                            "需队列执行（拿 VAE），与主链采样天然串行。",
-                inputs=[
-                    io.String.Input("项目名", default="",
-                                    tooltip="存档项目（output/h3_projects/<项目>）"),
-                    io.String.Input("源文件", default="",
-                                    tooltip="项目内 mp4（裸名或 finals/assets 前缀，如 finals/seg_000.mp4）"),
-                    io.Vae.Input("视频VAE", tooltip="与主链同一视频 VAE"),
-                    io.Vae.Input("音频VAE", optional=True, tooltip="含音频分支时必填"),
-                    io.Float.Input("起始秒", default=0.0, min=0.0, max=3600.0, step=0.1,
-                                   tooltip="秒窗起点（含）。单次编码上限 362 帧（约15秒），超限报错——转 keyframe 只取尾部几秒即可"),
-                    io.Float.Input("结束秒", default=0.0, min=0.0, max=3600.0, step=0.1,
-                                   tooltip="秒窗终点（不含）；0=到片尾（到片尾超限同样报错，请填结束秒缩小窗口）"),
-                    io.Combo.Input("分支", options=["图像+音频", "仅图像", "仅音频"],
-                                   default="图像+音频",
-                                   tooltip="只编码图像 / 只编码音频 / 两者都要（分开存则再开下面开关）"),
-                    io.Combo.Input("分开保存", options=["否", "是"], default="否",
-                                   tooltip="是=图像与音频落两个 .pt（_v/_a 后缀，各自登记 kind）"),
-                    io.String.Input("保存名", default="",
-                                    tooltip="latent 文件名（须以 .pt 结尾，如 seg0_head.pt）"),
-                ],
-                outputs=[
-                    io.String.Output("报告", tooltip="转存结果（秒窗/分支/落盘路径）"),
-                ],
-            )
-
-        @classmethod
-        def execute(cls, 项目名, 源文件, 视频VAE, 音频VAE=None,
-                    起始秒=0.0, 结束秒=0.0, 分支="图像+音频", 分开保存="否", 保存名=""):
-            rep = run_transcode_job(项目名, 源文件, 视频VAE, 音频VAE,
-                                    起始秒, 结束秒, 分支, 分开保存, 保存名)
-            return (rep,)
+    # P4d：H3MediaToLatent 节点类已删除（转码走主节点自动专跑，提交即执行；
+    # run_transcode_job 纯函数保留，主节点转码任务共用）。
 
 
     def run_transcode_job(项目名, 源文件, 视频VAE, 音频VAE=None,
                           起始秒=0.0, 结束秒=0.0, 分支="图像+音频", 分开保存="否", 保存名="",
                           _pbar=None, _interrupted=None):
-        """库内 mp4 -> latent 纯函数（供 H3MediaToLatent 节点与主节点转码任务共用）。
+        """库内 mp4 -> latent 纯函数（供主节点转码任务调用）。
 
         有界：秒窗超 362 帧直接报错；解码最多读上限+1 帧。_pbar 有 ProgressBar 则
         分步推进；_interrupted() 为真则抛 Interrupted（主节点转码任务支持队列取消）。
@@ -303,6 +290,7 @@ try:
         want_v = str(分支 or "") != "仅音频"
         want_a = str(分支 or "") != "仅图像"
         cut = frames
+        _transcode_env_note(视频VAE, cut)
         print(f"[H3库转存档] 视频VAE 编码 {n} 帧…", flush=True)
         v_lat = 视频VAE.encode(cut) if want_v else None
         _chk()

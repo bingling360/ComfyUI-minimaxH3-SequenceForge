@@ -41,6 +41,7 @@ ROUTES = [
     ("GET", "/h3chain/projects"),
     ("GET", "/h3chain/project"),
     ("GET", "/h3chain/upscale_models"),
+    ("GET", "/h3chain/vae_files"),
     ("GET", "/h3chain/experiments"),
     ("GET", "/h3chain/prompt-rules"),
     ("GET", "/h3chain/optimizer-config"),
@@ -57,6 +58,17 @@ ROUTES = [
     ("POST", "/h3chain/import_asset"),
     ("POST", "/h3chain/assets"),
     ("POST", "/h3chain/asset_check"),
+    ("POST", "/h3chain/compile_refs"),
+    ("POST", "/h3chain/transcode_submit"),
+    ("GET", "/h3chain/transcode_jobs"),
+    ("GET", "/h3chain/transcode_job"),
+    ("POST", "/h3chain/transcode_cancel"),
+    ("POST", "/h3chain/library_upload"),
+    ("GET", "/h3chain/library_file"),
+    ("GET", "/h3chain/asset_links"),
+    ("POST", "/h3chain/asset_link"),
+    ("POST", "/h3chain/asset_unlink"),
+    ("POST", "/h3chain/asset_mirror"),
     ("POST", "/h3chain/delete_project"),
     ("POST", "/h3chain/delete_file"),
     ("POST", "/h3chain/merge"),
@@ -211,6 +223,15 @@ def add_routes(routes):
             models = []
         return web.json_response({"ok": True, "models": models})
 
+    async def vae_files(request):
+        """VAE 文件列表（转码最小图选 VAE 用）：models/vae 下文件名。只读。"""
+        try:
+            import folder_paths
+            files = folder_paths.get_filename_list("vae")
+        except Exception as e:
+            return _err(f"无法列出 VAE 目录：{e}", code="VAE_LIST_FAILED", status=500)
+        return web.json_response({"ok": True, "files": list(files or [])})
+
     async def experiment_defs(request):
         """实验定义与参数元数据（前端实验面板动态渲染唯一数据源；含后端硬开关状态）。"""
         try:
@@ -294,6 +315,515 @@ def add_routes(routes):
         res = asset_hub.validate_pack(data.get("assets"), data.get("segments"), proot)
         status = 200 if res["ok"] else 422
         return web.json_response({"ok": res["ok"], **res}, status=status)
+
+    async def compile_refs(request):
+        """段引用干跑编译（不落盘）：refs/segments 内 asset_id 或 alias 混排 ->
+        每段 blocks + tag_map（<Picture k>/<Video k>/<Audio j>），9/3/3 与未知引用早爆。
+
+        请求体：{dir?, assets?, asset_links?, global_assets?, refs?, segments?}
+        - dir：给了就叠加该项目 manifest 的 asset_links + 旧 assets；
+          全局库能读则叠加（读不到按空库，不炸）。
+        - refs：单段数组；segments：多段（每段为 refs 数组或 {refs}）。
+        新旧兼容：旧 label 与新 alias 同一命名空间，asset_id 直引亦可。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
+        links = list(data.get("asset_links") or [])
+        legacy = list(data.get("assets") or [])
+        globals_ = list(data.get("global_assets") or [])
+        if isinstance(data.get("dir"), str) and projects.safe_name(data["dir"]):
+            mf = projects.read_project(data["dir"])
+            if isinstance(mf, dict):
+                if isinstance(mf.get("asset_links"), list):
+                    links = list(mf["asset_links"]) + links
+                if isinstance(mf.get("assets"), list):
+                    legacy = list(mf["assets"]) + legacy
+                # 项目 manifest 里的 asset_links 条目若无 asset_id（手写脏数据）直接忽略
+                links = [x for x in links if isinstance(x, dict) and x.get("asset_id")]
+            try:
+                lib = asset_store.load_library(asset_store.library_root())
+                globals_ = list(lib.get("assets") or []) + globals_
+            except Exception:
+                pass
+        try:
+            reg = asset_store.build_registry(globals_, links, legacy)
+        except Exception as e:
+            return _err(f"资产注册表构建失败：{e}", code="BAD_REQUEST", status=400)
+        if isinstance(data.get("segments"), list):
+            res = asset_store.compile_segments(reg, data["segments"])
+            status = 200 if res["ok"] else 422
+            return web.json_response({"ok": res["ok"], **res}, status=status)
+        res = asset_store.compile_refs(reg, data.get("refs") or [], 1)
+        status = 200 if res["ok"] else 422
+        return web.json_response({"ok": res["ok"], **res}, status=status)
+
+    async def transcode_submit(request):
+        """提交后台转码任务（随时可提交，不受生成锁影响；执行在队列侧认领）。
+
+        体 {dir, src, start_s?, end_s?, branch?, split?, save_name?} ->
+        {ok, job}。参数非法/项目或源文件不存在回 400/404。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import transcode_queue as _tq
+        except ImportError:
+            import transcode_queue as _tq
+        name = projects.safe_name(str(data.get("dir") or ""))
+        if not name:
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        if projects.read_project(name) is None:
+            return _err("项目不存在（没有 manifest，先新建或跑一段）",
+                         code="NOT_FOUND", status=404)
+        src = str(data.get("src") or "").strip().replace("\\", "/")
+        parts = [p for p in src.split("/") if p and p != "."]
+        if not parts or len(parts) > 2 or not all(projects.safe_name(p) for p in parts):
+            return _err(f"非法源文件：{data.get('src')!r}（须为项目内相对路径）",
+                         code="BAD_REQUEST", status=400)
+        try:
+            from . import checkpoint as _ckpt
+        except ImportError:
+            import checkpoint as _ckpt
+        root = os.path.join(_ckpt.projects_root(), name)
+        if not os.path.isfile(_ckpt.resolve_project_file(root, "/".join(parts))):
+            return _err(f"源文件不存在：{'/'.join(parts)}", code="NOT_FOUND", status=404)
+        try:
+            job = _tq.submit(name, "/".join(parts), data.get("start_s", 0.0),
+                             data.get("end_s", 0.0), data.get("branch", "图像+音频"),
+                             data.get("split", "否"), data.get("save_name", ""))
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        return web.json_response({"ok": True, "job": job})
+
+    async def transcode_jobs(request):
+        """任务列表（?dir= 可按项目过滤）。轮询不受生成锁影响。"""
+        try:
+            from . import transcode_queue as _tq
+        except ImportError:
+            import transcode_queue as _tq
+        proj = request.query.get("dir") if hasattr(request, "query") else None
+        proj = str(proj).strip() if proj else None
+        if proj and not projects.safe_name(proj):
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        return web.json_response({"ok": True, "jobs": _tq.list_jobs(proj)})
+
+    async def transcode_job(request):
+        """单个任务（?id=）。不存在回 404。"""
+        try:
+            from . import transcode_queue as _tq
+        except ImportError:
+            import transcode_queue as _tq
+        q = request.query if hasattr(request, "query") else {}
+        jid = q.get("id") if hasattr(q, "get") else None
+        job = _tq.get(jid)
+        if job is None:
+            return _err("任务不存在（进程重启会清空任务表，请重新提交）",
+                         code="NOT_FOUND", status=404)
+        return web.json_response({"ok": True, "job": job})
+
+    async def transcode_cancel(request):
+        """取消任务：queued 直接取消；running 标记后由执行侧中断收尾。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import transcode_queue as _tq
+        except ImportError:
+            import transcode_queue as _tq
+        job = _tq.cancel(data.get("id"))
+        if job is None:
+            return _err("任务不存在（进程重启会清空任务表，请重新提交）",
+                         code="NOT_FOUND", status=404)
+        return web.json_response({"ok": True, "job": job})
+
+    _UPLOAD_EXT = {"image": ("png", "jpg", "jpeg", "webp", "bmp"),
+                   "video": ("mp4", "mov", "mkv", "webm"),
+                   "audio": ("wav", "mp3", "flac", "ogg", "m4a")}
+
+    _LIB_CT = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+               "webp": "image/webp", "bmp": "image/bmp",
+               "mp4": "video/mp4", "mov": "video/quicktime",
+               "mkv": "video/x-matroska", "webm": "video/webm",
+               "wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+               "ogg": "audio/ogg", "m4a": "audio/mp4"}
+
+    async def library_file(request):
+        """全局库文件直读（?asset_id=）：资产瓦片预览/播放用。
+
+        只读，不受生成锁影响；路径禁闭在 library_root 内（realpath 复核防穿越）。
+        """
+        q = request.query if hasattr(request, "query") else {}
+        aid = q.get("asset_id") if hasattr(q, "get") else None
+        aid = str(aid or "").strip()
+        import re as _re
+        if not _re.fullmatch(r"a_[0-9a-f]{12}", aid):
+            return _err("非法的 asset_id", code="BAD_REQUEST", status=400)
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
+        try:
+            libroot = asset_store.try_library_root()
+        except Exception:
+            libroot = None
+        if not libroot:
+            return _err("全局库不可用", code="NOT_FOUND", status=404)
+        entry = None
+        try:
+            for e in (asset_store.load_library(libroot).get("assets") or []):
+                if isinstance(e, dict) and e.get("asset_id") == aid:
+                    entry = e
+                    break
+        except Exception:
+            entry = None
+        if entry is None:
+            return _err("资产不存在", code="NOT_FOUND", status=404)
+        rel = str(entry.get("file") or "").replace("\\", "/")
+        base = os.path.realpath(libroot)
+        target = os.path.realpath(os.path.join(base, *rel.split("/")))
+        if not target.startswith(base + os.sep) or not os.path.isfile(target):
+            return _err("资产文件缺失", code="NOT_FOUND", status=404)
+        ext = os.path.splitext(target)[1].lower().lstrip(".")
+        ctype = _LIB_CT.get(ext, "application/octet-stream")
+        if hasattr(web, "FileResponse"):
+            return web.FileResponse(target, headers={"Content-Type": ctype})
+        return web.json_response({"ok": True, "asset_id": aid, "file": rel})
+
+    async def asset_links(request):
+        """项目链接表（?dir=）：asset_links + 全局库回填 file/bytes，直供前端池子合并。
+
+        只读，不受生成锁影响；全局库不可用时 file 缺省（执行期按旧路径）。
+        """
+        q = request.query if hasattr(request, "query") else {}
+        name = projects.safe_name(str((q.get("dir") if hasattr(q, "get") else None) or ""))
+        if not name:
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        manifest = projects.read_project(name)
+        if manifest is None:
+            return _err("项目不存在", code="NOT_FOUND", status=404)
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
+        lib = {}
+        try:
+            for e in (asset_store.load_library(asset_store.try_library_root() or "").get("assets") or []):
+                if isinstance(e, dict) and e.get("asset_id"):
+                    lib[e["asset_id"]] = e
+        except Exception:
+            lib = {}
+        out = []
+        for x in (manifest.get("asset_links") or []):
+            if not isinstance(x, dict) or not x.get("asset_id"):
+                continue
+            ent = {"asset_id": x["asset_id"], "alias": x.get("alias") or "",
+                   "kind": x.get("kind") or "image"}
+            if isinstance(x.get("roles"), list):
+                ent["roles"] = [str(r) for r in x["roles"]
+                                if str(r) in ("首帧图", "尾帧图")][:2]
+            g = lib.get(x["asset_id"]) or {}
+            for k in ("file", "bytes", "orig_name"):
+                if g.get(k) is not None:
+                    ent[k] = g[k]
+            out.append(ent)
+        return web.json_response({"ok": True, "links": out})
+
+    async def asset_link(request):
+        """写链接：{dir, asset_id, alias, kind?, roles?, base_revision?} -> manifest。
+
+        改名/改标即重调本接口（同 alias 重指向；roles 显式传列表覆盖，缺省不动）。
+        revision 冲突回 409。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        name = projects.safe_name(str(data.get("dir") or ""))
+        if not name:
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        try:
+            manifest = projects.link_asset(
+                name, data.get("asset_id"), data.get("alias"),
+                data.get("kind") or "image", data.get("base_revision"),
+                data.get("roles") if isinstance(data.get("roles"), list) else None)
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(name, msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        if manifest is None:
+            return _err("项目不存在或链接非法", code="NOT_FOUND", status=404)
+        return web.json_response({"ok": True, "manifest": manifest})
+
+    async def asset_unlink(request):
+        """解链：{dir, asset_id?, alias?, base_revision?} -> manifest（幂等）。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        name = projects.safe_name(str(data.get("dir") or ""))
+        if not name:
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        try:
+            manifest = projects.unlink_asset(
+                name, data.get("asset_id"), data.get("alias"), data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(name, msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        if manifest is None:
+            return _err("项目不存在或参数非法", code="NOT_FOUND", status=404)
+        return web.json_response({"ok": True, "manifest": manifest})
+
+    async def asset_mirror(request):
+        """全局库调入项目：{dir, asset_id, save_name?} -> assets/<名> 拷贝。
+
+        只拷文件不写 manifest（前端推池条目后走 persistPool 照常登记）。
+        同名加 _2 后缀不覆盖；不受生成锁影响（纯文件拷贝）。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        name = projects.safe_name(str(data.get("dir") or ""))
+        if not name:
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        import re as _re2
+        aid = str(data.get("asset_id") or "").strip()
+        if not _re2.fullmatch(r"a_[0-9a-f]{12}", aid):
+            return _err("非法的 asset_id", code="BAD_REQUEST", status=400)
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
+        try:
+            libroot = asset_store.try_library_root()
+            entry = None
+            if libroot:
+                for e in (asset_store.load_library(libroot).get("assets") or []):
+                    if isinstance(e, dict) and e.get("asset_id") == aid:
+                        entry = e
+                        break
+        except Exception:
+            entry, libroot = None, None
+        if entry is None or not libroot:
+            return _err("资产不存在", code="NOT_FOUND", status=404)
+        rel = str(entry.get("file") or "").replace("\\", "/")
+        base = os.path.realpath(libroot)
+        src = os.path.realpath(os.path.join(base, *rel.split("/")))
+        if not src.startswith(base + os.sep) or not os.path.isfile(src):
+            return _err("资产文件缺失", code="NOT_FOUND", status=404)
+        try:
+            from . import checkpoint as _ckpt
+        except ImportError:
+            import checkpoint as _ckpt
+        if projects.read_project(name) is None:
+            return _err("项目不存在（没有 manifest，先新建或跑一段）",
+                         code="NOT_FOUND", status=404)
+        adir = _ckpt.assets_dir(os.path.join(_ckpt.projects_root(), name))
+        want = str(data.get("save_name") or "").strip().replace("\\", "/").split("/")[-1]
+        if not want:
+            want = entry.get("orig_name") or os.path.basename(src)
+        if not projects.safe_name(want) or not os.path.splitext(want)[1]:
+            return _err(f"非法保存名：{data.get('save_name')!r}", code="BAD_REQUEST", status=400)
+        import shutil as _sh
+        stem, ext = os.path.splitext(want)
+        cand, k = want, 2
+        while os.path.exists(os.path.join(adir, cand)):
+            cand = f"{stem}_{k}{ext}"
+            k += 1
+        try:
+            _sh.copy2(src, os.path.join(adir, cand))
+        except OSError as e:
+            return _err(f"拷贝失败：{e}", code="MIRROR_FAILED", status=500)
+        return web.json_response({"ok": True, "file": f"assets/{cand}"})
+
+    def _upload_kind(kind, filename):
+        k = str(kind or "").strip() or "image"
+        if k not in ("image", "video", "audio"):
+            k = "image"
+        ext = os.path.splitext(str(filename or ""))[1].lower().lstrip(".")
+        if not ext:
+            raise ValueError(f"上传文件缺扩展名：{filename!r}")
+        if ext not in _UPLOAD_EXT[k]:
+            raise ValueError(f"扩展名 .{ext} 与类别 {k} 不符（允许 {list(_UPLOAD_EXT[k])}）")
+        return k
+
+    async def library_upload(request):
+        """上传即入库（全局库 + 可选项目链接）：multipart（浏览器拖拽）或 JSON。
+
+        JSON 体 {src, kind?, tags?, desc?, link_dir?, alias?, base_revision?}：
+        src 为 input 内相对路径（headless/API 用）。multipart 字段：
+        file（文件）+ kind/tags（逗号分隔）/desc/link_dir/alias 文本。
+        纯文件拷贝 + 登记，不受生成锁影响；revision 冲突回 409。
+        """
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
+        # 先看 Content-Type 再读 body：aiohttp 的 body 流只能消费一次，
+        # 先 json() 再 multipart() 会报 Could not find starting boundary。
+        ctype = ""
+        try:
+            hdrs = getattr(request, "headers", {}) or {}
+            ctype = str(hdrs.get("Content-Type", "") if hasattr(hdrs, "get") else "")
+        except Exception:
+            ctype = ""
+        data = None
+        if "multipart/form-data" not in ctype.lower():
+            try:
+                maybe = await request.json()
+            except Exception:
+                return _err("请求体不是合法 JSON（须为 JSON {src} 或 multipart 文件）",
+                             code="BAD_JSON", status=400)
+            if not isinstance(maybe, dict) or not maybe.get("src"):
+                return _err("JSON 体须含 src（input 内相对路径）",
+                             code="BAD_REQUEST", status=400)
+            data = maybe
+        fields = {}
+        tmp_path, tmp_name = None, ""
+        if data is None:
+            # multipart：文件流式落临时文件
+            try:
+                reader = await request.multipart()
+            except Exception:
+                return _err("不支持的请求体（须为 multipart 文件或 JSON {src}）",
+                             code="BAD_REQUEST", status=400)
+            size = 0
+            while True:
+                try:
+                    field = await reader.next()
+                except Exception as e:
+                    return _err(f"multipart 解析失败：{e}", code="BAD_REQUEST", status=400)
+                if field is None:
+                    break
+                if field.name == "file" and field.filename:
+                    tmp_name = os.path.basename(field.filename)
+                    import tempfile as _tf
+                    fd, tmp_path = _tf.mkstemp(prefix="h3lib_")
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            while True:
+                                chunk = await field.read_chunk()
+                                if not chunk:
+                                    break
+                                size += len(chunk)
+                                f.write(chunk)
+                    except Exception as e:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                        return _err(f"文件接收失败：{e}", code="UPLOAD_FAILED", status=500)
+                else:
+                    try:
+                        fields[field.name] = (await field.read(decode=True)).decode(
+                            "utf-8", "replace") if field.name else ""
+                    except Exception:
+                        pass
+            if not tmp_path:
+                return _err("multipart 里没有 file 文件字段", code="BAD_REQUEST", status=400)
+            try:
+                kind = _upload_kind(fields.get("kind"), tmp_name)
+            except ValueError as e:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                return _err(str(e), code="BAD_REQUEST", status=400)
+            tags = [t.strip() for t in str(fields.get("tags") or "").split(",") if t.strip()]
+            desc, link_dir = str(fields.get("desc") or ""), str(fields.get("link_dir") or "")
+            alias = str(fields.get("alias") or "")
+        else:
+            # JSON：input 内文件（防穿越 + realpath 复核，与 import_asset 同口径）
+            f = str(data.get("src") or "").strip().replace("\\", "/")
+            parts = [p for p in f.split("/") if p and p != "."]
+            if not parts or len(parts) > 2 or not all(projects.safe_name(p) for p in parts) \
+                    or not os.path.splitext(parts[-1])[1]:
+                return _err(f"非法源文件：{data.get('src')!r}", code="BAD_REQUEST", status=400)
+            try:
+                from folder_paths import get_input_directory
+                in_root = os.path.realpath(get_input_directory())
+            except Exception:
+                in_root = None
+            if not in_root:
+                return _err("无法定位 input 目录", code="BAD_REQUEST", status=400)
+            src_abs = os.path.realpath(os.path.join(in_root, *parts))
+            if not src_abs.startswith(in_root + os.sep) or not os.path.isfile(src_abs):
+                return _err(f"源文件不存在（input 目录没有）：{'/'.join(parts)}",
+                             code="NOT_FOUND", status=404)
+            try:
+                kind = _upload_kind(data.get("kind"), parts[-1])
+            except ValueError as e:
+                return _err(str(e), code="BAD_REQUEST", status=400)
+            tmp_path, tmp_name = src_abs, parts[-1]
+            tags = data.get("tags") if isinstance(data.get("tags"), list) else []
+            tags = [str(t).strip() for t in tags if str(t).strip()]
+            desc, link_dir = str(data.get("desc") or ""), str(data.get("link_dir") or "")
+            alias = str(data.get("alias") or "")
+        try:
+            lib_root = asset_store.library_root()
+            if tmp_path and data is None:
+                # multipart 已落盘：按名拷贝入库（register_content 内秒传去重）。
+                # 中转名挂在唯一 tmp 路径上（同名并发不互踩）；真实文件名透传
+                # orig_name，否则库内/调入/转码起名全被 h3lib_ 前缀污染。
+                import shutil as _sh
+                staged = tmp_path + "_stage_" + "".join(
+                    c for c in tmp_name if c.isalnum() or c in ("-", "_", "."))[-64:]
+                _sh.copy2(tmp_path, staged)
+                try:
+                    entry = asset_store.register_content(
+                        lib_root, staged, kind, tags, desc, orig_name=tmp_name)
+                finally:
+                    for p in (staged, tmp_path):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+            else:
+                entry = asset_store.register_content(lib_root, tmp_path, kind, tags, desc)
+        except ValueError as e:
+            try:
+                if data is None and tmp_path and os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        except Exception as e:
+            return _err(f"入库失败：{type(e).__name__}: {e}", code="UPLOAD_FAILED", status=500)
+        out = {"ok": True, "entry": entry}
+        if link_dir:
+            if not projects.safe_name(link_dir):
+                return _err("无效的 link_dir（项目目录名）", code="BAD_NAME", status=400)
+            if projects.read_project(link_dir) is None:
+                return _err("链接项目不存在（没有 manifest，先新建或跑一段）",
+                             code="NOT_FOUND", status=404)
+            lbl = alias.strip()[:24] or os.path.splitext(entry["orig_name"])[0][:24]
+            try:
+                mf = projects.link_asset(link_dir, entry["asset_id"], lbl, kind,
+                                         (data or {}).get("base_revision")
+                                         if isinstance(data, dict) else None)
+            except ValueError as e:
+                msg = str(e)
+                if msg.startswith("REVISION_CONFLICT"):
+                    return _rev_conflict(link_dir, msg)
+                return _err(msg, code="BAD_REQUEST", status=400)
+            if mf is None:
+                return _err("链接失败（项目不存在）", code="NOT_FOUND", status=404)
+            out["manifest"] = mf
+            out["alias"] = lbl
+        status = 200
+        return web.json_response(out, status=status)
 
     def _rev_conflict(request_dir, msg):
         try:
@@ -458,6 +988,56 @@ def add_routes(routes):
             return _err(f"优化失败：{e}", code="OPTIMIZE_FAILED", status=500)
         return web.json_response({"ok": True, "prompt": text})
 
+    def _load_expander():
+        """加载 tools/h3_prompt_expander/service.py（非包目录，走 sys.path 注入）。"""
+        import importlib
+        import sys as _sys
+        root = os.path.dirname(os.path.abspath(__file__))
+        exp_dir = os.path.join(root, "tools", "h3_prompt_expander")
+        if exp_dir not in _sys.path:
+            _sys.path.insert(0, exp_dir)
+        return importlib.import_module("service")
+
+    async def expand(request):
+        """提示词扩写（长耗时，放线程池）：意图理解 + 官方编译 + 确认卡，一次返回。
+
+        与 /h3chain/optimize 的区别：optimize 返回纯文本（快速改写），
+        expand 返回结构化信封（intent/pe/确认卡/校验），供导演台确认环使用。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            svc = _load_expander()
+        except Exception as e:
+            return _err(f"扩写模块未就绪：{e}", code="EXPAND_UNAVAILABLE", status=500)
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, svc.expand_via_config, data.get("config"), data)
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="EXPAND_FAILED", status=502)
+        except Exception as e:
+            return _err(f"扩写失败：{e}", code="EXPAND_FAILED", status=500)
+        return web.json_response(result)
+
+    async def expand_validate(request):
+        """只校验已有信封（不调 LLM）：给前端"校验"按钮用。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            svc = _load_expander()
+        except Exception as e:
+            return _err(f"扩写模块未就绪：{e}", code="EXPAND_UNAVAILABLE", status=500)
+        try:
+            return web.json_response(svc.validate_only(data))
+        except Exception as e:
+            return _err(f"校验失败：{e}", code="VALIDATE_FAILED", status=500)
+
     async def compile_prompt(request):
         """结构化 prompt 编译预览（不落盘）：返回官方英文 + 校验，供段卡分组调用。"""
         try:
@@ -566,10 +1146,13 @@ def add_routes(routes):
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),
         ("GET", "/h3chain/upscale_models", upscale_models),
+        ("GET", "/h3chain/vae_files", vae_files),
         ("GET", "/h3chain/experiments", experiment_defs),
         ("GET", "/h3chain/prompt-rules", prompt_rules),
         ("GET", "/h3chain/optimizer-config", optimizer_config),
         ("POST", "/h3chain/optimize", optimize),
+        ("POST", "/h3chain/expand", expand),
+        ("POST", "/h3chain/expand_validate", expand_validate),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),
         ("POST", "/h3chain/compile", compile_prompt),
@@ -582,6 +1165,17 @@ def add_routes(routes):
         ("POST", "/h3chain/import_asset", import_asset),
         ("POST", "/h3chain/assets", save_assets),
         ("POST", "/h3chain/asset_check", asset_check),
+        ("POST", "/h3chain/compile_refs", compile_refs),
+        ("POST", "/h3chain/transcode_submit", transcode_submit),
+        ("GET", "/h3chain/transcode_jobs", transcode_jobs),
+        ("GET", "/h3chain/transcode_job", transcode_job),
+        ("POST", "/h3chain/transcode_cancel", transcode_cancel),
+        ("POST", "/h3chain/library_upload", library_upload),
+        ("GET", "/h3chain/library_file", library_file),
+        ("GET", "/h3chain/asset_links", asset_links),
+        ("POST", "/h3chain/asset_link", asset_link),
+        ("POST", "/h3chain/asset_unlink", asset_unlink),
+        ("POST", "/h3chain/asset_mirror", asset_mirror),
         ("POST", "/h3chain/delete_project", delete_project),
         ("POST", "/h3chain/delete_file", delete_file),
         ("POST", "/h3chain/merge", merge),

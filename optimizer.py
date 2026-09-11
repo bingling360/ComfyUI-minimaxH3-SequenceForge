@@ -7,7 +7,8 @@
 - prompt/*.txt 规则文件只读下发，由调用方按 rule_file=auto/指定/none 注入
 - 云通道：OpenAI 兼容（openai/openrouter/百炼/SiliconFlow/RunningHub 走兼容路径）、
   Gemini GenerateContent、Responses 路径；同步 urllib 实现，调用方放线程池
-- 本地通道：Transformers 视觉模型 / GGUF（llama-cpp）可选，未装时报明确缺件错误
+- 本地通道：Transformers 视觉模型 / GGUF（llama-cpp-python），句柄进程内缓存，
+  只扫 ComfyUI/models/llm；未装依赖时报明确缺件错误
 - 媒体：图片 dataURL 直传；视频/音频只传 label（不传二进制），与前端约定一致
 
 无第三方导入（torch/transformers/llama_cpp 只在函数内按需 import）。
@@ -56,6 +57,10 @@ RULE_OPTIONS = (
     "minimaxh3_official_ref2v_prompt_writing.txt",
     "none",
 )
+
+# 本地模型句柄进程内缓存：同一模型只加载一次（加载一次几十秒，反复加载会拖死节点）
+_GGUF_CACHE: dict = {}
+_TF_CACHE: dict = {}
 
 
 def prompt_dir() -> str:
@@ -352,25 +357,143 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
     return text
 
 
+def _media_images(media: list) -> list:
+    """取前 8 张图片 dataURL（与云通道同口径）。"""
+    out: list = []
+    for item in media or []:
+        if not isinstance(item, dict):
+            continue
+        for u in (item.get("images") or [])[:8]:
+            if isinstance(u, str) and u.startswith("data:image"):
+                out.append(u)
+        if len(out) >= 8:
+            break
+    return out[:8]
+
+
+def _b64_to_pil(data_url: str):
+    """dataURL -> PIL.Image（PIL 随 transformers 一起装，缺失则报缺件）。"""
+    import base64
+    import io
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        raise ValueError("未安装 Pillow，无法读取图片素材")
+    _, b64 = data_url.split(",", 1)
+    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+
+
 def _local_generate(cfg: dict, system: str, user_prompt: str, media: list) -> str:
+    """本地视觉模型推理（GGUF / Transformers 两路），进程内缓存句柄避免重复加载。"""
     sel = str(cfg.get("local_model") or "").strip()
     if not sel:
         raise ValueError("请先在优化设置里选择本地视觉模型")
-    # GGUF 路径
+    images = _media_images(media) if cfg.get("read_media") else []
+    root = (_llm_roots() or [""])[0]
+
+    # ---- GGUF 路径（llama-cpp-python + mmproj 视觉投影）----
     if sel.lower().endswith(".gguf"):
         try:
             from llama_cpp import Llama  # type: ignore
+            from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore
         except ImportError:
-            raise ValueError("未安装 llama-cpp-python，无法加载 GGUF 本地模型（详见 goohai 项目说明按 CUDA/Python 版本装轮子）")
-        raise ValueError("GGUF 本地推理走 llama-cpp 常驻通道，本期先报未接通：请改用 Transformers 模型或云 API")
-    # Transformers 路径
+            raise ValueError("未安装 llama-cpp-python，无法加载 GGUF 本地模型"
+                             "（按 CUDA/Python 版本装轮子，详见 goohai 项目说明）")
+        mmproj = str(cfg.get("local_mmproj") or "").strip()
+        llm = _GGUF_CACHE.get(sel)
+        if llm is None:
+            kw = {"model_path": os.path.join(root, sel), "n_ctx": 8192, "verbose": False}
+            if mmproj:
+                # mproj 走 GPU 加速（视觉塔比语言模型轻，显存占用小）
+                kw["chat_handler"] = Llava15ChatHandler(
+                    clip_model_path=os.path.join(root, mmproj), verbose=False)
+            if str(cfg.get("local_device") or "").lower() == "cuda":
+                kw["n_gpu_layers"] = -1
+            llm = Llama(**kw)
+            _GGUF_CACHE[sel] = llm
+        content: list = [{"type": "text", "text": user_prompt}]
+        for u in images:
+            content.append({"type": "image_url", "image_url": {"url": u}})
+        res = llm.create_chat_completion(
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": content}],
+            max_tokens=int(cfg.get("max_tokens") or 4096), temperature=0.2)
+        return str(res["choices"][0]["message"]["content"] or "").strip()
+
+    # ---- Transformers 路径（AutoModelForImageTextToText + 进程内缓存）----
     try:
         import torch  # type: ignore
         from transformers import AutoModelForImageTextToText, AutoProcessor  # type: ignore
     except ImportError:
         raise ValueError("未安装 transformers/torch，无法加载本地视觉模型（请改用云 API）")
-    _ = (torch, AutoModelForImageTextToText, AutoProcessor)
-    raise ValueError("本地 Transformers 推理需常驻显存通道，本期先报未接通：请改用云 API")
+    cached = _TF_CACHE.get(sel)
+    if cached is None:
+        path = os.path.join(root, sel)
+        device = str(cfg.get("local_device") or "cuda").lower()
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+        model = AutoModelForImageTextToText.from_pretrained(
+            path, dtype=dtype, device_map=device, trust_remote_code=True)
+        model.eval()
+        cached = (processor, model)
+        _TF_CACHE[sel] = cached
+    processor, model = cached
+    content = [{"type": "image"} for _ in images] + [{"type": "text", "text": user_prompt}]
+    messages = [{"role": "system", "content": [{"type": "text", "text": system}]},
+                {"role": "user", "content": content}]
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=prompt, images=[_b64_to_pil(u) for u in images] or None,
+                       return_tensors="pt").to(model.device)
+    with torch.inference_mode():
+        out = model.generate(**inputs, max_new_tokens=int(cfg.get("max_tokens") or 4096),
+                             do_sample=False)
+    gen = out[:, inputs["input_ids"].shape[1]:]
+    return processor.batch_decode(gen, skip_special_tokens=True)[0].strip()
+
+
+def generate_text(config_in: dict | None, system: str, user_prompt: str,
+                  media: list | None = None, max_tokens: int | None = None) -> str:
+    """通用文本生成入口：复用本模块的三协议云通道 + 本地通道。
+
+    供 h3_prompt_expander 等上层工具调用，避免各自维护一套 HTTP 客户端。
+    调用方负责拼 system/user；本函数只负责"把请求发出去并取回文本"。
+
+    - 云通道：_api_generate（自动按 protocol 走 openai 兼容 / gemini / responses）
+    - 本地通道：_local_generate（Transformers / GGUF）
+    """
+    cfg = normalize_config(config_in)
+    system = str(system or "")
+    user_prompt = str(user_prompt or "")
+    if not user_prompt.strip():
+        raise ValueError("待生成内容为空")
+    if max_tokens is not None:
+        try:
+            cfg["max_tokens"] = max(512, min(8192, int(max_tokens)))
+        except (TypeError, ValueError):
+            pass
+    media = media if isinstance(media, list) else []
+    if cfg.get("mode") == "local":
+        return _local_generate(cfg, system, user_prompt, media)
+    return _api_generate(cfg, system, user_prompt, media, int(cfg.get("max_tokens") or 4096))
+
+
+def generate_json(config_in: dict | None, system: str, user_prompt: str,
+                  media: list | None = None, max_tokens: int | None = None) -> dict:
+    """generate_text 的 JSON 版：容忍 ```json 围栏与前后废话，截取最大 JSON 段。"""
+    text = generate_text(config_in, system, user_prompt, media, max_tokens)
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    if m:
+        text = m.group(1)
+    try:
+        return json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except ValueError:
+                pass
+    raise RuntimeError(f"LLM 未返回合法 JSON：{text[:300]}")
 
 
 def optimize_once(config_in: dict | None, payload: dict | None) -> str:

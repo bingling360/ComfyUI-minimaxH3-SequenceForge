@@ -201,6 +201,27 @@
     renderGrid();
     renderFoot();
     renderScopes();
+    if (S.scope === "finals") autoArchiveFinals(S.items);
+  }
+
+  let _archivedAt = 0;
+
+  /** 成片自动存一份进全局库（跨项目复用）；幂等 —— 已入库的条目后端会跳过。 */
+  async function autoArchiveFinals(items) {
+    const A = window.H3Api;
+    if (!A?.libArchive) return;
+    const ids = (items || [])
+      .filter((x) => x.scope === "finals" && !x.asset_id)
+      .map((x) => x.id);
+    if (!ids.length) return;
+    const now = Date.now();
+    if (now - _archivedAt < 15000) return;      // 节流，别每次翻页都打后端
+    _archivedAt = now;
+    try {
+      const r = await A.libArchive(S.dir, ids);
+      const n = (r.body?.archived || []).length;
+      if (r.body?.ok && n) say(`成片已自动存入全局库 ${n} 个（跨项目可复用）`);
+    } catch (e) { /* 归档失败不影响浏览 */ }
   }
 
   async function refreshCollections() {
@@ -248,7 +269,7 @@
       mk("尾帧图", roles.includes("尾帧图"), () => actRole(it, "尾帧图"));
     }
     if (it.scope === "global") mk("调入项目", false, () => actMirror(it));
-    if (it.scope === "finals") mk("→资产", false, () => actToAssets(it));
+    if (it.scope === "finals") mk("调入项目", false, () => actToAssets(it));
     if (it.scope === "latent" && window.H3Director?.upscaleLatent) {
       mk("二采", false, () => window.H3Director.upscaleLatent(S.dir, it.file, say));
     }
@@ -565,7 +586,7 @@
     if (!A.libMirror) { fail("接口未就绪（h3_api.js 未更新）"); return; }
     const r = await A.libMirror(S.dir, it.id, it.name);
     if (!r.body?.ok) { fail(A.errText(r, "调入项目失败")); return; }
-    after(`已调入项目：${r.body.file}\n别名「${r.body.label}」——提示词里写 [[${r.body.label}]] 即可引用`);
+    after(`已调入项目：${r.body.file}\n别名「${r.body.label}」——提示词里写 @${r.body.label} 即可引用`);
     fetchPage(false);
   }
 
@@ -579,7 +600,7 @@
       else fail(`${it.name}：${A.errText(r, "调入失败")}`);
     }
     if (ok) {
-      say(`已调入 ${ok} 个到项目 assets/：${names.join("、")}\n提示词里写 [[别名]] 即可引用`);
+      say(`已调入 ${ok} 个到项目 assets/：${names.join("、")}\n提示词里写 @别名 即可引用`);
       fetchPage(false);
     }
   }
@@ -706,8 +727,8 @@
 
     const upBtn = el("button", "h3l-btn h3l-btn-cta", "＋ 上传");
     upBtn.type = "button";
-    upBtn.title = "上传做两件事：① 存进全局库（跨项目可复用）② 链接到本项目（提示词写 [[别名]] 即可引用）。"
-      + "想让文件落进项目 assets/，右键点「调入项目」。";
+    upBtn.title = "在「全局库」scope 上传 = 只进全局库一份（跨项目复用）；"
+      + "在其它 scope 上传 = 全局库一份 + 本项目 assets/ 一份（项目自包含）。";
     upBtn.onclick = () => {
       const inp = document.createElement("input");
       inp.type = "file";
@@ -715,18 +736,34 @@
       inp.onchange = async () => {
         const files = [...(inp.files || [])];
         if (!files.length) return;
-        const A = api();
+        const A0 = api();
+        // 落点按当前 scope 决定：
+        //   全局库 → 只进全局库一份（跨项目复用，不碰任何项目）
+        //   其它   → 全局库一份 + 项目 assets/ 一份（项目自包含，删项目不影响全局库）
+        const onlyGlobal = S.scope === "global";
         let ok = 0;
         for (const f of files) {
           try {
             const H3Assets = window.H3Assets;
             if (!H3Assets?.uploadDirect) throw new Error("上传接口不可用");
             const kind = H3Assets.guessKind(f);
-            await H3Assets.uploadDirect(f, { kind, link_dir: S.dir, alias: f.name.replace(/\.[^.]+$/, "").slice(0, 24) });
+            const alias = f.name.replace(/\.[^.]+$/, "").slice(0, 24);
+            const opt = onlyGlobal
+              ? { kind, alias }
+              : { kind, alias, link_dir: S.dir, mirror: "1" };
+            const res = await H3Assets.uploadDirect(f, opt);
+            if (!res?.ok) throw new Error("上传返回异常");
             ok++;
           } catch (e) { fail(`「${f.name}」上传失败：${e?.message || e}`); }
         }
-        if (ok) { say(`已上传 ${ok} 个到全局库并链接本项目`); fetchPage(false); }
+        if (!ok) return;
+        if (onlyGlobal) {
+          say(`已上传 ${ok} 个到全局库（跨项目可复用）\n要落进当前项目，点瓦片上的「调入项目」`);
+        } else {
+          say(`已上传 ${ok} 个：全局库一份 + 本项目 assets/ 一份\n提示词里写 @别名 即可引用`);
+        }
+        void A0;
+        fetchPage(false);
       };
       inp.click();
     };

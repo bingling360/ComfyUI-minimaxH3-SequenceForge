@@ -109,6 +109,7 @@
     libTag: (dir, id, tags) => _json("POST", "/h3chain/lib_tag", { dir, id, tags }),
     libAlias: (dir, id, alias) => _json("POST", "/h3chain/lib_alias", { dir, id, alias }),
     libMirror: (dir, id, label) => _json("POST", "/h3chain/lib_mirror", { dir, id, label }),
+    libArchive: (dir, ids) => _json("POST", "/h3chain/lib_archive", { dir, ids }),
     libCollectionSave: (payload) => _json("POST", "/h3chain/lib_collection_save", payload),
     libCollectionDelete: (dir, id) => _json("POST", "/h3chain/lib_collection_delete", { dir, id }),
     libDelete: (dir, ids) => _json("POST", "/h3chain/lib_delete", { dir, ids }),

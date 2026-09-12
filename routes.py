@@ -90,6 +90,7 @@ ROUTES = [
     ("POST", "/h3chain/lib_tag"),
     ("POST", "/h3chain/lib_alias"),
     ("POST", "/h3chain/lib_mirror"),
+    ("POST", "/h3chain/lib_archive"),
     ("POST", "/h3chain/lib_collection_save"),
     ("POST", "/h3chain/lib_collection_delete"),
     ("POST", "/h3chain/lib_delete"),
@@ -845,6 +846,18 @@ def add_routes(routes):
                 return _err("链接失败（项目不存在）", code="NOT_FOUND", status=404)
             out["manifest"] = mf
             out["alias"] = lbl
+            # mirror=1：上传即落项目（项目自包含）—— 再拷一份进 assets/ 并登记 manifest。
+            # 全局库那份保留（跨项目复用），项目这份保证"删项目不连累别人 / 项目自包含"。
+            if str((data or {}).get("mirror") or "").lower() in ("1", "true", "yes"):
+                try:
+                    h3lib.invalidate(link_dir)
+                    out["mirrored"] = h3lib.mirror_to_project(
+                        link_dir,
+                        {"scope": "global", "kind": kind, "name": lbl,
+                         "file": entry["file"]},
+                        lbl)
+                except ValueError as e:
+                    out["mirror_error"] = str(e)
         status = 200
         return web.json_response(out, status=status)
 
@@ -1461,6 +1474,47 @@ def add_routes(routes):
         h3lib.invalidate(dir_name)
         return web.json_response({"ok": True, **res, "requested": len(ids)})
 
+    async def lib_archive(request):
+        """把非全局库的条目存一份进全局库（成片产物自动备份，跨项目复用）。
+
+        幂等：已带 asset_id（即已在全局库）的条目直接跳过，不重复入库。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        raw = data.get("ids")
+        ids = [str(x) for x in raw] if isinstance(raw, list) else \
+            ([str(data["id"])] if data.get("id") else [])
+        root = h3lib._library_root()
+        if not root:
+            return _err("全局库不可用", code="NO_LIBRARY", status=400)
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
+        done, skipped = [], []
+        for i in ids:
+            it = _find_item(dir_name, i)
+            if it is None or it["scope"] == "global":
+                continue
+            if it.get("asset_id"):
+                continue                      # 已在全局库（幂等）
+            src = h3lib.resolve_item_path(it, dir_name)
+            if not src:
+                skipped.append(it["name"])
+                continue
+            try:
+                asset_store.register_content(root, src, it["kind"], [],
+                                             "", orig_name=it["name"])
+                done.append(it["name"])
+            except Exception as e:
+                skipped.append(f"{it['name']}（{e}）")
+        if done:
+            h3lib.invalidate(dir_name)
+        return web.json_response({"ok": True, "archived": done, "skipped": skipped})
+
     async def lib_stage(request):
         """把素材复制进 ComfyUI input 目录（原生 LoadImage/LoadVideo 只认 input）。"""
         try:
@@ -1645,6 +1699,7 @@ def add_routes(routes):
         ("POST", "/h3chain/lib_tag", lib_tag),
         ("POST", "/h3chain/lib_alias", lib_alias),
         ("POST", "/h3chain/lib_mirror", lib_mirror),
+        ("POST", "/h3chain/lib_archive", lib_archive),
         ("POST", "/h3chain/lib_collection_save", lib_collection_save),
         ("POST", "/h3chain/lib_collection_delete", lib_collection_delete),
         ("POST", "/h3chain/lib_delete", lib_delete),

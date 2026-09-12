@@ -375,7 +375,10 @@ def invalidate(project=None):
 
 # ---------- 本插件语义：段引用 / 角色标记 ----------
 
-_REF_TOKEN = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
+_REF_BRACKET = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
+# 负向后顾：`@` 前不能是字母数字下划线，免得把 a@b.com 里的 b 当成素材标签
+_REF_AT = re.compile(
+    r"(?<![0-9A-Za-z_])@([^\s@\[\]{}<>()（）,，.。;；:：!！?？\"'`|/\\]{1,24})")
 
 
 def compute_refs(manifest, items) -> dict:
@@ -412,8 +415,8 @@ def compute_refs(manifest, items) -> dict:
             key = (r.get("asset") or r.get("id") or r.get("label")) if isinstance(r, dict) else r
             touch(key, i + 1)
         txt = str(prompts[i] if i < len(prompts) else "")
-        for m in _REF_TOKEN.finditer(txt):
-            touch(m.group(1), i + 1)
+        for lbl in (_REF_BRACKET.findall(txt) + _REF_AT.findall(txt)):
+            touch(lbl, i + 1)
         ts = seg.get("tail_src")
         if isinstance(ts, dict) and ts.get("asset"):
             touch(ts["asset"], i + 1)
@@ -480,10 +483,11 @@ _SORT_KEYS = {
 
 
 def query(items, q="", scope="all", kind="all", sort="mtime", order="desc",
-          page=1, page_size=DEFAULT_PAGE_SIZE, collection=None, seg=None) -> dict:
+          page=1, page_size=DEFAULT_PAGE_SIZE, collection=None, seg=None,
+          min_rating=0) -> dict:
     """过滤 + 排序 + 分页 -> {total, page, page_size, total_pages, items}。
 
-    与 Majoor 的分页契约一致（page 1-based）。
+    与 Majoor 的分页契约一致（page 1-based）；min_rating 用于"只看 N 星以上"。
     """
     rows = list(items or [])
     if scope and scope != "all":
@@ -493,6 +497,12 @@ def query(items, q="", scope="all", kind="all", sort="mtime", order="desc",
             rows = [e for e in rows if e["kind"] in MEDIA_KINDS]
         else:
             rows = [e for e in rows if e["kind"] == kind]
+    try:
+        mr = int(min_rating or 0)
+    except (TypeError, ValueError):
+        mr = 0
+    if mr > 0:
+        rows = [e for e in rows if int(e.get("rating") or 0) >= mr]
     if seg:
         try:
             s = int(seg)

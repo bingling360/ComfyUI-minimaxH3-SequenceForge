@@ -1198,7 +1198,7 @@ def add_routes(routes):
             items, q=q.get("q"), scope=q.get("scope"), kind=q.get("kind"),
             sort=q.get("sort"), order=q.get("order"),
             page=q.get("page"), page_size=q.get("page_size"),
-            collection=coll, seg=q.get("seg"))
+            collection=coll, seg=q.get("seg"), min_rating=q.get("min_rating"))
         return web.json_response({"ok": True, "data": data,
                                   "counters": h3lib.counters(items)})
 
@@ -1297,7 +1297,11 @@ def add_routes(routes):
         return web.json_response({"ok": True, **r})
 
     async def lib_alias(request):
-        """改显示名：项目资产改 manifest.assets[].label，全局库改 orig_name。"""
+        """改显示名（项目内的叫法）。
+
+        查找顺序与显示名来源一致：项目链接（asset_links.alias）→ 项目资产
+        （manifest.assets[].label）→ 全局库显示名（orig_name，仅限没链接的全局条目）。
+        """
         try:
             data = await request.json()
         except Exception:
@@ -1309,7 +1313,56 @@ def add_routes(routes):
         it = _find_item(dir_name, str(data.get("id") or ""))
         if it is None:
             return _err("素材不存在", code="NOT_FOUND", status=404)
-        if it["scope"] == "global":
+        mf = projects.read_project(dir_name) if dir_name else None
+
+        def _rev_err(e):
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _err(msg, code="REVISION_CONFLICT", status=409)
+            return _err(msg, code="BAD_ARGS", status=400)
+
+        # 1) 项目链接条目：必须走 link_asset —— save_assets 不写 asset_links，
+        #    之前用它改链接别名，改动直接被丢掉（改名"没用"的根因）。
+        link = None
+        for L in (mf or {}).get("asset_links") or []:
+            if isinstance(L, dict) and str(L.get("alias")) == it["name"]:
+                link = L
+                break
+        if link is not None:
+            try:
+                out = projects.link_asset(
+                    dir_name, link.get("asset_id"), alias,
+                    link.get("kind") or it.get("kind") or "image",
+                    data.get("base_revision"), None)
+            except ValueError as e:
+                return _rev_err(e)
+            if out is None:
+                return _err("改名失败（链接条目）", code="BAD_ARGS", status=400)
+            h3lib.invalidate(dir_name)
+            return web.json_response({"ok": True, "alias": alias,
+                                      "revision": out.get("revision")})
+
+        # 2) 项目资产条目：改 label 后全量写回
+        if mf is not None:
+            assets = [dict(a) if isinstance(a, dict) else a for a in (mf.get("assets") or [])]
+            hit = False
+            for a in assets:
+                if isinstance(a, dict) and str(a.get("label")) == it["name"]:
+                    a["label"] = alias
+                    hit = True
+            if hit:
+                try:
+                    out = projects.save_assets(dir_name, assets, data.get("base_revision"))
+                except ValueError as e:
+                    return _rev_err(e)
+                if out is None:
+                    return _err("改名失败", code="BAD_ARGS", status=400)
+                h3lib.invalidate(dir_name)
+                return web.json_response({"ok": True, "alias": alias,
+                                          "revision": out.get("revision")})
+
+        # 3) 没有链接的全局库条目：改库内显示名
+        if it["scope"] == "global" and it.get("asset_id"):
             root = h3lib._library_root()
             if not root:
                 return _err("全局库不可用", code="NO_LIBRARY", status=400)
@@ -1317,44 +1370,22 @@ def add_routes(routes):
                 from . import asset_store
             except ImportError:
                 import asset_store
-            mf = asset_store.load_library(root)
+            lib = asset_store.load_library(root)
             hit = False
-            for a in mf.get("assets") or []:
-                if isinstance(a, dict) and str(a.get("asset_id")) == it.get("asset_id"):
+            for a in lib.get("assets") or []:
+                if isinstance(a, dict) and str(a.get("asset_id")) == it["asset_id"]:
                     a["orig_name"] = alias
                     a["updated_at"] = time.time()
                     hit = True
                     break
             if not hit:
                 return _err("全局库条目不存在", code="NOT_FOUND", status=404)
-            asset_store.save_library(root, mf)
-        else:
-            mf = projects.read_project(dir_name)
-            if mf is None:
-                return _err("项目不存在", code="NOT_FOUND", status=404)
-            assets = [dict(a) if isinstance(a, dict) else a for a in (mf.get("assets") or [])]
-            links, hit = [], False
-            for a in assets:
-                if isinstance(a, dict) and str(a.get("label")) == it["name"]:
-                    a["label"] = alias
-                    hit = True
-            for L in mf.get("asset_links") or []:
-                if isinstance(L, dict) and str(L.get("alias")) == it["name"]:
-                    L = dict(L)
-                    L["alias"] = alias
-                    hit = True
-                links.append(L)
-            if not hit:
-                return _err("该素材未登记在项目清单（先「入库」或「调入项目」）",
-                            code="NOT_IN_PROJECT", status=400)
-            try:
-                out = projects.save_assets(dir_name, assets, data.get("base_revision"))
-            except ValueError as e:
-                return _err(str(e), code="REVISION_CONFLICT", status=409)
-            if out is None:
-                return _err("保存失败", code="BAD_ARGS", status=400)
-        h3lib.invalidate(dir_name)
-        return web.json_response({"ok": True, "alias": alias})
+            asset_store.save_library(root, lib)
+            h3lib.invalidate(dir_name)
+            return web.json_response({"ok": True, "alias": alias})
+
+        return _err("这个素材没登记进项目（先「调入项目」或上传时入库），改不了名",
+                    code="NOT_IN_PROJECT", status=400)
 
     async def lib_mirror(request):
         """全局库条目 → 项目：拷文件进 assets/ **并写 manifest["assets"]**（一步到位）。

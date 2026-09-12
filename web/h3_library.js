@@ -30,6 +30,10 @@
     ["mtime", "按时间"], ["name", "按名称"], ["size", "按大小"],
     ["rating", "按评分"], ["kind", "按类型"],
   ];
+  const RATINGS = [
+    ["0", "全部星级"], ["1", "≥1★"], ["2", "≥2★"],
+    ["3", "≥3★"], ["4", "≥4★"], ["5", "只看 5★"],
+  ];
   const KIND_ICON = { video: "🎞", audio: "🎵", latent: "🧬", image: "🖼" };
   const KIND_CN = { image: "图片", video: "视频", audio: "音频", latent: "latent" };
 
@@ -185,7 +189,7 @@
     const res = await A.libList({
       dir: S.dir, q: S.q, scope: S.scope, kind: S.kind,
       sort: S.sort, order: S.order, page: S.page, page_size: S.pageSize,
-      collection: S.collection || "",
+      collection: S.collection || "", min_rating: S.minRating || 0,
     });
     if (!res.body?.ok) { fail(A.errText(res, "读取素材失败")); return; }
     const d = res.body.data || {};
@@ -533,7 +537,10 @@
   }
 
   async function actTag(it) {
-    const v = window.prompt(`给「${it.name}」打标签（逗号分隔）`, (it.tags || []).join(","));
+    const v = window.prompt(
+      `给「${it.name}」打标签（逗号分隔）。\n`
+      + "标签是你自己的分类（例：角色 / 场景 / 道具 / 用过），用来筛选和检索素材。",
+      (it.tags || []).join(","));
     if (v === null) return;
     const tags = String(v).split(/[,，]/).map((s) => s.trim()).filter(Boolean);
     const A = api();
@@ -639,7 +646,7 @@
     S = {
       dir: String(o.dir || ""), seg: Number(o.seg) || 1,
       onChanged: o.onChanged,
-      scope: "all", kind: "all", sort: "mtime", order: "desc",
+      scope: "all", kind: "all", sort: "mtime", order: "desc", minRating: "0",
       q: "", page: 1, pageSize: 60,
       items: [], total: 0, totalPages: 1, counters: {}, totalAll: 0,
       sel: new Set(), multi: false, collections: [], collection: "",
@@ -676,6 +683,7 @@
     };
     bar.append(mkSel(KINDS, "kind"));
     bar.append(mkSel(SORTS, "sort"));
+    bar.append(mkSel(RATINGS, "minRating"));
     const ordBtn = el("button", "h3l-btn", "↓ 倒序");
     ordBtn.type = "button";
     ordBtn.onclick = () => {

@@ -19,6 +19,8 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WANT_FUNCS = ("_normalize_order", "_kind_tokens", "_apply_label_tokens",
                "_reference_tags_minimal", "_uncovered_tags")
+# `@标签` 语法把原来的 _LABEL_TOKEN 拆成「括号写法 + @写法」两个正则
+_WANT_VARS = ("_REF_BRACKET", "_REF_AT")
 
 
 @pytest.fixture(scope="session")
@@ -30,13 +32,14 @@ def kern():
         if isinstance(node, ast.FunctionDef) and node.name in _WANT_FUNCS:
             wanted.append(node)
         if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "_LABEL_TOKEN" for t in node.targets):
+                isinstance(t, ast.Name) and t.id in _WANT_VARS for t in node.targets):
             wanted.append(node)
     assert {n.name for n in wanted if isinstance(n, ast.FunctionDef)} == set(_WANT_FUNCS)
     ns = {"re": re}
     exec(compile(ast.Module(body=wanted, type_ignores=[]),
                  "nodes.py:ref-kernel", "exec"), ns)
-    return types.SimpleNamespace(**{k: ns[k] for k in list(_WANT_FUNCS) + ["_LABEL_TOKEN"]})
+    return types.SimpleNamespace(
+        **{k: ns[k] for k in list(_WANT_FUNCS) + list(_WANT_VARS)})
 
 
 def test_minimal_block_shape(kern):

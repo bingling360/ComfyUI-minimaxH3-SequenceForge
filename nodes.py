@@ -529,7 +529,17 @@ def _parse_director_state(raw):
 
 _AR_RATIO = {"21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1.0}
 _MP_OPTIONS = [round(i * 0.1, 1) for i in range(1, 21)]   # 0.1–2.0MP，0.1 步进（官方箭头微调同款）
-_LABEL_TOKEN = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
+_REF_BRACKET = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
+# 负向后顾：`@` 前不能是字母数字下划线，免得把 a@b.com 里的 b 当成素材标签
+_REF_AT = re.compile(
+    r"(?<![0-9A-Za-z_])@([^\s@\[\]{}<>()（）,，.。;；:：!！?？\"'`|/\\]{1,24})")
+
+
+def _find_refs(text):
+    """提示词里引用的素材标签：新写法 `@标签` + 旧写法 `[[标签]]`（老存档还能跑）。"""
+    s = str(text or "")
+    return ([m.group(1) for m in _REF_BRACKET.finditer(s)]
+            + [m.group(1) for m in _REF_AT.finditer(s)])
 
 
 def _resolve_canvas(ar, mp):
@@ -578,16 +588,19 @@ def _kind_tokens(label_order):
 
 
 def _apply_label_tokens(prompt, label_order):
-    """把提示词中的 [[标签]] 替换为该段压实编号后的 <Picture k>/<Video k>/<Audio j>。
+    """把提示词里的 `@标签` 替换成该段压实编号后的 <Picture k>/<Video k>/<Audio j>。
 
     label_order 为该段按序引用的 (kind, 标签)（或旧格式纯标签=image）；各类别独立从 1
-    编号；长标签先替换，防「角色1」吃掉「角色10」前缀；剩余未知 [[..]] 报错并列出可用标签。
+    编号；长标签先替换，防「角色1」吃掉「角色10」前缀。
+    旧写法 `[[标签]]` 一并认（老项目存档还能跑）；`[[..]]` 是引用专用写法，
+    未知即报错；`@` 太常见（邮箱、@2x 之类），未知的不拦，避免误伤普通文本。
     """
     mapping = _kind_tokens(_normalize_order(label_order))
     out = prompt
     for lbl in sorted(mapping, key=len, reverse=True):
+        out = out.replace(f"@{lbl}", mapping[lbl])
         out = out.replace(f"[[{lbl}]]", mapping[lbl])
-    unknown = _LABEL_TOKEN.findall(out)
+    unknown = _REF_BRACKET.findall(out)
     if unknown:
         raise ValueError(f"提示词引用了未知素材标签「{unknown[0].strip()}」：可用标签 {list(mapping)}")
     return out
@@ -1037,17 +1050,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if _kk and _kk not in _keys:
                             _keys.append(_kk)
                     seg_custom_refs += 1
-                    # 提示词里 [[标签]] 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
-                    for tok in _LABEL_TOKEN.findall(full):
-                        lbl = tok.strip()
+                    # 提示词里 @标签 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
+                    for lbl in _find_refs(full):
+                        lbl = lbl.strip()
                         if lbl and lbl not in _keys:
                             _keys.append(lbl)
                 else:
-                    # 缺省 = 只用提示词文本 [[标签]] 里出现的素材（按出现顺序）；
+                    # 缺省 = 只用提示词文本 @标签 里出现的素材（按出现顺序）；
                     # 没出现 = 本段无引用（纯文本段）。资产库总量不限，只卡单段上
                     # 限——库再大也不会逼每段显式勾选。
-                    for tok in _LABEL_TOKEN.findall(full):
-                        lbl = tok.strip()
+                    for lbl in _find_refs(full):
+                        lbl = lbl.strip()
                         if lbl and lbl not in _keys:
                             _keys.append(lbl)
                 # P2 校验核：compile_refs（四形态统一），报错映射回旧链逐字格式；

@@ -17,11 +17,11 @@
  *     segments:[
  *       { scene_prompt:"场景描述", character_prompt:"角色描述",
  *         seconds:6.5,        // 本段时长（秒），null=跟随节点「每段时长」默认
- *         refs:["角色1","场景1"] },  // 本段引用的素材标签（跨类别），[]/缺省=只用文本[[标签]]出现的
+ *         refs:["角色1","场景1"] },  // 本段引用的素材标签（跨类别），[]/缺省=只用文本@标签出现的
  *       ...
  *     ] }
  *
- * 标签引用：提示词写 [[角色1]]，后端按段按类别压实重编号（图→<Picture k>、视→<Video k>、
+ * 标签引用：提示词写 @角色1，后端按段按类别压实重编号（图→<Picture k>、视→<Video k>、
  * 音→<Audio j>）；原生 token 写法继续兼容。v1 状态（只有 ref_images）自动迁移为图片类。
  * 段级注入：未勾选的素材完全不进该段 conditioning；参考视频的原声自动配对成 <Audio j>。
  *
@@ -61,20 +61,20 @@ const KIND_ICON = { image: "🖼", video: "🎞", audio: "🎵" };
 const KIND_TOKEN = { image: "Picture", video: "Video", audio: "Audio" };
 const KIND_CAPS = { image: 9, video: 3, audio: 3 };
 const KIND_ACCEPT = { image: "image/*", video: "video/*", audio: "audio/*" };
-/* 引用语模板库：插入到提示词光标处，[[标签]] 由后端按段压实为 <Picture k> */
+/* 引用语模板库：插入到提示词光标处，@标签 由后端按段压实为 <Picture k> */
 const REF_TEMPLATES = [
-    ["插入 [[标签]]", (l) => `[[${l}]]`],
-    ["主角出场", (l) => `主角 [[${l}]] 全程出镜（主体身份、外观与服饰全程保持一致）`],
-    ["配角出场", (l) => `画面中出现的 [[${l}]] 为次要角色，身份与外观保持一致`],
-    ["场景还原", (l) => `场景以 [[${l}]] 为准，延续其环境、光照与空间布局`],
-    ["风格参考", (l) => `整体画风、色调与质感参考 [[${l}]]`],
-    ["镜头参考", (l) => `运镜方式参考 [[${l}]]（可用官方词汇：Push In / Pan Left / Truck Right / Tracking Shot，加 with small amplitude at slow speed 等修饰）`],
+    ["插入 @标签", (l) => `@${l}`],
+    ["主角出场", (l) => `主角 @${l} 全程出镜（主体身份、外观与服饰全程保持一致）`],
+    ["配角出场", (l) => `画面中出现的 @${l} 为次要角色，身份与外观保持一致`],
+    ["场景还原", (l) => `场景以 @${l} 为准，延续其环境、光照与空间布局`],
+    ["风格参考", (l) => `整体画风、色调与质感参考 @${l}`],
+    ["镜头参考", (l) => `运镜方式参考 @${l}（可用官方词汇：Push In / Pan Left / Truck Right / Tracking Shot，加 with small amplitude at slow speed 等修饰）`],
     ["说话人", () => `短发女主 (S1) 轻声说：「……」`],
 ];
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧起手（可选尾帧图片=FL2VA 首尾帧），fl2va UNET"],
-    ["多参视频", "多参", "参考图/视频/音频，ref2va UNET，[[标签]] 引用"],
+    ["多参视频", "多参", "参考图/视频/音频，ref2va UNET，@标签 引用"],
 ];
 const MODE_DEFAULT = "文生视频";
 const MAX_SEG = 64;
@@ -298,7 +298,7 @@ function insertAtCursor(ta, text) {
     return ta.value;
 }
 
-/* P3：@补全——提示词框内 @ 前缀弹出池别名，点选/回车插入 [[别名]]。
+/* P3：@补全——提示词框内 @ 前缀弹出池别名，点选/回车插入 @别名。
  * 只改文本不调接口不重建面板（焦点守卫安全）；选中后派发 input 走既有防抖落盘。 */
 function attachAtComplete(ta, node) {
     if (!ta || ta.dataset.h3at === "1") return;
@@ -337,8 +337,8 @@ function attachAtComplete(ta, node) {
         close();
         if (!c || !a) return;
         const pos = ta.selectionStart ?? ta.value.length;
-        ta.value = ta.value.slice(0, c.start) + `[[${a.label}]]` + ta.value.slice(pos);
-        const np = c.start + a.label.length + 4;
+        ta.value = ta.value.slice(0, c.start) + `@${a.label}` + ta.value.slice(pos);
+        const np = c.start + a.label.length + 1;
         ta.focus();
         ta.setSelectionRange(np, np);
         ta.dispatchEvent(new Event("input", { bubbles: true }));
@@ -877,10 +877,10 @@ function setSegmentSeconds(node, idx, v) {
     return true;
 }
 
-/** 勾选/取消本段引用的素材标签；全部取消 = 只用提示词文本 [[标签]] 出现的
+/** 勾选/取消本段引用的素材标签；全部取消 = 只用提示词文本 @标签 出现的
  * （与后端约定一致：缺省文本驱动，不勾选也能跑）。
  *  勾选时按类别校验官方单段上限（图9/视3/音3），超限拦截并提示。
- *  P5 显性语义：勾选即在段正文末尾补可见 [[标签]]（取消勾选不删正文，防丢字）；
+ *  P5 显性语义：勾选即在段正文末尾补可见 @标签（取消勾选不删正文，防丢字）；
  *  调用方 blur 先于 click 触发，主框未落盘的输入已先行 flush，无竞态。 */
 function toggleSegmentRef(node, idx, label) {
     const ds = getDs(node);
@@ -903,9 +903,9 @@ function toggleSegmentRef(node, idx, label) {
         }
         seg.refs.push(label);
         const cur = String((ds.prompts || [])[idx] || "");
-        if (!cur.includes(`[[${label}]]`)) {
+        if (!cur.includes(`@${label}`)) {
             if (!Array.isArray(ds.prompts)) ds.prompts = [];
-            ds.prompts[idx] = cur + (cur && !/\s$/.test(cur) ? " " : "") + `[[${label}]]`;
+            ds.prompts[idx] = cur + (cur && !/\s$/.test(cur) ? " " : "") + `@${label}`;
         }
     }
     setDs(node, ds);
@@ -1667,7 +1667,7 @@ function enTasks(str) {
 }
 
 function defaultV2Mode(ds, segIdx) {
-    // 去模式跟随：按本段实际引用自动判定（有勾选/文本[[标签]]即 Ref2VA，否则 FL2VA）
+    // 去模式跟随：按本段实际引用自动判定（有勾选/文本@标签即 Ref2VA，否则 FL2VA）
     const seg = (ds?.segments || [])[segIdx];
     if (seg && Array.isArray(seg.refs) && seg.refs.length) return "Ref2VA";
     const txt = String(((ds?.prompts || [])[segIdx]) || "");
@@ -4518,7 +4518,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         };
         gRefBody.append(addRef);
         /* 分段素材调度：本段实际喂 conditioning 的资产集合（单段上限 图9/视3/音3）。
-         * 缺省（全空）= 只用提示词文本 [[标签]] 出现的；与上方参考条目是两回事：
+         * 缺省（全空）= 只用提示词文本 @标签 出现的；与上方参考条目是两回事：
          * 上方管官方六段式文本，下面管本段 conditioning 调度。 */
         {
             const pool2 = (data.ds.ref_assets || []);
@@ -4536,7 +4536,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
                     const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
                     chip.type = "button";
-                    chip.title = `${KIND_NAME[k]}素材${roles}：勾选后本段 conditioning 引用（同类按勾选顺序编号 <${KIND_TOKEN[k]} k>），正文自动补 [[标签]]；单段上限 图${KIND_CAPS.image}/视${KIND_CAPS.video}/音${KIND_CAPS.audio}`;
+                    chip.title = `${KIND_NAME[k]}素材${roles}：勾选后本段 conditioning 引用（同类按勾选顺序编号 <${KIND_TOKEN[k]} k>），正文自动补 @标签；单段上限 图${KIND_CAPS.image}/视${KIND_CAPS.video}/音${KIND_CAPS.audio}`;
                     if (k === "image") {
                         const im = document.createElement("img");
                         im.loading = "lazy";
@@ -4558,7 +4558,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     reset.type = "button";
                     reset.style.padding = "3px 8px";
                     reset.style.fontSize = "10.5px";
-                    reset.title = "清空段级调度 = 只用提示词文本 [[标签]] 出现的素材";
+                    reset.title = "清空段级调度 = 只用提示词文本 @标签 出现的素材";
                     reset.onclick = () => {
                         setSegmentField(node, segIdx, "refs", []);
                         scheduleRefresh(80);
@@ -4566,7 +4566,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     sched.append(reset);
                 } else {
                     sched.insertAdjacentHTML("beforeend",
-                        '<span class="h3d-secs-hint">未调度=只用文本[[标签]]</span>');
+                        '<span class="h3d-secs-hint">未调度=只用文本@标签</span>');
                 }
                 gRefBody.append(sched);
             }
@@ -4944,8 +4944,8 @@ function buildCards(data) {
             ta.value = it.text || "";
             const pool = (data.ds.ref_assets || []);
             const poolHint = pool.length
-                ? `用 [[${pool[0].label}]] 这样的标签引用素材，或手写 <Picture N>`
-                : "上传参考图后可用 [[标签]] 引用";
+                ? `用 @${pool[0].label} 这样的标签引用素材，或手写 <Picture N>`
+                : "上传参考图后可用 @标签 引用";
             ta.placeholder = `第 ${idx + 1} 段画面与动作时间线：顺着上一段结尾继续；`
                 + `对白写「…」自动转官方 <d>[中文] 格式，说话人标 (S1)；`
                 + `运镜可写 The camera pushes in with small amplitude at slow speed；${poolHint}`;
@@ -4987,7 +4987,7 @@ function buildCards(data) {
             }
             body.append(tabbar);
             /* 统一引用条（tab 外常驻）：chip 亮=本段已调度，点按即切换调度（可取消）；
-             * 主框下打开调度时若文本缺 [[标签]] 则顺手插入；具象化下同步追加参考条目。
+             * 主框下打开调度时若文本缺 @标签 则顺手插入；具象化下同步追加参考条目。
              * 标注徽标与资产库一致。 */
             if (node && it.idx !== undefined && pool.length) {
                 const refbar = el("div", "h3d-refrow");
@@ -4997,10 +4997,10 @@ function buildCards(data) {
                 for (const a of pool) {
                     const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
                     const on = schedNow.has(a.label);
-                    const c = el("button", "h3d-chipbtn" + (on ? " on" : ""), `${on ? "✓" : "＋"}[[${a.label}]]${roles}`);
+                    const c = el("button", "h3d-chipbtn" + (on ? " on" : ""), `${on ? "✓" : "＋"}@${a.label}${roles}`);
                     c.type = "button";
                     c.title = `${KIND_NAME[a.kind] || ""}「${a.label}」${roles}：${on ? "已调度，再点取消" : "未调度，点击调度"}` +
-                        "（主框下打开时自动补 [[标签]] 到文本；具象化下同步加参考条目）";
+                        "（主框下打开时自动补 @标签 到文本；具象化下同步加参考条目）";
                     c.onclick = () => {
                         const cur = ((getDs(node).segments || [])[it.idx] || {}).refs || [];
                         const has = cur.includes(a.label);
@@ -5013,13 +5013,13 @@ function buildCards(data) {
                         if (curTab === "v2") {
                             setPromptV2Field(node, it.idx, (pv) => {
                                 pv.references = Array.isArray(pv.references) ? pv.references : [];
-                                if (!pv.references.some((r) => r && (r.label === a.label || r.label === `[[${a.label}]]`))) {
+                                if (!pv.references.some((r) => r && (r.label === a.label || r.label === `@${a.label}`))) {
                                     pv.references.push({ label: a.label, note: roles ? roles.slice(1, -1) : "" });
                                 }
                             });
                         } else if (curTab !== "set") {
-                            if (!String(ta.value || "").includes(`[[${a.label}]]`)) {
-                                insertAtCursor(ta, `[[${a.label}]]`);
+                            if (!String(ta.value || "").includes(`@${a.label}`)) {
+                                insertAtCursor(ta, `@${a.label}`);
                                 try { debouncePromptWrite(node, it.idx, ta.value); } catch (e) {}
                             }
                         }
@@ -5459,7 +5459,7 @@ function labeledAssetCard(node, ds, idx) {
     labelInp.value = a.label;
     labelInp.spellcheck = false;
     labelInp.maxLength = 12;
-    labelInp.title = "素材标签：提示词用 [[标签]] 引用；回车或失焦提交，重名自动加后缀";
+    labelInp.title = "素材标签：提示词用 @标签 引用；回车或失焦提交，重名自动加后缀";
     const commit = () => {
         const next = renameAssetLabel(node, idx, labelInp.value);
         if (next !== labelInp.value) labelInp.value = next;
@@ -5489,7 +5489,7 @@ function labeledAssetCard(node, ds, idx) {
         + (usedBy ? `<span class="h3d-chip ok">${usedBy} 段指定</span>` : "")
         + (textDriven && (ds.segments || []).length ? '<span class="h3d-chip cyan">文本标签驱动</span>' : "");
     copy.append(labelInp, quick, usage,
-        el("small", "", `${escapeHtml(file)} · 提示词写 [[${escapeHtml(a.label)}]] → &lt;${KIND_TOKEN[kind]} k&gt;`));
+        el("small", "", `${escapeHtml(file)} · 提示词写 @${escapeHtml(a.label)} → &lt;${KIND_TOKEN[kind]} k&gt;`));
 
     const acts = el("div", "h3d-asset-acts");
     const rm = el("button", "h3d-btn h3d-btn-danger", "✕");

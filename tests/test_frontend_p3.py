@@ -399,9 +399,9 @@ def test_library_entry_and_old_gone():
 
 def test_explicit_ref_binding():
     d = _read("h3_director.js")
-    # 勾选即在正文补可见 [[标签]]（取消不删）
+    # 勾选即在正文补可见 @标签（取消不删）
     assert "ds.prompts[idx] = cur" in d
-    assert "勾选自动在正文补 [[标签]]" in d or "正文自动补 [[标签]]" in d
+    assert "勾选自动在正文补 @标签" in d or "正文自动补 @标签" in d
 
 
 def test_switch_race_guards():

@@ -182,7 +182,7 @@ def test_tool_nodes_wired_bypassed():
 def test_director_upscale_driver():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     assert "function runUpscaleTool(" in d
-    assert "⚡放大" in d
+    assert "window.H3Director" in d          # 供素材库调用的二采入口
     for sym in ['W("放大模型")', 'setW("项目名", dir)', 'setW("源文件", file)',
                 "up.mode = 0", "main.mode = 2", "await app.queuePrompt()",
                 "up.mode = prevUp", "main.mode = prevMain"]:

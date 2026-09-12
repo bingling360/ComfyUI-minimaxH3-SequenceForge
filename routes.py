@@ -25,11 +25,13 @@ PromptServer.add_routes() 只在启动时给当时已知的路由生成 /api 副
 import asyncio
 import json
 import os
+import time
 import traceback
 
 from aiohttp import web
 from folder_paths import get_output_directory
 
+from . import library as h3lib
 from . import projects
 
 _registered = False
@@ -74,6 +76,26 @@ ROUTES = [
     ("POST", "/h3chain/merge"),
     ("POST", "/h3chain/upscale_reset"),
     ("POST", "/h3chain/redo_cancel"),
+    ("POST", "/h3chain/expand"),
+    ("POST", "/h3chain/expand_validate"),
+    ("GET", "/h3chain/lib_list"),
+    ("GET", "/h3chain/lib_item"),
+    ("GET", "/h3chain/lib_thumb"),
+    ("GET", "/h3chain/lib_raw"),
+    ("GET", "/h3chain/lib_status"),
+    ("GET", "/h3chain/lib_collections"),
+    ("GET", "/h3chain/lib_zip_file"),
+    ("POST", "/h3chain/lib_scan"),
+    ("POST", "/h3chain/lib_rate"),
+    ("POST", "/h3chain/lib_tag"),
+    ("POST", "/h3chain/lib_alias"),
+    ("POST", "/h3chain/lib_collection_save"),
+    ("POST", "/h3chain/lib_collection_delete"),
+    ("POST", "/h3chain/lib_delete"),
+    ("POST", "/h3chain/lib_stage"),
+    ("POST", "/h3chain/lib_zip"),
+    ("POST", "/h3chain/lib_ref"),
+    ("POST", "/h3chain/lib_role"),
 ]
 
 _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
@@ -1140,8 +1162,395 @@ def add_routes(routes):
         return web.json_response({"ok": True, **{k: v for k, v in res.items() if k != "manifest"},
                                   "manifest": res["manifest"]})
 
+    # ---------- 素材库（Library）：一个浏览器 + 四个 scope ----------
+    # 蓝本 Majoor Assets Manager 的 API 形状；索引/查询在 library.py，
+    # 这里只做「HTTP 进出 + 本插件语义（段引用 / 角色标记）」的接线。
+
+    def _indexed(dir_name):
+        """构建索引并合入本插件语义：别名、角色标记、段引用、评分标签。"""
+        manifest = projects.read_project(dir_name) if dir_name else None
+        items = h3lib.build_index(dir_name)
+        h3lib.apply_aliases(items, manifest)
+        h3lib.apply_roles(items, manifest)
+        h3lib.compute_refs(manifest, items)
+        return h3lib.apply_meta(items, dir_name)
+
+    def _find_item(dir_name, item_id):
+        for e in _indexed(dir_name):
+            if e["id"] == item_id:
+                return e
+        return None
+
+    async def lib_list(request):
+        q = request.query
+        dir_name = str(q.get("dir") or "")
+        items = _indexed(dir_name)
+        coll = None
+        cid = str(q.get("collection") or "")
+        if cid:
+            coll = []
+            for c in h3lib.list_collections(dir_name):
+                if str(c.get("id")) == cid:
+                    coll = [str(x) for x in (c.get("items") or [])]
+                    break
+        data = h3lib.query(
+            items, q=q.get("q"), scope=q.get("scope"), kind=q.get("kind"),
+            sort=q.get("sort"), order=q.get("order"),
+            page=q.get("page"), page_size=q.get("page_size"),
+            collection=coll, seg=q.get("seg"))
+        return web.json_response({"ok": True, "data": data,
+                                  "counters": h3lib.counters(items)})
+
+    async def lib_item(request):
+        q = request.query
+        dir_name = str(q.get("dir") or "")
+        it = _find_item(dir_name, str(q.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        out = dict(it)
+        out["exists"] = bool(h3lib.resolve_item_path(it, dir_name))
+        return web.json_response({"ok": True, "item": out})
+
+    async def lib_thumb(request):
+        q = request.query
+        dir_name = str(q.get("dir") or "")
+        it = _find_item(dir_name, str(q.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        src = h3lib.resolve_item_path(it, dir_name)
+        if not src:
+            return _err("文件缺失", code="NOT_FOUND", status=404)
+        p = h3lib.make_thumb(src, None if it["scope"] == "global" else dir_name,
+                             it["id"], it["kind"])
+        if not p:
+            return _err("无缩略图（非图片或缺 Pillow）", code="NO_THUMB", status=404)
+        return web.FileResponse(p)
+
+    async def lib_raw(request):
+        q = request.query
+        dir_name = str(q.get("dir") or "")
+        it = _find_item(dir_name, str(q.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        src = h3lib.resolve_item_path(it, dir_name)
+        if not src:
+            return _err("文件缺失", code="NOT_FOUND", status=404)
+        return web.FileResponse(src)
+
+    async def lib_status(request):
+        dir_name = str(request.query.get("dir") or "")
+        items = _indexed(dir_name)
+        return web.json_response({"ok": True, "counters": h3lib.counters(items),
+                                  "total": len(items),
+                                  "collections": h3lib.list_collections(dir_name)})
+
+    async def lib_scan(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        dir_name = str(data.get("dir") or "")
+        if dir_name:
+            h3lib.invalidate(dir_name)
+        else:
+            h3lib.invalidate()
+        items = _indexed(dir_name)
+        return web.json_response({"ok": True, "counters": h3lib.counters(items),
+                                  "total": len(items)})
+
+    async def lib_rate(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        it = _find_item(dir_name, str(data.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        scope, proj = h3lib.meta_target(it, dir_name)
+        try:
+            r = h3lib.set_rating(scope, proj, it["id"], data.get("rating"))
+        except ValueError as e:
+            return _err(str(e), code="BAD_ARGS", status=400)
+        return web.json_response({"ok": True, **r})
+
+    async def lib_tag(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        it = _find_item(dir_name, str(data.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        scope, proj = h3lib.meta_target(it, dir_name)
+        try:
+            r = h3lib.set_tags(scope, proj, it["id"], data.get("tags"))
+        except ValueError as e:
+            return _err(str(e), code="BAD_ARGS", status=400)
+        return web.json_response({"ok": True, **r})
+
+    async def lib_alias(request):
+        """改显示名：项目资产改 manifest.assets[].label，全局库改 orig_name。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        alias = str(data.get("alias") or "").strip()[:24]
+        if not alias:
+            return _err("别名不能为空", code="BAD_ARGS", status=400)
+        it = _find_item(dir_name, str(data.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        if it["scope"] == "global":
+            root = h3lib._library_root()
+            if not root:
+                return _err("全局库不可用", code="NO_LIBRARY", status=400)
+            try:
+                from . import asset_store
+            except ImportError:
+                import asset_store
+            mf = asset_store.load_library(root)
+            hit = False
+            for a in mf.get("assets") or []:
+                if isinstance(a, dict) and str(a.get("asset_id")) == it.get("asset_id"):
+                    a["orig_name"] = alias
+                    a["updated_at"] = time.time()
+                    hit = True
+                    break
+            if not hit:
+                return _err("全局库条目不存在", code="NOT_FOUND", status=404)
+            asset_store.save_library(root, mf)
+        else:
+            mf = projects.read_project(dir_name)
+            if mf is None:
+                return _err("项目不存在", code="NOT_FOUND", status=404)
+            assets = [dict(a) if isinstance(a, dict) else a for a in (mf.get("assets") or [])]
+            links, hit = [], False
+            for a in assets:
+                if isinstance(a, dict) and str(a.get("label")) == it["name"]:
+                    a["label"] = alias
+                    hit = True
+            for L in mf.get("asset_links") or []:
+                if isinstance(L, dict) and str(L.get("alias")) == it["name"]:
+                    L = dict(L)
+                    L["alias"] = alias
+                    hit = True
+                links.append(L)
+            if not hit:
+                return _err("该素材未登记在项目清单（先「入库」或「调入项目」）",
+                            code="NOT_IN_PROJECT", status=400)
+            try:
+                out = projects.save_assets(dir_name, assets, data.get("base_revision"))
+            except ValueError as e:
+                return _err(str(e), code="REVISION_CONFLICT", status=409)
+            if out is None:
+                return _err("保存失败", code="BAD_ARGS", status=400)
+        h3lib.invalidate(dir_name)
+        return web.json_response({"ok": True, "alias": alias})
+
+    async def lib_collections(request):
+        return web.json_response({"ok": True,
+                                  "collections": h3lib.list_collections(
+                                      str(request.query.get("dir") or ""))})
+
+    async def lib_collection_save(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            c = h3lib.save_collection(str(data.get("dir") or ""), data.get("name"),
+                                      data.get("items"), data.get("id"))
+        except ValueError as e:
+            return _err(str(e), code="BAD_ARGS", status=400)
+        return web.json_response({"ok": True, "collection": c})
+
+    async def lib_collection_delete(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        if not h3lib.delete_collection(str(data.get("dir") or ""), data.get("id")):
+            return _err("集合不存在", code="NOT_FOUND", status=404)
+        return web.json_response({"ok": True})
+
+    async def lib_delete(request):
+        """删除物理文件；项目清单里的引用由前端确认后各自清理。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        raw = data.get("ids")
+        ids = [str(x) for x in raw] if isinstance(raw, list) else \
+            ([str(data["id"])] if data.get("id") else [])
+        paths = []
+        for i in ids:
+            it = _find_item(dir_name, i)
+            if it is None:
+                continue
+            p = h3lib.resolve_item_path(it, dir_name)
+            if p:
+                paths.append(p)
+        res = h3lib.delete_items(paths)
+        h3lib.invalidate(dir_name)
+        return web.json_response({"ok": True, **res, "requested": len(ids)})
+
+    async def lib_stage(request):
+        """把素材复制进 ComfyUI input 目录（原生 LoadImage/LoadVideo 只认 input）。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        it = _find_item(dir_name, str(data.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        src = h3lib.resolve_item_path(it, dir_name)
+        if not src:
+            return _err("文件缺失", code="NOT_FOUND", status=404)
+        try:
+            res = h3lib.stage_to_input(src, data.get("subdir") or "h3_staged")
+        except Exception as e:
+            return _err(f"暂存失败：{e}", code="STAGE_FAILED", status=500)
+        return web.json_response({"ok": True, **res})
+
+    async def lib_zip(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        raw = data.get("ids")
+        ids = [str(x) for x in raw] if isinstance(raw, list) else []
+        paths = []
+        for i in ids:
+            it = _find_item(dir_name, i)
+            if it is None:
+                continue
+            p = h3lib.resolve_item_path(it, dir_name)
+            if p:
+                paths.append(p)
+        try:
+            res = h3lib.make_zip(paths, dir_name or None)
+        except ValueError as e:
+            return _err(str(e), code="BAD_ARGS", status=400)
+        return web.json_response({"ok": True, **res})
+
+    async def lib_zip_file(request):
+        q = request.query
+        name = os.path.basename(str(q.get("name") or ""))
+        dir_name = str(q.get("dir") or "")
+        if not name or not dir_name:
+            return _err("参数非法", code="BAD_ARGS", status=400)
+        p = os.path.join(get_output_directory(), "h3_projects", dir_name, "_h3_zips", name)
+        if not os.path.isfile(p):
+            return _err("压缩包不存在", code="NOT_FOUND", status=404)
+        return web.FileResponse(p, headers={
+            "Content-Disposition": f'attachment; filename="{name}"'})
+
+    async def lib_ref(request):
+        """把素材引用到某段（写段 refs）。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        it = _find_item(dir_name, str(data.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        try:
+            seg_no = int(data.get("seg") or 0)
+        except (TypeError, ValueError):
+            seg_no = 0
+        if seg_no < 1:
+            return _err("段号非法", code="BAD_ARGS", status=400)
+        mf = projects.read_project(dir_name)
+        if mf is None:
+            return _err("项目不存在", code="NOT_FOUND", status=404)
+        segs = [dict(s) if isinstance(s, dict) else {} for s in (mf.get("segments") or [])]
+        while len(segs) < seg_no:
+            segs.append({})
+        key = it["asset_id"] if it.get("asset_id") else it["name"]
+        cur = list(segs[seg_no - 1].get("refs") or [])
+        if key not in cur:
+            cur.append(key)
+        segs[seg_no - 1]["refs"] = cur
+        try:
+            out = projects.save_prompts(dir_name, mf.get("prompts") or [], segs,
+                                        data.get("base_revision"))
+        except ValueError as e:
+            return _err(str(e), code="REVISION_CONFLICT", status=409)
+        if out is None:
+            return _err("保存失败", code="BAD_ARGS", status=400)
+        h3lib.invalidate(dir_name)
+        return web.json_response({"ok": True, "refs": cur, "revision": out.get("revision")})
+
+    async def lib_role(request):
+        """首帧图 / 尾帧图打标（全库唯一，改标自动让位）。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        role = str(data.get("role") or "")
+        if role not in ("首帧图", "尾帧图"):
+            return _err("role 非法", code="BAD_ARGS", status=400)
+        it = _find_item(dir_name, str(data.get("id") or ""))
+        if it is None:
+            return _err("素材不存在", code="NOT_FOUND", status=404)
+        mf = projects.read_project(dir_name)
+        if mf is None:
+            return _err("项目不存在", code="NOT_FOUND", status=404)
+        assets = [dict(a) if isinstance(a, dict) else a for a in (mf.get("assets") or [])]
+        hit = None
+        for a in assets:
+            if isinstance(a, dict) and str(a.get("label")) == it["name"]:
+                hit = a
+                break
+        if hit is None:
+            return _err("该素材不在项目资产里（全局库条目请先「调入项目」）",
+                        code="NOT_IN_PROJECT", status=400)
+        cur = [str(r) for r in (hit.get("roles") or [])]
+        if role in cur:
+            cur = [r for r in cur if r != role]
+        else:
+            for a in assets:
+                if isinstance(a, dict) and isinstance(a.get("roles"), list) and role in a["roles"]:
+                    a["roles"] = [r for r in a["roles"] if r != role]
+            cur.append(role)
+        hit["roles"] = cur
+        try:
+            out = projects.save_assets(dir_name, assets, data.get("base_revision"))
+        except ValueError as e:
+            return _err(str(e), code="REVISION_CONFLICT", status=409)
+        if out is None:
+            return _err("保存失败", code="BAD_ARGS", status=400)
+        h3lib.invalidate(dir_name)
+        return web.json_response({"ok": True, "roles": cur, "revision": out.get("revision")})
+
     handlers = [
         ("GET", "/h3chain/ping", ping),
+        ("GET", "/h3chain/lib_list", lib_list),
+        ("GET", "/h3chain/lib_item", lib_item),
+        ("GET", "/h3chain/lib_thumb", lib_thumb),
+        ("GET", "/h3chain/lib_raw", lib_raw),
+        ("GET", "/h3chain/lib_status", lib_status),
+        ("GET", "/h3chain/lib_collections", lib_collections),
+        ("GET", "/h3chain/lib_zip_file", lib_zip_file),
+        ("POST", "/h3chain/lib_scan", lib_scan),
+        ("POST", "/h3chain/lib_rate", lib_rate),
+        ("POST", "/h3chain/lib_tag", lib_tag),
+        ("POST", "/h3chain/lib_alias", lib_alias),
+        ("POST", "/h3chain/lib_collection_save", lib_collection_save),
+        ("POST", "/h3chain/lib_collection_delete", lib_collection_delete),
+        ("POST", "/h3chain/lib_delete", lib_delete),
+        ("POST", "/h3chain/lib_stage", lib_stage),
+        ("POST", "/h3chain/lib_zip", lib_zip),
+        ("POST", "/h3chain/lib_ref", lib_ref),
+        ("POST", "/h3chain/lib_role", lib_role),
         ("GET", "/h3chain/busy", busy_state),
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),

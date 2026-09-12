@@ -93,7 +93,8 @@ def routes(projects, store, checkpoint):
                       ("from . import transcode_queue as _tq", "import transcode_queue as _tq"),
                       ("from . import transcode_queue", "import transcode_queue"),
                       ("from . import checkpoint as _ckpt", "import checkpoint as _ckpt"),
-                      ("from . import prompts as _prompts", "import prompts as _prompts")])
+                      ("from . import prompts as _prompts", "import prompts as _prompts"),
+                      ("from . import library as h3lib", "import library as h3lib")])
 
 
 class _Router:
@@ -314,15 +315,19 @@ def _read(web_file):
     return open(os.path.join(ROOT, "web", web_file), encoding="utf-8").read()
 
 
-def test_director_tiles():
+def test_library_browser_ui():
+    """新素材库：瓦片只放缩略图 + 徽标，动作收进右键菜单 / 预览器。"""
+    lib = _read("h3_library.js")
+    for sym in ["window.H3Lib", "h3l-scope", "h3l-grid", "h3l-tile", "h3l-menu",
+                "h3l-viewer", "h3l-thumb", "IntersectionObserver",
+                "function openMenu(", "function openViewer(",
+                "libList", "libThumbUrl", "libRawUrl", "libStage", "libZip",
+                "libRef", "libRole"]:
+        assert sym in lib, sym
     d = _read("h3_director.js")
-    for sym in ["h3d-tilegrid", "h3d-tile", "h3d-tseg", "h3d-tuse", "h3d-tlabel",
-                "h3d-dropzone", "upgradeTileTags", "uploadLibFile", "mirrorGlobalEntry"]:
-        assert sym in d, sym
-    assert 'chip.dataset.seg' in d and 'chip.dataset.label' in d
-    assert "assetPreviewUrl(dir, a.file, a.asset_id)" in d
-    assert "⇩调入项目" in d and "assetMirror" in d
-    assert "ondrop" in d and "dataTransfer" in d
+    assert "window.H3Lib.open" in d          # 入口改为调用新浏览器
+    for gone in ["h3d-tilegrid", "h3d-kindcols", "h3d-dropzone", "renderLibAssets"]:
+        assert gone not in d, gone
 
 
 def test_director_atcomplete():
@@ -352,11 +357,15 @@ def test_director_link_sync():
 
 
 def test_director_legacy_intact():
+    """三库下线后仍要留住的通用件（折叠框 / 预览地址 / 入口 / 画布镜像）。"""
     d = _read("h3_director.js")
-    for sym in ["function importPoolFile", "assetCheck(pool",
-                "function openTrimSub",  # 成片库仍保留帧窗裁剪
-                '"图像+音频"', '"仅图像"', '"仅音频"']:
+    for sym in ["function foldBox(", "function assetPreviewUrl(",
+                "function renderV2Section(", "window.H3Lib.open",
+                "window.H3Director", "syncMirrors"]:
         assert sym in d, sym
+    for gone in ["function openTrimSub", "function renderLibFinals",
+                 "function renderLibLatent", "function renderLibAssets"]:
+        assert gone not in d, gone
 
 
 def test_helpers_api():
@@ -371,20 +380,16 @@ def test_helpers_api():
         assert sym in api, sym
 
 
-def test_library_fullscreen_folds():
+def test_library_entry_and_old_gone():
+    """导演台只留入口；旧三库面板（全屏 libbox / 三栏 kindcols / 瓦片网格）全下线。"""
     d = _read("h3_director.js")
-    for sym in ["function foldBox(", "function kindCol(", "_foldState",
-                "h3d-libfold", "h3d-kindcols", "h3d-kindcol",
-                "lib-assets-global", "全局资产库", "lib-assets-project", "项目资产库",
-                "lib-assets-clips", "lib-assets-reg",
-                "lib-finals-", "lib-latent-list", "lib-latent-slice",
-                "proj-list", "项目存档（",
-                "width:min(1560px,100%)", "h3d-libbox .h3d-btn"]:
+    for sym in ["function renderV2Section(", "window.H3Lib.open",
+                "function foldBox(", "h3d-libfold", "proj-list", "项目存档（"]:
         assert sym in d, sym
-    # 旧的小面板尺寸必须消失（否则层叠覆盖全屏规则）
-    assert "width:min(1060px,96vw)" not in d
-    # 图/视/音三栏嵌套已取消（瓦片被挤到看不见子面板/按钮的根因）
-    assert "h3d-kindcols{display:grid;grid-template-columns:repeat(3" not in d
+    for gone in ["h3d-libbox", "h3d-libhead", "h3d-libtab", "h3d-libbody",
+                 "h3d-kindcols", "h3d-kindcol", "h3d-tilegrid", "h3d-dropzone",
+                 "h3d-prog", "h3d-jstat", "width:min(1060px,96vw)"]:
+        assert gone not in d, gone
 
 
 def test_explicit_ref_binding():
@@ -414,8 +419,13 @@ def test_switch_race_guards():
     assert "await refresh();" in d
 
 
-def test_library_hydration():
-    d = _read("h3_director.js")
-    assert "function mergeServerPool(" in d
-    assert "mergeServerPool(node, dir, mf)" in d
-    assert "byId.get" in d or "byId" in d
+def test_library_backend_index():
+    """索引层：四 scope + 分页契约 + 语义合入（角色 / 段引用 / 元数据 sidecar）。"""
+    src = open(os.path.join(ROOT, "library.py"), encoding="utf-8").read()
+    for sym in ['SCOPES = ("project", "global", "finals", "latent")',
+                "def build_index(", "def scan_scope(", "def query(",
+                "def apply_aliases(", "def compute_refs(", "def apply_roles(",
+                "def apply_meta(", "def stage_to_input(", "def make_zip(",
+                "def make_thumb(", "def load_meta(", "def save_meta(",
+                "total_pages", "page_size"]:
+        assert sym in src, sym

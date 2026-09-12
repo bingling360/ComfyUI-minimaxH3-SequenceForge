@@ -932,8 +932,8 @@ function toggleSegmentFrameRef(node, idx, name) {
 }
 
 /* ---- 资产池维护（状态驱动 + 配套工作流 LoadImage 镜像点亮/隐藏） ----
- * 旧三槽位上传（setFirstFrame/setEndFrame/setLastFrame/addAsset）已删除：
- * 统一走 uploadPoolFile（上传即入库进项目 assets/）。 */
+ * 旧三槽位上传（setFirstFrame/setEndFrame/setLastFrame/addAsset）已删除；
+ * 素材的上传 / 入库 / 引用统一在「素材库」浏览器（web/h3_library.js）里做。 */
 
 /* 素材池改动直写项目 manifest["assets"]（读最新 revision 落盘，冲突返回 false 调手动保存）。
  * P3：带 asset_id 的全局链接条目住 asset_links，不进 legacy assets（保存时剥离）。 */
@@ -1435,7 +1435,7 @@ async function loadDefaultWorkflow() {
     scheduleRefresh(300);
 }
 
-/* pickAsset 已删除：旧三槽位上传入口随资产标注化下线，统一走 uploadPoolFile（上传即入库）。 */
+/* pickAsset 已删除：旧三槽位上传入口随资产标注化下线，上传改由「素材库」承担。 */
 
 /* ---- 插入视频段前端已废弃（彻底删除 UI；后端 ds.inserts 解析/存档保留，
  *  旧项目数据不丢失；后续 latent 注入框架在分段设置里重做）。
@@ -3313,23 +3313,6 @@ function injectStyles() {
     .h3d-chipbtn{padding:2px 9px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
-    /* ---- 三库全屏子面板 ---- */
-    .h3d-libbox{width:min(1560px,100%);height:100%;max-height:100%;display:flex;flex-direction:column;background:var(--h3d-panel);border:1px solid var(--h3d-line);border-radius:14px;overflow:hidden}
-    .h3d-libhead{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--h3d-line);background:#1b1a16;flex-wrap:wrap}
-    .h3d-libhead strong{font-size:14px}
-    .h3d-libtab{padding:5px 14px;border:1px solid #3a352c;border-radius:14px;background:#1b1a16;color:#a8a294;cursor:pointer;font-size:12px;font-family:inherit}
-    .h3d-libtab.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
-    .h3d-libbody{padding:16px 18px;overflow:auto;display:grid;gap:14px;align-content:start}
-    .h3d-librow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;border:1px solid #37332b;border-radius:8px;background:#181712}
-    .h3d-librow video{width:180px;max-height:100px;border-radius:6px;background:#000}
-    .h3d-librow img{width:64px;height:64px;border-radius:6px;object-fit:cover;background:#000}
-    .h3d-libname{font-size:12px;word-break:break-all;flex:1;min-width:140px}
-    .h3d-libmeta{font-size:10.5px;color:var(--h3d-muted)}
-    .h3d-libctl{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-    .h3d-libctl input{width:76px;border:1px solid #3a352c;border-radius:5px;background:#211f1a;color:var(--h3d-bone);padding:3px 5px;font:11px ui-monospace,Consolas;outline:none}
-    .h3d-libctl select{border:1px solid #3a352c;border-radius:5px;background:#211f1a;color:var(--h3d-bone);padding:3px 5px;font-size:11px;outline:none}
-    .h3d-libsec{font-size:12px;font-weight:700;color:var(--h3d-cyan);margin-top:4px}
-    .h3d-libbusy{padding:8px 10px;border:1px solid #7a5f36;border-radius:7px;background:#352a19;color:#e9c07a;font-size:12px}
     .h3d-hubrow{display:flex;gap:8px;flex-wrap:wrap}
     .h3d-hubbtn{flex:1;min-width:120px;padding:10px;border:1px solid #37332b;border-radius:9px;background:#181712;color:var(--h3d-bone);cursor:pointer;font-size:13px;font-family:inherit;text-align:center}
     .h3d-hubbtn:hover{border-color:var(--h3d-cyan)}
@@ -3342,38 +3325,16 @@ function injectStyles() {
     .h3d-quicklbl button{padding:2px 7px;border:1px solid #3a352c;border-radius:10px;background:#25221c;color:#a39d90;cursor:pointer;font-size:10px;font-family:inherit}
     .h3d-quicklbl button:hover{border-color:#46604f;color:#d9d4c9}
     .h3d-asset-usage{margin-top:5px;display:flex;gap:4px;flex-wrap:wrap}
-    /* ---- P5 全屏三库：大面板 + 大按钮 + 伸缩框 ---- */
-    .h3d-libbox .h3d-btn{padding:9px 18px;font-size:13.5px}
-    .h3d-libbox .h3d-tbtns .h3d-btn{padding:5px 12px;font-size:12px}
-    .h3d-libbox .h3d-tseg{padding:3px 12px;font-size:11.5px}
+
+    /* ---- 伸缩框（foldBox：项目存档等折叠面板） ---- */
     .h3d-libfold{border:1px solid #37332b;border-radius:12px;background:#141310;overflow:hidden}
     .h3d-libfold>summary.h3d-libfoldsum{cursor:pointer;padding:13px 16px;font-size:14.5px;font-weight:700;list-style:none;user-select:none}
     .h3d-libfold>summary.h3d-libfoldsum::-webkit-details-marker{display:none}
     .h3d-libfold>summary.h3d-libfoldsum::before{content:"▸ ";color:var(--h3d-muted)}
     .h3d-libfold[open]>summary.h3d-libfoldsum::before{content:"▾ ";color:var(--h3d-cyan)}
     .h3d-libfoldbody{padding:4px 14px 14px;display:grid;gap:12px}
-    /* 单列堆叠：取消 图/视/音 三栏嵌套——原来三栏里再 auto-fill 150px，
-     * 瓦片被压到按钮溢出换行、行内子面板窄成一条线（"展开后功能看不到"的根因） */
-    .h3d-kindcols{display:grid;grid-template-columns:1fr;gap:14px}
-    .h3d-kindcol{min-width:0;border:1px dashed #2e2a24;border-radius:10px;padding:10px;display:grid;gap:8px;align-content:start}
-    .h3d-kindcol>h4{margin:0;font-size:13px;color:var(--h3d-bone)}
-    /* ---- P3 资产瓦片网格 + @补全 + 任务进度 ---- */
-    .h3d-tilegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px}
-    .h3d-tile{display:flex;flex-direction:column;gap:5px;padding:7px;border:1px solid #37332b;border-radius:9px;background:#181712;min-width:0}
-    .h3d-tile.h3d-drop{border-color:var(--h3d-cyan);box-shadow:0 0 0 1px var(--h3d-cyan) inset}
-    .h3d-tile img{width:100%;height:96px;border-radius:6px;object-fit:cover;background:#000}
-    .h3d-tile video{width:100%;max-height:96px;border-radius:6px;background:#000}
-    .h3d-tile .h3d-ticon{font-size:30px;text-align:center;line-height:64px;background:#0d0c0a;border-radius:6px}
-    .h3d-tlabel{font:600 12px "Microsoft YaHei UI","Segoe UI",sans-serif;word-break:break-all}
-    .h3d-tmeta{font-size:10px;color:var(--h3d-muted);word-break:break-all}
-    .h3d-troles{font-size:10.5px;color:#7fd6a8}
-    .h3d-tuse{display:flex;gap:3px;flex-wrap:wrap}
-    .h3d-tseg{padding:1px 7px;border:1px solid #2f6e57;border-radius:9px;background:#12291f;color:#7fe0b0;cursor:pointer;font-size:10px;font-family:inherit}
-    .h3d-tseg:hover{filter:brightness(1.3)}
-    .h3d-tbtns{display:flex;gap:4px;flex-wrap:wrap}
-    .h3d-tbtns .h3d-btn{padding:2px 8px;font-size:11px}
-    .h3d-dropzone{border:1px dashed #46604f;border-radius:9px;padding:10px;text-align:center;color:var(--h3d-muted);font-size:11.5px;background:#1f2a23}
-    .h3d-dropzone.h3d-drop{border-color:var(--h3d-cyan);color:var(--h3d-cyan)}
+
+    /* ---- @ 补全弹层 ---- */
     .h3d-atpop{position:fixed;z-index:99999;min-width:180px;max-width:300px;max-height:240px;overflow:auto;background:#1b1a16;border:1px solid #46604f;border-radius:8px;padding:4px;box-shadow:0 6px 22px #000a}
     .h3d-atpop div{padding:5px 8px;border-radius:5px;cursor:pointer;font-size:12px;color:#d9d4c9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-atpop div small{color:var(--h3d-muted);margin-left:6px}
@@ -3738,7 +3699,7 @@ function updateDesk(data) {
     z.project.textContent = `项目 · ${dirName}`;
     paintLeds();
 
-    /* 左栏：项目与链（含素材三库入口；资产管理已并入全屏子面板） */
+    /* 左栏：项目与链（含「素材库」入口，见 renderV2Section） */
     renderLeftColumn(z.lProj, data);
 
     /* 中栏：状态条 + 进度轨 + 段落卡片（有编辑器/播放中时跳过重渲） */
@@ -3889,161 +3850,44 @@ function renderLeftColumn(sec, data) {
     renderV2Section(sec, data);
 }
 
-/* ---- 三库入口（左下角）：资产库 / 成片库 / latent 库全屏子面板 ----
- * 取代旧 v2 扩展区：点击按钮进入导演台全屏子面板做素材管理与裁剪；
- * 生成中剪辑入口锁定（后端 423 + 前端置灰横幅）。 */
+/* ---- 素材库入口（左下角）：一个浏览器 + 四个 scope ----
+ * 蓝本 Majoor Assets Manager：瓦片只放缩略图 + 徽标，动作全部收进右键菜单 / 预览器。
+ * 真正的 UI 在 web/h3_library.js（window.H3Lib.open）。 */
 function renderV2Section(sec, data) {
     try {
         const { state, mf, ds } = data || {};
         const dir = state?.dir || "";
         sec.append(el("div", "h3d-sechead",
-            "<strong>素材三库</strong><small>资产 · 成片 · latent（全屏管理）</small>"));
+            "<strong>素材库</strong><small>项目资产 · 全局库 · 成片 · latent（同一个浏览器）</small>"));
         const hub = el("div", "h3d-hubrow");
-        const counts = [
-            ["assets", "📦 资产库", `${(ds?.ref_assets || []).length} 素材 · 点标签即引用`],
-            ["finals", "🎬 成片库", `分段×${(mf?.videos || []).filter(Boolean).length} · 成片×${(mf?.finals || []).length}`],
-            ["latent", "🧬 latent库", `latent×${(mf?.latents || []).length} · 片段×${(mf?.clips || []).length}`],
-        ];
-        for (const [tab, label, sub] of counts) {
-            const b = el("button", "h3d-hubbtn", `${escapeHtml(label)}<small>${escapeHtml(sub)}</small>`);
-            b.type = "button";
-            b.title = "进入导演台全屏子面板做素材管理与裁剪" + (dir ? "" : "（先新建/读档一个项目）");
-            b.onclick = () => openLibraryHub(tab);
-            hub.append(b);
-        }
+        const nAsset = (ds?.ref_assets || []).length;
+        const nFin = (mf?.videos || []).filter(Boolean).length + (mf?.finals || []).length
+            + (mf?.merges || []).length;
+        const nLat = (mf?.latents || []).length;
+        const b = el("button", "h3d-hubbtn",
+            "🗂 打开素材库" +
+            `<small>资产 ${nAsset} · 成片 ${nFin} · latent ${nLat} · 可搜索 / 筛选 / 批量</small>`);
+        b.type = "button";
+        b.title = dir ? "浏览与管理全部素材（右键 = 动作菜单，双击 = 预览）" : "先新建 / 读档一个项目";
+        b.onclick = () => {
+            if (!dir) { alert("先新建 / 读档一个项目"); return; }
+            if (!window.H3Lib) { alert("素材库前端未加载（web/h3_library.js）"); return; }
+            window.H3Lib.open({
+                dir,
+                seg: (typeof _selSeg === "number" ? _selSeg : 0) + 1,
+                onChanged: () => scheduleRefresh(300),
+            });
+        };
+        hub.append(b);
         sec.append(hub);
-        sec.append(el("div", "h3d-foot", "资产标签点选即插入提示词；成片/latent 行内剪辑仅非生成期可用（生成中锁定）；库间可互调。"));
+        sec.append(el("div", "h3d-foot",
+            "素材按「缩略图 + 徽标」铺网格；引用到段 / 标注首尾帧 / 调入项目 / 暂存 input 都在右键菜单里。"));
     } catch (e) {
-        try { sec.append(el("div", "h3d-empty", "三库入口加载失败（不影响主功能）")); } catch (_) { /* 空 */ }
+        try { sec.append(el("div", "h3d-empty", "素材库入口加载失败（不影响主功能）")); } catch (_) { /* 空 */ }
     }
 }
 
-/* ---- 三库全屏子面板：资产库 / 成片库 / latent 库 ----
- * 数据现取（节点 ds + manifest.json），操作走 H3Api/H3Latent；
- * 生成中后端回 423，前端横幅 + 按钮置灰（isBusy 预检）。 */
-async function openLibraryHub(tab) {
-    try {
-        const node = findNode();
-        if (!node) { alert("画布上未找到 H3 节点"); return; }
-        const dir = getDirValue(node);
-        if (!dir) { alert("先新建/读档一个项目"); return; }
-        if (document.querySelector(".h3d-libbox")) return;
-        const overlay = el("div", "h3d-viewer");
-        const box = el("div", "h3d-libbox");
-        const head = el("div", "h3d-libhead");
-        head.append(el("strong", "", "素材三库"));
-        const body = el("div", "h3d-libbody");
-        const tabs = [["assets", "📦 资产库"], ["finals", "🎬 成片库"], ["latent", "🧬 latent库"]];
-        let cur = tab || "assets";
-        const paintHead = () => {
-            head.querySelectorAll(".h3d-libtab").forEach((n) => n.remove());
-            const anchor = head.querySelector(".h3d-libmeta");
-            for (const [k, label] of tabs) {
-                const b = el("button", "h3d-libtab" + (k === cur ? " on" : ""), label);
-                b.type = "button";
-                b.onclick = async () => { cur = k; paintHead(); await paintBody(); };
-                if (anchor) head.insertBefore(b, anchor);
-                else head.append(b);
-            }
-        };
-        const refreshBtn = el("button", "h3d-close", "↻");
-        refreshBtn.title = "刷新本页（上传/替换文件后点此同步最新状态）";
-        refreshBtn.onclick = async () => { await paintBody(); };
-        const close = el("button", "h3d-close", "✕");
-        close.title = "关闭（Esc）";
-        close.onclick = () => { overlay.remove(); scheduleRefresh(300); };
-        head.append(el("span", "h3d-libmeta", `项目 ${dir}`), refreshBtn, close);
-        box.append(head, body);
-        overlay.append(box);
-        overlay.addEventListener("pointerdown", (e) => {
-            if (e.target === overlay) { overlay.remove(); scheduleRefresh(300); }
-        });
-        overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
-        document.body.append(overlay);
-        const paintBody = async () => {
-            body.replaceChildren(el("div", "h3d-empty", "加载中…"));
-            const mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
-            // hydration：服务端资产回填 widget（新开页面 widget 是工作流文件里的
-            // 旧池，不回填就一片空白；widget 优先、asset_id 对齐，不丢本地改动）
-            let ds = getDs(node);
-            try { ds = await mergeServerPool(node, dir, mf); } catch (e) {
-                console.warn("[h3-director] mergeServerPool failed:", e);
-            }
-            const busy = window.H3Latent ? await window.H3Latent.isBusy() : false;
-            body.replaceChildren();
-            if (busy) body.append(el("div", "h3d-libbusy", "⏳ 正在生成中：剪辑/转码/移动入口已锁定，完成后自动解锁（本面板仅可浏览）。"));
-            const out = el("pre", "h3d-v2out", "");
-            out.style.display = "none";
-            const say = (t) => { out.style.display = ""; out.textContent = String(t); };
-            if (cur === "assets") renderLibAssets(body, node, dir, ds, mf, busy, say, paintBody);
-            else if (cur === "finals") renderLibFinals(body, node, dir, ds, mf, busy, say, paintBody);
-            else renderLibLatent(body, node, dir, ds, mf, busy, say, paintBody);
-            body.append(out);
-        };
-        paintHead();
-        await paintBody();
-        close.focus();
-    } catch (e) { alert("三库面板打开失败：" + (e?.message || e)); }
-}
-
-/* 服务端资产回填 widget（hydration）：manifest.assets + asset_links 并入池子。
- * widget 优先：同 asset_id 只补 file；同 alias 链接覆盖 legacy（与后端首胜一致）；
- * 两边都没有的追加。无 file 的链接跳过（无法预览也无法执行）。
- * 新开页面/换浏览器时 widget 是工作流文件里的旧池，不回填则资产库空白。 */
-async function mergeServerPool(node, dir, mf) {
-    const ds = getDs(node);
-    const pool = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
-    const byId = new Map();
-    const byLabel = new Map();
-    for (const a of pool) {
-        if (!a) continue;
-        if (a.asset_id) byId.set(a.asset_id, a);
-        byLabel.set(a.label, a);
-    }
-    let changed = false;
-    const normKind = (k) => (KIND_LIST.includes(k) ? k : "image");
-    const normRoles = (r) => (Array.isArray(r)
-        ? r.map(String).filter((x) => x === "首帧图" || x === "尾帧图") : []);
-    for (const a of (mf?.assets || [])) {
-        if (!a || !a.file || !a.label || byLabel.has(String(a.label))) continue;
-        const ent = {
-            file: String(a.file), kind: normKind(a.kind),
-            label: String(a.label), asset_id: "", roles: normRoles(a.roles),
-        };
-        pool.push(ent);
-        byLabel.set(ent.label, ent);
-        changed = true;
-    }
-    try {
-        const lr = await window.H3Api?.assetLinks?.(dir);
-        const links = (lr?.body?.ok && lr.body.links) || [];
-        for (const L of links) {
-            const alias = String(L?.alias || "");
-            if (!alias) continue;
-            const aid = String(L?.asset_id || "");
-            const mine = (aid && byId.get(aid)) || null;
-            if (mine) {
-                if (!mine.file && L.file) { mine.file = String(L.file); changed = true; }
-                continue;
-            }
-            if (!L.file) continue;
-            const ent = {
-                file: String(L.file), kind: normKind(L.kind), label: alias,
-                asset_id: aid, roles: normRoles(L.roles),
-            };
-            const at = pool.findIndex((x) => x && x.label === alias);
-            if (at >= 0) pool[at] = ent;
-            else pool.push(ent);
-            byLabel.set(alias, ent);
-            if (aid) byId.set(aid, ent);
-            changed = true;
-        }
-    } catch (e) { console.warn("[h3-director] assetLinks fetch failed:", e); }
-    if (changed) setDs(node, ds);
-    return getDs(node);
-}
-
-/* P5 伸缩框（状态常驻内存，重绘不丢失折叠态） */
+/* 伸缩框（状态常驻内存，重绘不丢失折叠态） */
 const _foldState = {};
 function foldBox(id, title, defaultOpen) {
     const det = document.createElement("details");
@@ -4056,307 +3900,9 @@ function foldBox(id, title, defaultOpen) {
     return { det, box };
 }
 
-function kindCol(title, gridEl, emptyTxt) {
-    const col = el("div", "h3d-kindcol");
-    col.append(el("h4", "", title));
-    if (gridEl.children.length) col.append(gridEl);
-    else col.append(el("div", "h3d-empty", emptyTxt));
-    return col;
-}
-
 /* 资产库：链路说明 + 旧槽迁移 + 素材池（标注/引用/移除/剪辑/转码/入库）+ 登记表
  * 原左栏「素材池 · 分段处理中心」与模式条已并入本页；无模式门槛，链路后端自动推导。
  * repaint=重绘本页（标注切换/删卡/入库后调用）。 */
-function renderLibAssets(body, node, dir, ds, mf, busy, say, repaint) {
-    const refresh = (typeof repaint === "function") ? repaint : (() => {});
-    const pool = ds?.ref_assets || [];
-    /* 链路说明（只读）：后端按实际引用自动推导，无手动模式 */
-    {
-        const hasRef = (ds?.segments || []).some((s) => (s?.refs || []).length)
-            || (ds?.prompts || []).some((p) => /\[\[.+\]\]/.test(String(p || "")));
-        const head = ds.first_frame || pool.some((a) => (a.roles || []).includes("首帧图"));
-        const tail = ds.end_frame || pool.some((a) => (a.roles || []).includes("尾帧图"));
-        const txt = hasRef ? "ref conditioning（有段引用素材）"
-            : head && tail ? "FL2VA 首尾帧" : tail ? "L2VA 尾帧终点" : head ? "i2v 首段起手" : "纯文生";
-        body.append(el("div", "h3d-libsec", "链路（自动推导，无模式选择）"));
-        body.append(el("div", "h3d-foot",
-            `本次链路：${escapeHtml(txt)}。首帧可与引用共存（头锚叠加）；权重混用（fl2va 跑多参）机械可跑，效果看权重。`));
-    }
-    /* 旧三槽位迁移：first/end/last_frame → 入库打标（last_frame 另写各段 tail_src） */
-    if (ds.first_frame || ds.end_frame || ds.last_frame) {
-        const bar = el("div", "h3d-libbusy");
-        bar.textContent = "检测到旧版首帧/尾帧/尾锚槽位数据，可一键导入资产库并自动打标（原槽位清空）。";
-        const b = el("button", "h3d-btn h3d-btn-cyan", "一键导入打标");
-        b.onclick = async () => {
-            try {
-                await migrateLegacyAnchors(node, dir);
-                say("旧槽位已导入资产库并打标");
-                scheduleRefresh(300);
-                refresh();
-            } catch (e) { say("导入失败：" + (e?.message || e)); }
-        };
-        bar.append(b);
-        body.append(bar);
-    }
-    body.append(el("div", "h3d-libsec", `标签素材池（${pool.length}，总量不限）· 【引用】插入当前选中段提示词`));
-    if (!pool.length) body.append(el("div", "h3d-empty", "素材池为空：把文件拖到下方网格直接入库，或点 ＋图片/视频/音频 上传；标签 [[..]] 由后端按段压实为 Picture/Video/Audio"));
-    /* P3 瓦片网格：缩略图 + 别名 + 来源 + 段引用徽标；拖放直接入库
-     * P5：按 全局/项目 × 图/视/音 六分栏装配（按钮逻辑零改动，只换挂载目标） */
-    const usage = (window.H3Assets?.segUsage) ? window.H3Assets.segUsage(ds) : {};
-    const grids = {};
-    const counts = {};
-    for (const scope of ["g", "p"]) {
-        for (const k of KIND_LIST) {
-            grids[`${scope}_${k}`] = el("div", "h3d-tilegrid");
-            counts[`${scope}_${k}`] = 0;
-        }
-    }
-    for (let i = 0; i < pool.length; i++) {
-        const a = pool[i];
-        const tile = el("div", "h3d-tile");
-        const prevUrl = assetPreviewUrl(dir, a.file, a.asset_id);
-        if (a.kind === "image") {
-            const im = document.createElement("img");
-            im.loading = "lazy"; im.src = prevUrl;
-            im.onerror = () => im.remove();
-            tile.append(im);
-        } else if (a.kind === "video") {
-            const v = document.createElement("video");
-            v.muted = true; v.preload = "metadata"; v.src = prevUrl;
-            v.onerror = () => v.replaceWith(el("span", "h3d-ticon", "🎞"));
-            tile.append(v);
-        } else {
-            const au = document.createElement("audio");
-            au.controls = true; au.preload = "metadata"; au.src = prevUrl;
-            au.onerror = () => au.replaceWith(el("span", "h3d-ticon", "🎵"));
-            tile.append(au);
-        }
-        const roles = Array.isArray(a.roles) ? a.roles : [];
-        const roleTxt = roles.length ? `【${roles.join("·")}】` : "";
-        tile.append(el("div", "h3d-tlabel", `${escapeHtml(a.label)}${escapeHtml(roleTxt)}`));
-        const srcTxt = a.asset_id ? `全局库 · ${escapeHtml(String(a.file).split("/").pop())}` : escapeHtml(a.file);
-        tile.append(el("div", "h3d-tmeta", `${KIND_NAME[a.kind] || a.kind} · ${srcTxt}`));
-        /* 段引用徽标：点按跳到该段 */
-        const used = usage[a.label] || [];
-        if (used.length) {
-            const ub = el("div", "h3d-tuse");
-            for (const sn of used) {
-                const chip = el("button", "h3d-tseg", `段${sn}`);
-                chip.title = `跳到第 ${sn} 段`;
-                chip.dataset.seg = String(sn);
-                chip.dataset.label = a.label;
-                chip.onclick = () => {
-                    _selSeg = Math.max(0, sn - 1);
-                    scheduleRefresh(0);
-                    say(`已选中段 ${sn}`);
-                };
-                ub.append(chip);
-            }
-            tile.append(ub);
-        }
-        const btns = el("div", "h3d-tbtns");
-        /* 标注切换（仅图片可标；首帧图/尾帧图各只留一张，改标自动让位） */
-        if ((a.kind || "image") === "image") {
-            for (const role of ["首帧图", "尾帧图"]) {
-                const t = el("button", "h3d-btn" + (roles.includes(role) ? " h3d-btn-cyan" : ""), role);
-                t.title = `标注为${role}（全库只留一张，改标自动取消上一张）`;
-                t.onclick = () => {
-                    setAssetRoles(node, i, role);
-                    scheduleRefresh(120);
-                    refresh();
-                };
-                btns.append(t);
-            }
-        }
-        const ref = el("button", "h3d-btn h3d-btn-cyan", "引用");
-        ref.title = "把 [[标签]] 插入当前选中段提示词末尾";
-        ref.onclick = () => {
-            try {
-                const d = getDs(node);
-                const n = (d.prompts || []).length;
-                const t = Math.max(0, Math.min(typeof _selSeg === "number" ? _selSeg : 0, n - 1));
-                const cur = String((d.prompts || [])[t] || "");
-                setPromptText(node, t, cur + (cur && !/\s$/.test(cur) ? " " : "") + `[[${a.label}]]`);
-                say(`已引用 [[${a.label}]] 到段 ${t + 1}`);
-                scheduleRefresh(200);
-            } catch (e) { say("引用失败：" + (e?.message || e)); }
-        };
-        btns.append(ref);
-        /* 剪辑/分离/转 latent 不再内联：本插件只负责素材的"引用与打标"，
-         * 裁剪/分离/转码走画布上的 ComfyUI 原生节点，产物回 output 后点「入库」。 */
-        const inLib = String(a.file || "").replace(/\\/g, "/").startsWith("assets/");
-        const inGlobal = !inLib && (!!a.asset_id || /^(images|videos|audios)\//.test(String(a.file || "")));
-        if (inGlobal) {
-            const bMir = el("button", "h3d-btn h3d-btn-cyan", "⇩调入项目");
-            bMir.title = "拷贝进项目 assets/（让项目自包含；引用与生成只需项目内文件）";
-            bMir.onclick = async () => {
-                try {
-                    await mirrorGlobalEntry(node, dir, i);
-                    say(`已调入项目：${a.label}`);
-                    scheduleRefresh(300);
-                    refresh();
-                } catch (e) { say("调入失败：" + (e?.message || e)); }
-            };
-            btns.append(bMir);
-        } else if (!inLib) {
-            const bImp = el("button", "h3d-btn h3d-btn-cyan", "入库");
-            bImp.title = "拷贝进项目 assets/（项目自包含）";
-            bImp.onclick = async () => {
-                try {
-                    await importPoolFile(node, dir, i);
-                    say(`已入库：${a.file}`);
-                    scheduleRefresh(300);
-                    refresh();
-                } catch (e) { say("入库失败：" + (e?.message || e)); }
-            };
-            btns.append(bImp);
-        }
-        const rm = el("button", "h3d-btn h3d-btn-danger", "移出");
-        rm.title = "从素材池移除（各段引用同步清理，不删文件）";
-        rm.onclick = () => { removeRefImage(node, i); say(`已移出「${a.label}」`); scheduleRefresh(200); refresh(); };
-        btns.append(rm);
-        tile.append(btns);
-        const kk = KIND_LIST.includes(a.kind) ? a.kind : "image";
-        const scope = a.asset_id ? "g" : "p";
-        grids[scope + "_" + kk].append(tile);
-        counts[scope + "_" + kk]++;
-    }
-    /* P5：全局库 / 项目资产库分开展示，各自图视音三栏 */
-    const KIND_TITLE = { image: "🖼 图片", video: "🎞 视频", audio: "🎵 音频" };
-    const nG = counts.g_image + counts.g_video + counts.g_audio;
-    const nP = counts.p_image + counts.p_video + counts.p_audio;
-    {
-        const { det, box } = foldBox("lib-assets-global",
-            `🌍 全局资产库（${nG}）· 跨项目复用，删项目不丢`, true);
-        const cols = el("div", "h3d-kindcols");
-        for (const k of KIND_LIST) {
-            cols.append(kindCol(`${KIND_TITLE[k]}（${counts["g_" + k]}）`,
-                grids["g_" + k], "暂无，可拖文件到下方拖放区入库"));
-        }
-        box.append(cols);
-        if (!nG) box.append(el("div", "h3d-empty",
-            "全局库为空：人物/服装/场景等跨项目复用的素材放这里，一次入库多片复用。"));
-        body.append(det);
-    }
-    {
-        const { det, box } = foldBox("lib-assets-project",
-            `📁 项目资产库（${nP}）· 仅本项目可见，随项目删除`, true);
-        const cols = el("div", "h3d-kindcols");
-        for (const k of KIND_LIST) {
-            cols.append(kindCol(`${KIND_TITLE[k]}（${counts["p_" + k]}）`,
-                grids["p_" + k], "暂无"));
-        }
-        box.append(cols);
-        body.append(det);
-    }
-    for (const g of Object.values(grids)) upgradeTileTags(g, dir, ds);
-    /* 拖放区：文件拖进来直接走全局库入库 + 项目链接（单次往返） */
-    const dz = el("div", "h3d-dropzone", "把图片 / 视频 / 音频拖到这里，直接入库（全局库 + 本项目链接）");
-    dz.ondragover = (e) => { e.preventDefault(); dz.classList.add("h3d-drop"); };
-    dz.ondragleave = () => dz.classList.remove("h3d-drop");
-    dz.ondrop = async (e) => {
-        e.preventDefault();
-        dz.classList.remove("h3d-drop");
-        const files = [...(e.dataTransfer?.files || [])];
-        if (!files.length) return;
-        let ok = 0;
-        for (const f of files) {
-            try {
-                await uploadLibFile(node, dir, f, null);
-                ok++;
-            } catch (err) { say(`「${f.name}」入库失败：${err?.message || err}`); }
-        }
-        if (ok) say(`已入库 ${ok} 个（全局库 + 本项目链接）`);
-        scheduleRefresh(300);
-        refresh();
-    };
-    body.append(dz);
-    /* gridfix: removed stray duplicate upgradeTileTags(grid,...) — grids already handled above */
-    const upRow = el("div", "h3d-libctl");
-    upRow.append(el("span", "h3d-libmeta", "上传入库（全局库 + 本项目链接，单次往返）："));
-    for (const k of KIND_LIST) {
-        const b = el("button", "h3d-btn", `＋ ${KIND_NAME[k]}`);
-        b.title = `上传${KIND_NAME[k]} → 全局库入库并链接本项目（提示词写 [[标签]] → <${KIND_TOKEN[k]} k>；单段引用上限 图9/视3/音3 在调度时卡）`;
-        b.onclick = () => {
-            const input = document.createElement("input");
-            input.type = "file";
-            input.accept = KIND_ACCEPT[k] || "image/*";
-            input.onchange = async () => {
-                const f = input.files && input.files[0];
-                if (!f) return;
-                try {
-                    await uploadLibFile(node, dir, f, k, () => refresh());
-                } catch (e) { say("入库失败：" + (e?.message || e)); }
-            };
-            input.click();
-        };
-        upRow.append(b);
-    }
-    body.append(upRow);
-    const bar = el("div", "h3d-libctl");
-    const bSave = el("button", "h3d-btn", "保存资产库");
-    bSave.title = "素材池全量存入 manifest（revision 乐观锁；全局链接住 asset_links，不进本表）";
-    bSave.disabled = busy;
-    bSave.onclick = async () => {
-        try {
-            const legacy = pool.filter((a) => a && !a.asset_id);
-            const r = await window.H3Api.saveAssets(dir, legacy, mf?.revision);
-            if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "保存失败"));
-            say(`资产库已保存（revision=${r.body.manifest?.revision}）`);
-            scheduleRefresh(600);
-        } catch (e) { say("保存资产失败：" + (e?.message || e)); }
-    };
-    const bCheck = el("button", "h3d-btn", "校验资产");
-    bCheck.title = "缺文件/重标签/单段上限早爆检查，不落盘";
-    bCheck.onclick = async () => {
-        try {
-            const r = await window.H3Api.assetCheck(pool,
-                (ds?.segments || []).map((s) => ({ refs: s?.refs || [] })), dir);
-            say(r.body?.report || JSON.stringify(r.body));
-        } catch (e) { say("校验失败：" + (e?.message || e)); }
-    };
-    bar.append(bSave, bCheck);
-    body.append(bar);
-    body.append(el("div", "h3d-foot",
-        "本库只管「引用 + 打标」：裁剪 / 音画分离 / 转 latent 不再内联，"
-        + "请在画布上用 ComfyUI 原生节点处理，产物回到输出目录后点本库「入库」。"));
-    {
-        const clipsA = (mf?.clips || []).filter((c) => c?.file
-            && String(c.file).replace(/\\/g, "/").startsWith("assets/"));
-        if (clipsA.length) {
-            const { det, box } = foldBox("lib-assets-clips",
-                `✂ 本库剪辑片段（${clipsA.length}）`, true);
-            for (const c of clipsA) {
-                const row = el("div", "h3d-librow");
-                const isWav = /\.wav$/i.test(c.file || "");
-                const op = c.op === "split-v" ? "分离·画面" : c.op === "split-a" ? "分离·音频" : "剪辑";
-                if (isWav) {
-                    const au = document.createElement("audio");
-                    au.controls = true; au.preload = "metadata";
-                    au.src = viewUrl(`h3_projects/${dir}`, c.file);
-                    au.onerror = () => au.remove();
-                    row.append(au);
-                }
-                row.append(el("span", "h3d-libname",
-                    `${op} · ${c.file} ← ${c.src || "?"}${c.start_s != null ? ` [${c.start_s}s, ${c.end_s}s)` : ""}`));
-                box.append(row);
-            }
-            body.append(det);
-        }
-    }
-    const reg = mf?.assets || [];
-    if (reg.length) {
-        const { det, box } = foldBox("lib-assets-reg",
-            `📋 项目登记（${reg.length}）· 成片库调入的产物`, false);
-        for (const a of reg) {
-            const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
-            box.append(el("div", "h3d-librow",
-                `${escapeHtml(a.label || "?")}${escapeHtml(roles)}（${escapeHtml(a.kind || "")}）· ${escapeHtml(a.file || "")}`));
-        }
-        body.append(det);
-    }
-}
-
 /* 资产预览地址：asset_id（全局库）> assets/…（项目 output）> 其余（input） */
 function assetPreviewUrl(dir, file, asset_id) {
     if (asset_id && window.H3Api?.libraryFileUrl) return window.H3Api.libraryFileUrl(asset_id);
@@ -4366,342 +3912,14 @@ function assetPreviewUrl(dir, file, asset_id) {
 }
 
 /* 资产标注切换：同 role 全库唯一，改标自动取消上一张 */
-function setAssetRoles(node, idx, role) {
-    const ds = getDs(node);
-    const a = (ds.ref_assets || [])[idx];
-    if (!a) return;
-    const cur = Array.isArray(a.roles) ? a.roles : [];
-    if (cur.includes(role)) {
-        a.roles = cur.filter((r) => r !== role);
-    } else {
-        for (const x of (ds.ref_assets || [])) {
-            if (Array.isArray(x.roles) && x.roles.includes(role)) {
-                x.roles = x.roles.filter((r) => r !== role);
-                /* P3：被让位的链接条目同步清标 */
-                if (x.asset_id && window.H3Api?.assetLink) {
-                    const dir0 = getDirValue(node);
-                    if (dir0) {
-                        window.H3Api.assetLink({ dir: dir0, asset_id: x.asset_id,
-                            alias: x.label, kind: x.kind, roles: x.roles })
-                            .catch((e) => console.warn("[h3-director] assetLink roles failed:", e));
-                    }
-                }
-            }
-        }
-        a.roles = [...cur, role];
-    }
-    setDs(node, ds);
-    persistPool(node);
-    /* P3：链接条目改标同步服务端（roles 显式覆盖，含取消） */
-    if (a.asset_id && window.H3Api?.assetLink) {
-        const dir = getDirValue(node);
-        if (dir) {
-            window.H3Api.assetLink({ dir, asset_id: a.asset_id,
-                alias: a.label, kind: a.kind, roles: a.roles })
-                .catch((e) => console.warn("[h3-director] assetLink roles failed:", e));
-        }
-    }
-}
-
 /* 上传并入库：input 上传 → 拷贝进项目 assets/ → 池条目 file 改写 */
-async function uploadPoolFile(node, dir, kind, done) {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = KIND_ACCEPT[kind] || "image/*";
-    input.onchange = async () => {
-        const f = input.files && input.files[0];
-        if (!f) return;
-        try {
-            const name = await uploadToInput(f);
-            const ds = getDs(node);
-            const sameKind = ds.ref_assets.filter((x) => x.kind === kind).length;
-            const taken = new Set(ds.ref_assets.map((x) => x.label));
-            const label = uniqueLabelFrom(taken, `${KIND_NAME[kind]}${sameKind + 1}`);
-            const r = await window.H3Api.importAsset(dir, name,
-                { label, kind, base_revision: undefined });
-            if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "入库失败"));
-            ds.ref_assets.push({
-                file: r.body.file, kind: r.body.kind || kind,
-                label: r.body.label || label, roles: [],
-            });
-            setDs(node, ds);
-            syncMirrors(node, ds);
-            scheduleRefresh(200);
-            if (typeof done === "function") done();
-        } catch (e) {
-            alert(`入库失败：${e?.message || e}`);
-        }
-    };
-    input.click();
-}
-
 /* 旧池条目入库：input 文件 → 项目 assets/ 并改写 file */
-async function importPoolFile(node, dir, idx) {
-    const ds = getDs(node);
-    const a = (ds.ref_assets || [])[idx];
-    if (!a) throw new Error("条目不存在");
-    const r = await window.H3Api.importAsset(dir, a.file, { label: a.label, kind: a.kind });
-    if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "入库失败"));
-    a.file = r.body.file;
-    if (r.body.label) {
-        const old = a.label;
-        a.label = r.body.label;
-        for (const s of ds.segments || []) {
-            if (Array.isArray(s.refs)) s.refs = s.refs.map((l) => (l === old ? a.label : l));
-        }
-    }
-    setDs(node, ds);
-    syncMirrors(node, ds);
-}
-
 /* P3 上传即入库（单次往返）：文件 → 全局库 + 本项目链接 → 推池。
  * 后端无 libraryUpload（旧版）时回落两步走（input 中转 + importAsset）。 */
-async function uploadLibFile(node, dir, file, forcedKind, done) {
-    const H3 = window.H3Assets;
-    const kind = forcedKind || (H3 ? H3.guessKind(file) : "image");
-    const ds0 = getDs(node);
-    const taken = new Set((ds0.ref_assets || []).map((x) => x.label));
-    const stem = String(file?.name || "素材").replace(/\.[A-Za-z0-9]+$/, "").slice(0, 24)
-        || `${KIND_NAME[kind]}${(ds0.ref_assets || []).filter((x) => x.kind === kind).length + 1}`;
-    const alias = uniqueLabelFrom(taken, stem);
-    if (H3?.uploadDirect && window.H3Api?.libraryUpload) {
-        const r = await H3.uploadDirect(file, { kind, link_dir: dir, alias });
-        const d2 = getDs(node);
-        d2.ref_assets.push({
-            label: r.alias || alias, kind, file: r.entry.file,
-            asset_id: r.entry.asset_id, roles: [],
-        });
-        setDs(node, d2);
-    } else {
-        const name = await uploadToInput(file);
-        const r = await window.H3Api.importAsset(dir, name, { label: alias, kind });
-        if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "入库失败"));
-        const d2 = getDs(node);
-        d2.ref_assets.push({
-            file: r.body.file, kind: r.body.kind || kind,
-            label: r.body.label || alias, roles: [],
-        });
-        setDs(node, d2);
-        syncMirrors(node, d2);
-    }
-    scheduleRefresh(200);
-    if (typeof done === "function") done();
-}
-
 /* P3 全局库调入项目：拷贝进 assets/ 并推 legacy 池条目（剪辑/转码/旧链用项目内文件） */
-async function mirrorGlobalEntry(node, dir, idx) {
-    const ds = getDs(node);
-    const a = (ds.ref_assets || [])[idx];
-    if (!a?.asset_id) throw new Error("该条目不在全局库");
-    const r = await window.H3Api.assetMirror({ dir, asset_id: a.asset_id });
-    if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "调入失败"));
-    const taken = new Set((ds.ref_assets || []).map((x) => x.label));
-    ds.ref_assets.push({
-        label: uniqueLabelFrom(taken, `${a.label}入库`),
-        kind: a.kind, file: r.body.file, roles: [],
-    });
-    setDs(node, ds);
-    persistPool(node);
-}
-
 /* P3 标签所见即所得：整包干跑一次，把每段真实 token 写回引用徽标（失败静默保留段号）。 */
-async function upgradeTileTags(grid, dir, ds) {
-    try {
-        const H3Api = window.H3Api;
-        if (!H3Api?.compileRefs || !grid.isConnected) return;
-        const segments = (ds?.segments || []).map((s) => ({ refs: s?.refs || [] }));
-        if (!segments.some((s) => s.refs.length)) return;
-        const r = await H3Api.compileRefs({ dir, segments });
-        if (!r.body?.ok || !grid.isConnected) return;
-        const short = (tok) => String(tok || "").replace("<Picture ", "P").replace("<Video ", "V")
-            .replace("<Audio ", "A").replace(">", "");
-        (r.body.segs || []).forEach((seg, i) => {
-            for (const b of seg?.blocks || []) {
-                const chip = grid.querySelector(
-                    `.h3d-tseg[data-seg="${i + 1}"][data-label="${CSS.escape(b.alias || "")}"]`);
-                if (chip) chip.textContent = `段${i + 1}·${short(b.token)}`;
-            }
-        });
-    } catch (e) { /* 静默：徽标保持段号 */ }
-}
-
 /* 旧三槽位迁移：first/end/last_frame → 入库打标；last_frame 另写各段 tail_src */
-async function migrateLegacyAnchors(node, dir) {
-    const ds = getDs(node);
-    const jobs = [
-        [ds.first_frame, "首帧图"],
-        [ds.end_frame, "尾帧图"],
-    ];
-    for (const [file, role] of jobs) {
-        if (!file) continue;
-        const taken = new Set(ds.ref_assets.map((x) => x.label));
-        const label = uniqueLabelFrom(taken, role);
-        const r = await window.H3Api.importAsset(dir, file, { label, kind: "image", roles: [role] });
-        if (!r.body?.ok) throw new Error(window.H3Api.errText(r, `导入${role}失败`));
-        ds.ref_assets.push({ file: r.body.file, kind: "image", label: r.body.label || label, roles: [role] });
-    }
-    if (ds.last_frame) {
-        const taken = new Set(ds.ref_assets.map((x) => x.label));
-        const label = uniqueLabelFrom(taken, "尾锚");
-        const r = await window.H3Api.importAsset(dir, ds.last_frame, { label, kind: "image" });
-        if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "导入尾锚失败"));
-        const lb = r.body.label || label;
-        ds.ref_assets.push({ file: r.body.file, kind: "image", label: lb, roles: [] });
-        for (const s of ds.segments || []) s.tail_src = { asset: lb };
-    }
-    ds.first_frame = "";
-    ds.end_frame = "";
-    ds.last_frame = "";
-    setDs(node, ds);
-    syncMirrors(node, ds);
-}
-
 /* 裁剪子面板：探针取帧率/总帧，入帧/出帧数字窗，确认后按帧换算秒执行 */
-async function openTrimSub(sub, dir, file, mf, busy, say, refresh, setRowBusy) {
-    if (sub.style.display !== "none") { sub.style.display = "none"; sub.replaceChildren(); return; }
-    sub.style.display = "";
-    sub.replaceChildren(el("span", "h3d-libmeta", "读取中…"));
-    let info = null;
-    try {
-        const r = await window.H3Api.probe(dir, file);
-        if (r.body?.ok) info = r.body;
-    } catch (e) { /* 探针失败则手动填 */ }
-    sub.replaceChildren();
-    const fps = Number(info?.fps) || 24;
-    const total = Number(info?.frames) || 0;
-    sub.append(el("span", "h3d-libmeta",
-        `${file} · ${fps}fps${total ? ` · 共约${total}帧(${(total / fps).toFixed(1)}s)` : ""}`));
-    const mkNum = (v, title) => {
-        const inp = document.createElement("input");
-        inp.type = "number"; inp.min = "0"; inp.step = "1";
-        inp.value = v; inp.title = title;
-        return inp;
-    };
-    const inS = mkNum(0, "入点帧（含）");
-    const inE = mkNum(total || 48, "出点帧（不含）");
-    const go = el("button", "h3d-btn h3d-btn-cyan", "确认裁剪");
-    go.title = "按帧窗裁剪为新文件，落回本库";
-    go.disabled = busy;
-    go.onclick = async () => {
-        const s0 = Math.max(0, parseInt(inS.value, 10) || 0);
-        let s1 = parseInt(inE.value, 10);
-        s1 = Number.isFinite(s1) && s1 > 0 ? s1 : total;
-        if (!(s1 > s0)) { say("帧窗为空：出点必须大于入点"); return; }
-        setRowBusy(true, `裁剪中：${file} [${s0}, ${s1})…`);
-        try {
-            const r = await window.H3Latent.trim(dir, file,
-                +(s0 / fps).toFixed(3), +(s1 / fps).toFixed(3), "", mf?.revision);
-            say(`已存 ${r.file}（帧[${s0}, ${s1})）`);
-            scheduleRefresh(600);
-            refresh();
-        } catch (e) { say("裁剪失败：" + (e?.message || e)); }
-        finally { setRowBusy(false); }
-    };
-    const cancel = el("button", "h3d-btn", "收起");
-    cancel.onclick = () => { sub.style.display = "none"; sub.replaceChildren(); };
-    const ctl = el("div", "h3d-libctl");
-    ctl.append(document.createTextNode("入帧"), inS, document.createTextNode("出帧"), inE, go, cancel);
-    sub.append(ctl);
-}
-
-function renderLibFinals(body, node, dir, ds, mf, busy, say, repaint) {
-    const opName = (c) => c?.op === "split-v" ? "分离·画面" : c?.op === "split-a" ? "分离·音频" : "剪辑";
-    const clipsHere = (mf?.clips || []).filter((c) => c?.file).filter((c) => {
-        const f = String(c.file).replace(/\\/g, "/");
-        return f.startsWith("finals/") || !f.includes("/");
-    });
-    const groups = [
-        ["分段视频", (mf?.videos || []).map((f, i) => ({ file: f, tag: `段${i + 1}` })).filter((x) => x.file)],
-        ["完整成片", (mf?.finals || []).filter(Boolean).map((f) => ({ file: f, tag: "成片" }))],
-        ["合并导出", (mf?.merges || []).filter((m) => m?.file).map((m) => ({ file: m.file, tag: "合并" }))],
-        ["剪辑片段（本库）", clipsHere.map((c) => ({ file: c.file, tag: `${opName(c)}←${c.src || "?"}` }))],
-    ];
-    const sub = `h3_projects/${dir}`;
-    for (const [title, items] of groups) {
-        const { det, box } = foldBox(`lib-finals-${title}`, `${title}（${items.length}）`,
-            items.length > 0);
-        if (!items.length) box.append(el("div", "h3d-empty", "暂无"));
-        for (const it of items) {
-            const row = el("div", "h3d-librow");
-            const isWav = /\.wav$/i.test(it.file || "");
-            if (isWav) {
-                const au = document.createElement("audio");
-                au.controls = true; au.preload = "metadata";
-                au.src = viewUrl(sub, it.file);
-                au.onerror = () => au.remove();
-                row.append(au);
-            } else {
-                const v = document.createElement("video");
-                v.controls = true; v.preload = "metadata";
-                v.src = viewUrl(sub, it.file);
-                v.onerror = () => v.remove();
-                row.append(v);
-            }
-            row.append(el("span", "h3d-libname", `${it.tag} · ${it.file}`));
-            const sub2 = el("div", "h3d-libsub");
-            sub2.style.display = "none";
-            const setRowBusy = (on, txt) => {
-                row.querySelectorAll("button").forEach((b) => { b.disabled = !!on; });
-                if (on && txt) say(txt);
-            };
-            if (!isWav) {
-                const bTrim = el("button", "h3d-btn", "裁剪");
-                bTrim.title = "展开裁剪子面板（帧数窗），裁好落回本库";
-                bTrim.disabled = busy;
-                bTrim.onclick = () => openTrimSub(sub2, dir, it.file, mf, busy, say, repaint, setRowBusy);
-                row.append(bTrim);
-            }
-            const bMove = el("button", "h3d-btn", "→资产库");
-            bMove.title = "调入资产库（文件搬家 + 自动登记标签，可再剪辑转 latent）";
-            bMove.disabled = busy;
-            bMove.onclick = async () => {
-                setRowBusy(true, `调入资产库：${it.file}…`);
-                try {
-                    const stem = String(it.file.split("/").pop().split(".")[0] || "clip");
-                    await window.H3Latent.moveMedia(dir, it.file, "assets",
-                        { register_asset: true, label: stem.slice(0, 24),
-                          kind: isWav ? "audio" : "video" });
-                    say(`已调入资产库：${stem}`);
-                    scheduleRefresh(600); await repaint();
-                } catch (e) { say("调入失败：" + (e?.message || e)); }
-                finally { setRowBusy(false); }
-            };
-            if (!isWav) {
-                const bSplit = el("button", "h3d-btn", "音画分离");
-                bSplit.title = "分离为画面 mp4 + 音频 wav，回库为新文件（音频进本页列表可播）";
-                bSplit.disabled = busy;
-                bSplit.onclick = async () => {
-                    setRowBusy(true, `分离中：${it.file}…`);
-                    try {
-                        await window.H3Latent.splitAv(dir, it.file, {});
-                        say("分离完成（画面_mp4 + 音频_wav 已登记在本库）");
-                        scheduleRefresh(600); await repaint();
-                    } catch (e) { say("分离失败：" + (e?.message || e)); }
-                    finally { setRowBusy(false); }
-                };
-                row.append(bSplit);
-            }
-            const bDel = el("button", "h3d-btn h3d-btn-danger", "删");
-            bDel.title = "删除该文件（manifest 引用不动链，其余内容不动）";
-            bDel.onclick = async () => {
-                if (!confirm(`删除 ${it.file}？`)) return;
-                try {
-                    const r = await api.fetchApi("/h3chain/delete_file", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ path: `h3_projects/${dir}/${it.file}` }),
-                    });
-                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                    scheduleRefresh(600); await repaint();
-                } catch (e) { say("删除失败：" + (e?.message || e)); }
-            };
-            row.append(bMove, bDel);
-            box.append(row, sub2);
-        }
-        body.append(det);
-    }
-    body.append(el("div", "h3d-foot", "资产库剪出的片段显示在资产库页；转 latent 在资产库点对应行，两处裁剪都是帧数窗子面板。"));}
-
 /* latent 库：已登记 latent（切片/删除）+ 手工切片表单 */
 /* P4e：latent 行一键放大——驱动画布 H3LatentUpscale（临时模式切换，finally 还原）。
  * 只走神经 enlarge（×2 存回本库）；二次采样等高级参数去画布节点调。
@@ -4745,85 +3963,6 @@ async function runUpscaleTool(node, dir, file, say) {
         try { if (main.setDirtyCanvas) main.setDirtyCanvas(true, true); } catch (e) {}
     }
 }
-
-function renderLibLatent(body, node, dir, ds, mf, busy, say, repaint) {
-    const list = mf?.latents || [];
-    const { det: detL, box: boxL } = foldBox("lib-latent-list",
-        `🧬 已登记 latent（${list.length}）· kind: av=图像+音频 / video=仅图像 / audio=仅音频`,
-        true);
-    if (!list.length) boxL.append(el("div", "h3d-empty", "暂无：分段生成时自动保存（seg_NNN_auto.pt），或下方手工切片"));
-    for (const L of list) {
-        if (!L?.file) continue;
-        const row = el("div", "h3d-librow");
-        row.append(el("span", "h3d-libname",
-            `${L.file} · ${L.kind || "av"} · ←${L.src || "?"} [${L.start_f ?? "?"}, ${L.end_f ?? "?"})`));
-        const bUp = el("button", "h3d-btn h3d-btn-cyan", "⚡放大");
-        bUp.title = "驱动画布 H3LatentUpscale 神经放大×2 存回本库（主节点临时旁路，提交后自动恢复）";
-        bUp.onclick = async () => {
-            try {
-                await runUpscaleTool(node, dir, L.file, say);
-                scheduleRefresh(3000);
-                await repaint();
-            } catch (e) { say("放大失败：" + (e?.message || e)); }
-        };
-        row.append(bUp);
-        const bDel = el("button", "h3d-btn h3d-btn-danger", "删");
-        bDel.title = "删除该 latent 登记文件";
-        bDel.onclick = async () => {
-            try {
-                await window.H3Latent.remove(dir, L.file, mf?.revision);
-                scheduleRefresh(600); await repaint();
-            } catch (e) { say("删除失败：" + (e?.message || e)); }
-        };
-        row.append(bDel);
-        boxL.append(row);
-    }
-    body.append(detL);
-    const { det: detS, box: boxS } = foldBox("lib-latent-slice",
-        "✂ 手工切片（段存档/已登记 latent → 新 latent，无需 VAE）", true);
-    const ctl = el("div", "h3d-libctl");
-    const inSeg = document.createElement("input");
-    inSeg.value = "0"; inSeg.title = "段文件号（0-based，对应 seg_000.pt；用 latent 源时填 -1）";
-    const inSrc = document.createElement("input");
-    inSrc.value = ""; inSrc.placeholder = "latent/x.pt"; inSrc.title = "latent 源（为空则用段存档）";
-    inSrc.style.width = "120px";
-    const inS = document.createElement("input");
-    inS.value = "0"; inS.title = "起始像素帧（含）";
-    const inE = document.createElement("input");
-    inE.value = "48"; inE.title = "结束像素帧（不含）";
-    const inN = document.createElement("input");
-    inN.value = ""; inN.placeholder = "保存名.pt"; inN.title = "latent 文件名（须以 .pt 结尾）";
-    inN.style.width = "120px";
-    const kindSel = document.createElement("select");
-    for (const [v, t] of [["av", "图像+音频"], ["video", "仅图像"], ["audio", "仅音频"]]) {
-        const o = document.createElement("option");
-        o.value = v; o.textContent = t;
-        kindSel.append(o);
-    }
-    kindSel.title = "分支：仅图像/仅音频分开存（注入时只走对应分支）";
-    const bSlice = el("button", "h3d-btn h3d-btn-cyan", "切片保存");
-    bSlice.title = "POST /h3chain/latent_slice：整 token 切";
-    bSlice.disabled = busy;
-    bSlice.onclick = async () => {
-        try {
-            const src = inSrc.value.trim()
-                ? { file: inSrc.value.trim() }
-                : { seg: parseInt(inSeg.value, 10) || 0 };
-            const r = await window.H3Latent.slice(dir, src,
-                parseInt(inS.value, 10) || 0, parseInt(inE.value, 10) || 0,
-                inN.value.trim(), mf?.revision, kindSel.value);
-            say(`已存 ${r.file}`);
-            scheduleRefresh(600); await repaint();
-        } catch (e) { say("切片失败：" + (e?.message || e)); }
-    };
-    ctl.append(document.createTextNode("段"), inSeg, document.createTextNode("源"), inSrc,
-        document.createTextNode("帧"), inS, document.createTextNode("~"), inE,
-        inN, kindSel, bSlice);
-    boxS.append(ctl);
-    body.append(detS);
-    body.append(el("div", "h3d-foot", "分段设置里可选本段是否注入 latent（keyframe，桥来源下拉）、保存哪段 latent；库内任意 latent 点「⚡放大」一键神经放大×2（画布 H3LatentUpscale，需先选放大模型；二次采样等高级参数去画布调）。"));
-}
-
 
 function mergeProjects(projects, state) {
     const map = new Map();
@@ -6361,8 +5500,7 @@ function labeledAssetCard(node, ds, idx) {
     return card;
 }
 
-/* 素材池左栏面板已并入资产库全屏子面板（renderLibAssets：模式条 + 链路锚定 +
- * 标签素材池）。assetCard / labeledAssetCard / syncMirrors（画布镜像）保留复用。 */
+/* assetCard / labeledAssetCard / syncMirrors（画布镜像）保留复用。 */
 
 /* ---- 链参数（面板直写画布控件）：基础设置 + 视频延续（关键帧设置/检测重摇） ----
  * 基础设置 = 原生工作流画幅/时长/采样类；视频延续 = 段间引导相关（大折叠套两子折叠，
@@ -7734,6 +6872,15 @@ function mountFallbackFab() {
 function removeFab() {
     if (fabEl) { fabEl.remove(); fabEl = null; }
 }
+
+/* 供「素材库」浏览器调用：latent 二采要驱动画布节点，逻辑留在导演台里。 */
+window.H3Director = {
+    upscaleLatent(dir, file, say) {
+        const node = findNode();
+        if (!node) return Promise.resolve();
+        return runUpscaleTool(node, dir, file, typeof say === "function" ? say : () => {});
+    },
+};
 
 app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",

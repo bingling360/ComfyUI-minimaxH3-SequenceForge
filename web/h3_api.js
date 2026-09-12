@@ -44,6 +44,17 @@
     return (fallback || "请求失败") + `（HTTP ${res.status}）`;
   }
 
+  /* 查询串：跳过空值（scopes/过滤全是可选参数） */
+  function _qs(obj) {
+    const p = new URLSearchParams();
+    Object.keys(obj || {}).forEach((k) => {
+      const v = obj[k];
+      if (v === undefined || v === null || v === "") return;
+      p.append(k, String(v));
+    });
+    return p.toString();
+  }
+
   const Api = {
     getProjects: (summary) => _call(summary ? "/h3chain/projects?summary=1" : "/h3chain/projects"),
     getProject: (dir) => _call("/h3chain/project?dir=" + encodeURIComponent(dir || "")),
@@ -83,6 +94,26 @@
     optimize: (payload) => _json("POST", "/h3chain/optimize", payload),
     expand: (payload) => _json("POST", "/h3chain/expand", payload),
     expandValidate: (payload) => _json("POST", "/h3chain/expand_validate", payload),
+    /* ---- 素材库（Library）：一个浏览器 + 四个 scope ---- */
+    libList: (p) => _call("/h3chain/lib_list?" + _qs(p)),
+    libItem: (p) => _call("/h3chain/lib_item?" + _qs(p)),
+    libStatus: (p) => _call("/h3chain/lib_status?" + _qs(p)),
+    libCollections: (dir) => _call("/h3chain/lib_collections?" + _qs({ dir })),
+    libThumbUrl: (dir, id) =>
+      "/h3chain/lib_thumb?" + _qs({ dir, id }),
+    libRawUrl: (dir, id) => "/h3chain/lib_raw?" + _qs({ dir, id }),
+    libZipUrl: (dir, name) => "/h3chain/lib_zip_file?" + _qs({ dir, name }),
+    libScan: (dir) => _json("POST", "/h3chain/lib_scan", { dir }),
+    libRate: (dir, id, rating) => _json("POST", "/h3chain/lib_rate", { dir, id, rating }),
+    libTag: (dir, id, tags) => _json("POST", "/h3chain/lib_tag", { dir, id, tags }),
+    libAlias: (dir, id, alias) => _json("POST", "/h3chain/lib_alias", { dir, id, alias }),
+    libCollectionSave: (payload) => _json("POST", "/h3chain/lib_collection_save", payload),
+    libCollectionDelete: (dir, id) => _json("POST", "/h3chain/lib_collection_delete", { dir, id }),
+    libDelete: (dir, ids) => _json("POST", "/h3chain/lib_delete", { dir, ids }),
+    libStage: (dir, id) => _json("POST", "/h3chain/lib_stage", { dir, id }),
+    libZip: (dir, ids) => _json("POST", "/h3chain/lib_zip", { dir, ids }),
+    libRef: (dir, id, seg) => _json("POST", "/h3chain/lib_ref", { dir, id, seg }),
+    libRole: (dir, id, role) => _json("POST", "/h3chain/lib_role", { dir, id, role }),
     isConflict,
     isBusy,
     errText,

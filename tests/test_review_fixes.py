@@ -92,7 +92,8 @@ def routes(projects, store, checkpoint):
                       ("from . import transcode_queue as _tq", "import transcode_queue as _tq"),
                       ("from . import transcode_queue", "import transcode_queue"),
                       ("from . import checkpoint as _ckpt", "import checkpoint as _ckpt"),
-                      ("from . import prompts as _prompts", "import prompts as _prompts")])
+                      ("from . import prompts as _prompts", "import prompts as _prompts"),
+                      ("from . import library as h3lib", "import library as h3lib")])
 
 
 def _nodes_src():
@@ -205,6 +206,6 @@ def test_staged_unique_name():
 
 def test_roles_sync_points():
     d = _director_src()
-    assert "roles: x.roles" in d  # 切项目合并透传
-    assert "alias: asset.label, kind: asset.kind, roles: a.roles" in d or \
-        "alias: a.label, kind: a.kind, roles: a.roles" in d
+    # roles 透传（getDs 读 / setDs 写）——旧三库面板下线后仍在
+    assert "roles: Array.isArray(a.roles) ? a.roles.filter(" in d
+    assert "roles: Array.isArray(L.roles) ? L.roles.filter(" in d

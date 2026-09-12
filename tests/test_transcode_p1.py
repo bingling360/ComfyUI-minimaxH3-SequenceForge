@@ -92,7 +92,8 @@ def routes(projects, tq, store, checkpoint):
                       ("from . import transcode_queue as _tq", "import transcode_queue as _tq"),
                       ("from . import transcode_queue", "import transcode_queue"),
                       ("from . import checkpoint as _ckpt", "import checkpoint as _ckpt"),
-                      ("from . import prompts as _prompts", "import prompts as _prompts")])
+                      ("from . import prompts as _prompts", "import prompts as _prompts"),
+                      ("from . import library as h3lib", "import library as h3lib")])
 
 
 @pytest.fixture(autouse=True)

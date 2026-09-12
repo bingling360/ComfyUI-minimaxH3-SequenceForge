@@ -101,12 +101,14 @@
     libCollections: (dir) => _call("/h3chain/lib_collections?" + _qs({ dir })),
     libThumbUrl: (dir, id) =>
       "/h3chain/lib_thumb?" + _qs({ dir, id }),
-    libRawUrl: (dir, id) => "/h3chain/lib_raw?" + _qs({ dir, id }),
+    libRawUrl: (dir, id, download) =>
+      "/h3chain/lib_raw?" + _qs({ dir, id, download: download ? 1 : "" }),
     libZipUrl: (dir, name) => "/h3chain/lib_zip_file?" + _qs({ dir, name }),
     libScan: (dir) => _json("POST", "/h3chain/lib_scan", { dir }),
     libRate: (dir, id, rating) => _json("POST", "/h3chain/lib_rate", { dir, id, rating }),
     libTag: (dir, id, tags) => _json("POST", "/h3chain/lib_tag", { dir, id, tags }),
     libAlias: (dir, id, alias) => _json("POST", "/h3chain/lib_alias", { dir, id, alias }),
+    libMirror: (dir, id, label) => _json("POST", "/h3chain/lib_mirror", { dir, id, label }),
     libCollectionSave: (payload) => _json("POST", "/h3chain/lib_collection_save", payload),
     libCollectionDelete: (dir, id) => _json("POST", "/h3chain/lib_collection_delete", { dir, id }),
     libDelete: (dir, ids) => _json("POST", "/h3chain/lib_delete", { dir, ids }),

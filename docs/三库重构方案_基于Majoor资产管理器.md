@@ -253,4 +253,28 @@
 
 ---
 
+## 9. 首轮试用反馈修复（2026-09-12）
+
+用户反馈：前端风格对了，但**界面被导演台盖住、「调入项目」没反应、预览器按钮像失效、下载直接打开浏览器、动作语义看不懂**。
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| 素材库被导演台盖住，要叉掉导演台才看得见 | 导演台 `.h3d-page` 的 z-index 是 `1000000`，素材库只有 `9000` | 素材库 `1000005`、预览器 `1000006`、右键菜单 `1000007`、提示 `1000009` |
+| 「调入项目」点了没反应 | 旧 `asset_mirror` **只拷文件不写 manifest** —— 它假设前端会再推一次池子登记（旧三库面板的 `persistPool` 有这步，新浏览器没有） | 新增 `POST /h3chain/lib_mirror` → `library.mirror_to_project()`：拷进 `assets/` **并**写 `manifest["assets"]`，一步到位 |
+| 预览器里的按钮像失效 | 反馈只写浏览器底部状态行，被预览器挡住 → "点了没反应" | 新增 toast 浮层（成功绿 / 失败红），所有失败路径改走 `fail()` |
+| 下载跳到浏览器打开 | `window.open(libRawUrl)` 走的是 inline | `lib_raw?download=1` 带 `Content-Disposition: attachment`；前端改用 `<a download>` |
+| 「暂存到 input」看不懂 | 文案没解释 | 改「📤 复制到 input 目录（供画布 LoadImage / LoadVideo 选择）」，成功后提示去哪选 |
+| 「引用到段」不知道干嘛 | 文案没说效果 | 改「🎯 作为第 N 段的参考素材」，成功后提示"会编译成 `<Picture 1>` 这类编号写进该段提示词" |
+| 全局库素材引用/打标失败 | 没登记进项目清单，`compile_refs` 解析不到 | `lib_ref` / `lib_role` 对全局库条目**自动补链接**（`link_asset`）后再写 |
+| 索引找不到刚上传的文件 | 索引有 3 秒 TTL 缓存 | `lib_mirror` 入口先 `invalidate` 再查 |
+
+另外补上：
+- 多选状态下可**批量调入项目**（`actMirrorMany`）
+- `normalize_kind` 从 `asset_store` 复刻进 `library.py`（`mirror_to_project` 依赖它，此前漏定义）
+- 全局库 vs 项目资产的关系写进上传按钮提示：上传 = ① 进全局库（跨项目复用）② 链接本项目；要让文件落进项目 `assets/` 点「调入项目」
+
+验证：`node --check` × 3 + `py_compile` 通过；回归 **108 passed / 2 failed**（2 个为缺 torch 的环境问题）。
+
+---
+
 *本文档为设计方案 + 实施记录。*

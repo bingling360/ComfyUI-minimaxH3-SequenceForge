@@ -89,6 +89,7 @@ ROUTES = [
     ("POST", "/h3chain/lib_rate"),
     ("POST", "/h3chain/lib_tag"),
     ("POST", "/h3chain/lib_alias"),
+    ("POST", "/h3chain/lib_mirror"),
     ("POST", "/h3chain/lib_collection_save"),
     ("POST", "/h3chain/lib_collection_delete"),
     ("POST", "/h3chain/lib_delete"),
@@ -1227,6 +1228,7 @@ def add_routes(routes):
         return web.FileResponse(p)
 
     async def lib_raw(request):
+        """原文件流：默认 inline（预览用）；`download=1` 带 attachment 头触发另存为。"""
         q = request.query
         dir_name = str(q.get("dir") or "")
         it = _find_item(dir_name, str(q.get("id") or ""))
@@ -1235,6 +1237,10 @@ def add_routes(routes):
         src = h3lib.resolve_item_path(it, dir_name)
         if not src:
             return _err("文件缺失", code="NOT_FOUND", status=404)
+        if str(q.get("download") or "").lower() in ("1", "true", "yes"):
+            fn = os.path.basename(src)
+            return web.FileResponse(src, headers={
+                "Content-Disposition": f'attachment; filename="{fn}"'})
         return web.FileResponse(src)
 
     async def lib_status(request):
@@ -1349,6 +1355,32 @@ def add_routes(routes):
                 return _err("保存失败", code="BAD_ARGS", status=400)
         h3lib.invalidate(dir_name)
         return web.json_response({"ok": True, "alias": alias})
+
+    async def lib_mirror(request):
+        """全局库条目 → 项目：拷文件进 assets/ **并写 manifest["assets"]**（一步到位）。
+
+        调完立刻能在「项目资产」scope 看到、可用 [[别名]] 引用 —— 不需要前端再推池。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        dir_name = str(data.get("dir") or "")
+        h3lib.invalidate(dir_name)          # 先刷索引：刚上传的条目要能立刻被找到
+        it = _find_item(dir_name, str(data.get("id") or ""))
+        if it is None:
+            return _err("素材不存在（索引没刷到，可点「重新扫描」再试）",
+                        code="NOT_FOUND", status=404)
+        if it["scope"] != "global":
+            return _err("只有全局库条目需要「调入项目」（项目资产已经在项目里了）",
+                        code="NOT_GLOBAL", status=400)
+        try:
+            res = h3lib.mirror_to_project(dir_name, it,
+                                          str(data.get("label") or "") or None)
+        except ValueError as e:
+            return _err(str(e), code="BAD_ARGS", status=400)
+        h3lib.invalidate(dir_name)
+        return web.json_response({"ok": True, **res})
 
     async def lib_collections(request):
         return web.json_response({"ok": True,
@@ -1469,7 +1501,20 @@ def add_routes(routes):
             return _err("段号非法", code="BAD_ARGS", status=400)
         mf = projects.read_project(dir_name)
         if mf is None:
-            return _err("项目不存在", code="NOT_FOUND", status=404)
+            return _err("项目不存在（先新建项目或跑一段）", code="NOT_FOUND", status=404)
+        # 全局库条目：先确认项目里有它的链接，否则 refs 里的别名编译不出 <Picture N>
+        if it["scope"] == "global" and it.get("asset_id"):
+            linked = any(isinstance(L, dict) and str(L.get("asset_id")) == it["asset_id"]
+                         for L in (mf.get("asset_links") or []))
+            if not linked:
+                try:
+                    out = projects.link_asset(dir_name, it["asset_id"], it["name"],
+                                              it.get("kind") or "image", None, None)
+                except ValueError as e:
+                    return _err(str(e), code="BAD_ARGS", status=400)
+                if out is None:
+                    return _err("把全局素材链接进项目失败", code="BAD_ARGS", status=400)
+                mf = out
         segs = [dict(s) if isinstance(s, dict) else {} for s in (mf.get("segments") or [])]
         while len(segs) < seg_no:
             segs.append({})
@@ -1503,7 +1548,28 @@ def add_routes(routes):
             return _err("素材不存在", code="NOT_FOUND", status=404)
         mf = projects.read_project(dir_name)
         if mf is None:
-            return _err("项目不存在", code="NOT_FOUND", status=404)
+            return _err("项目不存在（先新建项目或跑一段）", code="NOT_FOUND", status=404)
+        # 全局库条目：写进 asset_links 的 roles（不复制文件，链接即参与编译）
+        if it["scope"] == "global" and it.get("asset_id"):
+            cur = []
+            for L in mf.get("asset_links") or []:
+                if isinstance(L, dict) and str(L.get("asset_id")) == it["asset_id"]:
+                    cur = [str(r) for r in (L.get("roles") or [])]
+            nxt = [r for r in cur if r != role] if role in cur else (cur + [role])
+            try:
+                out = projects.link_asset(dir_name, it["asset_id"], it["name"],
+                                          it.get("kind") or "image",
+                                          data.get("base_revision"), nxt)
+            except ValueError as e:
+                msg = str(e)
+                if msg.startswith("REVISION_CONFLICT"):
+                    return _err(msg, code="REVISION_CONFLICT", status=409)
+                return _err(msg, code="BAD_ARGS", status=400)
+            if out is None:
+                return _err("保存失败（全局条目链接不上）", code="BAD_ARGS", status=400)
+            h3lib.invalidate(dir_name)
+            return web.json_response({"ok": True, "roles": nxt,
+                                      "revision": out.get("revision")})
         assets = [dict(a) if isinstance(a, dict) else a for a in (mf.get("assets") or [])]
         hit = None
         for a in assets:
@@ -1511,7 +1577,7 @@ def add_routes(routes):
                 hit = a
                 break
         if hit is None:
-            return _err("该素材不在项目资产里（全局库条目请先「调入项目」）",
+            return _err("该素材还没登记进项目（先「调入项目」，或上传时勾选入库）",
                         code="NOT_IN_PROJECT", status=400)
         cur = [str(r) for r in (hit.get("roles") or [])]
         if role in cur:
@@ -1525,7 +1591,10 @@ def add_routes(routes):
         try:
             out = projects.save_assets(dir_name, assets, data.get("base_revision"))
         except ValueError as e:
-            return _err(str(e), code="REVISION_CONFLICT", status=409)
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _err(msg, code="REVISION_CONFLICT", status=409)
+            return _err(msg, code="BAD_ARGS", status=400)
         if out is None:
             return _err("保存失败", code="BAD_ARGS", status=400)
         h3lib.invalidate(dir_name)
@@ -1544,6 +1613,7 @@ def add_routes(routes):
         ("POST", "/h3chain/lib_rate", lib_rate),
         ("POST", "/h3chain/lib_tag", lib_tag),
         ("POST", "/h3chain/lib_alias", lib_alias),
+        ("POST", "/h3chain/lib_mirror", lib_mirror),
         ("POST", "/h3chain/lib_collection_save", lib_collection_save),
         ("POST", "/h3chain/lib_collection_delete", lib_collection_delete),
         ("POST", "/h3chain/lib_delete", lib_delete),

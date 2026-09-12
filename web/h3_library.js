@@ -68,9 +68,33 @@
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
+  let toastEl = null;
+  let toastTimer = 0;
+
+  /** 浮层提示：底部状态行会被预览器挡住，只靠它会"点了没反应"。 */
+  function toast(msg, isErr) {
+    const s = String(msg || "");
+    if (!s) return;
+    if (toastEl) toastEl.remove();
+    clearTimeout(toastTimer);
+    toastEl = el("div", "h3l-toast" + (isErr ? " err" : ""), esc(s));
+    document.body.append(toastEl);
+    toastTimer = setTimeout(() => {
+      if (toastEl) { toastEl.remove(); toastEl = null; }
+    }, isErr ? 6500 : 3600);
+  }
+
   function say(t) {
-    if (!S || !S.msg) return;
-    S.msg.textContent = String(t || "");
+    const s = String(t || "");
+    if (S && S.msg) S.msg.textContent = s;
+    if (s) toast(s);
+  }
+
+  /** 失败反馈：红框 + 底部状态行（两处都写，保证看得见）。 */
+  function fail(t) {
+    const s = String(t || "操作失败");
+    if (S && S.msg) S.msg.textContent = s;
+    toast(s, true);
   }
 
   function api() {
@@ -85,7 +109,7 @@
     if (styled) return;
     styled = true;
     const css = `
-.h3l-overlay{position:fixed;inset:0;z-index:9000;background:#0b0b09e6;display:flex;align-items:center;justify-content:center;padding:18px}
+.h3l-overlay{position:fixed;inset:0;z-index:1000005;background:#0b0b09e6;display:flex;align-items:center;justify-content:center;padding:18px}
 .h3l-box{width:min(1660px,100%);height:100%;display:flex;flex-direction:column;background:#141310;border:1px solid #37332b;border-radius:14px;overflow:hidden;color:#d9d4c9;font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif}
 .h3l-head{display:flex;gap:10px;align-items:center;padding:11px 14px;border-bottom:1px solid #37332b;background:#1b1a16;flex-wrap:wrap}
 .h3l-head strong{font-size:15px;color:#f0ece2}
@@ -122,13 +146,13 @@
 .h3l-foot{display:flex;gap:10px;align-items:center;padding:9px 14px;border-top:1px solid #37332b;background:#1b1a16;font-size:12px;color:#8a857b;flex-wrap:wrap}
 .h3l-empty{grid-column:1/-1;padding:44px 12px;text-align:center;color:#7f7a70}
 .h3l-msg{flex:1;color:#a8a294;font-size:12px;min-width:120px}
-.h3l-menu{position:fixed;z-index:9500;min-width:210px;max-height:70vh;overflow:auto;background:#1e1c18;border:1px solid #46604f;border-radius:9px;padding:5px;box-shadow:0 10px 34px #000c}
+.h3l-menu{position:fixed;z-index:1000007;min-width:210px;max-height:70vh;overflow:auto;background:#1e1c18;border:1px solid #46604f;border-radius:9px;padding:5px;box-shadow:0 10px 34px #000c}
 .h3l-menu button{display:block;width:100%;text-align:left;padding:7px 10px;border:0;border-radius:6px;background:transparent;color:#d9d4c9;cursor:pointer;font-size:12.5px;font-family:inherit}
 .h3l-menu button:hover{background:#24402f;color:#7fe0b0}
 .h3l-menu button.danger:hover{background:#3a1a1c;color:#f0a0a4}
 .h3l-menu .h3l-sep{height:1px;margin:5px 6px;background:#37332b}
 .h3l-menu .h3l-cap{padding:6px 10px 3px;color:#7f7a70;font-size:10.5px}
-.h3l-viewer{position:fixed;inset:0;z-index:9400;background:#000000f2;display:flex;gap:0}
+.h3l-viewer{position:fixed;inset:0;z-index:1000006;background:#000000f2;display:flex;gap:0}
 .h3l-vstage{flex:1;display:flex;align-items:center;justify-content:center;padding:22px;min-width:0}
 .h3l-vstage img,.h3l-vstage video{max-width:100%;max-height:100%;border-radius:8px}
 .h3l-vstage audio{width:min(560px,90%)}
@@ -140,6 +164,8 @@
 .h3l-stars{display:flex;gap:2px}
 .h3l-stars span{cursor:pointer;font-size:17px;color:#5c574d}
 .h3l-stars span.on{color:#e9c07a}
+.h3l-toast{position:fixed;right:22px;top:22px;z-index:1000009;max-width:min(460px,80vw);padding:11px 15px;border:1px solid #46604f;border-radius:10px;background:#16241c;color:#c9f0d8;font:13px/1.55 "Microsoft YaHei UI","Segoe UI",sans-serif;box-shadow:0 8px 28px #000b;white-space:pre-wrap;word-break:break-word}
+.h3l-toast.err{border-color:#9a4144;background:#2c1618;color:#f3b6ba}
 `;
     const s = document.createElement("style");
     s.textContent = css;
@@ -156,7 +182,7 @@
       sort: S.sort, order: S.order, page: S.page, page_size: S.pageSize,
       collection: S.collection || "",
     });
-    if (!res.body?.ok) { say(A.errText(res, "读取素材失败")); return; }
+    if (!res.body?.ok) { fail(A.errText(res, "读取素材失败")); return; }
     const d = res.body.data || {};
     S.items = append ? S.items.concat(d.items || []) : (d.items || []);
     S.total = d.total || 0;
@@ -313,7 +339,7 @@
       m.append(el("div", "h3l-sep"));
     }
     if ((it.kind === "image" || it.kind === "video" || it.kind === "audio") && !many) {
-      m.append(menuItem("⤴ 引用到第 " + (S.seg || 1) + " 段", () => actRef(it)));
+      m.append(menuItem("🎯 作为第 " + (S.seg || 1) + " 段的参考素材", () => actRef(it)));
     }
     if (it.kind === "image" && !many) {
       m.append(menuItem("🎬 标为首帧图", () => actRole(it, "首帧图")));
@@ -326,10 +352,17 @@
       m.append(menuItem("✏ 重命名…", () => actAlias(it)));
       m.append(el("div", "h3l-sep"));
     }
+    if (many) {
+      const gl = S.items.filter((x) => S.sel.has(x.id) && x.scope === "global");
+      if (gl.length) {
+        m.append(menuItem(`⇩ 把选中的 ${gl.length} 个全局素材调入项目`, () => actMirrorMany(gl)));
+        m.append(el("div", "h3l-sep"));
+      }
+    }
     if (it.scope === "global" && !many) {
-      m.append(menuItem("⇩ 调入项目", () => actMirror(it)));
+      m.append(menuItem("⇩ 调入项目（复制一份到项目 assets/）", () => actMirror(it)));
     } else if (it.scope === "finals" && !many) {
-      m.append(menuItem("→ 调入资产库", () => actToAssets(it)));
+      m.append(menuItem("→ 移进项目资产（从成片挪一份到 assets/）", () => actToAssets(it)));
     }
     if (it.scope === "latent" && !many && window.H3Director?.upscaleLatent) {
       m.append(menuItem("🔍 二采放大（驱动画布 H3LatentUpscale）",
@@ -339,7 +372,7 @@
     m.append(menuItem("📥 下载文件" + (many ? "（打包）" : ""), () => actDownload(it, ids)));
     m.append(menuItem("🗜 打包 ZIP" + (many ? `（${ids.length} 个）` : ""), () => actZip(ids)));
     m.append(el("div", "h3l-sep"));
-    m.append(menuItem("🧪 暂存到 input（在画布用原生节点）", () => actStage(ids), false));
+    m.append(menuItem("📤 复制到 input 目录（供画布 LoadImage / LoadVideo 选择）", () => actStage(ids)));
     if (!many) {
       m.append(el("div", "h3l-sep"));
       m.append(menuItem("🗑 删除文件", () => actDelete(ids), true));
@@ -420,7 +453,7 @@
       acts.append(b);
       return b;
     };
-    if (it.kind !== "latent") add("引用到段", () => actRef(it));
+    if (it.kind !== "latent") add("作为参考素材", () => actRef(it));
     if (it.kind === "image") {
       add("标首帧图", () => actRole(it, "首帧图"));
       add("标尾帧图", () => actRole(it, "尾帧图"));
@@ -428,11 +461,11 @@
     add("重命名", () => actAlias(it));
     add("标签", () => actTag(it));
     if (it.scope === "global") add("调入项目", () => actMirror(it));
-    if (it.scope === "finals") add("调入资产库", () => actToAssets(it));
+    if (it.scope === "finals") add("移进项目资产", () => actToAssets(it));
     if (it.scope === "latent" && window.H3Director?.upscaleLatent) {
       add("二采放大", () => window.H3Director.upscaleLatent(S.dir, it.file, say));
     }
-    add("暂存到 input", () => actStage([it.id]));
+    add("复制到 input", () => actStage([it.id]));
     add("下载", () => actDownload(it, [it.id]));
     side.append(acts);
 
@@ -467,15 +500,16 @@
     const A = api();
     const segNo = Number(S.seg) || 1;
     const r = await A.libRef(S.dir, it.id, segNo);
-    if (!r.body?.ok) { say(A.errText(r, "引用失败")); return; }
-    after(`已把「${it.name}」引用到第 ${segNo} 段`);
+    if (!r.body?.ok) { fail(A.errText(r, "引用失败")); return; }
+    after(`「${it.name}」已作为第 ${segNo} 段的参考素材\n`
+      + "生成时会编译成 <Picture 1> / <Video 1> / <Audio 1> 这类编号写进该段提示词。");
     fetchPage(false);
   }
 
   async function actRole(it, role) {
     const A = api();
     const r = await A.libRole(S.dir, it.id, role);
-    if (!r.body?.ok) { say(A.errText(r, "标注失败")); return; }
+    if (!r.body?.ok) { fail(A.errText(r, "标注失败")); return; }
     after(`「${it.name}」→ ${role}`);
     fetchPage(false);
   }
@@ -485,7 +519,7 @@
     if (v === null) return;
     const A = api();
     const r = await A.libRate(S.dir, it.id, Number(v) || 0);
-    if (!r.body?.ok) { say(A.errText(r, "评分失败")); return; }
+    if (!r.body?.ok) { fail(A.errText(r, "评分失败")); return; }
     after("评分已保存");
     fetchPage(false);
   }
@@ -496,7 +530,7 @@
     const tags = String(v).split(/[,，]/).map((s) => s.trim()).filter(Boolean);
     const A = api();
     const r = await A.libTag(S.dir, it.id, tags);
-    if (!r.body?.ok) { say(A.errText(r, "标签保存失败")); return; }
+    if (!r.body?.ok) { fail(A.errText(r, "标签保存失败")); return; }
     after("标签已保存");
     fetchPage(false);
   }
@@ -506,17 +540,33 @@
     if (v === null || !String(v).trim()) return;
     const A = api();
     const r = await A.libAlias(S.dir, it.id, String(v).trim());
-    if (!r.body?.ok) { say(A.errText(r, "重命名失败")); return; }
+    if (!r.body?.ok) { fail(A.errText(r, "重命名失败")); return; }
     after("已重命名");
     fetchPage(false);
   }
 
   async function actMirror(it) {
     const A = api();
-    const r = await A.assetMirror({ dir: S.dir, asset_id: it.asset_id, alias: it.name });
-    if (!r.body?.ok) { say(A.errText(r, "调入项目失败")); return; }
-    after(`「${it.name}」已调入项目`);
+    if (!A.libMirror) { fail("接口未就绪（h3_api.js 未更新）"); return; }
+    const r = await A.libMirror(S.dir, it.id, it.name);
+    if (!r.body?.ok) { fail(A.errText(r, "调入项目失败")); return; }
+    after(`已调入项目：${r.body.file}\n别名「${r.body.label}」——提示词里写 [[${r.body.label}]] 即可引用`);
     fetchPage(false);
+  }
+
+  async function actMirrorMany(items) {
+    const A = api();
+    let ok = 0;
+    const names = [];
+    for (const it of items) {
+      const r = await A.libMirror(S.dir, it.id, it.name);
+      if (r.body?.ok) { ok++; names.push(r.body.label); }
+      else fail(`${it.name}：${A.errText(r, "调入失败")}`);
+    }
+    if (ok) {
+      say(`已调入 ${ok} 个到项目 assets/：${names.join("、")}\n提示词里写 [[别名]] 即可引用`);
+      fetchPage(false);
+    }
   }
 
   async function actToAssets(it) {
@@ -524,8 +574,8 @@
     const stem = String(it.file).split("/").pop().replace(/\.[^.]+$/, "") || "clip";
     const r = await A.moveMedia(S.dir, it.file, "assets",
       { register_asset: true, label: stem.slice(0, 24), kind: it.kind });
-    if (!r.body?.ok) { say(A.errText(r, "调入资产库失败")); return; }
-    after(`「${stem}」已调入资产库`);
+    if (!r.body?.ok) { fail(A.errText(r, "移进项目资产失败")); return; }
+    after(`「${stem}」已移进项目资产（assets/）`);
     fetchPage(false);
   }
 
@@ -543,13 +593,20 @@
   function actDownload(it, ids) {
     const A = api();
     if (ids.length > 1) { actZip(ids); return; }
-    window.open(A.libRawUrl(S.dir, it.id), "_blank");
+    // 带 download=1：后端加 attachment 头触发另存为（否则浏览器会直接打开原文件）
+    const a = document.createElement("a");
+    a.href = A.libRawUrl(S.dir, it.id, true);
+    a.download = it.name || "";
+    document.body.append(a);
+    a.click();
+    a.remove();
+    say(`开始下载：${it.name}`);
   }
 
   async function actZip(ids) {
     const A = api();
     const r = await A.libZip(S.dir, ids);
-    if (!r.body?.ok) { say(A.errText(r, "打包失败")); return; }
+    if (!r.body?.ok) { fail(A.errText(r, "打包失败")); return; }
     window.open(A.libZipUrl(S.dir, r.body.zip), "_blank");
     say(`已打包 ${r.body.count} 个文件（${fmtSize(r.body.bytes)}）`);
   }
@@ -560,16 +617,19 @@
     for (const id of ids) {
       const r = await A.libStage(S.dir, id);
       if (r.body?.ok) { ok++; last = r.body.staged || ""; }
-      else say(A.errText(r, "暂存失败"));
+      else fail(A.errText(r, "暂存失败"));
     }
-    if (ok) say(`已暂存 ${ok} 个到 input/${last ? last.split("/")[0] : ""}（在画布用 LoadImage/LoadVideo 引用）`);
+    if (ok) {
+      say(`已复制 ${ok} 个到 ComfyUI 的 input 目录（${last}）\n`
+        + "在画布上加 LoadImage / LoadVideo 节点，文件名下拉里就能选到它。");
+    }
   }
 
   async function actDelete(ids) {
     if (!window.confirm(`确认删除这 ${ids.length} 个文件的物理文件？（不可撤销）`)) return;
     const A = api();
     const r = await A.libDelete(S.dir, ids);
-    if (!r.body?.ok) { say(A.errText(r, "删除失败")); return; }
+    if (!r.body?.ok) { fail(A.errText(r, "删除失败")); return; }
     S.sel.clear();
     say(`已删除 ${(r.body.deleted || []).length} 个` +
         ((r.body.skipped || []).length ? `，跳过 ${r.body.skipped.length} 个` : ""));
@@ -644,7 +704,8 @@
 
     const upBtn = el("button", "h3l-btn h3l-btn-cta", "＋ 上传");
     upBtn.type = "button";
-    upBtn.title = "上传到全局库并链接本项目（提示词里用 [[别名]] 引用）";
+    upBtn.title = "上传做两件事：① 存进全局库（跨项目可复用）② 链接到本项目（提示词写 [[别名]] 即可引用）。"
+      + "想让文件落进项目 assets/，右键点「调入项目」。";
     upBtn.onclick = () => {
       const inp = document.createElement("input");
       inp.type = "file";
@@ -661,7 +722,7 @@
             const kind = H3Assets.guessKind(f);
             await H3Assets.uploadDirect(f, { kind, link_dir: S.dir, alias: f.name.replace(/\.[^.]+$/, "").slice(0, 24) });
             ok++;
-          } catch (e) { say(`「${f.name}」上传失败：${e?.message || e}`); }
+          } catch (e) { fail(`「${f.name}」上传失败：${e?.message || e}`); }
         }
         if (ok) { say(`已上传 ${ok} 个到全局库并链接本项目`); fetchPage(false); }
       };
@@ -674,7 +735,7 @@
     scanBtn.onclick = async () => {
       const A = api();
       const r = await A.libScan(S.dir);
-      if (!r.body?.ok) { say(A.errText(r, "扫描失败")); return; }
+      if (!r.body?.ok) { fail(A.errText(r, "扫描失败")); return; }
       say("已重新扫描");
       fetchPage(false);
     };

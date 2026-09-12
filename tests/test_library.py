@@ -230,6 +230,44 @@ def test_make_zip_and_resolve(proj, tmp_path):
     assert L.resolve_item_path({"scope": "project", "file": "../x"}, proj) == ""
 
 
+def test_mirror_to_project(proj, tmp_path, monkeypatch):
+    """全局库条目 → 项目：拷文件进 assets/ 并登记 manifest（一步到位，不是只拷文件）。"""
+    import sys
+    import types
+
+    saved = {}
+    fake = types.ModuleType("projects")
+    fake.safe_name = lambda n: str(n or "")
+    fake.read_project = lambda n: {"assets": [{"label": "已有的", "kind": "image",
+                                               "file": "assets/old.png"}]}
+
+    def _save(n, assets, rev=None):
+        saved["assets"] = assets
+        return {"revision": 7}
+    fake.save_assets = _save
+    monkeypatch.setitem(sys.modules, "projects", fake)
+
+    lib = tmp_path / "lib"
+    (lib / "images").mkdir(parents=True)
+    (lib / "images" / "x.png").write_bytes(b"png")
+    monkeypatch.setattr(L, "_library_root", lambda: str(lib))
+
+    item = {"scope": "global", "kind": "image", "name": "女主",
+            "file": "images/x.png", "asset_id": "a_000000000000"}
+    res = L.mirror_to_project("demo", item)
+    assert res["label"] == "女主"
+    assert res["file"].startswith("assets/")
+    # 文件真的落到项目 assets/ 了
+    assert (tmp_path / "h3_projects" / "demo" / res["file"]).is_file()
+    # manifest 里也登记了（旧条目保留）
+    labels = [a["label"] for a in saved["assets"]]
+    assert "女主" in labels and "已有的" in labels
+    # 源文件缺失要报错
+    item2 = dict(item, file="images/nope.png")
+    with pytest.raises(ValueError):
+        L.mirror_to_project("demo", item2)
+
+
 def test_invalidate(proj):
     L.build_index(proj)
     assert any(k.endswith("|demo") for k in L._INDEX_CACHE)

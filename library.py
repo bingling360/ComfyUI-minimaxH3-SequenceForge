@@ -59,6 +59,12 @@ def kind_of(filename) -> str:
     return EXT_KIND.get(os.path.splitext(str(filename or ""))[1].lower(), "")
 
 
+def normalize_kind(kind) -> str:
+    """类别白名单归一（与 asset_store / asset_hub 同口径）。"""
+    k = str(kind or "image").strip()
+    return k if k in MEDIA_KINDS else "image"
+
+
 def safe_rel(rel) -> str:
     """相对路径归一：去反斜杠、拒穿越。非法返回空串。"""
     parts = [p for p in str(rel or "").replace("\\", "/").split("/") if p and p != "."]
@@ -642,6 +648,55 @@ def make_zip(paths, project_root=None) -> dict:
         for p in files:
             z.write(p, os.path.basename(p))
     return {"zip": name, "abs": dest, "count": len(files), "bytes": os.path.getsize(dest)}
+
+
+def mirror_to_project(project, item, label=None) -> dict:
+    """全局库条目 → 项目：拷文件进 assets/ **并写 manifest["assets"]**（一步到位）。
+
+    与 routes 里旧 `asset_mirror` 的区别：那个只拷文件，登记要前端再推一遍池子
+    （旧三库面板的 persistPool 干的活）。新浏览器没有那一步，所以这里一次做完，
+    调完立刻能在「项目资产」里看到、并用 `[[别名]]` 引用。
+    """
+    try:
+        from . import projects as _pj
+    except ImportError:
+        import projects as _pj
+    name = _pj.safe_name(project)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    src = resolve_item_path(item, name)
+    if not src:
+        raise ValueError("源文件缺失（全局库文件可能已被删）")
+    manifest = _pj.read_project(name)
+    if manifest is None:
+        raise ValueError("项目不存在（先新建项目或跑一段）")
+    adir = os.path.join(_project_root(name), "assets")
+    os.makedirs(adir, exist_ok=True)
+    kind = normalize_kind(item.get("kind"))
+    ext = os.path.splitext(src)[1]
+    want = str(label or item.get("name") or os.path.basename(src)).strip()
+    want = os.path.basename(want)
+    if not os.path.splitext(want)[1]:
+        want += ext
+    cand, k = want, 2
+    while os.path.exists(os.path.join(adir, cand)):
+        cand = f"{os.path.splitext(want)[0]}_{k}{ext}"
+        k += 1
+    shutil.copy2(src, os.path.join(adir, cand))
+    rel = f"assets/{cand}"
+    assets = [dict(a) if isinstance(a, dict) else a for a in (manifest.get("assets") or [])]
+    taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
+    lbl = (str(label or item.get("name") or os.path.splitext(cand)[0])).strip()[:24]
+    lbl = lbl or os.path.splitext(cand)[0][:24]
+    b, n = lbl, 2
+    while lbl in taken:
+        lbl = f"{b}{n}"[:24]
+        n += 1
+    assets.append({"label": lbl, "kind": kind, "file": rel})
+    out = _pj.save_assets(name, assets, None)
+    if out is None:
+        raise ValueError("写入项目清单失败")
+    return {"file": rel, "label": lbl, "kind": kind, "revision": out.get("revision")}
 
 
 def resolve_item_path(item, project=None) -> str:

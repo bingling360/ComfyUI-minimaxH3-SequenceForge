@@ -332,11 +332,13 @@ def test_director_atcomplete():
         assert sym in d, sym
 
 
-def test_director_server_jobs():
+def test_director_no_inline_transcode():
+    """资产库只做引用/打标：内联的裁剪/分离/转latent 与后台任务区必须已下线。"""
     d = _read("h3_director.js")
-    for sym in ["renderServerJobs", "transcodeJobs(dir)", "h3d-prog", "h3d-jstat",
-                "cancelJob", "提交后台任务", "submitJob", "renderServerJobs(body, dir, say)"]:
-        assert sym in d, sym
+    for gone in ["renderServerJobs", "renderTranscodeJobs", "pruneDoneJobs",
+                 "openTranscodeSub", "autoQueueTranscode", "transcodeVaeFiles",
+                 "transcode_jobs", "h3d-jstat", "提交后台任务"]:
+        assert gone not in d, gone
 
 
 def test_director_link_sync():
@@ -351,10 +353,8 @@ def test_director_link_sync():
 
 def test_director_legacy_intact():
     d = _read("h3_director.js")
-    for sym in ["function renderTranscodeJobs", "function pruneDoneJobs",
-                "ds.transcode_jobs.push", "openTranscodeSub(sub, node, dir, a.file, mf, say, refresh)",
-                "transcode_jobs: (Array.isArray(raw.transcode_jobs)",
-                "function importPoolFile", "assetCheck(pool",
+    for sym in ["function importPoolFile", "assetCheck(pool",
+                "function openTrimSub",  # 成片库仍保留帧窗裁剪
                 '"图像+音频"', '"仅图像"', '"仅音频"']:
         assert sym in d, sym
 
@@ -362,13 +362,12 @@ def test_director_legacy_intact():
 def test_helpers_api():
     a = _read("h3_assets.js")
     for sym in ["assetId", "poolAliases", "segUsage", "compileTags", "uploadDirect",
-                "guessKind", "submitJob", "pollJob", "cancelJob",
-                "cleanAsset", "dedupe", "checkSegRefs"]:
+                "guessKind", "cleanAsset", "dedupe", "checkSegRefs"]:
         assert sym in a, sym
     assert "registerExtension" not in a
     api = _read("h3_api.js")
     for sym in ["compileRefs", "assetLinks", "assetLink", "assetUnlink",
-                "assetMirror", "libraryFileUrl", "transcodeSubmit", "libraryUpload"]:
+                "assetMirror", "libraryFileUrl", "libraryUpload", "vaeFiles"]:
         assert sym in api, sym
 
 
@@ -377,13 +376,15 @@ def test_library_fullscreen_folds():
     for sym in ["function foldBox(", "function kindCol(", "_foldState",
                 "h3d-libfold", "h3d-kindcols", "h3d-kindcol",
                 "lib-assets-global", "全局资产库", "lib-assets-project", "项目资产库",
-                "lib-assets-jobs", "lib-assets-clips", "lib-assets-reg",
+                "lib-assets-clips", "lib-assets-reg",
                 "lib-finals-", "lib-latent-list", "lib-latent-slice",
                 "proj-list", "项目存档（",
                 "width:min(1560px,100%)", "h3d-libbox .h3d-btn"]:
         assert sym in d, sym
     # 旧的小面板尺寸必须消失（否则层叠覆盖全屏规则）
     assert "width:min(1060px,96vw)" not in d
+    # 图/视/音三栏嵌套已取消（瓦片被挤到看不见子面板/按钮的根因）
+    assert "h3d-kindcols{display:grid;grid-template-columns:repeat(3" not in d
 
 
 def test_explicit_ref_binding():

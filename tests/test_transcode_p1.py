@@ -303,14 +303,17 @@ def test_shim_wiring_strings():
     assert "_server_pending" in nd and "has_queued" in nd
     assert "if _jobs or _server_pending:" in nd
     assert "共完成" in nd
+    # 转码失败打控制台堆栈（报告只留一行）
+    assert nd.count("_tb.print_exc()") >= 2
     api = open(os.path.join(ROOT, "web", "h3_api.js"), encoding="utf-8").read()
-    for sym in ["transcodeSubmit", "transcodeJobs", "transcodeJob",
-                "transcodeCancel", "libraryUploadJson", "libraryUpload"]:
+    for sym in ["libraryUploadJson", "libraryUpload", "vaeFiles"]:
         assert sym in api, sym
+    # 前端不再内联转码：资产库只做引用/打标，裁剪/分离/转latent 交给画布原生节点
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
-    # 提交后自动排队执行（两按钮走 autoQueueTranscode，最小图失败回落整图）
-    assert d.count("await autoQueueTranscode(") >= 2
-    assert "自动排队执行" in d
+    for gone in ["openTranscodeSub", "queueTranscodeRun", "autoQueueTranscode",
+                 "transcodeVaeFiles", "transcode_jobs", "renderTranscodeJobs",
+                 "renderServerJobs", "pruneDoneJobs"]:
+        assert gone not in d, gone
 
 
 def test_vae_files_route(routes):
@@ -332,31 +335,13 @@ def test_vae_files_route(routes):
     assert res.status == 200 and len(res.data["files"]) == 3
 
 
-def test_minimal_graph_wiring():
+def test_minimal_graph_compat_in_nodes():
+    """最小图兼容只在后端：主节点模型/文本编码器必须可选（专跑只加载 VAE）。"""
     nd = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
     assert 'io.Model.Input("模型", optional=True' in nd
     assert 'io.Clip.Input("文本编码器", optional=True' in nd
     assert 'kwargs.setdefault("模型", None)' in nd
     assert 'kwargs.setdefault("文本编码器", None)' in nd
-    d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
-    for sym in ["transcodeVaeFiles", "queueTranscodeRun", "autoQueueTranscode",
-                '"/prompt"', "H3SeamlessChainSampler", "vaeFiles",
-                "仅加载 VAE", "回落整图排队"]:
-        assert sym in d, sym
-    api = open(os.path.join(ROOT, "web", "h3_api.js"), encoding="utf-8").read()
-    assert "vaeFiles" in api
-    # 最小图必须带 OUTPUT_NODE 终端，否则整包以 prompt_no_outputs 被拒
-    assert "PreviewAny" in d and '["92", 3]' in d
-    # 官方要求所有 widget 输入带值（有默认值也不行）：29 个一个不能少
-    for name in ["宽高比", "百万像素", "宽度", "高度", "每段时长", "引导帧数",
-                 "种子", "步数", "CFG", "采样器", "调度器", "自动存档", "存档目录",
-                 "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪", "审片模式",
-                 "自动保存", "重跑起始段", "接缝重摇", "重摇阈值", "重摇上限",
-                 "递减锚定", "生成模式", "自动成片", "导演台状态", "一采编码",
-                 "资产包", "视频VAE", "音频VAE"]:
-        assert '"%s"' % name in d, name
-    # 转码失败打控制台堆栈（报告只留一行）
-    assert nd.count("_tb.print_exc()") >= 2
 
 
 def test_encode_audio_latent_normalizes_dims():

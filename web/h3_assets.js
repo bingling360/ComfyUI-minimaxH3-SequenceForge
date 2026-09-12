@@ -149,34 +149,8 @@
     return "image";
   }
 
-  async function submitJob(dir, src, opts) {
-    const H3Api = window.H3Api;
-    if (!H3Api) throw new Error("H3Api 未加载");
-    const o = opts || {};
-    const res = await H3Api.transcodeSubmit(Object.assign({ dir, src }, o));
-    if (!res.body?.ok) throw new Error(H3Api.errText(res, "提交转码失败"));
-    return res.body.job;
-  }
-
-  async function pollJob(id) {
-    const H3Api = window.H3Api;
-    if (!H3Api) throw new Error("H3Api 未加载");
-    const res = await H3Api.transcodeJob(id);
-    if (!res.body?.ok) throw new Error(H3Api.errText(res, "查询任务失败"));
-    return res.body.job;
-  }
-
-  async function cancelJob(id) {
-    const H3Api = window.H3Api;
-    if (!H3Api) throw new Error("H3Api 未加载");
-    const res = await H3Api.transcodeCancel(id);
-    if (!res.body?.ok) throw new Error(H3Api.errText(res, "取消任务失败"));
-    return res.body.job;
-  }
-
   if (typeof window !== "undefined") {
     window.H3Assets = { CAPS, cleanAsset, dedupe, checkSegRefs, save, check,
-      assetId, poolAliases, segUsage, compileTags, uploadDirect, guessKind,
-      submitJob, pollJob, cancelJob };
+      assetId, poolAliases, segUsage, compileTags, uploadDirect, guessKind };
   }
 })();

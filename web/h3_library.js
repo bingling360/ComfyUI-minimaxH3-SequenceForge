@@ -141,6 +141,11 @@
 .h3l-name{font-weight:600;font-size:12.5px;word-break:break-all;color:#f0ece2}
 .h3l-meta{font-size:10.5px;color:#8a857b;word-break:break-all;display:flex;gap:5px;flex-wrap:wrap}
 .h3l-badges{display:flex;gap:3px;flex-wrap:wrap}
+.h3l-tbtns{display:flex;gap:4px;flex-wrap:wrap;margin-top:2px}
+.h3l-tbtn{padding:2px 7px;border:1px solid #3a352c;border-radius:7px;background:#211f1a;color:#a8a294;cursor:pointer;font-size:10.5px;font-family:inherit}
+.h3l-tbtn:hover{border-color:#46604f;color:#d9d4c9}
+.h3l-tbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+.h3l-tbtn.danger:hover{border-color:#9a4144;color:#f0a0a4}
 .h3l-chip{padding:1px 7px;border:1px solid #2f6e57;border-radius:9px;background:#12291f;color:#7fe0b0;font-size:10px}
 .h3l-tag{padding:1px 7px;border:1px solid #3a352c;border-radius:9px;color:#a8a294;font-size:10px}
 .h3l-foot{display:flex;gap:10px;align-items:center;padding:9px 14px;border-top:1px solid #37332b;background:#1b1a16;font-size:12px;color:#8a857b;flex-wrap:wrap}
@@ -224,6 +229,32 @@
     }
   }
 
+  /** 瓦片上的常驻动作：只留真正常用的几个（其余进右键菜单，别糊满瓦片）。 */
+  function tileButtons(it) {
+    const box = el("div", "h3l-tbtns");
+    const mk = (label, on, fn, danger) => {
+      const b = el("button", "h3l-tbtn" + (on ? " on" : "") + (danger ? " danger" : ""), esc(label));
+      b.type = "button";
+      b.onclick = (e) => { e.stopPropagation(); fn(); };
+      box.append(b);
+    };
+    const roles = it.roles || [];
+    if (it.kind === "image" && (it.scope === "project" || it.scope === "global")) {
+      mk("首帧图", roles.includes("首帧图"), () => actRole(it, "首帧图"));
+      mk("尾帧图", roles.includes("尾帧图"), () => actRole(it, "尾帧图"));
+    }
+    if (it.scope === "global") mk("调入项目", false, () => actMirror(it));
+    if (it.scope === "finals") mk("→资产", false, () => actToAssets(it));
+    if (it.scope === "latent" && window.H3Director?.upscaleLatent) {
+      mk("二采", false, () => window.H3Director.upscaleLatent(S.dir, it.file, say));
+    }
+    if (it.scope === "project" || it.scope === "global") {
+      mk("改名", false, () => actAlias(it));
+    }
+    mk("删除", false, () => actDelete([it.id]), true);
+    return box;
+  }
+
   function tileFor(it) {
     const t = el("div", "h3l-tile" + (S.sel.has(it.id) ? " sel" : ""));
     t.dataset.id = it.id;
@@ -246,6 +277,8 @@
     for (const sn of it.refs || []) bg.append(el("span", "h3l-chip", `段${sn}`));
     for (const tg of it.tags || []) bg.append(el("span", "h3l-tag", esc(tg)));
     if (bg.children.length) t.append(bg);
+    // 常用动作直接摆在瓦片上（不要藏进"双击才出现"的界面）
+    t.append(tileButtons(it));
 
     t.addEventListener("dblclick", () => openViewer(it));
     t.addEventListener("click", (e) => {
@@ -338,9 +371,6 @@
       m.append(menuItem("👁 预览", () => openViewer(it)));
       m.append(el("div", "h3l-sep"));
     }
-    if ((it.kind === "image" || it.kind === "video" || it.kind === "audio") && !many) {
-      m.append(menuItem("🎯 作为第 " + (S.seg || 1) + " 段的参考素材", () => actRef(it)));
-    }
     if (it.kind === "image" && !many) {
       m.append(menuItem("🎬 标为首帧图", () => actRole(it, "首帧图")));
       m.append(menuItem("🏁 标为尾帧图", () => actRole(it, "尾帧图")));
@@ -372,7 +402,6 @@
     m.append(menuItem("📥 下载文件" + (many ? "（打包）" : ""), () => actDownload(it, ids)));
     m.append(menuItem("🗜 打包 ZIP" + (many ? `（${ids.length} 个）` : ""), () => actZip(ids)));
     m.append(el("div", "h3l-sep"));
-    m.append(menuItem("📤 复制到 input 目录（供画布 LoadImage / LoadVideo 选择）", () => actStage(ids)));
     if (!many) {
       m.append(el("div", "h3l-sep"));
       m.append(menuItem("🗑 删除文件", () => actDelete(ids), true));
@@ -453,20 +482,9 @@
       acts.append(b);
       return b;
     };
-    if (it.kind !== "latent") add("作为参考素材", () => actRef(it));
-    if (it.kind === "image") {
-      add("标首帧图", () => actRole(it, "首帧图"));
-      add("标尾帧图", () => actRole(it, "尾帧图"));
-    }
-    add("重命名", () => actAlias(it));
-    add("标签", () => actTag(it));
-    if (it.scope === "global") add("调入项目", () => actMirror(it));
-    if (it.scope === "finals") add("移进项目资产", () => actToAssets(it));
-    if (it.scope === "latent" && window.H3Director?.upscaleLatent) {
-      add("二采放大", () => window.H3Director.upscaleLatent(S.dir, it.file, say));
-    }
-    add("复制到 input", () => actStage([it.id]));
+    // 预览器只做"看" + 低频项：常用动作都摆在瓦片上了，这儿不重复一遍
     add("下载", () => actDownload(it, [it.id]));
+    add("标签", () => actTag(it));
     side.append(acts);
 
     const bar = el("div", "h3l-vact");
@@ -494,16 +512,6 @@
   function after(what) {
     say(what);
     if (typeof S.onChanged === "function") { try { S.onChanged(); } catch (e) { /* 可选 */ } }
-  }
-
-  async function actRef(it) {
-    const A = api();
-    const segNo = Number(S.seg) || 1;
-    const r = await A.libRef(S.dir, it.id, segNo);
-    if (!r.body?.ok) { fail(A.errText(r, "引用失败")); return; }
-    after(`「${it.name}」已作为第 ${segNo} 段的参考素材\n`
-      + "生成时会编译成 <Picture 1> / <Video 1> / <Audio 1> 这类编号写进该段提示词。");
-    fetchPage(false);
   }
 
   async function actRole(it, role) {
@@ -609,20 +617,6 @@
     if (!r.body?.ok) { fail(A.errText(r, "打包失败")); return; }
     window.open(A.libZipUrl(S.dir, r.body.zip), "_blank");
     say(`已打包 ${r.body.count} 个文件（${fmtSize(r.body.bytes)}）`);
-  }
-
-  async function actStage(ids) {
-    const A = api();
-    let ok = 0, last = "";
-    for (const id of ids) {
-      const r = await A.libStage(S.dir, id);
-      if (r.body?.ok) { ok++; last = r.body.staged || ""; }
-      else fail(A.errText(r, "暂存失败"));
-    }
-    if (ok) {
-      say(`已复制 ${ok} 个到 ComfyUI 的 input 目录（${last}）\n`
-        + "在画布上加 LoadImage / LoadVideo 节点，文件名下拉里就能选到它。");
-    }
   }
 
   async function actDelete(ids) {

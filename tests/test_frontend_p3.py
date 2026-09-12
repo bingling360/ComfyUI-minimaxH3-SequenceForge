@@ -316,16 +316,21 @@ def _read(web_file):
 
 
 def test_library_browser_ui():
-    """新素材库：瓦片只放缩略图 + 徽标，动作收进右键菜单 / 预览器。"""
+    """新素材库：常用按钮摆在瓦片上，低频动作在右键菜单，预览器只做"看"。"""
     lib = _read("h3_library.js")
     for sym in ["window.H3Lib", "h3l-scope", "h3l-grid", "h3l-tile", "h3l-menu",
-                "h3l-viewer", "h3l-thumb", "IntersectionObserver",
-                "function openMenu(", "function openViewer(",
-                "libList", "libThumbUrl", "libRawUrl", "libStage", "libZip",
-                "libRef", "libRole"]:
+                "h3l-viewer", "h3l-thumb", "h3l-tbtns", "h3l-tbtn",
+                "function tileButtons(", "function openMenu(", "function openViewer(",
+                "libList", "libThumbUrl", "libRawUrl", "libMirror", "libZip",
+                "libRole", "libAlias"]:
         assert sym in lib, sym
+    # 多余动作已下线：不再有"引用到段""复制到 input"
+    for gone in ["actRef", "actStage", "作为参考素材", "复制到 input"]:
+        assert gone not in lib, gone
     d = _read("h3_director.js")
-    assert "window.H3Lib.open" in d          # 入口改为调用新浏览器
+    assert "window.H3Lib.open" in d
+    # 后端清单必须回填 widget，否则段引用与 @ 补全看不到新素材
+    assert "await hydratePool()" in d
     for gone in ["h3d-tilegrid", "h3d-kindcols", "h3d-dropzone", "renderLibAssets"]:
         assert gone not in d, gone
 

@@ -6831,8 +6831,45 @@ function openExpandModal(node, segIdx, pv0) {
 
 /* ---------- 刷新 ---------- */
 
+/* ---------- 池子 hydration（项目清单 → 节点 widget） ----------
+ * 素材库里的「调入项目 / 上传 / 改名」都只写 manifest，不回填 widget 的话，
+ * 段卡的引用勾选（h3d-refchip）与提示词框的 @ 补全就看不到新素材 ——
+ * 「素材进了项目库却不能在提示词里用」就是这个。按 revision 节流，不每次重写。 */
+let _poolRev = "";
+async function hydratePool() {
+    const node = findNode();
+    if (!node) return;
+    const dir = getDirValue(node);
+    if (!dir) return;
+    let mf = null;
+    try {
+        mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
+    } catch (e) { return; }
+    const rev = `${dir}:${(mf && mf.revision) || 0}`;
+    if (_poolRev === rev) return;
+    const ds = getDs(node);
+    const pool = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    const seen = new Set(pool.map((a) => String((a && a.label) || "")));
+    let changed = false;
+    for (const a of ((mf && mf.assets) || [])) {
+        if (!a || !a.label || !a.file || seen.has(String(a.label))) continue;
+        pool.push({
+            file: String(a.file), kind: a.kind || "image", label: String(a.label),
+            asset_id: "", roles: Array.isArray(a.roles) ? a.roles : [],
+        });
+        seen.add(String(a.label));
+        changed = true;
+    }
+    _poolRev = rev;
+    if (changed) {
+        ds.ref_assets = pool;
+        setDs(node, ds);
+    }
+}
+
 async function refresh() {
     try {
+        await hydratePool();          // 先同步后端清单，段卡与 @ 补全才看得到新素材
         const data = await collectData();
         renderMini(data);
         if (desk) updateDesk(data);

@@ -108,7 +108,9 @@
     libRate: (dir, id, rating) => _json("POST", "/h3chain/lib_rate", { dir, id, rating }),
     libTag: (dir, id, tags) => _json("POST", "/h3chain/lib_tag", { dir, id, tags }),
     libAlias: (dir, id, alias) => _json("POST", "/h3chain/lib_alias", { dir, id, alias }),
-    // mode: "link"（默认，链接引用不复制）| "copy"（拷一份进项目 assets/）
+    /* mode: "copy"（前端固定传这个：复制一份进项目 assets/ 并登记清单）
+     *     | "link"（老形态：只写 asset_links 不复制文件 —— 前端已不再使用，
+     *             后端保留只为兼容老项目里已有的链接条目） */
     libMirror: (dir, id, label, mode) =>
       _json("POST", "/h3chain/lib_mirror", { dir, id, label, mode: mode || "link" }),
     libArchive: (dir, ids) => _json("POST", "/h3chain/lib_archive", { dir, ids }),

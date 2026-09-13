@@ -46,7 +46,7 @@ const W_DS = "导演台状态";
 const W_AR = "宽高比";
 const W_MP = "百万像素";
 /* 版本标记：浏览器控制台过滤 [h3-director] 可确认加载的是新 JS 还是缓存旧版 */
-const H3D_VER = "20260826+portrait-thumb";
+const H3D_VER = "20260914+lib-dup-gate";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
@@ -89,8 +89,18 @@ const REF_TEMPLATES = [
         "an audio reference; keep timbre, rhythm and mood"],
     ["说话人", () => `短发女主 (S1) 轻声说：「……」`, "", ""],
 ];
-/** 每段的锚定方式选择（seg idx → REF_TEMPLATES 下标；-1=无），重绘不丢 */
+/** 每段的锚定方式选择（seg idx → REF_TEMPLATES 下标），重绘不丢。
+ *  默认 0 = 裸引用：**没有单独的「无」档**——「无」与「裸引用（不加描述）」插入的
+ *  正文完全一样（都是裸 @标签），两个选项只会让人以为有区别。 */
 const _refTpl = new Map();
+const REF_TPL_DEFAULT = 0;
+
+/* 卡片轻量重绘钩子（每次 buildCards 重置，当前渲染出的段卡各自注册一个）：
+ * 焦点守卫会跳过整卡重建，若此时什么都不做，卡片内的即时状态（引用 chips / 计数 /
+ * 正文绿框）就停在旧值上——表现就是"要再点一下别的才更新"。刷新周期改为调用这些
+ * 钩子，把卡片内的活状态推进到最新，重活（整卡重建）仍等焦点离开。 */
+let _cardPainters = [];
+function registerCardPainter(fn) { if (typeof fn === "function") _cardPainters.push(fn); }
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧起手（可选尾帧图片=FL2VA 首尾帧），fl2va UNET"],
@@ -360,7 +370,9 @@ function createPromptEditor(opts) {
         sp.className = "h3d-rtag";
         sp.contentEditable = "false";
         sp.dataset.label = String(label);
-        sp.title = `@${label}：本段引用的素材（编译为官方 <Picture/Video/Audio k>）`;
+        sp.title = `@${label}：本段引用的素材（编译为官方 <Picture/Video/Audio k>）`
+            + "\n右侧 ✕ = 只取消**这一处**引用（同一素材引用 N 次就点 N 下，一次少一处）；"
+            + "要一次清掉本段对它的全部引用，用引用条上 chip 旁边的 ✕。";
         sp.append(document.createTextNode("@" + label));
         /* ✕ 用 span 而不是 <button>：contenteditable 内的交互元素在 Chromium 下
          * 行为不一致（button 的 click 有时被选区逻辑吃掉 → "点了没反应"）。
@@ -369,11 +381,11 @@ function createPromptEditor(opts) {
         x.className = "h3d-rtagx";
         x.setAttribute("role", "button");
         x.textContent = "✕";
-        x.title = `取消本段对「${label}」的全部引用（正文里的引用一起清掉）`;
+        x.title = `取消这一处引用（同一素材的其它引用保留；清全部请用引用条 chip 旁的 ✕）`;
         x.addEventListener("mousedown", (e) => {
             e.preventDefault();
             e.stopPropagation();
-            removeTag(label);
+            removeOneTag(sp);            // 只取这一处 —— 不是 removeTag（那是清全部）
             if (typeof o.onRemove === "function") o.onRemove(label);
         });
         x.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
@@ -512,6 +524,13 @@ function createPromptEditor(opts) {
         return next;
     }
 
+    /** 删除 token 后的空白收拾（行内连续空格压一个、行首行尾空白去掉） */
+    function tidy(t) {
+        return String(t).replace(/[ \t]{2,}/g, " ")
+            .replace(/ *\n */g, "\n").replace(/^[ \t]+/, "").replace(/[ \t]+$/, "");
+    }
+
+    /** 清掉本段对该素材的**全部**引用（引用条 chip 旁的 ✕ / 右键 chip 走这里）。 */
     function removeTag(label) {
         const cur = ser(box);
         const want = String(label || "");
@@ -523,7 +542,47 @@ function createPromptEditor(opts) {
             next += tk.label ? `@${tk.label}` : tk.text;
         }
         if (!hit) return false;
-        next = next.replace(/[ \t]{2,}/g, " ").replace(/ *\n */g, "\n").replace(/^[ \t]+/, "");
+        next = tidy(next);
+        render(next);
+        box.focus();
+        if (at != null) placeCaret(Math.min(at, next.length));
+        fireInput();
+        return true;
+    }
+
+    /** 只取消**一处**引用（绿框自带的 ✕ 走这里）：删掉被点的那个绿框对应的那一次
+     *  `@别名`，同名其它引用原样保留 —— 引用次数 N 降到 N-1，降到 0 时引用条里对应的
+     *  chip 自动置灰（＋@别名）。
+     *
+     *  为什么按"第几个"删而不是按 DOM 节点直接删：正文（序列化文本）是唯一真相，
+     *  所有渲染都由 render(文本) 重建，所以只能把文本里的第 nth 个同名 token 去掉。
+     *  绿框顺序与 refTokens 顺序一致（都由 render 产出），因此 DOM 里第 nth 个同名
+     *  绿框 == 文本里第 nth 个同名 token。 */
+    function removeOneTag(tagEl) {
+        const want = String((tagEl && tagEl.dataset && tagEl.dataset.label) || "");
+        if (!want) return false;
+        let nth = 0;
+        if (tagEl) {
+            for (const n of box.querySelectorAll(".h3d-rtag")) {
+                if (n === tagEl) break;
+                if ((n.dataset.label || "") === want) nth += 1;
+            }
+        }
+        const at = caret();
+        let seen = 0;
+        let hit = false;
+        let next = "";
+        for (const tk of refTokens(ser(box))) {
+            if (tk.label && tk.label === want) {
+                if (seen === nth) { seen += 1; hit = true; continue; }
+                seen += 1;
+                next += `@${tk.label}`;
+                continue;
+            }
+            next += tk.label ? `@${tk.label}` : tk.text;
+        }
+        if (!hit) return false;
+        next = tidy(next);
         render(next);
         box.focus();
         if (at != null) placeCaret(Math.min(at, next.length));
@@ -580,7 +639,9 @@ function createPromptEditor(opts) {
         },
         insertTag,
         removeTag,
+        removeOneTag,
         tagCount,
+        normalizeLoose,
         setLabels(fn) { o.labels = fn; },
     };
     /* 粘贴只收纯文本：防 HTML 注入 / 样式污染 */
@@ -594,32 +655,38 @@ function createPromptEditor(opts) {
     box.addEventListener("blur", () => { render(api.value); });
 
     /* 打字停顿后自动成框：手打 @别名 也会变成绿框（700ms 防抖 + IME 保护，
-     * 只在"确实还有没成框的 @别名"时才动 DOM，避免打断中文输入法组合） */
+     * 只在"确实还有没成框的 @别名"时才动 DOM，避免打断中文输入法组合）。
+     * 同时对外暴露 normalizeLoose()：卡片轻量重绘时**立即**补框，不等 700ms、
+     * 也不等整卡重建（重建被焦点守卫挡着时，晚到素材的 @别名会一直留成裸文本
+     * —— 就是"第二个素材的绿框来不及出现，再点一个才出来"的成因）。 */
     let composing = false;
     let normTimer = 0;
     box.addEventListener("compositionstart", () => { composing = true; });
     box.addEventListener("compositionend", () => { composing = false; });
+    /** 把正文里"还没成框"的 @别名 就地渲染成绿框（幂等：无裸别名时返回 false 不动 DOM） */
+    function normalizeLoose() {
+        if (composing) return false;
+        const text = api.value;
+        const domCount = {};
+        box.querySelectorAll(".h3d-rtag").forEach((n) => {
+            const l = n.dataset.label || "";
+            domCount[l] = (domCount[l] || 0) + 1;
+        });
+        let loose = false;
+        for (const l of labelsOf()) {
+            const inText = text.split(`@${l}`).length - 1;
+            if (inText > (domCount[l] || 0)) { loose = true; break; }
+        }
+        if (!loose) return false;
+        const at = caret();
+        render(text);
+        if (at != null) placeCaret(Math.min(at, text.length));
+        return true;
+    }
     box.addEventListener("input", (e) => {
         if (e && e.h3synthetic) return;
         clearTimeout(normTimer);
-        normTimer = setTimeout(() => {
-            if (composing) return;
-            const text = api.value;
-            const domCount = {};
-            box.querySelectorAll(".h3d-rtag").forEach((n) => {
-                const l = n.dataset.label || "";
-                domCount[l] = (domCount[l] || 0) + 1;
-            });
-            let loose = false;
-            for (const l of labelsOf()) {
-                const inText = text.split(`@${l}`).length - 1;
-                if (inText > (domCount[l] || 0)) { loose = true; break; }
-            }
-            if (!loose) return;
-            const at = caret();
-            render(text);
-            if (at != null) placeCaret(Math.min(at, text.length));
-        }, 700);
+        normTimer = setTimeout(normalizeLoose, 700);
     });
     api.value = String(o.value || "");
     return api;
@@ -4583,7 +4650,15 @@ function renderCenterColumn(colC, data) {
     // v2 分组含大量 input/select：任一聚焦都视为编辑中（否则 900ms 轮询重建会抢焦点）
     const taFocus = !!colC.querySelector(".h3d-ta:focus, .h3d-v2f:focus, input:focus, select:focus");
     const locked = taFocus || !!colC.querySelector(".h3d-editor") || isVideoPlaying(colC) || !!dragSeg;
-    if (!locked && (sig !== desk.cardsSig || !colC.querySelector(".h3d-center-pad"))) {
+    if (locked) {
+        /* 不重建，但卡片**自己**的即时状态照旧推进（引用 chips / 计数 / 正文绿框）；
+         * 否则焦点在框里时，任何刷新都被丢掉 → "要点别的才更新"。 */
+        for (const fn of _cardPainters) {
+            try { fn(); } catch (e) { /* 单卡重绘失败不影响别的卡 */ }
+        }
+        return;
+    }
+    if (sig !== desk.cardsSig || !colC.querySelector(".h3d-center-pad")) {
         desk.cardsSig = sig;
         [...colC.children].slice(1).forEach((n) => n.remove());
         colC.append(buildCenterBody(data));
@@ -5431,6 +5506,7 @@ function buildCards(data) {
     const bridges = mf?.bridge_scores || [];
     const redoMarks = redoMap(data.ds, mf);   // slot -> mode（ds 标记 ∪ manifest 队列）
     const wrap = el("div", "h3d-cards");
+    _cardPainters = [];                        // 旧卡的钩子随旧卡一起丢掉，由下面新卡重新注册
 
     if (!plan.length) {
         wrap.append(el("div", "h3d-empty",
@@ -5539,14 +5615,30 @@ function buildCards(data) {
             const poolHint = pool.length
                 ? `用 @${pool[0].label} 这样的标签引用素材（引用会显示成绿框，点 ✕ 取消）`
                 : "上传参考图后可用 @标签 引用";
-            /* 富文本提示词框：@别名 显示为内联绿框（✕ = 取消该素材在本段的全部引用） */
+            /* 卡片轻量重绘（引用条建好后赋值；在此之前是空实现 = 无害）。
+             * 引用 chips / 计数 / 绿框三处状态由它统一推进，任何"改了引用"的入口
+             * 都立刻调它，不等 240ms 刷新（刷新在焦点守卫下会被丢掉）。 */
+            let repaintCard = () => {};
+            /* 富文本提示词框：@别名 显示为内联绿框。
+             * 绿框里的 ✕ = 只取消**这一处**引用（引用 N 次点 N 下，N=0 时引用条
+             *  对应 chip 自动置灰）；引用条 chip 旁的 ✕ 才是"清全部"。 */
             const ta = createPromptEditor({
                 value: it.text || "",
-                labels: () => ((data.ds.ref_assets || []).map((a) => a.label)),
+                /* 别名表读**活的**节点状态，不用 collectData 的快照：上传/改名/删除素材后
+                 * 快照会一直停在建卡那一刻，新素材的 @别名就永远渲染不成绿框。 */
+                labels: () => {
+                    let arr = data.ds.ref_assets;
+                    if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
+                    return (arr || []).map((a) => a.label);
+                },
                 onRemove: (label) => {
                     if (!node || it.idx === undefined) return;
-                    applyPromptEdit(node, it.idx, ta);   // 正文（已去掉绿框）立即落盘
-                    removeSegmentRef(node, it.idx, label);
+                    /* 正文是唯一真相：applyPromptEdit 按新正文重算 refs，正好少一处。
+                     * 这里**不再**跟一个 removeSegmentRef —— 那是"清全部"时代给
+                     * removeTag 兜底的；现在 ✕ 只清一处，再减一次会让计数一次掉 2
+                     *（引用 2 次点一下直接归零）。写回失败时才退回兜底。 */
+                    if (!applyPromptEdit(node, it.idx, ta)) removeSegmentRef(node, it.idx, label);
+                    repaintCard();                       // 引用条即时同步（以前要再点别的才刷新）
                     scheduleRefresh(240);
                 },
             });
@@ -5596,13 +5688,24 @@ function buildCards(data) {
              * chip 旁的「✕」= 取消本段对它的**全部**引用（正文里的绿框一起清掉）。
              * 素材个数上限仍按官方 9/3/3（去重算），重复次数另有软上限。
              * 下拉 = 锚定方式（先选方式再点素材，按方式把句式写进正文）。
-             * 末尾两个按钮：本段的首帧图 / 尾帧图参考（从项目里的图片选或现传）。 */
-            if (node && it.idx !== undefined && pool.length) {
+             * 末尾两个按钮：本段的首帧图 / 尾帧图参考（从项目里的图片选或现传）。
+             * **不再要求"建卡时已有素材"**：素材晚到时 chips 由 syncChips 自动补出来，
+             * 引用条本身不必等整卡重建才出现（否则零素材时上传第一张会"没反应"）。 */
+            if (node && it.idx !== undefined) {
                 const refbar = el("div", "h3d-refrow");
                 refbar.append(el("label", "", "引用素材"));
                 const counter = el("span", "h3d-secs-hint", "");
-                /* 锚定方式（引用语）：-1=无；下标=REF_TEMPLATES。按段记住，重绘不丢。 */
-                let refTpl = _refTpl.has(it.idx) ? _refTpl.get(it.idx) : -1;
+                refbar.append(counter);        // 计数先入位：chips 一律插在它前面（syncChips 用）
+                /* 素材池取**活**的节点状态（上传/改名/删除素材后 chips 与别名表立即跟上），
+                 * 建卡快照 pool 只作回落 —— 快照会一直停在建卡那一刻。 */
+                const livePool = () => {
+                    if (!node) return pool;
+                    try { return (getDs(node).ref_assets || []); } catch (e) { return pool; }
+                };
+                /* 锚定方式（引用语）：下标=REF_TEMPLATES，默认「裸引用（不加描述）」。
+                 * 按段记住（_refTpl），重绘不丢。 */
+                let refTpl = _refTpl.has(it.idx) ? _refTpl.get(it.idx) : REF_TPL_DEFAULT;
+                if (!REF_TEMPLATES[refTpl]) refTpl = REF_TPL_DEFAULT;
                 /* 官方 tag 预览：按「本段勾选顺序」对三类各自独立编号（与后端
                  * compile_refs 同口径，重复引用只占一个编号）—— 让用户直接看到
                  * @女主 会变成 <Picture 1>，写几次就出现几次。 */
@@ -5611,25 +5714,40 @@ function buildCards(data) {
                     const { c, a, roles } = rec;
                     c.classList.toggle("on", n > 0);
                     c.textContent = `${n > 0 ? "✓" : "＋"}@${a.label}${roles}${n > 1 ? ` ×${n}` : ""}`;
-                    const armedName = (REF_TEMPLATES[refTpl] || [])[0];
+                    const armedName = (REF_TEMPLATES[refTpl] || [])[0] || "裸引用（不加描述）";
                     c.title = `${KIND_NAME[a.kind] || ""}「${a.label}」${roles}：`
                         + (n > 0
                             ? `本段已引用 ${n} 次${token ? `（正文里每个 @${a.label} 都会编译成 ${token}）` : ""}`
                             : "本段未引用")
                         + "\n点一次 = 在提示词框里插一个绿框（正文补一个 @标签，点两次=引用两次）；"
                         + "右侧 ✕（或右键本 chip）= 取消本段对它的全部引用。"
-                        + (armedName
-                            ? `\n当前锚定方式「${armedName}」：点它会按这个方式写入正文。`
-                            : "\n未选锚定方式：只插裸 @标签（正文里自己描述用法）。");
+                        + "\n（正文里绿框自带的 ✕ 是「只取消那一处」，点一次少一处。）"
+                        + `\n当前锚定方式「${armedName}」：点它会按这个方式写入正文。`;
                 };
                 const chips = [];
+                let chipKeys = null;      // 已建 chips 的别名序列（与 livePool 对齐；池变了才重建 DOM）
+                const syncChips = (live) => {
+                    const arr = live || livePool();
+                    const joined = arr.map((x) => String(x.label || "")).join("\u0001");
+                    if (joined === chipKeys) return;       // 池没变：chips DOM 原样留用
+                    chipKeys = joined;
+                    for (const rec of chips.splice(0)) { rec.c.remove(); rec.minus.remove(); }
+                    for (const a of arr) {
+                        const rec = mkChip(a);
+                        refbar.insertBefore(rec.c, counter);
+                        refbar.insertBefore(rec.minus, counter);
+                        chips.push(rec);
+                    }
+                };
                 const paintAll = () => {
+                    const live = livePool();
+                    syncChips(live);
                     const seg = (getDs(node).segments || [])[it.idx] || defaultSegment();
                     const refs = seg.refs || [];
                     const cnt = { image: 0, video: 0, audio: 0 };
                     const tokens = {};
                     for (const l of new Set(refs)) {          // 编号按素材，不看重复
-                        const hit = pool.find((x) => x.label === l);
+                        const hit = live.find((x) => x.label === l) || pool.find((x) => x.label === l);
                         if (!hit) continue;
                         const k = hit.kind || "image";
                         if (cnt[k] === undefined) cnt[k] = 0;
@@ -5648,28 +5766,29 @@ function buildCards(data) {
                         ? `已引用 ${nAsset} 个素材（共 ${refs.length} 次 · 图${cnt.image}/${KIND_CAPS.image}·视${cnt.video}/${KIND_CAPS.video}·音${cnt.audio}/${KIND_CAPS.audio}）`
                         : "本段未引用素材";
                 };
-                for (const a of pool) {
+                /* 用 mousedown 而不是 click：① 卡片重绘可能夹在 mousedown/click
+                 * 之间把节点换掉 → click 永远不来（"点了没反应"）；
+                 * ② preventDefault 不让编辑器失焦，避免失焦回写旧文本。
+                 * 失败也可见（不再静默）。 */
+                const guard = (fn) => (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try { fn(); } catch (err) {
+                        console.error("[h3-director] 引用操作失败：", err);
+                        setLed("error", `引用操作失败：${err?.message || err}`);
+                    }
+                };
+                /* 单个 chip（含旁挂 ✕）的构造：池变化时 syncChips 会整批重建，所以
+                 * 构造函数必须独立于"建卡那一刻的池"。 */
+                const mkChip = (a) => {
                     const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
                     const c = el("button", "h3d-chipbtn");
                     c.type = "button";
                     c.dataset.ref = String(a.label || "");
                     const minus = el("button", "h3d-chipminus", "✕");
                     minus.type = "button";
-                    minus.title = `取消本段对「${a.label}」的全部引用（正文里的绿框一起清掉）`;
-                    const rec = { c, minus, a, roles };
-                    chips.push(rec);
-                    /* 用 mousedown 而不是 click：① 卡片重绘可能夹在 mousedown/click
-                     * 之间把节点换掉 → click 永远不来（"点了没反应"）；
-                     * ② preventDefault 不让编辑器失焦，避免失焦回写旧文本。
-                     * 失败也可见（不再静默）。 */
-                    const guard = (fn) => (e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        try { fn(); } catch (err) {
-                            console.error("[h3-director] 引用操作失败：", err);
-                            setLed("error", `引用操作失败：${err?.message || err}`);
-                        }
-                    };
+                    minus.title = `取消本段对「${a.label}」的全部引用（正文里的绿框一起清掉；`
+                        + `只想取消某一处，用正文里那个绿框自带的 ✕）`;
                     c.addEventListener("mousedown", guard(() => {
                         if (!canAddRef(node, it.idx, a.label)) return;
                         if (curTab === "set") {                 // 设置页没有正文可插：只登记引用
@@ -5688,7 +5807,7 @@ function buildCards(data) {
                             applyPromptEdit(node, it.idx, ta);
                             if (curTab === "v2") applyRefAnchorToV2(node, it.idx, a.label, tplDef || [], roles);
                         }
-                        paintAll();                 // 先让 chip 状态即时落地
+                        repaintCard();              // chip + 计数 + 绿框一次到位（不等刷新）
                         scheduleRefresh(240);
                     }));
                     const clearAll = () => {
@@ -5697,7 +5816,7 @@ function buildCards(data) {
                             applyPromptEdit(node, it.idx, ta);
                         }
                         removeSegmentRef(node, it.idx, a.label); // refs 归零（双保险）
-                        paintAll();
+                        repaintCard();
                         scheduleRefresh(240);
                     };
                     minus.addEventListener("mousedown", guard(clearAll));
@@ -5707,10 +5826,9 @@ function buildCards(data) {
                         e.stopPropagation();
                         try { clearAll(); } catch (err) { console.error(err); }
                     });
-                    refbar.append(c, minus);
-                }
+                    return { c, minus, a, roles };
+                };
                 paintAll();
-                refbar.append(counter);
                 /* 段级首尾帧参考图：从项目里的图片选（或现传一张），作为本段的
                  * 首帧 / 尾帧参考（段头 / 段尾身份锚；首段首帧图 = i2v 起手帧）。 */
                 const frameBtns = el("div", "h3d-frmbtns");
@@ -5740,9 +5858,22 @@ function buildCards(data) {
                 };
                 paintFrameBtns();
                 refbar.append(frameBtns);
+                /* 卡片轻量重绘：先补正文绿框（晚到的素材别名 → 立刻成框并回写正文/引用），
+                 * 再重画引用 chips + 计数 + 首尾帧按钮。聚焦锁定期间由刷新周期反复调用，
+                 * 也是 ✕ / chip 点击的即时刷新入口。 */
+                repaintCard = () => {
+                    if (!ta.el || !ta.el.isConnected) return;   // 卡片已被换掉：别拿旧 DOM 回写状态
+                    let fixed = false;
+                    try { fixed = ta.normalizeLoose(); } catch (e) { fixed = false; }
+                    if (fixed && node && it.idx !== undefined) applyPromptEdit(node, it.idx, ta);
+                    paintAll();
+                    paintFrameBtns();
+                };
+                registerCardPainter(repaintCard);
                 /* 锚定方式（引用语）：**先选方式，再点参考素材** —— 点哪个素材就按该方式
-                 * 把句式写进正文（`场景以 @X 为准…`），不选 = 只插裸 @标签。
-                 * 选择是"常驻模式"（切段/重绘后仍保持），选回「无」即关闭。 */
+                 * 把句式写进正文（`场景以 @X 为准…`）。
+                 * 选择是"常驻模式"（切段/重绘后仍保持）；默认「裸引用（不加描述）」= 只插
+                 * 裸 @标签（原「无」档与它插入的正文完全一样，已合并成一个选项）。 */
                 const tpl = document.createElement("select");
                 tpl.className = "h3d-reftpl";
                 const mkOpt = (v, txt) => {
@@ -5751,14 +5882,13 @@ function buildCards(data) {
                     o.textContent = txt;
                     return o;
                 };
-                tpl.append(mkOpt("", "锚定方式：无（只插 @标签）"));
                 REF_TEMPLATES.forEach(([name], ti) => tpl.append(mkOpt(ti, `锚定方式：${name}`)));
-                tpl.value = refTpl >= 0 ? String(refTpl) : "";
+                tpl.value = String(refTpl);
                 tpl.title = "选一种锚定方式，再点上面的参考素材：该素材会按这个方式写进提示词。"
-                    + "\n不选 = 只插裸 @标签，用法自己在正文里描述。";
+                    + "\n选「裸引用（不加描述）」= 只插 @标签，用法自己在正文里描述。";
                 tpl.onchange = () => {
-                    const v = tpl.value === "" ? -1 : Number(tpl.value);
-                    refTpl = Number.isInteger(v) && REF_TEMPLATES[v] ? v : -1;
+                    const v = Number(tpl.value);
+                    refTpl = Number.isInteger(v) && REF_TEMPLATES[v] ? v : REF_TPL_DEFAULT;
                     _refTpl.set(it.idx, refTpl);
                     paintAll();
                 };

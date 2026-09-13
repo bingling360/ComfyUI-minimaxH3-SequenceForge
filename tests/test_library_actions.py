@@ -285,6 +285,59 @@ def test_mirror_link_not_copy(handlers, proj, tmp_path, monkeypatch):
     assert len(AS.load_library(str(lib))["assets"]) == 1
 
 
+def _seed_global_lib(tmp_path, monkeypatch, orig_name="girl.png", aid="a_aaaaaaaaaaaa"):
+    """在临时全局库里放一个条目（项目里有同名 assets/girl.png）。"""
+    import asset_store as AS
+    lib = tmp_path / "lib"
+    (lib / "images").mkdir(parents=True, exist_ok=True)
+    (lib / "images" / "g.png").write_bytes(b"png")
+    monkeypatch.setattr(AS, "library_root", lambda *a, **k: str(lib))
+    sys.modules["asset_store"] = AS
+    AS.save_library(str(lib), {"assets": [{
+        "asset_id": aid, "sha256": "1" * 64, "kind": "image",
+        "file": "images/g.png", "orig_name": orig_name, "bytes": 3,
+        "tags": [], "desc": "", "created_at": 1, "updated_at": 1}]})
+    sys.modules["library"].invalidate()
+    return lib
+
+
+def test_lib_list_marks_blocked_targets(handlers, proj, tmp_path, monkeypatch):
+    """目标库已有同名 -> lib_list 给该条目标 blocked（前端据此不画按钮）。"""
+    _seed_global_lib(tmp_path, monkeypatch)
+    fn = handlers[("GET", "/h3chain/lib_list")]
+    res = asyncio.run(fn(_Req(query={"dir": "demo", "scope": "global"})))
+    assert res.status == 200, res.data
+    rows = res.data["data"]["items"]
+    assert [e["file"] for e in rows] == ["images/g.png"]
+    assert rows[0]["blocked"] == ["project"], "项目资产里有同名 girl.png"
+
+    # 反向：项目资产那条也该被标成 global（全局库已有同名）
+    res2 = asyncio.run(fn(_Req(query={"dir": "demo", "scope": "project"})))
+    rows2 = [e for e in res2.data["data"]["items"] if e["file"] == "assets/girl.png"]
+    assert rows2 and rows2[0]["blocked"] == ["global"]
+
+
+def test_lib_mirror_copy_refused_when_dup(handlers, proj, tmp_path, monkeypatch):
+    """接口层兜底：项目已有同名时 copy 模式直接 409，不复制出第二份。"""
+    _seed_global_lib(tmp_path, monkeypatch)
+    before = sorted(os.listdir(proj["root"] / "assets"))
+    fn = handlers[("POST", "/h3chain/lib_mirror")]
+    res = asyncio.run(fn(_Req({"dir": "demo", "id": "global:images/g.png",
+                               "mode": "copy", "label": "女主2"})))
+    assert res.status == 409 and res.data.get("code") == "DUP_NAME"
+    assert sorted(os.listdir(proj["root"] / "assets")) == before
+
+
+def test_lib_archive_skips_dup_name(handlers, proj, tmp_path, monkeypatch):
+    """接口层兜底：全局库已有同名 -> lib_archive 跳过而不是再存一份。"""
+    _seed_global_lib(tmp_path, monkeypatch)
+    fn = handlers[("POST", "/h3chain/lib_archive")]
+    res = asyncio.run(fn(_Req({"dir": "demo", "ids": ["project:assets/girl.png"]})))
+    assert res.status == 200, res.data
+    assert res.data["archived"] == []
+    assert any("全局库已有同名" in s for s in res.data["skipped"])
+
+
 def test_upload_dest_finals(handlers, proj, tmp_path, monkeypatch):
     """dest=finals：拷进项目 finals/（目录扫描即见），不登记进资产清单。"""
     import asset_store as AS

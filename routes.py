@@ -1133,6 +1133,9 @@ def add_routes(routes):
             if msg.startswith("REVISION_CONFLICT"):
                 return _rev_conflict(str(data.get("dir") or ""), msg)
             return _err(msg, code="BAD_REQUEST", status=400)
+        # 文件在两个库之间搬了家：素材库索引缓存必须失效，否则成片/资产两侧的
+        # 瓦片与「调入」按钮（同名检测）都还是旧状态。
+        h3lib.invalidate(str(data.get("dir") or ""))
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def split_av(request):
@@ -1217,6 +1220,11 @@ def add_routes(routes):
             sort=q.get("sort"), order=q.get("order"),
             page=q.get("page"), page_size=q.get("page_size"),
             collection=coll, seg=q.get("seg"), min_rating=q.get("min_rating"))
+        # 目标库同名检测：用**完整索引**算（前端只有当前页，看不到目标库全貌），
+        # 命中后前端直接不画那个方向的「调入」按钮。
+        blocked = h3lib.blocked_targets(items)
+        for e in data.get("items") or []:
+            e["blocked"] = blocked.get(e["id"]) or []
         return web.json_response({"ok": True, "data": data,
                                   "counters": h3lib.counters(items)})
 
@@ -1448,6 +1456,12 @@ def add_routes(routes):
                         code="NOT_GLOBAL", status=400)
         mode = str(data.get("mode") or "link").strip().lower()
         if mode == "copy":
+            # 同名闸门：项目资产里已经有同名条目 -> 拒绝（前端连按钮都不画，
+            # 这里兜底，避免绕过界面直接打接口复制出第二份）
+            blocked = h3lib.blocked_targets(_indexed(dir_name)).get(it["id"]) or []
+            if "project" in blocked:
+                return _err(f"项目资产里已经有同名文件「{it['name']}」，不再调入",
+                            code="DUP_NAME", status=409)
             try:
                 res = h3lib.mirror_to_project(dir_name, it,
                                               str(data.get("label") or "") or None)
@@ -1554,12 +1568,17 @@ def add_routes(routes):
         except ImportError:
             import asset_store
         done, skipped = [], []
+        blocked = h3lib.blocked_targets(_indexed(dir_name))
         for i in ids:
             it = _find_item(dir_name, i)
             if it is None or it["scope"] == "global":
                 continue
             if it.get("asset_id"):
                 continue                      # 已在全局库（幂等）
+            if "global" in (blocked.get(it["id"]) or []):
+                # 同名闸门：全局库已有同名条目 -> 不入库（前端按钮也不显示）
+                skipped.append(f"{it['name']}（全局库已有同名）")
+                continue
             src = h3lib.resolve_item_path(it, dir_name)
             if not src:
                 skipped.append(it["name"])
@@ -1570,8 +1589,9 @@ def add_routes(routes):
                 done.append(it["name"])
             except Exception as e:
                 skipped.append(f"{it['name']}（{e}）")
-        if done:
-            h3lib.invalidate(dir_name)
+        # 无论是否真的新入库都要刷索引：按钮的显示与否取决于"另一端有没有同名"，
+        # 缓存不失效的话，刚点完「存入全局库」按钮不会消失。
+        h3lib.invalidate(dir_name)
         return web.json_response({"ok": True, "archived": done, "skipped": skipped})
 
     async def lib_stage(request):

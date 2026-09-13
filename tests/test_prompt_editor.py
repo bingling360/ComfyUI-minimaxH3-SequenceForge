@@ -8,6 +8,8 @@
    与后端 compile_refs / _find_refs 同口径（负向后顾、最长优先、允许重复计数）。
 2) 源码断言：富文本编辑器、✕ 清全部引用、正文=唯一真相（setPromptText 同步 refs）、
    锚定方式（引用语）为常驻模式且带官方 retention 标记。
+3) 引用监控即时性（本轮修复）：卡片轻量重绘钩子 + 活池/活别名表 + 晚到别名即时补框。
+4) 两层 ✕ 语义分层：绿框 ✕ 只取消一处（removeOneTag），引用条 chip ✕ 清全部（removeTag）。
 """
 
 import json
@@ -118,33 +120,81 @@ def test_editor_runtime_jsdom():
 
 def test_editor_source_points():
     d = _src()
-    # 富文本编辑器 + 内联绿框 + ✕ 清全部
+    # 富文本编辑器 + 内联绿框 + 两层 ✕（绿框=取消这一处；引用条 chip=清全部）
     assert "function createPromptEditor(opts)" in d
     assert 'classList.add("h3d-rtag")' not in d            # 绿框类由 className 赋值
     assert '"h3d-rtag"' in d and '"h3d-rtagx"' in d
-    assert "取消本段对「${label}」的全部引用" in d
+    assert "取消这一处引用" in d                              # 绿框 ✕ 的 tooltip
+    assert "取消本段对「${a.label}」的全部引用" in d            # 引用条 chip ✕ 的 tooltip
     # 编辑器对外暴露 textarea 兼容面（@补全/AI 优化/编译预览零改动）
-    for api in ("insertText(text)", "insertTag", "removeTag", "tagCount",
-                "get value()", "set value(v)", "setSelectionRange"):
+    for api in ("insertText(text)", "insertTag", "removeTag", "removeOneTag", "tagCount",
+                "normalizeLoose", "get value()", "set value(v)", "setSelectionRange"):
         assert api in d, f"编辑器缺少兼容接口：{api}"
     # 正文是唯一真相：写回提示词时同步 refs
     assert "syncRefsFromText(ds, idx, text);" in d
     assert "function syncRefsFromText(ds, idx, text)" in d
 
 
+def test_two_level_remove_semantics():
+    """两层 ✕ 语义必须分层（线下 bug：绿框 ✕ 被接到 removeTag → "点小叉全叉掉了"）。
+
+    - 绿框自带 ✕ → removeOneTag：只取消**这一处**（引用 N 次点 N 下）。
+    - 引用条 chip 旁 ✕ / 右键 chip → removeTag：清本段**全部**引用。
+    - 段卡 onRemove 不得再跟一个 removeSegmentRef（否则一次点击计数掉 2）。
+    """
+    d = _src()
+    # 绿框 ✕ 走 removeOneTag，不走 removeTag
+    i = d.index("x.addEventListener(\"mousedown\", (e) => {")
+    assert "removeOneTag(sp);" in d[i:i + 400], "绿框 ✕ 必须调 removeOneTag"
+    assert "function removeOneTag(tagEl)" in d
+    # 引用条那一层仍是清全部
+    assert "removeTag(a.label);" in d                     # chip ✕ / 右键 chip 的 clearAll
+    assert "function removeTag(label)" in d
+    # 段卡 onRemove：写回失败才退回 removeSegmentRef（不能无条件再减一次）
+    assert "if (!applyPromptEdit(node, it.idx, ta)) removeSegmentRef(node, it.idx, label);" in d
+    assert d.count("removeSegmentRef(node, it.idx, label)") == 1, \
+        "绿框 ✕ 路径只应有一处 removeSegmentRef（且是带条件的兜底）"
+
+
 def test_anchor_mode_source_points():
     d = _src()
     # 引用语 = 常驻「锚定方式」模式（选方式 → 点素材 → 按方式写入正文）
-    assert "锚定方式：无（只插 @标签）" in d
     assert "const _refTpl = new Map()" in d
+    assert "const REF_TPL_DEFAULT = 0" in d
     assert "applyRefAnchorToV2(node, it.idx, a.label, tplDef || [], roles)" in d
     assert "function applyRefAnchorToV2(node, idx, label, tplDef, roles)" in d
     # 模板带官方 retention 标记与角色句
     assert '"fully_preserved"' in d and '"partially_preserved"' in d and '"weak_reference"' in d
     # 只在已有具象化结构时写 v2（不把三字段段切成六字段）
     assert "if (!pv || typeof pv !== \"object\") return false;" in d
-    # 裸引用模板仍在
+    # 裸引用模板仍在，且**只此一档**：原「无」与它插入的正文完全一样，已合并掉
     assert "裸引用（不加描述）" in d
+    assert "锚定方式：无" not in d
+    assert 'mkOpt("", "锚定方式' not in d
+
+
+def test_ref_state_timely_source_points():
+    """引用监控"不及时"回归（源码点）：三条链路缺一不可。
+
+    旧行为：焦点在提示词框里时 renderCenterColumn 整体跳过重建，而引用条/绿框
+    只靠整卡重建刷新 —— 于是"切了锚定方式/按了 ✕ 要再点一下别的才更新"。
+    """
+    d = _src()
+    # ① 卡片轻量重绘钩子：锁定期间仍推进卡片内的即时状态
+    assert "let _cardPainters = []" in d
+    assert "function registerCardPainter(fn)" in d
+    assert "_cardPainters = [];" in d                     # buildCards 每次重置
+    assert "for (const fn of _cardPainters)" in d
+    assert "registerCardPainter(repaintCard);" in d
+    # ② ✕ / chip 点击立即重绘（并 guard 掉已被换掉的旧卡 DOM）
+    assert d.count("repaintCard();") >= 3
+    assert "if (!ta.el || !ta.el.isConnected) return;" in d
+    # ③ 别名表 + 素材池读**活**状态，不读建卡快照；晚到别名即时补框
+    assert "livePool" in d
+    assert "normalizeLoose" in d
+    assert "try { arr = getDs(node).ref_assets; }" in d
+    # chips 跟随活池重建（新上传素材不必等整卡重建就能出现）
+    assert "const syncChips = (live)" in d
 
 
 def test_clear_prompts_drops_refs():

@@ -349,6 +349,48 @@ def test_library_browser_ui():
         assert gone not in d, gone
 
 
+def test_library_scope_and_move_actions():
+    """素材库：没有「全部」栏；库间动作=复制/存入，没有链接形态的第二个按钮。"""
+    lib = _read("h3_library.js")
+    # 「全部」子面板下线（后端 library.SCOPES 也从来没这个 scope）
+    assert '["all", "全部"]' not in lib
+    assert 'scope: "project"' in lib                      # 默认停在项目资产
+    # 链接形态下线：不再有单独的「复制进项目」，调入项目固定 mode="copy"
+    for gone in ["actMirror", "actMirrorCopy", "复制进项目", ', "link")',
+                 "链接引用，不复制文件"]:
+        assert gone not in lib, gone
+    assert '"copy"' in lib and "function actBring(" in lib
+    # 三个方向各就各位：全局→项目、项目→全局、成片→项目 + 成片→全局
+    assert "function actArchive(" in lib and "function actArchiveMany(" in lib
+    assert "function actToAssets(" in lib
+    finals_block = ('if (it.scope === "finals") {\n'
+                    '      if (!isBlocked(it, "project")) mk("调入项目", false, () => actToAssets(it));\n'
+                    '      if (!isBlocked(it, "global")) mk("存入全局库", false, () => actArchive(it));\n'
+                    '    }')
+    assert finals_block in lib, "成片瓦片必须同时有「调入项目」和「存入全局库」"
+    # 成片不再打开就自动存一份进全局库（那段静默复制已删）
+    assert "autoArchiveFinals" not in lib
+    # 目标库同名 -> 该方向按钮不画（判定在后端，前端只认 it.blocked）
+    assert "function isBlocked(" in lib
+    assert "isBlocked(it, \"project\")" in lib and "isBlocked(it, \"global\")" in lib
+    assert "it.blocked" in lib
+    # 多选批量也要过滤掉被挡住的（否则一次点下去照样复制出重名）
+    assert "!isBlocked(x, \"project\")" in lib and "!isBlocked(x, \"global\")" in lib
+
+
+def test_library_dup_name_gate_backend():
+    """后端同名闸门：lib_list 用完整索引算 blocked；接口层也拒绝重名调入。"""
+    import library
+    assert hasattr(library, "blocked_targets") and hasattr(library, "name_keys")
+    assert library.MOVE_TARGETS["finals"] == ("project", "global")
+    r = open(os.path.join(ROOT, "routes.py"), encoding="utf-8").read()
+    assert "blocked_targets(_indexed(dir_name))" in r
+    assert "DUP_NAME" in r                       # lib_mirror 的同名拒绝
+    assert "全局库已有同名" in r                   # lib_archive 的同名跳过
+    # 库间搬家后必须让索引缓存失效，否则按钮不会自动消失
+    assert r.index("projects.move_media(") < r.index("h3lib.invalidate(str(data.get(\"dir\") or \"\"))")
+
+
 def test_director_atcomplete():
     d = _read("h3_director.js")
     for sym in ["attachAtComplete", "h3d-atpop", "ta.dataset.h3at",

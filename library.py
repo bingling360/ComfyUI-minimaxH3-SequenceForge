@@ -619,6 +619,82 @@ def counters(items) -> dict:
     return c
 
 
+# ---------- 库间调入：目标库同名检测 ----------
+
+# 每个 scope 允许"调入"的目标 scope（**只列跨库方向**，同库内不算重复）
+MOVE_TARGETS = {
+    "global": ("project",),                 # 全局库 → 调入项目（复制一份进 assets/）
+    "project": ("global",),                 # 项目资产 → 存入全局库
+    "finals": ("project", "global"),        # 成片 → 调入项目（搬家）+ 存入全局库
+    "latent": (),                           # 全局库不收 latent，没有库间动作
+}
+
+
+def name_keys(item) -> set:
+    """判定"同名"用的键集：显示名 + 文件名，统一**去扩展名 + 小写**。
+
+    为什么要两个都取、还要去扩展名：
+
+    - 全局库存的是内容寻址文件名（`ab12cd34_阿依.png`），显示名才是 `阿依.png`；
+    - 项目资产的显示名被 manifest 别名覆盖成 `阿依`（**没有扩展名**，见 apply_aliases）；
+    - 成片/项目未起别名时显示名就是文件名。
+
+    只比文件名或只比显示名都会漏 —— 两边都取、去扩展名再比，才能对上
+    「全局库 阿依.png」vs「项目资产 阿依」这种同一份东西。
+
+    另外补一个 **24 字符截断**的键：`manifest.assets[].label` / `asset_links[].alias`
+    入库时被截到 24 字（见 mirror_to_project / store_to_project），超长名字截断后
+    才是真正写进项目的那个名字，不补这个键就会漏判、让人连点两次复制出两份。
+    """
+    out = set()
+    for raw in (item.get("name"), item.get("file")):
+        s = str(raw or "").replace("\\", "/").split("/")[-1].strip().casefold()
+        if not s:
+            continue
+        s = os.path.splitext(s)[0] or s
+        if not s:
+            continue
+        out.add(s)
+        out.add(s[:24])
+    return out
+
+
+def blocked_targets(items) -> dict:
+    """{item_id: [目标 scope, ...]}：目标库已有同名文件 -> 该方向的调入按钮要隐藏。
+
+    前端只拿到当前页，看不到目标库全貌，所以这个判定必须在后端用**完整索引**做。
+    判定两件事：
+
+    1. 同名：目标库任意条目的 `name_keys` 与它相交（去扩展名、忽略大小写）；
+    2. 已链接（仅 全局库 → 项目）：项目 `asset_links` 里已有同一 asset_id，
+       那就已经在项目里了，不该再复制一份（这条不靠名字，靠 asset_id）。
+
+    注意"同名"是**跨库**概念：同库内本来就可以有同名（不同文件夹），不参与判定。
+    """
+    rows = [e for e in (items or []) if isinstance(e, dict)]
+    keys, ids = {}, {}
+    for e in rows:
+        sc = e.get("scope")
+        ks = keys.setdefault(sc, set())
+        ks |= name_keys(e)
+        if e.get("asset_id"):
+            ids.setdefault(sc, set()).add(str(e["asset_id"]))
+    out = {}
+    for e in rows:
+        sc = e.get("scope")
+        hit = []
+        for t in MOVE_TARGETS.get(sc) or ():
+            if t not in keys:
+                continue
+            if name_keys(e) & keys[t]:
+                hit.append(t)
+            elif (sc == "global" and t == "project" and e.get("asset_id")
+                  and str(e["asset_id"]) in (ids.get("project") or set())):
+                hit.append(t)          # 项目已链接这份：不用再复制一份进 assets/
+        out[e["id"]] = hit
+    return out
+
+
 # ---------- 缩略图 ----------
 
 def thumb_path(project, item_id) -> str:

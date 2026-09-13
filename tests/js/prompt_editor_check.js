@@ -2,6 +2,11 @@
  * shipped 源码执行，断言插/删/计数/落盘行为。失败时进程退出码 1。
  *
  * 跑法：NODE_PATH=<repo>/node_modules node tests/js/prompt_editor_check.js
+ *
+ * 覆盖：插入/删除/计数/落盘、最长优先分词、晚到素材的裸别名即时补框
+ * （normalizeLoose，引用监控"不及时"回归）、绿框 ✕ 同步回调 onRemove、
+ * 绿框 ✕ 只取消一处（removeOneTag）与 chip ✕ 清全部（removeTag）语义分层、
+ * 锚定方式「裸引用/无」已合并。
  */
 const fs = require("fs");
 const path = require("path");
@@ -156,6 +161,83 @@ eq(ds.segments[0].refs.filter((l) => l === "阿依").length, 0, "refs 里该素�
 // ⑧ 解析函数（与后端同口径）
 eq(M.refsFromText("联系 a@阿依.com 不算", ds.ref_assets), [], "邮箱不误伤");
 eq(M.refsFromText("@阿依的家 与 @阿依", ds.ref_assets), ["阿依的家", "阿依"], "最长优先");
+
+/* ⑨ 引用监控"不及时"回归（线下报的 bug）：别名表是**活的**函数而不是建卡快照——
+ * 素材晚于正文入池时，正文里的 @别名 会先落成裸文本；素材一入池，normalizeLoose()
+ * 必须立刻把它补成绿框（旧实现只在 input 后 700ms 跑，且用建卡快照，补不上）。 */
+let liveLabs = ["阿依"];
+const ta2 = M.createPromptEditor({
+    value: "", labels: () => liveLabs, onRemove: () => {},
+});
+window.document.body.append(ta2.el);
+ta2.insertText("@新素材 出场");                       // 池里还没有「新素材」
+eq(ta2.el.querySelectorAll(".h3d-rtag").length, 0, "未入池别名应是裸文本");
+ok(ta2.normalizeLoose() === false, "没有裸别名时 normalizeLoose 不动 DOM");
+liveLabs = ["阿依", "新素材"];                        // 上传完成 → 入池
+ok(ta2.normalizeLoose() === true, "晚到别名应报告修复");
+eq(ta2.el.querySelectorAll(".h3d-rtag").length, 1, "晚到别名补成绿框");
+eq(ta2.el.querySelector(".h3d-rtag").dataset.label, "新素材", "绿框别名取最长匹配");
+ok(ta2.normalizeLoose() === false, "补完再调应幂等（不重复动 DOM）");
+
+/* ⑩ 绿框 ✕ 必须同步回调 onRemove：引用条的 chips/计数靠它即时归零，
+ * 不能等下一次整卡重建（焦点守卫会把它挡掉 → "要再按别的才更新"）。 */
+let removedLabel = null;
+const ta3 = M.createPromptEditor({
+    value: "@阿依 与 @阿依的家",
+    labels: () => ds.ref_assets.map((a) => a.label),
+    onRemove: (l) => { removedLabel = l; },
+});
+window.document.body.append(ta3.el);
+const firstTag = ta3.el.querySelector(".h3d-rtag");
+eq(firstTag.dataset.label, "阿依", "首个绿框=阿依");
+firstTag.querySelector(".h3d-rtagx").dispatchEvent(
+    new window.MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+eq(removedLabel, "阿依", "✕ 应触发 onRemove（引用条据此刷新）");
+eq(ta3.tagCount("阿依"), 0, "✕ 后该素材绿框清零");
+eq(ta3.tagCount("阿依的家"), 1, "✕ 不误伤长别名");
+
+/* ⑪ 锚定方式：原「无」与「裸引用（不加描述）」插入的正文完全一样（都是裸 @标签），
+ * 已合并成一个选项——裸引用即默认档，源码里不得再留「锚定方式：无」。 */
+ok(M.REF_TEMPLATES[0][0] === "裸引用（不加描述）", `第 0 档应为裸引用：${M.REF_TEMPLATES[0][0]}`);
+eq(M.REF_TEMPLATES[0][1]("阿依"), "@阿依", "裸引用句式=裸 @标签");
+ok(M.REF_TEMPLATES[0][2] !== "" , "裸引用仍带官方保留标记（语义差异化保留）");
+ok(!src.includes("锚定方式：无"), "不应再有「锚定方式：无」选项");
+
+/* ⑫ 绿框 ✕ = 只取消**这一处**（本轮修复）：同一素材引用 N 次时点一下只少一处
+ * （正文少一个 @别名 → refs 少一条 → 引用条 N 降到 N-1），而不是一次清光；
+ * 降到 0 时才算清空。旧行为是把 ✕ 接到 removeTag（清全部）→ "点小叉就全叉掉"。 */
+let removeHits = [];
+const ta4 = M.createPromptEditor({
+    value: "@阿依 开头，@阿依 结尾",
+    labels: () => ds.ref_assets.map((a) => a.label),
+    onRemove: (l) => { removeHits.push(l); },
+});
+window.document.body.append(ta4.el);
+eq(ta4.tagCount("阿依"), 2, "初始两处引用");
+const tag4 = ta4.el.querySelector(".h3d-rtag");
+tag4.querySelector(".h3d-rtagx").dispatchEvent(
+    new window.MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+eq(ta4.tagCount("阿依"), 1, "点一次 ✕ 只少一处");
+eq(removeHits, ["阿依"], "每次 ✕ 回调一次 onRemove");
+ok(ta4.value.includes("@阿依"), `正文仍留有另一处引用：${ta4.value}`);
+ds.prompts[0] = "@阿依 开头，@阿依 结尾";
+ds.segments[0].refs = ["阿依", "阿依"];
+M.applyPromptEdit(node, 0, ta4);
+eq(ds.segments[0].refs, ["阿依"], "引用条口径=一次 ✕ 只掉一处（旧实现 applyPromptEdit+removeSegmentRef 会连掉两处）");
+const tag4b = ta4.el.querySelector(".h3d-rtag");
+tag4b.querySelector(".h3d-rtagx").dispatchEvent(
+    new window.MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+eq(ta4.tagCount("阿依"), 0, "再点一次才归零");
+eq(ta4.value, "开头， 结尾", `两处都去掉后正文只剩文字：${ta4.value}`);
+
+/* ⑬ 层层语义不能混：removeTag 仍是"清全部"（引用条 chip 旁的 ✕ 用它），
+ * removeOneTag 是"只取一处"（绿框用）。 */
+const ta5 = M.createPromptEditor({ value: "@阿依 与 @阿依", labels: () => ["阿依"], onRemove: () => {} });
+window.document.body.append(ta5.el);
+ta5.removeOneTag(ta5.el.querySelector(".h3d-rtag"));
+eq(ta5.tagCount("阿依"), 1, "removeOneTag 只取一处");
+ta5.removeTag("阿依");
+eq(ta5.tagCount("阿依"), 0, "removeTag 清全部");
 
 if (fails.length) {
     console.error("FAIL:\n - " + fails.join("\n - "));

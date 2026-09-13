@@ -5,7 +5,13 @@
  *   （之前把 7~8 个动作做成瓦片按钮，窄栏里必然换行溢出 —— 这才是"展开看不到"的病根。）
  *
  * 四个 scope：项目资产 / 全局库 / 成片 / latent，外加「收藏集」过滤。
+ * 没有「全部」——四个库各管各的，混一栏只会让人分不清文件到底在哪。
  * 后端 library.py 只做索引 + 查询；本文件只做 UI 与动作分发。
+ *
+ * 库间搬运动作（**都是显式点击，绝不顺手复制**）：
+ *   全局库  →「调入项目」= 复制一份进项目 assets/（项目自包含，不生成链接）
+ *   项目资产→「存入全局库」= 全局库多一份（跨项目复用）
+ *   成片    →「调入项目」+「存入全局库」（同上两个方向）
  *
  * 用法：window.H3Lib.open({ dir, seg, onChanged })
  *   dir       项目目录名（决定 project/finals/latent 三个 scope 的数据源）
@@ -15,8 +21,9 @@
 (function () {
   "use strict";
 
+  /* 没有「全部」：四个库的文件位置语义不同，混一栏看不出东西在哪，
+   * 而且上传落点是按当前 scope 决定的，「全部」会让落点含糊。 */
   const SCOPES = [
-    ["all", "全部"],
     ["project", "项目资产"],
     ["global", "全局库"],
     ["finals", "成片"],
@@ -30,6 +37,10 @@
     ["mtime", "按时间"], ["name", "按名称"], ["size", "按大小"],
     ["rating", "按评分"], ["kind", "按类型"],
   ];
+  // 与后端 library.MOVE_TARGETS 同源：scope -> 中文名（徽标提示用）
+  const SCOPE_CN = {
+    project: "项目资产", global: "全局库", finals: "成片", latent: "latent",
+  };
   const RATINGS = [
     ["0", "全部星级"], ["1", "≥1★"], ["2", "≥2★"],
     ["3", "≥3★"], ["4", "≥4★"], ["5", "只看 5★"],
@@ -210,6 +221,7 @@
 .h3l-tbtn.danger:hover{border-color:#9a4144;color:#f0a0a4}
 .h3l-chip{padding:1px 7px;border:1px solid #2f6e57;border-radius:9px;background:#12291f;color:#7fe0b0;font-size:10px}
 .h3l-tag{padding:1px 7px;border:1px solid #3a352c;border-radius:9px;color:#a8a294;font-size:10px}
+.h3l-tag.dim{border-style:dashed;border-color:#4d4333;color:#9c8a63;cursor:help}
 .h3l-foot{display:flex;gap:10px;align-items:center;padding:9px 14px;border-top:1px solid #37332b;background:#1b1a16;font-size:12px;color:#8a857b;flex-wrap:wrap}
 .h3l-empty{grid-column:1/-1;padding:44px 12px;text-align:center;color:#7f7a70}
 .h3l-msg{flex:1;color:#a8a294;font-size:12px;min-width:120px}
@@ -268,28 +280,10 @@
     renderGrid();
     renderFoot();
     renderScopes();
-    if (S.scope === "finals") autoArchiveFinals(S.items);
   }
-
-  let _archivedAt = 0;
-
-  /** 成片自动存一份进全局库（跨项目复用）；幂等 —— 已入库的条目后端会跳过。 */
-  async function autoArchiveFinals(items) {
-    const A = window.H3Api;
-    if (!A?.libArchive) return;
-    const ids = (items || [])
-      .filter((x) => x.scope === "finals" && !x.asset_id)
-      .map((x) => x.id);
-    if (!ids.length) return;
-    const now = Date.now();
-    if (now - _archivedAt < 15000) return;      // 节流，别每次翻页都打后端
-    _archivedAt = now;
-    try {
-      const r = await A.libArchive(S.dir, ids);
-      const n = (r.body?.archived || []).length;
-      if (r.body?.ok && n) say(`成片已自动存入全局库 ${n} 个（跨项目可复用）`);
-    } catch (e) { /* 归档失败不影响浏览 */ }
-  }
+  /* 注：成片**不再**打开就自动存一份进全局库（原来那段 autoArchive 已删）。
+   * 静默复制正是"诡异"的来源；入库改成瓦片上的「存入全局库」显式按钮，
+   * 顺带省掉每次打开成片都要给大视频算一遍 sha256。 */
 
   async function refreshCollections() {
     const A = api();
@@ -304,9 +298,9 @@
   function renderScopes() {
     S.scopeBox.replaceChildren();
     for (const [k, zh] of SCOPES) {
-      const n = k === "all" ? (S.totalAll || "") : (S.counters[k] || 0);
+      const n = S.counters[k] || 0;
       const b = el("button", "h3l-scope" + (S.scope === k ? " on" : ""),
-        esc(zh) + (k === "all" ? "" : `<em>${n}</em>`));
+        esc(zh) + `<em>${n}</em>`);
       b.type = "button";
       b.onclick = () => {
         S.scope = k;
@@ -326,6 +320,15 @@
     }
   }
 
+  /** 目标库里已经有同名文件了吗？有 -> 这个方向的「调入」按钮不画出来。
+   *
+   * `it.blocked` 由后端 `lib_list` 用**完整索引**算好（前端只有当前页，
+   * 自己比对会漏掉没加载到的条目）。值是目标 scope 数组，如 ["project"]。
+   */
+  function isBlocked(it, target) {
+    return Array.isArray(it.blocked) && it.blocked.indexOf(target) >= 0;
+  }
+
   /** 瓦片上的常驻动作：只留真正常用的几个（其余进右键菜单，别糊满瓦片）。 */
   function tileButtons(it) {
     const box = el("div", "h3l-tbtns");
@@ -342,12 +345,16 @@
       mk(`✓ ${roles.join("·")}`, true,
         () => say(`「${it.name}」带有旧的首尾帧标注：现在请在导演台每段的「资产引用」栏指定首/尾帧图`));
     }
+    /* 库间搬运：全局库 → 项目（复制文件），项目 / 成片 → 全局库（存入复用）。
+     * 每个方向只留一个按钮，语义就是字面意思，没有"链接引用"这种第二种形态。 */
     if (it.scope === "global") {
-      mk("调入项目", false, () => actMirror(it));
-      mk("复制进项目", false, () => actMirrorCopy(it));
+      if (!isBlocked(it, "project")) mk("调入项目", false, () => actBring(it));
     }
-    if (it.scope === "finals") mk("调入项目", false, () => actToAssets(it));
-    if (it.scope === "project" && !it.linked) {
+    if (it.scope === "finals") {
+      if (!isBlocked(it, "project")) mk("调入项目", false, () => actToAssets(it));
+      if (!isBlocked(it, "global")) mk("存入全局库", false, () => actArchive(it));
+    }
+    if (it.scope === "project" && !it.linked && !isBlocked(it, "global")) {
       mk("存入全局库", false, () => actArchive(it));
     }
     if (it.scope === "latent" && window.H3Director?.upscaleLatent) {
@@ -403,6 +410,14 @@
     const bg = el("div", "h3l-badges");
     for (const sn of it.refs || []) bg.append(el("span", "h3l-chip", `段${sn}`));
     for (const tg of it.tags || []) bg.append(el("span", "h3l-tag", esc(tg)));
+    /* 调入按钮被"目标库已有同名"挡掉时，留一个说明徽标 —— 否则用户只看到
+     * 按钮不见了，不知道是为什么（这不是按钮，纯文字）。 */
+    for (const b of it.blocked || []) {
+      const cn = SCOPE_CN[b] || b;
+      const chip = el("span", "h3l-tag dim", esc(`同名已在${cn}`));
+      chip.title = `${cn}里已经有同名文件，所以这个方向的调入按钮不显示`;
+      bg.append(chip);
+    }
     if (bg.children.length) t.append(bg);
     // 常用动作直接摆在瓦片上（不要藏进"双击才出现"的界面）
     t.append(tileButtons(it));
@@ -511,18 +526,36 @@
       m.append(el("div", "h3l-sep"));
     }
     if (many) {
-      const gl = S.items.filter((x) => S.sel.has(x.id) && x.scope === "global");
+      // 目标库已有同名的直接排除在批量动作之外（与瓦片按钮同一套判定）
+      const gl = S.items.filter((x) => S.sel.has(x.id) && x.scope === "global"
+        && !isBlocked(x, "project"));
       if (gl.length) {
-        m.append(menuItem(`⇩ 把选中的 ${gl.length} 个全局素材调入项目`, () => actMirrorMany(gl)));
+        m.append(menuItem(`⇩ 把选中的 ${gl.length} 个全局素材调入项目（复制）`,
+          () => actBringMany(gl)));
+        m.append(el("div", "h3l-sep"));
+      }
+      // latent 不能入库（全局库只收 image/video/audio），过滤掉免得后端逐个报错
+      const up = S.items.filter((x) => S.sel.has(x.id)
+        && (x.scope === "project" || x.scope === "finals") && !x.linked
+        && !isBlocked(x, "global"));
+      if (up.length) {
+        m.append(menuItem(`⬆ 把选中的 ${up.length} 个存入全局库`, () => actArchiveMany(up)));
         m.append(el("div", "h3l-sep"));
       }
     }
     if (it.scope === "global" && !many) {
-      m.append(menuItem("⇩ 调入项目（链接引用，不复制文件）", () => actMirror(it)));
-      m.append(menuItem("⇩ 调入项目（复制一份到项目 assets/）", () => actMirrorCopy(it)));
+      if (!isBlocked(it, "project")) {
+        m.append(menuItem("⇩ 调入项目（复制一份到项目 assets/）", () => actBring(it)));
+      }
     } else if (it.scope === "finals" && !many) {
-      m.append(menuItem("→ 移进项目资产（从成片挪一份到 assets/）", () => actToAssets(it)));
-    } else if (it.scope === "project" && !many && !it.linked) {
+      if (!isBlocked(it, "project")) {
+        m.append(menuItem("→ 调入项目（从成片挪进 assets/，成片库里这份会移走）",
+          () => actToAssets(it)));
+      }
+      if (!isBlocked(it, "global")) {
+        m.append(menuItem("⬆ 存入全局库（跨项目可复用）", () => actArchive(it)));
+      }
+    } else if (it.scope === "project" && !many && !it.linked && !isBlocked(it, "global")) {
       m.append(menuItem("⬆ 存入全局库（跨项目可复用）", () => actArchive(it)));
     }
     if (it.scope === "latent" && !many && window.H3Director?.upscaleLatent) {
@@ -715,24 +748,20 @@
     fetchPage(false);
   }
 
-  /** 调入项目（默认=**链接**，不复制文件：文件仍只在全局库一份）。 */
-  async function actMirror(it) {
-    const A = api();
-    if (!A.libMirror) { fail("接口未就绪（h3_api.js 未更新）"); return; }
-    const r = await A.libMirror(S.dir, it.id, it.name, "link");
-    if (!r.body?.ok) { fail(A.errText(r, "调入项目失败")); return; }
-    after(`已链接进项目：别名「${r.body.alias}」\n提示词里写 @${r.body.alias} 即可引用`
-      + "（不复制文件：全局库那份就是唯一实体）");
-    fetchPage(false);
-  }
-
-  /** 调入项目（复制文件）：项目自包含，删项目不连累全局库，但会多占一份磁盘。 */
-  async function actMirrorCopy(it) {
+  /** 全局库 → 项目：**复制一份**进项目 assets/ 并登记清单（唯一形态，不再有"链接"）。
+   *
+   * 之前有个 mode="link" 只写 asset_links 不复制文件，结果项目里多出一个
+   * 「🔗 链接」条目、文件其实还躺在全局库 —— 用户看到的不是"我的项目里有这个素材"。
+   * 现在统一 copy：项目自包含（删项目不连累全局库），代价只是多占一份磁盘。
+   * 后端 link 分支保留只为兼容老项目里已有的链接条目（能显示、能解链）。
+   */
+  async function actBring(it) {
     const A = api();
     if (!A.libMirror) { fail("接口未就绪（h3_api.js 未更新）"); return; }
     const r = await A.libMirror(S.dir, it.id, it.name, "copy");
-    if (!r.body?.ok) { fail(A.errText(r, "复制进项目失败")); return; }
-    after(`已复制进项目：${r.body.file}\n别名「${r.body.label}」——提示词里写 @${r.body.label} 即可引用`);
+    if (!r.body?.ok) { fail(A.errText(r, "调入项目失败")); return; }
+    after(`已调入项目（复制一份）：${r.body.file}\n别名「${r.body.label}」`
+      + `——提示词里写 @${r.body.label} 即可引用`);
     fetchPage(false);
   }
 
@@ -748,19 +777,30 @@
     fetchPage(false);
   }
 
-  async function actMirrorMany(items) {
+  async function actBringMany(items) {
     const A = api();
     let ok = 0;
     const names = [];
     for (const it of items) {
-      const r = await A.libMirror(S.dir, it.id, it.name, "link");
-      if (r.body?.ok) { ok++; names.push(r.body.alias); }
+      const r = await A.libMirror(S.dir, it.id, it.name, "copy");
+      if (r.body?.ok) { ok++; names.push(r.body.label); }
       else fail(`${it.name}：${A.errText(r, "调入失败")}`);
     }
     if (ok) {
-      say(`已链接进项目 ${ok} 个：${names.join("、")}\n提示词里写 @别名 即可引用（不复制文件）`);
+      after(`已调入项目（各复制一份）${ok} 个：${names.join("、")}\n提示词里写 @别名 即可引用`);
       fetchPage(false);
     }
+  }
+
+  /** 批量存入全局库（项目资产 / 成片 → 全局库）。 */
+  async function actArchiveMany(items) {
+    const A = api();
+    if (!A.libArchive) { fail("接口未就绪（h3_api.js 未更新）"); return; }
+    const r = await A.libArchive(S.dir, items.map((x) => x.id));
+    if (!r.body?.ok) { fail(A.errText(r, "存入全局库失败")); return; }
+    const n = (r.body.archived || []).length;
+    after(n ? `已存入全局库 ${n} 个（跨项目可复用）` : "选中的都已在全局库，无需重复存入");
+    fetchPage(false);
   }
 
   async function actToAssets(it) {
@@ -768,8 +808,10 @@
     const stem = String(it.file).split("/").pop().replace(/\.[^.]+$/, "") || "clip";
     const r = await A.moveMedia(S.dir, it.file, "assets",
       { register_asset: true, label: stem.slice(0, 24), kind: it.kind });
-    if (!r.body?.ok) { fail(A.errText(r, "移进项目资产失败")); return; }
-    after(`「${stem}」已移进项目资产（assets/）`);
+    if (!r.body?.ok) { fail(A.errText(r, "调入项目失败")); return; }
+    after(`「${stem}」已从成片挪进项目资产 assets/`      // 是搬家，不是复制：说清楚
+      + `\n别名「${stem.slice(0, 24)}」——提示词里写 @${stem.slice(0, 24)} 即可引用`
+      + "\n（成片库里这份已经不在了）");
     fetchPage(false);
   }
 
@@ -833,9 +875,9 @@
     S = {
       dir: String(o.dir || ""), seg: Number(o.seg) || 1,
       onChanged: o.onChanged,
-      scope: "all", kind: "all", sort: "mtime", order: "desc", minRating: "0",
+      scope: "project", kind: "all", sort: "mtime", order: "desc", minRating: "0",
       q: "", page: 1, pageSize: 60,
-      items: [], total: 0, totalPages: 1, counters: {}, totalAll: 0,
+      items: [], total: 0, totalPages: 1, counters: {},
       sel: new Set(), multi: false, collections: [], collection: "",
       cur: null,
     };
@@ -895,7 +937,7 @@
      *   全局库 → 只进全局库（跨项目复用）
      *   项目资产 → 只落本项目 assets/（登记清单，可直接 @别名 引用）
      *   成片     → 只落本项目 finals/（目录扫描即见）
-     *   全部/latent → 按项目资产处理
+     *   latent   → 按项目资产处理
      * 想要"全局库也存一份"用项目瓦片上的「存入全局库」（显式动作）。 */
     const upBtn = el("button", "h3l-btn h3l-btn-cta", "＋ 上传");
     upBtn.type = "button";
@@ -1008,7 +1050,6 @@
       const st = await A.libStatus({ dir: S.dir });
       if (st.body?.ok) {
         S.counters = st.body.counters || {};
-        S.totalAll = st.body.total || 0;
         renderScopes();
       }
     } catch (e) { /* 状态拿不到不影响浏览 */ }

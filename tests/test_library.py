@@ -118,6 +118,63 @@ def test_query_sort_and_seg(proj):
     assert L.query(items, seg=1)["total"] == 0
 
 
+# ---- 库间调入：目标库同名检测 ----
+
+def _it(scope, name, file, asset_id=""):
+    return {"id": f"{scope}:{file}", "scope": scope, "name": name,
+            "file": file, "asset_id": asset_id, "kind": "image"}
+
+
+def test_name_keys_strips_ext_and_case():
+    # 全局库存的是 sha 前缀文件名，项目资产显示的是别名（无扩展名）
+    g = _it("global", "阿依.png", "images/ab12cd34_阿依.png")
+    p = _it("project", "阿依", "assets/阿依.png")
+    assert L.name_keys(g) & L.name_keys(p), "同一份东西必须判成同名"
+    # 大小学与扩展名都忽略：ABC.PNG / abc 算同一个名字
+    assert "abc" in L.name_keys(_it("global", "ABC.PNG", "images/x.png"))
+    assert "abc" in L.name_keys(_it("project", "abc", "assets/y.jpg"))
+    assert L.name_keys(_it("project", "", "assets/only.png")) == {"only"}
+    # 超长名字：别名入库会被截到 24 字，截断后的键也要能对上
+    long_name = "超长素材名字" * 10 + ".png"
+    assert (L.name_keys(_it("global", long_name, "images/x.png"))
+            & L.name_keys(_it("project", long_name[:24], "assets/y.png")))
+
+
+def test_blocked_targets_same_name():
+    """目标库有同名 -> 该方向被挡（前端据此不画「调入」按钮）。"""
+    items = [
+        _it("global", "阿依.png", "images/ab12_阿依.png", "a_1"),
+        _it("global", "bg.png", "images/cd34_bg.png", "a_2"),
+        _it("global", "独一份.png", "images/ef56_独一份.png", "a_3"),
+        _it("project", "阿依", "assets/阿依.png"),                 # 与 a_1 同名
+        _it("project", "bg", "images/cd34_bg.png", "a_2"),         # 已链接 a_2
+        _it("finals", "final_1.mp4", "videos/final_1.mp4"),
+        _it("finals", "独一份.mp4", "videos/独一份.mp4"),
+        _it("latent", "kf.pt", "latents/kf.pt"),
+    ]
+    b = L.blocked_targets(items)
+    assert b["global:images/ab12_阿依.png"] == ["project"]        # 项目资产已有同名
+    assert b["global:images/cd34_bg.png"] == ["project"]          # 项目已链接（同 asset_id）
+    assert b["global:images/ef56_独一份.png"] == []               # 项目里没有 -> 可以调入
+    assert b["project:assets/阿依.png"] == ["global"]             # 反向：全局库已有同名
+    assert b["finals:videos/final_1.mp4"] == []                   # 项目里没有 final_1
+    assert b["finals:videos/独一份.mp4"] == ["global"]            # 全局库已有「独一份」
+    assert b["latent:latents/kf.pt"] == []                        # latent 没有库间动作
+
+
+def test_blocked_targets_same_scope_not_dup():
+    """同名只在**跨库**时算重复：同库内本来就可以有同名（不同文件夹）。"""
+    items = [
+        _it("project", "a.png", "assets/a.png"),
+        _it("project", "a.png", "assets/sub/a.png"),
+        _it("global", "a.png", "images/zz_a.png", "a_9"),
+    ]
+    b = L.blocked_targets(items)
+    assert b["global:images/zz_a.png"] == ["project"]
+    assert b["project:assets/a.png"] == ["global"]
+    assert b["project:assets/sub/a.png"] == ["global"]
+
+
 # ---- 元数据 sidecar ----
 
 def test_meta_rating_tags(proj):

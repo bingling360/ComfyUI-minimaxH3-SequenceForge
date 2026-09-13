@@ -62,15 +62,35 @@ const KIND_TOKEN = { image: "Picture", video: "Video", audio: "Audio" };
 const KIND_CAPS = { image: 9, video: 3, audio: 3 };
 const KIND_ACCEPT = { image: "image/*", video: "video/*", audio: "audio/*" };
 /* 引用语模板库：插入到提示词光标处，@标签 由后端按段压实为 <Picture k> */
+/* 引用语 = **锚定方式**：先选一种，再点参考素材，句式按该方式写进正文。
+ * 每条同时带官方 `retention_analysis` 保留标记与 `subject_definitions` 角色句
+ * （具象化段会一并写进 v2 结构，编译时进官方字段；主提示词段只用句式文本）。
+ * 官方标记：fully_preserved / partially_preserved / weak_reference（见
+ * prompt/minimaxh3_official_ref2v_prompt_writing.txt 第 4 节）。 */
 const REF_TEMPLATES = [
-    ["插入 @标签", (l) => `@${l}`],
-    ["主角出场", (l) => `主角 @${l} 全程出镜（主体身份、外观与服饰全程保持一致）`],
-    ["配角出场", (l) => `画面中出现的 @${l} 为次要角色，身份与外观保持一致`],
-    ["场景还原", (l) => `场景以 @${l} 为准，延续其环境、光照与空间布局`],
-    ["风格参考", (l) => `整体画风、色调与质感参考 @${l}`],
-    ["镜头参考", (l) => `运镜方式参考 @${l}（可用官方词汇：Push In / Pan Left / Truck Right / Tracking Shot，加 with small amplitude at slow speed 等修饰）`],
-    ["说话人", () => `短发女主 (S1) 轻声说：「……」`],
+    ["裸引用（不加描述）", (l) => `@${l}`, "partially_preserved", ""],
+    ["主角出场", (l) => `主角 @${l} 全程出镜，主体身份、外观与服饰全程保持一致`,
+        "fully_preserved",
+        "the main subject; keep identity, facial features and outfit consistent across every shot"],
+    ["配角出场", (l) => `画面中出现的 @${l} 为次要角色，身份与外观保持一致`,
+        "fully_preserved",
+        "a supporting character; keep identity and appearance consistent"],
+    ["场景还原", (l) => `场景以 @${l} 为准，延续其环境、光照与空间布局`,
+        "partially_preserved",
+        "the environment reference; keep layout, lighting and spatial arrangement"],
+    ["风格参考", (l) => `整体画风、色调与质感参考 @${l}`,
+        "weak_reference",
+        "a style reference; keep overall palette, texture and rendering feel"],
+    ["镜头参考", (l) => `运镜方式参考 @${l}（可用官方词汇：Push In / Pan Left / Truck Right / Tracking Shot，加 with small amplitude at slow speed 等修饰）`,
+        "weak_reference",
+        "a camera-movement reference; keep motion direction and pacing only"],
+    ["音频参考", (l) => `声音以 @${l} 为准（音色、节奏与情绪延续）`,
+        "weak_reference",
+        "an audio reference; keep timbre, rhythm and mood"],
+    ["说话人", () => `短发女主 (S1) 轻声说：「……」`, "", ""],
 ];
+/** 每段的锚定方式选择（seg idx → REF_TEMPLATES 下标；-1=无），重绘不丢 */
+const _refTpl = new Map();
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧起手（可选尾帧图片=FL2VA 首尾帧），fl2va UNET"],
@@ -289,6 +309,7 @@ function uniqueLabelFrom(taken, base) {
 /** 在 textarea 光标处插入文本（未聚焦则追加到末尾），返回新值 */
 function insertAtCursor(ta, text) {
     if (!ta) return "";
+    if (typeof ta.insertText === "function") return ta.insertText(text);   // 富文本编辑器
     const s = ta.selectionStart ?? ta.value.length;
     const e = ta.selectionEnd ?? s;
     ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
@@ -296,6 +317,318 @@ function insertAtCursor(ta, text) {
     ta.focus();
     ta.setSelectionRange(pos, pos);
     return ta.value;
+}
+
+/* ---------- 富文本提示词编辑器（@别名 → 内联绿框） ----------
+ * 需求：提示词框里被引用的素材要像"标签"一样显示成绿框（点 ✕ 即取消该素材在本段的
+ * 全部引用），而不是一段裸文本 —— 裸文本看不见、也删不干净（「取消参考清不完」）。
+ *
+ * 设计要点：
+ * - 正文（序列化后的纯文本）是**唯一真相**：seg.refs 由正文里的 @别名 出现序列同步
+ *   （见 syncRefsFromText），所以 ✕/手删/手打都能对上，不会再出现"清不完"。
+ * - 对外暴露 textarea 兼容接口（value / focus / addEventListener / selectionStart /
+ *   setSelectionRange / dataset / placeholder…），@补全、AI 优化、编译预览等既有代码
+ *   零改动即可复用。
+ * - 绿框是 contenteditable=false 的原子节点：光标进不去，退格整块删。
+ */
+function createPromptEditor(opts) {
+    const o = opts || {};
+    const box = document.createElement("div");
+    box.className = "h3d-ta h3d-rta";
+    box.contentEditable = "true";
+    box.spellcheck = false;
+    const labelsOf = () => (typeof o.labels === "function" ? o.labels() : (o.labels || []))
+        .map(String).filter(Boolean);
+
+    /* —— 序列化：DOM → 纯文本（绿框还原成 @别名；块级换行补 \n） —— */
+    function ser(node) {
+        let out = "";
+        for (const n of node.childNodes) {
+            if (n.nodeType === 3) { out += n.nodeValue || ""; continue; }
+            if (n.nodeType !== 1) continue;
+            if (n.dataset && n.dataset.label) { out += "@" + n.dataset.label; continue; }
+            if (n.tagName === "BR") { out += "\n"; continue; }
+            const block = /^(DIV|P|LI|TR|SECTION)$/.test(n.tagName);
+            const inner = ser(n);
+            out += (block && out && !/\n$/.test(out) ? "\n" : "") + inner;
+        }
+        return out;
+    }
+
+    function makeTag(label) {
+        const sp = document.createElement("span");
+        sp.className = "h3d-rtag";
+        sp.contentEditable = "false";
+        sp.dataset.label = String(label);
+        sp.title = `@${label}：本段引用的素材（编译为官方 <Picture/Video/Audio k>）`;
+        sp.append(document.createTextNode("@" + label));
+        const x = document.createElement("button");
+        x.type = "button";
+        x.className = "h3d-rtagx";
+        x.textContent = "✕";
+        x.title = `取消本段对「${label}」的全部引用（正文里的引用一起清掉）`;
+        x.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+        x.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            removeTag(label);
+            if (typeof o.onRemove === "function") o.onRemove(label);
+        });
+        sp.append(x);
+        return sp;
+    }
+
+    function render(text) {
+        box.replaceChildren();
+        const s = String(text == null ? "" : text);
+        const labs = [...labelsOf()].sort((a, b) => b.length - a.length);
+        let buf = "";
+        let i = 0;
+        while (i < s.length) {
+            if (s[i] === "@" && !/[0-9A-Za-z_]/.test(s[i - 1] || "")) {
+                const hit = labs.find((l) => s.startsWith(l, i + 1));
+                if (hit) {
+                    if (buf) { box.append(document.createTextNode(buf)); buf = ""; }
+                    box.append(makeTag(hit));
+                    i += hit.length + 1;
+                    continue;
+                }
+            }
+            buf += s[i];
+            i += 1;
+        }
+        if (buf) box.append(document.createTextNode(buf));
+    }
+
+    /* —— 光标偏移（以序列化文本为准） —— */
+    function rangeText(range) {
+        const tmp = document.createElement("div");
+        tmp.append(range.cloneContents());
+        return ser(tmp);
+    }
+    function caret() {
+        const sel = window.getSelection();
+        if (!sel || !sel.rangeCount) return null;
+        const r = sel.getRangeAt(0);
+        if (!box.contains(r.startContainer)) return null;
+        const pre = r.cloneRange();
+        pre.selectNodeContents(box);
+        pre.setEnd(r.startContainer, r.startOffset);
+        return rangeText(pre).length;
+    }
+    function placeCaret(offset) {
+        const want = Math.max(0, Number(offset) || 0);
+        let acc = 0;
+        const walk = (node) => {
+            for (const n of node.childNodes) {
+                if (n.nodeType === 3) {
+                    const len = (n.nodeValue || "").length;
+                    if (acc + len >= want) {
+                        const r = document.createRange();
+                        r.setStart(n, Math.max(0, want - acc));
+                        r.collapse(true);
+                        return r;
+                    }
+                    acc += len;
+                } else if (n.nodeType === 1) {
+                    if (n.dataset && n.dataset.label) {
+                        const len = n.dataset.label.length + 1;
+                        if (acc + len >= want) {
+                            const r = document.createRange();
+                            r.setStartAfter(n);
+                            r.collapse(true);
+                            return r;
+                        }
+                        acc += len;
+                    } else if (n.tagName === "BR") {
+                        if (acc + 1 >= want) {
+                            const r = document.createRange();
+                            r.setStartAfter(n);
+                            r.collapse(true);
+                            return r;
+                        }
+                        acc += 1;
+                    } else {
+                        const got = walk(n);
+                        if (got) return got;
+                    }
+                }
+            }
+            return null;
+        };
+        const r = walk(box) || (() => {
+            const rr = document.createRange();
+            rr.selectNodeContents(box);
+            rr.collapse(false);
+            return rr;
+        })();
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+    }
+
+    function fireInput() {
+        // h3synthetic：程序化插入（绿框/✕）触发的 input —— @补全据此跳过（别弹窗）
+        const ev = new Event("input", { bubbles: true });
+        ev.h3synthetic = true;
+        box.dispatchEvent(ev);
+    }
+
+    /** 插入一个绿框（在光标处）；同时可选插入前置/后置文本（引用语句式） */
+    function insertTag(label, before, after) {
+        const lbl = String(label || "");
+        if (!lbl) return "";
+        const at = caret();
+        const cur = box.value;                    // 序列化文本（绿框算 @别名 的长度）
+        const plain = at == null ? cur.length : at;   // 没焦点=追加到末尾
+        const pre = String(before || "");
+        const post = String(after || "");
+        const needSpace = cur && !/[\s\n]$/.test(cur.slice(0, plain)) ? " " : "";
+        const next = cur.slice(0, plain) + needSpace + pre + `@${lbl}` + post + cur.slice(plain);
+        box.value = next;                       // 重渲染（新 @别名 变成绿框）
+        placeCaret(plain + needSpace.length + pre.length + lbl.length + 1);
+        focus();
+        fireInput();
+        return next;
+    }
+
+    function removeTag(label) {
+        const cur = box.value;
+        const re = new RegExp(`@${escapeRegExp(String(label))}(?![0-9A-Za-z_])`, "g");
+        if (!re.test(cur)) return false;
+        const next = cur.replace(re, "").replace(/[ \t]{2,}/g, " ").replace(/ *\n */g, "\n");
+        box.value = next;
+        focus();
+        fireInput();
+        return true;
+    }
+
+    function tagCount(label) {
+        const cur = box.value;
+        const re = new RegExp(`@${escapeRegExp(String(label))}(?![0-9A-Za-z_])`, "g");
+        return (cur.match(re) || []).length;
+    }
+
+    /* —— textarea 兼容面 —— */
+    const api = {
+        el: box,
+        get value() { return ser(box); },
+        set value(v) {
+            const had = document.activeElement === box;
+            const at = had ? caret() : null;
+            render(v);
+            if (had && at != null) placeCaret(Math.min(at, box.value.length));
+        },
+        get dataset() { return box.dataset; },
+        get placeholder() { return box.dataset.ph || ""; },
+        set placeholder(v) { box.dataset.ph = String(v || ""); },
+        get title() { return box.title; },
+        set title(v) { box.title = String(v || ""); },
+        get disabled() { return box.contentEditable === "false"; },
+        set disabled(v) {
+            box.contentEditable = v ? "false" : "true";
+            box.classList.toggle("h3d-rta-off", !!v);
+        },
+        get selectionStart() { const c = caret(); return c == null ? this.value.length : c; },
+        get selectionEnd() { return this.selectionStart; },
+        setSelectionRange(a) { placeCaret(a); },
+        focus() { try { box.focus(); } catch (e) { /* 不可聚焦时忽略 */ } },
+        blur() { try { box.blur(); } catch (e) { /* 忽略 */ } },
+        addEventListener(t, fn, cap) { box.addEventListener(t, fn, cap); },
+        removeEventListener(t, fn, cap) { box.removeEventListener(t, fn, cap); },
+        dispatchEvent(ev) { return box.dispatchEvent(ev); },
+        getBoundingClientRect() { return box.getBoundingClientRect(); },
+        contains(n) { return box === n || box.contains(n); },
+        insertText(text) {
+            // 纯文本插入（含 @别名 时同样渲染成绿框）
+            const at = caret();
+            const cur = this.value;
+            const pos = at == null ? cur.length : at;
+            const next = cur.slice(0, pos) + String(text || "") + cur.slice(pos);
+            this.value = next;
+            placeCaret(pos + String(text || "").length);
+            focus();
+            fireInput();
+            return next;
+        },
+        insertTag,
+        removeTag,
+        tagCount,
+        setLabels(fn) { o.labels = fn; },
+    };
+    /* 粘贴只收纯文本：防 HTML 注入 / 样式污染 */
+    box.addEventListener("paste", (e) => {
+        const t = e.clipboardData?.getData("text/plain");
+        if (t == null) return;
+        e.preventDefault();
+        api.insertText(t);
+    });
+    /* 失焦时规范化：手打的 @别名 也变成绿框 */
+    box.addEventListener("blur", () => { render(api.value); });
+
+    /* 打字停顿后自动成框：手打 @别名 也会变成绿框（700ms 防抖 + IME 保护，
+     * 只在"确实还有没成框的 @别名"时才动 DOM，避免打断中文输入法组合） */
+    let composing = false;
+    let normTimer = 0;
+    box.addEventListener("compositionstart", () => { composing = true; });
+    box.addEventListener("compositionend", () => { composing = false; });
+    box.addEventListener("input", (e) => {
+        if (e && e.h3synthetic) return;
+        clearTimeout(normTimer);
+        normTimer = setTimeout(() => {
+            if (composing) return;
+            const text = api.value;
+            const domCount = {};
+            box.querySelectorAll(".h3d-rtag").forEach((n) => {
+                const l = n.dataset.label || "";
+                domCount[l] = (domCount[l] || 0) + 1;
+            });
+            let loose = false;
+            for (const l of labelsOf()) {
+                const inText = text.split(`@${l}`).length - 1;
+                if (inText > (domCount[l] || 0)) { loose = true; break; }
+            }
+            if (!loose) return;
+            const at = caret();
+            render(text);
+            if (at != null) placeCaret(Math.min(at, text.length));
+        }, 700);
+    });
+    api.value = String(o.value || "");
+    return api;
+}
+
+function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 正文 → 本段引用集合（正文是唯一真相）：按首次出现顺序，允许重复计数。
+ *  与后端 compile_refs / _find_refs 同口径（`@标签`，负向后顾防 a@b.com）。 */
+function refsFromText(text, pool) {
+    const s = String(text || "");
+    const labs = (pool || []).map((a) => String(a.label || "")).filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+    const out = [];
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] === "@" && !/[0-9A-Za-z_]/.test(s[i - 1] || "")) {
+            const hit = labs.find((l) => s.startsWith(l, i + 1));
+            if (hit) { out.push(hit); i += hit.length + 1; continue; }
+        }
+        i += 1;
+    }
+    return out;
+}
+
+/** 段引用同步（ds 内联改）：正文里的 @别名 序列 → seg.refs */
+function syncRefsFromText(ds, idx, text) {
+    const seg = (ds.segments || [])[idx];
+    if (!seg) return false;
+    const next = refsFromText(text, ds.ref_assets);
+    const cur = Array.isArray(seg.refs) ? seg.refs : [];
+    if (cur.length === next.length && cur.every((x, i) => x === next[i])) return false;
+    seg.refs = next;
+    return true;
 }
 
 /* P3：@补全——提示词框内 @ 前缀弹出池别名，点选/回车插入 @别名。
@@ -343,7 +676,13 @@ function attachAtComplete(ta, node) {
         ta.setSelectionRange(np, np);
         ta.dispatchEvent(new Event("input", { bubbles: true }));
     };
-    ta.addEventListener("input", () => { sel = 0; paint(); });
+    ta.addEventListener("input", (e) => {
+        // 程序化插入（绿框/✕）不触发补全：插入后光标正好贴在 @别名 后面，
+        // 否则会立刻弹出一个"已完成"的候选框
+        if (e && e.h3synthetic) { close(); return; }
+        sel = 0;
+        paint();
+    });
     ta.addEventListener("keydown", (e) => {
         if (!pop) return;
         if (e.key === "ArrowDown") { e.preventDefault(); sel = (sel + 1) % items.length; paint(); }
@@ -809,6 +1148,8 @@ function setPromptText(node, idx, text) {
     const ds = getDs(node);
     if (idx < 0 || idx >= ds.prompts.length) return false;
     ds.prompts[idx] = text;
+    /* 正文是唯一真相：本段引用集合跟着正文里的 @别名 走（手删绿框/手打 @别名都同步） */
+    syncRefsFromText(ds, idx, text);
     setDs(node, ds);
     schedulePromptFlush();   // 编辑即落盘（防抖）：提示词的持久源=项目文件夹
     return true;
@@ -841,10 +1182,12 @@ function removePromptSegment(node, idx) {
 function clearPrompts(node) {
     const ds = getDs(node);
     ds.prompts = ds.prompts.map(() => "");
-    // 清文本但保留每段时长/素材引用/断链开关/v2结构（结构设置跨项目沿用）
+    // 清文本但保留每段时长/断链开关/v2结构（结构设置跨项目沿用）。
+    // refs 一并清空：正文是引用的唯一真相，留 refs 会出现「正文没有 @标签、
+    // 引用栏却还亮着」的自相矛盾（清不干净的另一半原因）。
     if (ds.segments) ds.segments = ds.segments.map((s) => ({
         ...defaultSegment(), seconds: s?.seconds ?? null,
-        refs: Array.isArray(s?.refs) ? s.refs : [], unlink: !!s?.unlink,
+        refs: [], unlink: !!s?.unlink,
         disabled: !!s?.disabled,
         auto_ref: (s?.auto_ref === null || s?.auto_ref === undefined) ? null : !!s.auto_ref,
         auto_seq: (s?.auto_seq === null || s?.auto_seq === undefined) ? null : !!s.auto_seq,
@@ -900,27 +1243,10 @@ function refCount(seg, label) {
 
 /** 加一次引用（+1）。超限弹提示并返回 false。 */
 function addSegmentRef(node, idx, label) {
+    if (!canAddRef(node, idx, label)) return false;
     const ds = getDs(node);
-    if (idx < 0 || idx >= (ds.segments || []).length) return false;
     const seg = ds.segments[idx];
     if (!Array.isArray(seg.refs)) seg.refs = [];
-    const asset = (ds.ref_assets || []).find((a) => a.label === label);
-    const kind = asset ? asset.kind : "image";
-    const uniq = new Set(seg.refs);
-    if (!uniq.has(label)) {
-        const sameKind = [...uniq].filter((l) => {
-            const a = (ds.ref_assets || []).find((x) => x.label === l);
-            return a && a.kind === kind;
-        }).length;
-        if (sameKind >= KIND_CAPS[kind]) {
-            alert(`本段引用${KIND_NAME[kind]}素材已达官方上限 ${KIND_CAPS[kind]} 个：请先取消一个再勾选「${label}」`);
-            return false;
-        }
-    }
-    if (refCount(seg, label) >= REF_REPEAT_MAX) {
-        alert(`「${label}」在本段已引用 ${REF_REPEAT_MAX} 次（同一段上限）：先减一次再加`);
-        return false;
-    }
     seg.refs.push(label);
     const cur = String((ds.prompts || [])[idx] || "");
     if (!cur.includes(`@${label}`)) {
@@ -940,6 +1266,72 @@ function removeSegmentRef(node, idx, label) {
     if (refCount(seg, label) <= 1) seg.refs = seg.refs.filter((l) => l !== label);
     else seg.refs.splice(seg.refs.lastIndexOf(label), 1);
     setDs(node, ds);
+    return true;
+}
+
+/** 加引用前的上限预检（不写状态）：素材个数按官方 9/3/3（去重算），
+ *  单素材重复次数另有软上限。返回 true=可以加。 */
+function canAddRef(node, idx, label) {
+    const ds = getDs(node);
+    const seg = (ds.segments || [])[idx];
+    if (!seg) return false;
+    const refs = Array.isArray(seg.refs) ? seg.refs : [];
+    const asset = (ds.ref_assets || []).find((a) => a.label === label);
+    const kind = asset ? asset.kind : "image";
+    const uniq = new Set(refs);
+    if (!uniq.has(label)) {
+        const sameKind = [...uniq].filter((l) => {
+            const a = (ds.ref_assets || []).find((x) => x.label === l);
+            return a && a.kind === kind;
+        }).length;
+        if (sameKind >= KIND_CAPS[kind]) {
+            alert(`本段引用${KIND_NAME[kind]}素材已达官方上限 ${KIND_CAPS[kind]} 个：请先取消一个再引用「${label}」`);
+            return false;
+        }
+    }
+    if (refs.filter((l) => l === label).length >= REF_REPEAT_MAX) {
+        alert(`「${label}」在本段已引用 ${REF_REPEAT_MAX} 次（同一段上限）：先取消几次再引用`);
+        return false;
+    }
+    return true;
+}
+
+/** 编辑器正文 → ds.prompts[idx] + seg.refs（正文是唯一真相）+ 落盘 */
+function applyPromptEdit(node, idx, editor) {
+    const text = (editor && typeof editor.value === "string")
+        ? editor.value : String(editor == null ? "" : editor);
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.prompts || []).length) return false;
+    ds.prompts[idx] = text;
+    syncRefsFromText(ds, idx, text);
+    setDs(node, ds);
+    schedulePromptFlush();
+    return true;
+}
+
+/** 把锚定方式写进**已有**具象化结构：references 补官方角色句、retention 补官方
+ *  保留标记（编译时进 subject_definitions / retention_analysis 两个字段）。
+ *  本段没有 prompt_v2 时**不创建**——免得把三字段段悄悄切成六字段；那种情况下
+ *  只靠正文里的句式文本生效（模型同样看得到）。 */
+function applyRefAnchorToV2(node, idx, label, tplDef, roles) {
+    const marker = (tplDef || [])[2];
+    const roleNote = (tplDef || [])[3];
+    const ds = getDs(node);
+    const seg = (ds.segments || [])[idx];
+    const pv = seg && seg.prompt_v2;
+    if (!pv || typeof pv !== "object") return false;
+    if (!Array.isArray(pv.references)) pv.references = [];
+    const ref = pv.references.find((r) => r && (r.label === label || r.label === `@${label}`));
+    if (ref) { if (roleNote) ref.note = roleNote; }
+    else pv.references.push({ label, note: roleNote || (roles ? roles.slice(1, -1) : "") });
+    if (marker) {
+        if (!Array.isArray(pv.retention)) pv.retention = [];
+        const rt = pv.retention.find((r) => r && r.label === label);
+        if (rt) rt.marker = marker;
+        else pv.retention.push({ label, marker, note: roleNote || "" });
+    }
+    setDs(node, ds);
+    schedulePromptFlush();
     return true;
 }
 
@@ -3245,6 +3637,15 @@ function injectStyles() {
     .h3d-ta{width:100%;min-height:84px;resize:vertical;border:1px solid #444c56;border-radius:6px;background:#2d333b;color:var(--h3d-bone);padding:8px 9px;font:12.5px/1.65 "Microsoft YaHei UI","Segoe UI",sans-serif;outline:none;box-sizing:border-box}
     .h3d-ta:focus{border-color:#6cb6ff;box-shadow:0 0 0 2px #6cb6ff33}
     .h3d-ta:disabled{color:#636e7b;cursor:not-allowed;background:#22272e}
+    /* 富文本提示词框：@别名 渲染成内联绿框（原子节点，退格整块删） */
+    .h3d-rta{display:block;min-height:84px;max-height:40vh;overflow:auto;white-space:pre-wrap;word-break:break-word;cursor:text}
+    .h3d-rta:empty:before{content:attr(data-ph);color:#7d8695;pointer-events:none}
+    .h3d-rta-off{color:#636e7b;cursor:not-allowed;background:#22272e}
+    .h3d-rtag{display:inline-flex;align-items:center;gap:3px;margin:0 2px;padding:0 3px 0 7px;border:1px solid #2f6e57;border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;vertical-align:baseline;user-select:all}
+    .h3d-rtagx{padding:0 4px;border:0;border-radius:9px;background:transparent;color:#7fe0b0cc;cursor:pointer;font-size:10.5px;line-height:1.5;font-family:inherit}
+    .h3d-rtagx:hover{background:#3a1a1c;color:#f0a0a4}
+    .h3d-fixfocus{font-size:11px;padding:3px 8px;opacity:.75}
+    .h3d-fixfocus:hover{opacity:1}
     .h3d-ta-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px}
     .h3d-ta-hint{color:var(--h3d-muted);font-size:10.5px}
     .h3d-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:2px}
@@ -3611,9 +4012,22 @@ function openDesk() {
     const right = el("div", "h3d-top-right");
     const ledWrap = el("span", `h3d-led ${ledPhase}`, '<i></i><em></em>');
     const sub = el("span", "h3d-sub h3d-top-project", "");
+    /* 桌面端（Electron）偶发：窗口/画布抢走键盘焦点，输入框点进去打不了字。
+     * 兜底按钮：把键盘焦点抢回来（正常情况也用不着，放着不碍事）。 */
+    const fixFocus = el("button", "h3d-btn h3d-fixfocus", "⌨ 输入修复");
+    fixFocus.title = "桌面端点不进输入框？点这里把键盘焦点抢回来（ComfyUI 桌面端偶发，"
+        + "刷新页面也能解决）";
+    fixFocus.onclick = () => {
+        try { window.focus(); } catch (e) { /* 忽略 */ }
+        try { document.body.focus(); } catch (e) { /* 忽略 */ }
+        const canvas = document.querySelector("canvas#graph-canvas, canvas.litegraph");
+        try { canvas && canvas.blur(); } catch (e) { /* 忽略 */ }
+        const ed = desk?.page?.querySelector(".h3d-rta, textarea, input");
+        if (ed) { try { ed.focus(); } catch (e) { /* 忽略 */ } }
+    };
     const close = el("button", "h3d-close", "✕");
     close.title = "关闭导演台（Esc）";
-    right.append(ledWrap, sub, close);
+    right.append(fixFocus, ledWrap, sub, close);
     topbar.append(left, right);
 
     /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */
@@ -5082,14 +5496,20 @@ function buildCards(data) {
 
         /* 提示词：切换式三页（主提示词/v2/设置；主框=最终进模型文本） */
         {
-            const ta = document.createElement("textarea");
-            ta.className = "h3d-ta";
-            ta.rows = 3;
-            ta.value = it.text || "";
             const pool = (data.ds.ref_assets || []);
             const poolHint = pool.length
-                ? `用 @${pool[0].label} 这样的标签引用素材，或手写 <Picture N>`
+                ? `用 @${pool[0].label} 这样的标签引用素材（引用会显示成绿框，点 ✕ 取消）`
                 : "上传参考图后可用 @标签 引用";
+            /* 富文本提示词框：@别名 显示为内联绿框（✕ = 取消该素材在本段的全部引用） */
+            const ta = createPromptEditor({
+                value: it.text || "",
+                labels: () => ((data.ds.ref_assets || []).map((a) => a.label)),
+                onRemove: (label) => {
+                    if (!node || it.idx === undefined) return;
+                    removeSegmentRef(node, it.idx, label);
+                    scheduleRefresh(240);
+                },
+            });
             ta.placeholder = `第 ${idx + 1} 段画面与动作时间线：顺着上一段结尾继续；`
                 + `对白写「…」自动转官方 <d>[中文] 格式，说话人标 (S1)；`
                 + `运镜可写 The camera pushes in with small amplitude at slow speed；${poolHint}`;
@@ -5131,15 +5551,18 @@ function buildCards(data) {
             }
             body.append(tabbar);
             /* 统一引用条（tab 外常驻）：
-             * chip 点一次 = 引用一次（显示 ×N），同一个素材可以在一段里引用多次
-             * —— 正文里就写 N 个 @别名，编译后是同一个 <Picture k> 出现 N 次；
-             * chip 旁的「−」减一次（减到 0 = 本段不再引用它）。
+             * chip 点一次 = 在提示词框里插一个绿框（显示 ×N），同一素材可引用多次
+             * —— 正文里就有 N 个 @别名，编译后是同一个 <Picture k> 出现 N 次；
+             * chip 旁的「✕」= 取消本段对它的**全部**引用（正文里的绿框一起清掉）。
              * 素材个数上限仍按官方 9/3/3（去重算），重复次数另有软上限。
+             * 下拉 = 锚定方式（先选方式再点素材，按方式把句式写进正文）。
              * 末尾两个按钮：本段的首帧图 / 尾帧图参考（从项目里的图片选或现传）。 */
             if (node && it.idx !== undefined && pool.length) {
                 const refbar = el("div", "h3d-refrow");
-                refbar.append(el("label", "", "资产引用"));
+                refbar.append(el("label", "", "引用素材"));
                 const counter = el("span", "h3d-secs-hint", "");
+                /* 锚定方式（引用语）：-1=无；下标=REF_TEMPLATES。按段记住，重绘不丢。 */
+                let refTpl = _refTpl.has(it.idx) ? _refTpl.get(it.idx) : -1;
                 /* 官方 tag 预览：按「本段勾选顺序」对三类各自独立编号（与后端
                  * compile_refs 同口径，重复引用只占一个编号）—— 让用户直接看到
                  * @女主 会变成 <Picture 1>，写几次就出现几次。 */
@@ -5148,12 +5571,16 @@ function buildCards(data) {
                     const { c, a, roles } = rec;
                     c.classList.toggle("on", n > 0);
                     c.textContent = `${n > 0 ? "✓" : "＋"}@${a.label}${roles}${n > 1 ? ` ×${n}` : ""}`;
+                    const armedName = (REF_TEMPLATES[refTpl] || [])[0];
                     c.title = `${KIND_NAME[a.kind] || ""}「${a.label}」${roles}：`
                         + (n > 0
                             ? `本段已引用 ${n} 次${token ? `（正文里每个 @${a.label} 都会编译成 ${token}）` : ""}`
                             : "本段未引用")
-                        + "\n点一次 = 加一次引用（正文补一个 @标签）；右侧「−」减一次。"
-                        + "\n同一素材在一段里可以引用多次（例如开头和结尾都提到它）。";
+                        + "\n点一次 = 在提示词框里插一个绿框（正文补一个 @标签）；"
+                        + "右侧 ✕ = 取消本段对它的全部引用。"
+                        + (armedName
+                            ? `\n当前锚定方式「${armedName}」：点它会按这个方式写入正文。`
+                            : "\n未选锚定方式：只插裸 @标签（正文里自己描述用法）。");
                 };
                 const chips = [];
                 const paintAll = () => {
@@ -5183,37 +5610,38 @@ function buildCards(data) {
                     const c = el("button", "h3d-chipbtn");
                     c.type = "button";
                     c.dataset.ref = String(a.label || "");
-                    const minus = el("button", "h3d-chipminus", "−");
+                    const minus = el("button", "h3d-chipminus", "✕");
                     minus.type = "button";
-                    minus.title = `「${a.label}」减一次引用（减到 0 = 本段不再引用）`;
+                    minus.title = `取消本段对「${a.label}」的全部引用（正文里的绿框一起清掉）`;
                     const rec = { c, minus, a, roles };
                     chips.push(rec);
                     c.onclick = () => {
-                        if (!addSegmentRef(node, it.idx, a.label)) return;
-                        paintAll();                 // 先让 chip 状态即时落地
-                        if (curTab === "v2") {
-                            setPromptV2Field(node, it.idx, (pv) => {
-                                pv.references = Array.isArray(pv.references) ? pv.references : [];
-                                if (!pv.references.some((r) => r && (r.label === a.label || r.label === `@${a.label}`))) {
-                                    pv.references.push({ label: a.label, note: roles ? roles.slice(1, -1) : "" });
-                                }
-                            });
-                        } else if (curTab !== "set") {
-                            /* 每点一次就往正文加一个 @标签：写几次 = 引用几次（官方
-                             * <Picture k> 在正文里出现几次，模型就参考几次） */
-                            insertAtCursor(ta, (ta.value && !/[\s,，。;；\n]$/.test(ta.value.slice(-1)) ? " " : "") + `@${a.label}`);
-                            try { debouncePromptWrite(node, it.idx, ta.value); } catch (e) {}
+                        if (!canAddRef(node, it.idx, a.label)) return;
+                        if (curTab === "set") {                 // 设置页没有正文可插：只登记引用
+                            addSegmentRef(node, it.idx, a.label);
+                        } else {
+                            const tplDef = REF_TEMPLATES[refTpl];
+                            if (tplDef) {
+                                /* 锚定方式：按句式写入（@别名 落成绿框，前后文一起进正文） */
+                                const phrase = tplDef[1](a.label);
+                                const m = /^(.*?)@([^\s]+)([\s\S]*)$/.exec(phrase);
+                                if (m) ta.insertTag(a.label, m[1], m[3]);
+                                else ta.insertText(phrase);
+                            } else {
+                                ta.insertTag(a.label);
+                            }
+                            applyPromptEdit(node, it.idx, ta);
+                            if (curTab === "v2") applyRefAnchorToV2(node, it.idx, a.label, tplDef || [], roles);
                         }
+                        paintAll();                 // 先让 chip 状态即时落地
                         scheduleRefresh(240);
                     };
                     minus.onclick = () => {
-                        removeSegmentRef(node, it.idx, a.label);
-                        /* 正文同步删掉一个 @标签（次数与正文保持一致） */
-                        if (curTab !== "set" && String(ta.value || "").includes(`@${a.label}`)) {
-                            const at = ta.value.lastIndexOf(`@${a.label}`);
-                            ta.value = ta.value.slice(0, at) + ta.value.slice(at + a.label.length + 1);
-                            try { debouncePromptWrite(node, it.idx, ta.value); } catch (e) {}
+                        if (curTab !== "set") {
+                            ta.removeTag(a.label);              // 正文里所有该绿框一次清掉
+                            applyPromptEdit(node, it.idx, ta);
                         }
+                        removeSegmentRef(node, it.idx, a.label); // refs 归零（双保险）
                         paintAll();
                         scheduleRefresh(240);
                     };
@@ -5246,34 +5674,32 @@ function buildCards(data) {
                 };
                 paintFrameBtns();
                 refbar.append(frameBtns);
-                /* 引用语模板：把现成句式插入主提示词光标处 */
+                /* 锚定方式（引用语）：**先选方式，再点参考素材** —— 点哪个素材就按该方式
+                 * 把句式写进正文（`场景以 @X 为准…`），不选 = 只插裸 @标签。
+                 * 选择是"常驻模式"（切段/重绘后仍保持），选回「无」即关闭。 */
                 const tpl = document.createElement("select");
                 tpl.className = "h3d-reftpl";
-                const optEmpty = document.createElement("option");
-                optEmpty.value = "";
-                optEmpty.textContent = "引用语…";
-                tpl.append(optEmpty);
-                REF_TEMPLATES.forEach(([name, fn], ti) => {
+                const mkOpt = (v, txt) => {
                     const o = document.createElement("option");
-                    o.value = String(ti);
-                    o.textContent = name;
-                    tpl.append(o);
-                });
+                    o.value = String(v);
+                    o.textContent = txt;
+                    return o;
+                };
+                tpl.append(mkOpt("", "锚定方式：无（只插 @标签）"));
+                REF_TEMPLATES.forEach(([name], ti) => tpl.append(mkOpt(ti, `锚定方式：${name}`)));
+                tpl.value = refTpl >= 0 ? String(refTpl) : "";
+                tpl.title = "选一种锚定方式，再点上面的参考素材：该素材会按这个方式写进提示词。"
+                    + "\n不选 = 只插裸 @标签，用法自己在正文里描述。";
                 tpl.onchange = () => {
-                    const ti = Number(tpl.value);
-                    tpl.value = "";
-                    if (!Number.isInteger(ti) || !REF_TEMPLATES[ti]) return;
-                    const seg0 = data.ds.segments[it.idx] || defaultSegment();
-                    const target = (seg0.refs || [])[0] || pool[0].label;
-                    const phrase = REF_TEMPLATES[ti][1](target);
-                    insertAtCursor(ta, (ta.value && !/[\s,，。;；]$/.test(ta.value.slice(-1)) ? "\n" : "") + phrase);
-                    setPromptText(node, it.idx, ta.value);
-                    scheduleRefresh(150);
+                    const v = tpl.value === "" ? -1 : Number(tpl.value);
+                    refTpl = Number.isInteger(v) && REF_TEMPLATES[v] ? v : -1;
+                    _refTpl.set(it.idx, refTpl);
+                    paintAll();
                 };
                 refbar.append(tpl);
                 body.append(refbar);
             }
-            paneMain.append(ta);
+            paneMain.append(ta.el || ta);
             /* AI优化工具条：优化/设置/原稿切换/从v2同步（双写入口） */
             const optbar = el("div", "h3d-actions");
             optbar.dataset.optbar = String(it.idx);
@@ -7151,6 +7577,40 @@ async function refresh() {
 
 const FAB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>`;
 
+/* ---------- 桌面端（Electron）输入焦点兜底 ----------
+ * 症状：ComfyUI 桌面端进入后不刷新，所有输入框都打不进字（窗口/画布占着键盘焦点）。
+ * 兜底三招（都无害，正常情况下不触发）：
+ *   ① 点进输入框时若焦点还停在 body/canvas，主动再 focus 一次（含下一拍重试）；
+ *   ② 输入框内按键在捕获阶段 stopPropagation，别被画布的热键处理吃掉；
+ *   ③ 顶栏「⌨ 输入修复」按钮手动抢回焦点（见 openDesk）。 */
+function installDesktopFocusFix() {
+    if (window.__h3FocusFix) return;
+    window.__h3FocusFix = true;
+    const EDITABLE = "input, textarea, select, [contenteditable='true']";
+    document.addEventListener("pointerdown", (e) => {
+        const t = e.target;
+        if (!t || !t.closest) return;
+        const ed = t.closest(EDITABLE);
+        if (!ed) return;
+        try { if (!document.hasFocus()) window.focus(); } catch (err) { /* 忽略 */ }
+        const ae = document.activeElement;
+        const stuck = !ae || ae === document.body || ae === document.documentElement
+            || ae.tagName === "CANVAS";
+        if (stuck && ae !== ed) {
+            try { ed.focus({ preventScroll: true }); } catch (err) { try { ed.focus(); } catch (e2) { /* 忽略 */ } }
+            setTimeout(() => {
+                if (document.activeElement !== ed) {
+                    try { ed.focus({ preventScroll: true }); } catch (err) { /* 忽略 */ }
+                }
+            }, 0);
+        }
+    }, true);
+    document.addEventListener("keydown", (e) => {
+        const ae = document.activeElement;
+        if (ae && ae.closest && ae.closest(EDITABLE)) e.stopPropagation();
+    }, true);
+}
+
 function mountSidebar(target) {
     miniBox = target;
     target.setAttribute("translate", "no");   // 迷你卡同样免疫浏览器机翻（容器为本扩展专属）
@@ -7201,6 +7661,7 @@ app.registerExtension({
     setup() {
         console.log("[h3-director] loaded", H3D_VER);
         injectStyles();
+        installDesktopFocusFix();   // 桌面端输入框打不进字的兜底
 
         /* 旧工作流迁移：widget 参数官方化后按位错位，载入画布前重排 widgets_values */
         if (typeof app.loadGraphData === "function") {

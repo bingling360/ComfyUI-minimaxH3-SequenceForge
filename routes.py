@@ -801,92 +801,68 @@ def add_routes(routes):
             alias = str(data.get("alias") or "")
             mirror_raw = str(data.get("mirror") or "")
             dest = str(data.get("dest") or "")
-        try:
-            lib_root = asset_store.library_root()
-            if tmp_path and data is None:
-                # multipart 已落盘：按名拷贝入库（register_content 内秒传去重）。
-                # 中转名挂在唯一 tmp 路径上（同名并发不互踩）；真实文件名透传
-                # orig_name，否则库内/调入/转码起名全被 h3lib_ 前缀污染。
-                import shutil as _sh
-                staged = tmp_path + "_stage_" + "".join(
-                    c for c in tmp_name if c.isalnum() or c in ("-", "_", "."))[-64:]
-                _sh.copy2(tmp_path, staged)
-                try:
-                    entry = asset_store.register_content(
-                        lib_root, staged, kind, tags, desc, orig_name=tmp_name)
-                finally:
-                    for p in (staged, tmp_path):
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
-            else:
-                entry = asset_store.register_content(lib_root, tmp_path, kind, tags, desc)
-        except ValueError as e:
-            try:
-                if data is None and tmp_path and os.path.isfile(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
-            return _err(str(e), code="BAD_REQUEST", status=400)
-        except Exception as e:
-            return _err(f"入库失败：{type(e).__name__}: {e}", code="UPLOAD_FAILED", status=500)
-        out = {"ok": True, "entry": entry}
-        # 落点 dest（前端按当前 scope 传）：
-        #   global  —— 只进全局库（跨项目复用，不碰任何项目）
-        #   project —— 全局库一份 + 项目 assets/ 一份（登记 manifest，可用 @别名 引用）
-        #   finals  —— 全局库一份 + 项目 finals/ 一份（成片库，目录扫描即见）
-        # 缺省（空）= 给了 link_dir 就按 project（兼容旧调用）
+        # 落点 dest（前端按当前 scope 传）——**上传到哪里就是哪里，不顺手复制**：
+        #   global  —— 只进全局库（跨项目复用）
+        #   project —— 只落项目 assets/ 并登记清单（可用 @别名 引用）
+        #   finals  —— 只落项目 finals/（成片库，目录扫描即见）
+        # 缺省（空）= 给了 link_dir 就按 project（兼容旧调用）。
+        # 注：早期实现是"项目落点也往全局库复制一份"，用户明确反馈那样不对 ——
+        # 跨项目复用改成显式动作（项目瓦片上的「存入全局库」→ /h3chain/lib_archive）。
         dest = str(dest or "").strip().lower()
         if dest not in ("global", "project", "finals"):
             dest = "project" if link_dir else "global"
-        mirror_on = str(mirror_raw or "").lower() in ("1", "true", "yes")
-        if dest == "project":
-            mirror_on = True
-        out["dest"] = dest
-        if link_dir and dest != "global":
-            if not projects.safe_name(link_dir):
-                return _err("无效的 link_dir（项目目录名）", code="BAD_NAME", status=400)
-            if projects.read_project(link_dir) is None:
-                return _err("链接项目不存在（没有 manifest，先新建或跑一段）",
-                             code="NOT_FOUND", status=404)
-            if dest == "finals":
-                # 成片库是目录扫描型：拷进 finals/ 即可见，不登记进资产清单
-                try:
-                    src_abs = os.path.join(lib_root, *str(entry["file"]).split("/"))
-                    out["stored"] = h3lib.store_to_finals(
-                        link_dir, src_abs, entry.get("orig_name") or "")
-                    h3lib.invalidate(link_dir)
-                except ValueError as e:
-                    out["store_error"] = str(e)
+        out = {"ok": True, "dest": dest}
+        import shutil as _sh
+        lib_root = None
+        staged = tmp_path
+        cleanup = []
+        if tmp_path and data is None:
+            # multipart 已落盘：按真实文件名再拷一份（register_content 内秒传去重）。
+            # 中转名挂在唯一 tmp 路径上（同名并发不互踩）；真实文件名透传 orig_name，
+            # 否则库内/调入/转码起名全被 h3lib_ 前缀污染。
+            staged = tmp_path + "_stage_" + "".join(
+                c for c in tmp_name if c.isalnum() or c in ("-", "_", "."))[-64:]
+            try:
+                _sh.copy2(tmp_path, staged)
+            except OSError as e:
+                return _err(f"文件接收失败：{e}", code="UPLOAD_FAILED", status=500)
+            cleanup = [staged, tmp_path]
+        try:
+            if dest == "global":
+                lib_root = asset_store.library_root()
+                entry = asset_store.register_content(
+                    lib_root, staged, kind, tags, desc,
+                    orig_name=(tmp_name if data is None else None))
+                out["entry"] = entry
+                out["asset_id"] = entry.get("asset_id")
+                out["file"] = entry.get("file")
             else:
-                lbl = alias.strip()[:24] or os.path.splitext(entry["orig_name"])[0][:24]
+                if not link_dir:
+                    return _err("项目落点必须给 link_dir（项目目录名）",
+                                code="BAD_REQUEST", status=400)
+                if not projects.safe_name(link_dir):
+                    return _err("无效的 link_dir（项目目录名）", code="BAD_NAME", status=400)
+                if projects.read_project(link_dir) is None:
+                    return _err("项目不存在（没有 manifest，先新建或跑一段）",
+                                code="NOT_FOUND", status=404)
+                if dest == "finals":
+                    # 成片库是目录扫描型：拷进 finals/ 即可见，不登记进资产清单
+                    out["stored"] = h3lib.store_to_finals(
+                        link_dir, staged, tmp_name or None)
+                else:
+                    out["stored"] = h3lib.store_to_project(
+                        link_dir, staged, tmp_name or None, kind, alias)
+                h3lib.invalidate(link_dir)
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        except Exception as e:
+            return _err(f"入库失败：{type(e).__name__}: {e}", code="UPLOAD_FAILED", status=500)
+        finally:
+            for p in cleanup:
                 try:
-                    mf = projects.link_asset(link_dir, entry["asset_id"], lbl, kind,
-                                             (data or {}).get("base_revision")
-                                             if isinstance(data, dict) else None)
-                except ValueError as e:
-                    msg = str(e)
-                    if msg.startswith("REVISION_CONFLICT"):
-                        return _rev_conflict(link_dir, msg)
-                    return _err(msg, code="BAD_REQUEST", status=400)
-                if mf is None:
-                    return _err("链接失败（项目不存在）", code="NOT_FOUND", status=404)
-                out["manifest"] = mf
-                out["alias"] = lbl
-                # mirror：上传即落项目（项目自包含）—— 再拷一份进 assets/ 并登记 manifest。
-                # 全局库那份保留（跨项目复用），项目这份保证"删项目不连累别人 / 项目自包含"。
-                if mirror_on:
-                    try:
-                        h3lib.invalidate(link_dir)
-                        out["mirrored"] = h3lib.mirror_to_project(
-                            link_dir,
-                            {"scope": "global", "kind": kind, "name": lbl,
-                             "file": entry["file"]},
-                            lbl)
-                    except ValueError as e:
-                        out["mirror_error"] = str(e)
-                h3lib.invalidate(link_dir)   # 拷完再刷一次：新文件立即可见
+                    os.remove(p)
+                except OSError:
+                    pass
         status = 200
         return web.json_response(out, status=status)
 
@@ -1449,9 +1425,13 @@ def add_routes(routes):
                     code="NOT_IN_PROJECT", status=400)
 
     async def lib_mirror(request):
-        """全局库条目 → 项目：拷文件进 assets/ **并写 manifest["assets"]**（一步到位）。
+        """全局库条目 → 项目。两种模式：
 
-        调完立刻能在「项目资产」scope 看到、可用 [[别名]] 引用 —— 不需要前端再推池。
+        - `mode="link"`（默认）：**只写 asset_links**（链接引用，文件不复制）——
+          双层存储的原意就是"一次入库、多项目链接"，也不会出现"项目里多一份、
+          全局里还是那份"的困惑。项目资产视图会列出链接条目（带「链接」徽标）。
+        - `mode="copy"`：拷一份进项目 assets/ 并登记 manifest.assets
+          （项目自包含：删项目不连累全局库，但会多占一份磁盘）。
         """
         try:
             data = await request.json()
@@ -1466,13 +1446,34 @@ def add_routes(routes):
         if it["scope"] != "global":
             return _err("只有全局库条目需要「调入项目」（项目资产已经在项目里了）",
                         code="NOT_GLOBAL", status=400)
+        mode = str(data.get("mode") or "link").strip().lower()
+        if mode == "copy":
+            try:
+                res = h3lib.mirror_to_project(dir_name, it,
+                                              str(data.get("label") or "") or None)
+            except ValueError as e:
+                return _err(str(e), code="BAD_ARGS", status=400)
+            h3lib.invalidate(dir_name)
+            return web.json_response({"ok": True, "mode": "copy", **res})
+        aid = str(it.get("asset_id") or "")
+        if not aid:
+            return _err("这个全局条目没有 asset_id（旧数据）：请用「调入项目（复制文件）」",
+                        code="NO_ASSET_ID", status=400)
+        lbl = str(data.get("label") or "").strip()[:24] or str(it.get("name") or "")[:24]
         try:
-            res = h3lib.mirror_to_project(dir_name, it,
-                                          str(data.get("label") or "") or None)
+            mf = projects.link_asset(dir_name, aid, lbl, it.get("kind") or "image",
+                                     data.get("base_revision"))
         except ValueError as e:
-            return _err(str(e), code="BAD_ARGS", status=400)
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(dir_name, msg)
+            return _err(msg, code="BAD_ARGS", status=400)
+        if mf is None:
+            return _err("链接失败（项目不存在或参数非法）", code="BAD_ARGS", status=400)
         h3lib.invalidate(dir_name)
-        return web.json_response({"ok": True, **res})
+        return web.json_response({"ok": True, "mode": "link", "link": True,
+                                  "alias": lbl, "asset_id": aid,
+                                  "revision": mf.get("revision")})
 
     async def lib_collections(request):
         return web.json_response({"ok": True,
@@ -1511,16 +1512,26 @@ def add_routes(routes):
         ids = [str(x) for x in raw] if isinstance(raw, list) else \
             ([str(data["id"])] if data.get("id") else [])
         paths = []
+        unlinked = []
         for i in ids:
             it = _find_item(dir_name, i)
             if it is None:
+                continue
+            if it.get("linked"):
+                # 链接条目（asset_links）：只解链 —— 文件是全局库那份，绝不能删
+                try:
+                    if projects.unlink_asset(dir_name, asset_id=it.get("asset_id")) is not None:
+                        unlinked.append(it["name"])
+                except ValueError as e:
+                    unlinked.append(f"{it['name']}（{e}）")
                 continue
             p = h3lib.resolve_item_path(it, dir_name)
             if p:
                 paths.append(p)
         res = h3lib.delete_items(paths)
         h3lib.invalidate(dir_name)
-        return web.json_response({"ok": True, **res, "requested": len(ids)})
+        return web.json_response({"ok": True, **res, "unlinked": unlinked,
+                                  "requested": len(ids)})
 
     async def lib_archive(request):
         """把非全局库的条目存一份进全局库（成片产物自动备份，跨项目复用）。

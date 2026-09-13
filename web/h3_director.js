@@ -362,18 +362,21 @@ function createPromptEditor(opts) {
         sp.dataset.label = String(label);
         sp.title = `@${label}：本段引用的素材（编译为官方 <Picture/Video/Audio k>）`;
         sp.append(document.createTextNode("@" + label));
-        const x = document.createElement("button");
-        x.type = "button";
+        /* ✕ 用 span 而不是 <button>：contenteditable 内的交互元素在 Chromium 下
+         * 行为不一致（button 的 click 有时被选区逻辑吃掉 → "点了没反应"）。
+         * 直接吃 mousedown：不依赖 click 配对，也不会因为重绘换节点而丢事件。 */
+        const x = document.createElement("span");
         x.className = "h3d-rtagx";
+        x.setAttribute("role", "button");
         x.textContent = "✕";
         x.title = `取消本段对「${label}」的全部引用（正文里的引用一起清掉）`;
-        x.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
-        x.addEventListener("click", (e) => {
+        x.addEventListener("mousedown", (e) => {
             e.preventDefault();
             e.stopPropagation();
             removeTag(label);
             if (typeof o.onRemove === "function") o.onRemove(label);
         });
+        x.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
         sp.append(x);
         return sp;
     }
@@ -1300,6 +1303,7 @@ function canAddRef(node, idx, label) {
 function applyPromptEdit(node, idx, editor) {
     const text = (editor && typeof editor.value === "string")
         ? editor.value : String(editor == null ? "" : editor);
+    cancelPromptWrite(idx);      // 先丢掉防抖中的旧文本，防被盖回去
     const ds = getDs(node);
     if (idx < 0 || idx >= (ds.prompts || []).length) return false;
     ds.prompts[idx] = text;
@@ -1977,6 +1981,16 @@ function debounceSegmentWrite(node, idx, field, text) {
 }
 
 /* 同步刷掉所有挂起的输入框写回（切项目前调用：按键进旧项目，一个不丢） */
+/** 丢掉某段待写的提示词（防抖中 + 待 flush 的闭包）：
+ *  程序化改正文（插/删绿框）前必须清掉，否则几百毫秒后旧文本会把改动盖回去
+ *  —— 表现就是"点了绿框/素材，状态闪一下又变回去"。 */
+function cancelPromptWrite(idx) {
+    const key = `p${idx}`;
+    const t = _taTimers.get(key);
+    if (t) { clearTimeout(t); _taTimers.delete(key); }
+    _taPending.delete(key);
+}
+
 function flushPendingEdits() {
     if (!_taPending.size && !_taTimers.size) return 0;
     const jobs = [..._taPending.values()];
@@ -3642,7 +3656,7 @@ function injectStyles() {
     .h3d-rta:empty:before{content:attr(data-ph);color:#7d8695;pointer-events:none}
     .h3d-rta-off{color:#636e7b;cursor:not-allowed;background:#22272e}
     .h3d-rtag{display:inline-flex;align-items:center;gap:3px;margin:0 2px;padding:0 3px 0 7px;border:1px solid #2f6e57;border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;vertical-align:baseline;user-select:all}
-    .h3d-rtagx{padding:0 4px;border:0;border-radius:9px;background:transparent;color:#7fe0b0cc;cursor:pointer;font-size:10.5px;line-height:1.5;font-family:inherit}
+    .h3d-rtagx{display:inline-block;padding:0 5px;border-radius:9px;background:transparent;color:#7fe0b0cc;cursor:pointer;font-size:10.5px;line-height:1.6;user-select:none}
     .h3d-rtagx:hover{background:#3a1a1c;color:#f0a0a4}
     .h3d-fixfocus{font-size:11px;padding:3px 8px;opacity:.75}
     .h3d-fixfocus:hover{opacity:1}
@@ -3730,6 +3744,8 @@ function injectStyles() {
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
     .h3d-chipminus{padding:2px 6px;margin-left:-3px;border:1px solid #3a352c;border-radius:9px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;line-height:1;font-family:inherit}
     .h3d-chipminus:hover{border-color:#9a4144;color:#f0a0a4}
+    .h3d-chipminus.off{opacity:.4}
+    .h3d-chipminus.off:hover{opacity:1}
     .h3d-frmbtns{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
     .h3d-frm{padding:2px 9px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit}
     .h3d-frm:hover{filter:brightness(1.25)}
@@ -5506,6 +5522,7 @@ function buildCards(data) {
                 labels: () => ((data.ds.ref_assets || []).map((a) => a.label)),
                 onRemove: (label) => {
                     if (!node || it.idx === undefined) return;
+                    applyPromptEdit(node, it.idx, ta);   // 正文（已去掉绿框）立即落盘
                     removeSegmentRef(node, it.idx, label);
                     scheduleRefresh(240);
                 },
@@ -5576,8 +5593,8 @@ function buildCards(data) {
                         + (n > 0
                             ? `本段已引用 ${n} 次${token ? `（正文里每个 @${a.label} 都会编译成 ${token}）` : ""}`
                             : "本段未引用")
-                        + "\n点一次 = 在提示词框里插一个绿框（正文补一个 @标签）；"
-                        + "右侧 ✕ = 取消本段对它的全部引用。"
+                        + "\n点一次 = 在提示词框里插一个绿框（正文补一个 @标签，点两次=引用两次）；"
+                        + "右侧 ✕（或右键本 chip）= 取消本段对它的全部引用。"
                         + (armedName
                             ? `\n当前锚定方式「${armedName}」：点它会按这个方式写入正文。`
                             : "\n未选锚定方式：只插裸 @标签（正文里自己描述用法）。");
@@ -5597,8 +5614,11 @@ function buildCards(data) {
                         tokens[l] = String(TOK_FMT[k] || TOK_FMT.image).replace("{}", cnt[k]);
                     }
                     for (const rec of chips) {
-                        paintChip(rec, refCount(seg, rec.a.label), tokens[rec.a.label]);
-                        rec.minus.style.display = refCount(seg, rec.a.label) > 0 ? "" : "none";
+                        const n = refCount(seg, rec.a.label);
+                        paintChip(rec, n, tokens[rec.a.label]);
+                        /* ✕ 常驻显示（未引用时置灰）：以前"有引用才出现"，
+                         * 用户想取消时找不到 —— 就是"点不了了"的来源。 */
+                        rec.minus.classList.toggle("off", n <= 0);
                     }
                     const nAsset = new Set(refs).size;
                     counter.textContent = nAsset
@@ -5615,7 +5635,19 @@ function buildCards(data) {
                     minus.title = `取消本段对「${a.label}」的全部引用（正文里的绿框一起清掉）`;
                     const rec = { c, minus, a, roles };
                     chips.push(rec);
-                    c.onclick = () => {
+                    /* 用 mousedown 而不是 click：① 卡片重绘可能夹在 mousedown/click
+                     * 之间把节点换掉 → click 永远不来（"点了没反应"）；
+                     * ② preventDefault 不让编辑器失焦，避免失焦回写旧文本。
+                     * 失败也可见（不再静默）。 */
+                    const guard = (fn) => (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        try { fn(); } catch (err) {
+                            console.error("[h3-director] 引用操作失败：", err);
+                            setLed("error", `引用操作失败：${err?.message || err}`);
+                        }
+                    };
+                    c.addEventListener("mousedown", guard(() => {
                         if (!canAddRef(node, it.idx, a.label)) return;
                         if (curTab === "set") {                 // 设置页没有正文可插：只登记引用
                             addSegmentRef(node, it.idx, a.label);
@@ -5635,8 +5667,8 @@ function buildCards(data) {
                         }
                         paintAll();                 // 先让 chip 状态即时落地
                         scheduleRefresh(240);
-                    };
-                    minus.onclick = () => {
+                    }));
+                    const clearAll = () => {
                         if (curTab !== "set") {
                             ta.removeTag(a.label);              // 正文里所有该绿框一次清掉
                             applyPromptEdit(node, it.idx, ta);
@@ -5645,6 +5677,13 @@ function buildCards(data) {
                         paintAll();
                         scheduleRefresh(240);
                     };
+                    minus.addEventListener("mousedown", guard(clearAll));
+                    /* 右键 chip = 一键清零（兜底：万一 ✕ 没看见） */
+                    c.addEventListener("contextmenu", (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        try { clearAll(); } catch (err) { console.error(err); }
+                    });
                     refbar.append(c, minus);
                 }
                 paintAll();
@@ -5665,9 +5704,13 @@ function buildCards(data) {
                         b.title = has
                             ? `本段${name}参考：${fi[key]}（点开可换一张 / 清除）`
                             : `选一张项目里的图片当本段${name}参考（也可现场上传）`;
-                        b.onclick = () => openFramePicker(node, it.idx, key, name, () => {
-                            paintFrameBtns();
-                            scheduleRefresh(240);
+                        b.addEventListener("mousedown", (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            openFramePicker(node, it.idx, key, name, () => {
+                                paintFrameBtns();
+                                scheduleRefresh(240);
+                            });
                         });
                         frameBtns.append(b);
                     }

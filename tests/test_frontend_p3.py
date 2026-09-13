@@ -301,12 +301,26 @@ def test_library_upload_multipart(routes, projects):
     r = asyncio.run(fn(req))
     assert req.json_calls == 0
     assert r.status == 200, r.data
-    assert r.data["entry"]["asset_id"].startswith("a_")
-    assert r.data["alias"] == "拖放图"
-    assert any(x["alias"] == "拖放图" for x in r.data["manifest"]["asset_links"])
+    # 给了 link_dir 而没给 dest -> 落点=项目（**只落项目，不往全局库复制一份**）
+    assert r.data["dest"] == "project"
+    assert r.data["stored"]["label"] == "拖放图"
+    assert r.data["stored"]["file"].startswith("assets/")
+    assert "entry" not in r.data
     # 缺 file 字段 -> 400
     r2 = asyncio.run(fn(_ReqMP([_MPField("kind", data=b"image")])))
     assert r2.status == 400
+    # dest=global：只进全局库（拿得到 asset_id）
+    req3 = _ReqMP([
+        _MPField("kind", data=b"image"),
+        _MPField("dest", data=b"global"),
+        _MPField("alias", data="库内图".encode()),
+        _MPField("file", filename="lib.png", data=b"\x89PNG-lib-bytes"),
+    ])
+    r3 = asyncio.run(fn(req3))
+    assert r3.status == 200, r3.data
+    assert r3.data["dest"] == "global"
+    assert r3.data["entry"]["asset_id"].startswith("a_")
+    assert "stored" not in r3.data
 
 
 # ---- 前端源码断言 ----

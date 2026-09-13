@@ -342,8 +342,14 @@
       mk(`✓ ${roles.join("·")}`, true,
         () => say(`「${it.name}」带有旧的首尾帧标注：现在请在导演台每段的「资产引用」栏指定首/尾帧图`));
     }
-    if (it.scope === "global") mk("调入项目", false, () => actMirror(it));
+    if (it.scope === "global") {
+      mk("调入项目", false, () => actMirror(it));
+      mk("复制进项目", false, () => actMirrorCopy(it));
+    }
     if (it.scope === "finals") mk("调入项目", false, () => actToAssets(it));
+    if (it.scope === "project" && !it.linked) {
+      mk("存入全局库", false, () => actArchive(it));
+    }
     if (it.scope === "latent" && window.H3Director?.upscaleLatent) {
       mk("二采", false, () => window.H3Director.upscaleLatent(S.dir, it.file, say));
     }
@@ -390,7 +396,8 @@
     paintStars();
     t.append(stars);
     const bits = [KIND_CN[it.kind] || it.kind];
-    if (it.size) bits.push(fmtSize(it.size));
+    if (it.linked) bits.push("🔗 链接（文件在全局库）");
+    else if (it.size) bits.push(fmtSize(it.size));
     if (it.mtime) bits.push(fmtTime(it.mtime));
     t.append(el("div", "h3l-meta", bits.map(esc).join(" · ")));
     const bg = el("div", "h3l-badges");
@@ -511,9 +518,12 @@
       }
     }
     if (it.scope === "global" && !many) {
-      m.append(menuItem("⇩ 调入项目（复制一份到项目 assets/）", () => actMirror(it)));
+      m.append(menuItem("⇩ 调入项目（链接引用，不复制文件）", () => actMirror(it)));
+      m.append(menuItem("⇩ 调入项目（复制一份到项目 assets/）", () => actMirrorCopy(it)));
     } else if (it.scope === "finals" && !many) {
       m.append(menuItem("→ 移进项目资产（从成片挪一份到 assets/）", () => actToAssets(it)));
+    } else if (it.scope === "project" && !many && !it.linked) {
+      m.append(menuItem("⬆ 存入全局库（跨项目可复用）", () => actArchive(it)));
     }
     if (it.scope === "latent" && !many && window.H3Director?.upscaleLatent) {
       m.append(menuItem("🔍 二采放大（驱动画布 H3LatentUpscale）",
@@ -705,12 +715,36 @@
     fetchPage(false);
   }
 
+  /** 调入项目（默认=**链接**，不复制文件：文件仍只在全局库一份）。 */
   async function actMirror(it) {
     const A = api();
     if (!A.libMirror) { fail("接口未就绪（h3_api.js 未更新）"); return; }
-    const r = await A.libMirror(S.dir, it.id, it.name);
+    const r = await A.libMirror(S.dir, it.id, it.name, "link");
     if (!r.body?.ok) { fail(A.errText(r, "调入项目失败")); return; }
-    after(`已调入项目：${r.body.file}\n别名「${r.body.label}」——提示词里写 @${r.body.label} 即可引用`);
+    after(`已链接进项目：别名「${r.body.alias}」\n提示词里写 @${r.body.alias} 即可引用`
+      + "（不复制文件：全局库那份就是唯一实体）");
+    fetchPage(false);
+  }
+
+  /** 调入项目（复制文件）：项目自包含，删项目不连累全局库，但会多占一份磁盘。 */
+  async function actMirrorCopy(it) {
+    const A = api();
+    if (!A.libMirror) { fail("接口未就绪（h3_api.js 未更新）"); return; }
+    const r = await A.libMirror(S.dir, it.id, it.name, "copy");
+    if (!r.body?.ok) { fail(A.errText(r, "复制进项目失败")); return; }
+    after(`已复制进项目：${r.body.file}\n别名「${r.body.label}」——提示词里写 @${r.body.label} 即可引用`);
+    fetchPage(false);
+  }
+
+  /** 项目资产 → 全局库（显式动作，跨项目复用；不是上传时顺手复制）。 */
+  async function actArchive(it) {
+    const A = api();
+    if (!A.libArchive) { fail("接口未就绪（h3_api.js 未更新）"); return; }
+    const r = await A.libArchive(S.dir, [it.id]);
+    if (!r.body?.ok) { fail(A.errText(r, "存入全局库失败")); return; }
+    const n = (r.body.archived || []).length;
+    after(n ? `「${it.name}」已存入全局库（跨项目可复用）`
+            : `「${it.name}」已在全局库，无需重复存入`);
     fetchPage(false);
   }
 
@@ -719,12 +753,12 @@
     let ok = 0;
     const names = [];
     for (const it of items) {
-      const r = await A.libMirror(S.dir, it.id, it.name);
-      if (r.body?.ok) { ok++; names.push(r.body.label); }
+      const r = await A.libMirror(S.dir, it.id, it.name, "link");
+      if (r.body?.ok) { ok++; names.push(r.body.alias); }
       else fail(`${it.name}：${A.errText(r, "调入失败")}`);
     }
     if (ok) {
-      say(`已调入 ${ok} 个到项目 assets/：${names.join("、")}\n提示词里写 @别名 即可引用`);
+      say(`已链接进项目 ${ok} 个：${names.join("、")}\n提示词里写 @别名 即可引用（不复制文件）`);
       fetchPage(false);
     }
   }
@@ -772,13 +806,20 @@
   }
 
   async function actDelete(ids) {
-    if (!window.confirm(`确认删除这 ${ids.length} 个文件的物理文件？（不可撤销）`)) return;
+    const linkedN = S.items.filter((x) => ids.includes(x.id) && x.linked).length;
+    const tip = linkedN
+      ? `选中里含 ${linkedN} 个「链接」条目：只会解除项目链接（全局库那份文件保留）。\n`
+        + "其余条目会删除物理文件，不可撤销。确认继续？"
+      : `确认删除这 ${ids.length} 个文件的物理文件？（不可撤销）`;
+    if (!window.confirm(tip)) return;
     const A = api();
     const r = await A.libDelete(S.dir, ids);
     if (!r.body?.ok) { fail(A.errText(r, "删除失败")); return; }
     S.sel.clear();
-    say(`已删除 ${(r.body.deleted || []).length} 个` +
-        ((r.body.skipped || []).length ? `，跳过 ${r.body.skipped.length} 个` : ""));
+    const un = (r.body.unlinked || []).length;
+    say(`已删除 ${(r.body.deleted || []).length} 个`
+        + (un ? `，解除链接 ${un} 个（全局库文件保留）` : "")
+        + ((r.body.skipped || []).length ? `，跳过 ${r.body.skipped.length} 个` : ""));
     notify();          // 项目里没了：导演台的引用栏/提示词补全要同步
     fetchPage(false);
   }
@@ -850,11 +891,12 @@
     };
     bar.append(multiBtn);
 
-    /* 上传落点 = 当前所在库（切 scope 时按钮文案跟着变）：
-     *   全局库 → 只进全局库一份（跨项目复用，不碰任何项目）
-     *   项目资产 → 全局库一份 + 本项目 assets/ 一份（登记清单，可直接 @别名 引用）
-     *   成片     → 全局库一份 + 本项目 finals/ 一份（目录扫描即见）
-     *   全部/latent → 按项目资产处理 */
+    /* 上传落点 = 当前所在库，**上传到哪里就是哪里，不顺手复制**：
+     *   全局库 → 只进全局库（跨项目复用）
+     *   项目资产 → 只落本项目 assets/（登记清单，可直接 @别名 引用）
+     *   成片     → 只落本项目 finals/（目录扫描即见）
+     *   全部/latent → 按项目资产处理
+     * 想要"全局库也存一份"用项目瓦片上的「存入全局库」（显式动作）。 */
     const upBtn = el("button", "h3l-btn h3l-btn-cta", "＋ 上传");
     upBtn.type = "button";
     const DEST_CN = { global: "全局库", project: "项目资产", finals: "成片库" };
@@ -864,12 +906,12 @@
       const dest = destOf(S.scope);
       upBtn.textContent = `＋ 上传到${DEST_CN[dest] || "项目资产"}`;
       upBtn.title = dest === "global"
-        ? "当前在「全局库」：只进全局库一份（跨项目复用，不碰任何项目）；"
+        ? "当前在「全局库」：只进全局库（跨项目复用，不碰任何项目）；"
           + "要落进项目请切到「项目资产」再传。"
         : dest === "finals"
-          ? "当前在「成片」：全局库存一份 + 本项目 finals/ 一份。"
-          : "当前在「项目资产」：全局库存一份（跨项目复用）+ 本项目 assets/ 一份"
-            + "并登记进清单，提示词里写 @别名 即可引用。";
+          ? "当前在「成片」：只落本项目 finals/（成片库，目录扫描即见）。"
+          : "当前在「项目资产」：只落本项目 assets/ 并登记进清单，"
+            + "提示词里写 @别名 即可引用（不会往全局库复制一份）。";
     };
     paintUpBtn();
     upBtn.onclick = () => {
@@ -905,7 +947,7 @@
         if (onlyGlobal) {
           say(`已上传 ${ok} 个到全局库（跨项目可复用）\n要落进当前项目，点瓦片上的「调入项目」`);
         } else {
-          say(`已上传 ${ok} 个到${DEST_CN[dest]}：全局库一份 + 本项目一份`
+          say(`已上传 ${ok} 个到${DEST_CN[dest]}（只这一份，不往别处复制）`
             + (dest === "project" ? "\n提示词里写 @别名 即可引用" : ""));
           if (typeof S.onChanged === "function") {
             try { S.onChanged(); } catch (e) { /* 通知导演台刷新（可选） */ }

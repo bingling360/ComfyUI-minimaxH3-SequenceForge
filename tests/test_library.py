@@ -283,6 +283,44 @@ def test_mirror_to_project(proj, tmp_path, monkeypatch):
         L.mirror_to_project("demo", item2)
 
 
+def test_link_entries_listed_and_resolved(proj, tmp_path, monkeypatch):
+    """项目链接（asset_links）要出现在「项目资产」里，且按全局库解析绝对路径。
+
+    双层存储=链接引用不复制：文件只在全局库一份，项目里只有 {asset_id, alias}。
+    不列出来的话，用户点完「调入项目」在项目资产里看不到任何东西，以为没生效。
+    """
+    import json
+    import sys
+    import types
+    aid = "a_0123456789ab"
+    root = tmp_path / "h3_projects" / "demo"
+    (root / "manifest.json").write_text(json.dumps({
+        "assets": [], "asset_links": [{"asset_id": aid, "alias": "女主", "kind": "image"}],
+    }, ensure_ascii=False), encoding="utf-8")
+    lib = tmp_path / "lib"
+    (lib / "images").mkdir(parents=True)
+    (lib / "images" / "x.png").write_bytes(b"png")
+    # asset_store 是 library 内部延迟 import 的：塞一个替身进 sys.modules
+    fake = types.ModuleType("asset_store")
+    fake.load_library = lambda root_: {"assets": [{
+        "asset_id": aid, "kind": "image", "file": "images/x.png",
+        "orig_name": "girl.png", "bytes": 3}]}
+    monkeypatch.setitem(sys.modules, "asset_store", fake)
+    monkeypatch.setattr(L, "_library_root", lambda: str(lib))
+    L.invalidate()
+
+    items = L.scan_scope("project", proj)
+    linked = [e for e in items if e.get("linked")]
+    assert len(linked) == 1
+    e = linked[0]
+    assert e["asset_id"] == aid and e["name"] == "女主"
+    assert e["file"] == "images/x.png"          # 全局库相对路径
+    assert e["origin"].endswith("链接全局库")
+    # 绝对路径按全局库解析（否则缩略图/预览全 404）
+    assert L.resolve_item_path(e, proj).endswith("x.png")
+    assert L.resolve_item_path(e, proj).startswith(str(lib))
+
+
 def test_store_to_finals(proj, tmp_path):
     """上传落点=成片：拷进 finals/（目录扫描即见），同名不覆盖。"""
     src = tmp_path / "src.mp4"

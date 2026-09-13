@@ -318,6 +318,7 @@ def scan_scope(scope, project=None) -> list:
             if k not in MEDIA_KINDS:
                 continue
             items.append(_entry("project", k, os.path.basename(rel), rel, full))
+        items.extend(_link_entries(project, root))
         return items
 
     if scope == "finals":
@@ -341,6 +342,53 @@ def scan_scope(scope, project=None) -> list:
                                     origin="latent"))
         return items
     return items
+
+
+def _link_entries(project, root) -> list:
+    """项目链接（manifest.asset_links）→ 「项目资产」条目。
+
+    双层存储的语义是**链接引用不复制**：文件只在全局库一份，项目里只存
+    {asset_id, alias}。但「项目资产」视图如果不列链接条目，用户点完「调入项目」
+    看不到任何东西，会以为没生效 —— 这里补上（带 linked 标记，前端显示「链接」徽标）。
+    """
+    out = []
+    try:
+        from . import checkpoint as _ck
+    except ImportError:
+        import checkpoint as _ck
+    try:
+        manifest = _ck.load_manifest(root)
+    except Exception:
+        return out
+    if not isinstance(manifest, dict):
+        return out
+    links = [x for x in (manifest.get("asset_links") or []) if isinstance(x, dict)
+             and x.get("asset_id")]
+    if not links:
+        return out
+    libroot = _library_root()
+    libmap = {}
+    if libroot:
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
+        for a in (asset_store.load_library(libroot).get("assets") or []):
+            if isinstance(a, dict) and a.get("asset_id"):
+                libmap[str(a["asset_id"])] = a
+    for L in links:
+        aid = str(L["asset_id"])
+        g = libmap.get(aid) or {}
+        f = str(g.get("file") or "").replace("\\", "/")
+        abs_p = os.path.join(libroot, *f.split("/")) if (libroot and f) else ""
+        e = _entry("project", normalize_kind(L.get("kind") or g.get("kind")),
+                   str(L.get("alias") or g.get("orig_name") or aid), f, abs_p,
+                   asset_id=aid, linked=True, origin="项目资产 · 链接全局库")
+        e["bytes"] = int(g.get("bytes") or 0)
+        e["roles"] = [str(r) for r in (L.get("roles") or [])
+                      if str(r) in ("首帧图", "尾帧图")]
+        out.append(e)
+    return out
 
 
 def build_index(project=None, scopes=None, use_cache=True) -> list:
@@ -733,6 +781,53 @@ def mirror_to_project(project, item, label=None) -> dict:
     return {"file": rel, "label": lbl, "kind": kind, "revision": out.get("revision")}
 
 
+def store_to_project(project, src_abs, name=None, kind="image", label=None) -> dict:
+    """上传落点为项目：拷进 <proj>/assets/ 并登记 manifest.assets（**不进全局库**）。
+
+    与 mirror_to_project 的区别：源是本地文件（不是全局库条目），也不写 asset_links
+    —— 就是"项目自己的一份"。跨项目复用请用显式的「存入全局库」动作（lib_archive），
+    不要在上传时顺手复制一份（用户明确反馈过那样"明显不对"）。
+    """
+    try:
+        from . import projects as _pj
+    except ImportError:
+        import projects as _pj
+    proj = _pj.safe_name(project)
+    if not proj:
+        raise ValueError("无效的项目目录名")
+    if not src_abs or not os.path.isfile(src_abs):
+        raise ValueError("源文件不存在")
+    manifest = _pj.read_project(proj)
+    if manifest is None:
+        raise ValueError("项目不存在（先新建项目或跑一段）")
+    kk = normalize_kind(kind)
+    adir = os.path.join(_project_root(proj), "assets")
+    os.makedirs(adir, exist_ok=True)
+    ext = os.path.splitext(src_abs)[1]
+    want = os.path.basename(str(name or os.path.basename(src_abs))).replace("\\", "/").split("/")[-1]
+    if not safe_rel(want) or not os.path.splitext(want)[1]:
+        want = os.path.basename(src_abs)
+    stem, k = os.path.splitext(want)[0], 2
+    cand = want
+    while os.path.exists(os.path.join(adir, cand)):
+        cand = f"{stem}_{k}{ext}"
+        k += 1
+    shutil.copy2(src_abs, os.path.join(adir, cand))
+    rel = f"assets/{cand}"
+    assets = [dict(a) if isinstance(a, dict) else a for a in (manifest.get("assets") or [])]
+    taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
+    lbl = (str(label or "").strip() or os.path.splitext(cand)[0])[:24] or "素材"
+    base, n = lbl, 2
+    while lbl in taken:
+        lbl = f"{base}{n}"[:24]
+        n += 1
+    assets.append({"label": lbl, "kind": kk, "file": rel})
+    out = _pj.save_assets(proj, assets, None)
+    if out is None:
+        raise ValueError("写入项目清单失败")
+    return {"file": rel, "label": lbl, "kind": kk, "revision": out.get("revision")}
+
+
 def store_to_finals(project, src_abs, name=None) -> dict:
     """把文件拷进项目 finals/（成片库）：同名加 _2 不覆盖，返回 {file, name}。
 
@@ -759,14 +854,18 @@ def store_to_finals(project, src_abs, name=None) -> dict:
 
 
 def resolve_item_path(item, project=None) -> str:
-    """条目 -> 存在的绝对路径（不存在返回空串）。"""
+    """条目 -> 存在的绝对路径（不存在返回空串）。
+
+    linked 条目（项目链接 asset_links）文件在全局库，按全局库根解析 —— 否则
+    缩略图/预览/删除都会去找 <proj>/images/… 而落空。
+    """
     if not isinstance(item, dict):
         return ""
     scope = item.get("scope")
     rel = safe_rel(item.get("file"))
     if not rel:
         return ""
-    if scope == "global":
+    if scope == "global" or item.get("linked"):
         root = _library_root()
         cand = os.path.join(root, *rel.split("/")) if root else ""
     else:

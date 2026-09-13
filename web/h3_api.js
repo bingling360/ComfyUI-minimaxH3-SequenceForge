@@ -108,7 +108,9 @@
     libRate: (dir, id, rating) => _json("POST", "/h3chain/lib_rate", { dir, id, rating }),
     libTag: (dir, id, tags) => _json("POST", "/h3chain/lib_tag", { dir, id, tags }),
     libAlias: (dir, id, alias) => _json("POST", "/h3chain/lib_alias", { dir, id, alias }),
-    libMirror: (dir, id, label) => _json("POST", "/h3chain/lib_mirror", { dir, id, label }),
+    // mode: "link"（默认，链接引用不复制）| "copy"（拷一份进项目 assets/）
+    libMirror: (dir, id, label, mode) =>
+      _json("POST", "/h3chain/lib_mirror", { dir, id, label, mode: mode || "link" }),
     libArchive: (dir, ids) => _json("POST", "/h3chain/lib_archive", { dir, ids }),
     libCollectionSave: (payload) => _json("POST", "/h3chain/lib_collection_save", payload),
     libCollectionDelete: (dir, id) => _json("POST", "/h3chain/lib_collection_delete", { dir, id }),

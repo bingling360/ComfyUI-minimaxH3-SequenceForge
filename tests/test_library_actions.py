@@ -200,8 +200,8 @@ class _MultipartReq:
         return self._reader
 
 
-def test_upload_dest_project_mirrors(handlers, proj, tmp_path, monkeypatch):
-    """dest=project 走 multipart 也要落项目（旧实现只在 JSON 分支读 mirror）。"""
+def test_upload_dest_project_stays_in_project(handlers, proj, tmp_path, monkeypatch):
+    """dest=project：**只落项目**（不进全局库）—— 上传到哪里就是哪里。"""
     import asset_store as AS
     lib = tmp_path / "lib"
     monkeypatch.setattr(AS, "library_root", lambda *a, **k: str(lib))
@@ -211,21 +211,24 @@ def test_upload_dest_project_mirrors(handlers, proj, tmp_path, monkeypatch):
         _Field("kind", b"image"),
         _Field("dest", b"project"),
         _Field("link_dir", b"demo"),
-        _Field("mirror", b"1"),
         _Field("alias", "新素材".encode("utf-8")),
         _Field("file", b"png-bytes-abc", filename="girl.png"),
     ])
     res = asyncio.run(fn(req))
     assert res.status == 200, res.data
     assert res.data["dest"] == "project"
-    assert res.data.get("alias") == "新素材"
-    assert res.data.get("mirrored", {}).get("file", "").startswith("assets/")
-    # 项目里真有一份（不只是全局库）
-    assert (proj["root"] / str(res.data["mirrored"]["file"])).is_file()
+    assert res.data["stored"]["label"] == "新素材"
+    assert res.data["stored"]["file"].startswith("assets/")
+    assert (proj["root"] / str(res.data["stored"]["file"])).is_file()
+    # 全局库不该多出任何东西（用户明确反馈"顺手复制一份"不对）
+    assert not os.path.isdir(lib) or not os.path.isfile(os.path.join(lib, "manifest.json"))
+    assert "entry" not in res.data
+    # 项目清单登记了（可用 @别名 引用）
+    assert any(a.get("label") == "新素材" for a in proj["state"]["mf"]["assets"])
 
 
 def test_upload_dest_global_only(handlers, proj, tmp_path, monkeypatch):
-    """dest=global：不碰项目（assets/ 数量不变，也不登记清单）。"""
+    """dest=global：只进全局库，不碰项目（assets/ 数量不变，也不登记清单）。"""
     import asset_store as AS
     lib = tmp_path / "lib"
     monkeypatch.setattr(AS, "library_root", lambda *a, **k: str(lib))
@@ -240,9 +243,46 @@ def test_upload_dest_global_only(handlers, proj, tmp_path, monkeypatch):
     ])
     res = asyncio.run(fn(req))
     assert res.status == 200, res.data
-    assert res.data["dest"] == "global" and "aliases" not in res.data
-    assert not res.data.get("mirrored")
+    assert res.data["dest"] == "global"
+    assert res.data["entry"]["asset_id"].startswith("a_")
+    assert not res.data.get("stored")
     assert sorted(os.listdir(proj["root"] / "assets")) == before
+
+
+def test_mirror_link_not_copy(handlers, proj, tmp_path, monkeypatch):
+    """调入项目默认=链接（asset_links，不复制文件）；copy 模式才拷一份。"""
+    lib = tmp_path / "lib"
+    (lib / "images").mkdir(parents=True)
+    (lib / "images" / "x.png").write_bytes(b"png")
+    import asset_store as AS
+    monkeypatch.setattr(AS, "library_root", lambda *a, **k: str(lib))
+    sys.modules["asset_store"] = AS
+    proj["state"]["mf"]["asset_links"] = []
+    aid = "a_0123456789ab"
+    links = []
+
+    def _link(n, asset_id, alias, kind="image", base_revision=None, roles=None):
+        links.append({"asset_id": asset_id, "alias": alias, "kind": kind})
+        proj["state"]["mf"]["asset_links"] = links
+        return proj["state"]["mf"]
+
+    sys.modules["projects"].link_asset = _link
+    # 全局库 manifest 里放一个条目，好让 _find_item 找到它
+    AS.save_library(str(lib), {"assets": [{
+        "asset_id": aid, "sha256": "0" * 64, "kind": "image",
+        "file": "images/x.png", "orig_name": "girl.png", "bytes": 3,
+        "tags": [], "desc": "", "created_at": 1, "updated_at": 1}]})
+    before_files = sorted(os.listdir(proj["root"] / "assets"))
+    fn = handlers[("POST", "/h3chain/lib_mirror")]
+    res = asyncio.run(fn(_Req({"dir": "demo", "id": "global:images/x.png",
+                               "label": "女主"})))
+    assert res.status == 200, res.data
+    assert res.data["mode"] == "link" and res.data["alias"] == "女主"
+    assert links and links[0]["asset_id"] == aid
+    # 项目 assets/ 没有多出文件（链接不复制）
+    assert sorted(os.listdir(proj["root"] / "assets")) == before_files
+    # 全局库条目数不变
+    assert len(AS.load_library(str(lib))["assets"]) == 1
 
 
 def test_upload_dest_finals(handlers, proj, tmp_path, monkeypatch):

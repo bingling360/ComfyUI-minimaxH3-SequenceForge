@@ -278,14 +278,20 @@ def test_library_upload_json(routes, projects):
     # input 缺文件
     r = asyncio.run(fn(_Req({"src": "ghost.png"})))
     assert r.status == 404
-    # 正常入库 + 项目链接
+    # 正常上传：dest=global 只进全局库
     open(os.path.join(TMP, "up_hero.png"), "wb").write(b"png-bytes")
     projects.create_project("t_uplink")
     r = asyncio.run(fn(_Req({"src": "up_hero.png", "kind": "image",
-                             "tags": ["角色"], "link_dir": "t_uplink", "alias": "英雄"})))
+                             "tags": ["角色"], "dest": "global"})))
     assert r.status == 200 and r.data["entry"]["asset_id"].startswith("a_")
-    assert r.data["alias"] == "英雄"
-    assert any(x["alias"] == "英雄" for x in r.data["manifest"]["asset_links"])
+    assert r.data["dest"] == "global"
+    # 落点=项目：只落项目（不进全局库、不建链接）
+    r = asyncio.run(fn(_Req({"src": "up_hero.png", "kind": "image",
+                             "link_dir": "t_uplink", "alias": "英雄"})))
+    assert r.status == 200, r.data
+    assert r.data["dest"] == "project"
+    assert r.data["stored"]["label"] == "英雄"
+    assert "entry" not in r.data
     # 类别不符
     r = asyncio.run(fn(_Req({"src": "up_hero.png", "kind": "audio"})))
     assert r.status == 400

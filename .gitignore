@@ -4,6 +4,10 @@
 
 # 项目工作数据（AI 助手本地记忆，不属于插件本体）
 .workbuddy/
+.workbuddy-ai/
+
+# 前端测试依赖（jsdom 等，npm install 生成；package.json/lock 已入库）
+node_modules/
 
 # Python
 __pycache__/

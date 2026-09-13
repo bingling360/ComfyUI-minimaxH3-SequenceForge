@@ -381,18 +381,22 @@ function createPromptEditor(opts) {
         return sp;
     }
 
-    function render(text) {
-        box.replaceChildren();
+    /** 正文分词：把 `@别名` 切成引用 token（**最长优先**，与后端 compile_refs /
+     *  refsFromText 同口径）。渲染、计数、删除全走这一条路 —— 早期用正则
+     *  `@短标签(?![0-9A-Za-z_])` 去删，负向后顾只挡 ASCII 字母，于是删「阿依」
+     *  会把「@阿依的家」的前缀吃掉（剩下「的家」）。 */
+    function refTokens(text) {
         const s = String(text == null ? "" : text);
         const labs = [...labelsOf()].sort((a, b) => b.length - a.length);
+        const out = [];
         let buf = "";
         let i = 0;
         while (i < s.length) {
             if (s[i] === "@" && !/[0-9A-Za-z_]/.test(s[i - 1] || "")) {
                 const hit = labs.find((l) => s.startsWith(l, i + 1));
                 if (hit) {
-                    if (buf) { box.append(document.createTextNode(buf)); buf = ""; }
-                    box.append(makeTag(hit));
+                    if (buf) { out.push({ text: buf }); buf = ""; }
+                    out.push({ label: hit });
                     i += hit.length + 1;
                     continue;
                 }
@@ -400,7 +404,16 @@ function createPromptEditor(opts) {
             buf += s[i];
             i += 1;
         }
-        if (buf) box.append(document.createTextNode(buf));
+        if (buf) out.push({ text: buf });
+        return out;
+    }
+
+    function render(text) {
+        box.replaceChildren();
+        for (const tk of refTokens(text)) {
+            if (tk.label) box.append(makeTag(tk.label));
+            else box.append(document.createTextNode(tk.text));
+        }
     }
 
     /* —— 光标偏移（以序列化文本为准） —— */
@@ -477,39 +490,50 @@ function createPromptEditor(opts) {
         box.dispatchEvent(ev);
     }
 
+    /* 注意：box 是 div，**没有 .value**！取正文一律用 ser(box)（textarea 兼容面
+     * 上的 api.value 才是 getter）。早期版本这里写成 box.value → undefined，
+     * 于是 insertTag 抛 "reading 'length'"（chip 点了报错）、removeTag 静默失效
+     * （✕ 取消不掉）。 */
     /** 插入一个绿框（在光标处）；同时可选插入前置/后置文本（引用语句式） */
     function insertTag(label, before, after) {
         const lbl = String(label || "");
         if (!lbl) return "";
         const at = caret();
-        const cur = box.value;                    // 序列化文本（绿框算 @别名 的长度）
+        const cur = ser(box);                    // 序列化文本（绿框算 @别名 的长度）
         const plain = at == null ? cur.length : at;   // 没焦点=追加到末尾
         const pre = String(before || "");
         const post = String(after || "");
         const needSpace = cur && !/[\s\n]$/.test(cur.slice(0, plain)) ? " " : "";
         const next = cur.slice(0, plain) + needSpace + pre + `@${lbl}` + post + cur.slice(plain);
-        box.value = next;                       // 重渲染（新 @别名 变成绿框）
+        render(next);                           // 重渲染（新 @别名 变成绿框）
+        box.focus();                            // 先 focus 再摆光标：focus 会把光标重置到开头
         placeCaret(plain + needSpace.length + pre.length + lbl.length + 1);
-        focus();
         fireInput();
         return next;
     }
 
     function removeTag(label) {
-        const cur = box.value;
-        const re = new RegExp(`@${escapeRegExp(String(label))}(?![0-9A-Za-z_])`, "g");
-        if (!re.test(cur)) return false;
-        const next = cur.replace(re, "").replace(/[ \t]{2,}/g, " ").replace(/ *\n */g, "\n");
-        box.value = next;
-        focus();
+        const cur = ser(box);
+        const want = String(label || "");
+        const at = caret();
+        let hit = 0;
+        let next = "";
+        for (const tk of refTokens(cur)) {
+            if (tk.label && tk.label === want) { hit += 1; continue; }
+            next += tk.label ? `@${tk.label}` : tk.text;
+        }
+        if (!hit) return false;
+        next = next.replace(/[ \t]{2,}/g, " ").replace(/ *\n */g, "\n").replace(/^[ \t]+/, "");
+        render(next);
+        box.focus();
+        if (at != null) placeCaret(Math.min(at, next.length));
         fireInput();
         return true;
     }
 
     function tagCount(label) {
-        const cur = box.value;
-        const re = new RegExp(`@${escapeRegExp(String(label))}(?![0-9A-Za-z_])`, "g");
-        return (cur.match(re) || []).length;
+        const want = String(label || "");
+        return refTokens(ser(box)).filter((tk) => tk.label === want).length;
     }
 
     /* —— textarea 兼容面 —— */
@@ -520,7 +544,7 @@ function createPromptEditor(opts) {
             const had = document.activeElement === box;
             const at = had ? caret() : null;
             render(v);
-            if (had && at != null) placeCaret(Math.min(at, box.value.length));
+            if (had && at != null) placeCaret(Math.min(at, ser(box).length));
         },
         get dataset() { return box.dataset; },
         get placeholder() { return box.dataset.ph || ""; },
@@ -549,8 +573,8 @@ function createPromptEditor(opts) {
             const pos = at == null ? cur.length : at;
             const next = cur.slice(0, pos) + String(text || "") + cur.slice(pos);
             this.value = next;
+            box.focus();                        // 先 focus 再摆光标
             placeCaret(pos + String(text || "").length);
-            focus();
             fireInput();
             return next;
         },
@@ -601,9 +625,8 @@ function createPromptEditor(opts) {
     return api;
 }
 
-function escapeRegExp(s) {
-    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+/* 注：引用 token 的匹配/删除一律走 refTokens（最长优先分词），不再用
+ * `@标签(?![0-9A-Za-z_])` 这类正则 —— 负向后顾挡不住中文，短标签会吃掉长标签前缀。 */
 
 /** 正文 → 本段引用集合（正文是唯一真相）：按首次出现顺序，允许重复计数。
  *  与后端 compile_refs / _find_refs 同口径（`@标签`，负向后顾防 a@b.com）。 */

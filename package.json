@@ -1,0 +1,8 @@
+{
+  "name": "comfyui-minimaxh3-sequenceforge",
+  "private": true,
+  "description": "仅用于前端回归测试：tests/js/*.js 用 jsdom 真跑 web/ 里的 shipped 源码。npm install 后 pytest 会跑编辑器链路真跑用例，未安装则自动跳过。",
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}

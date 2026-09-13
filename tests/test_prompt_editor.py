@@ -49,7 +49,6 @@ def _extract_fn(src, name):
 def test_refs_from_text_runtime():
     """正文 → 引用集合：真跑（node），覆盖重复计数/最长优先/邮箱不误伤。"""
     code = "\n".join([
-        _extract_fn(_src(), "escapeRegExp"),
         _extract_fn(_src(), "refsFromText"),
         """
         const pool = [{label: "女主"}, {label: "女主的家"}, {label: "背景"}];
@@ -98,6 +97,23 @@ def test_serialize_roundtrip_runtime():
     assert r.returncode == 0, r.stderr
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got == "开头 @女主 与 @女主的家 一起\n第二行", got
+
+
+@pytest.mark.skipif(NODE is None, reason="需要 node 执行前端")
+def test_editor_runtime_jsdom():
+    """jsdom 真跑编辑器：插/删/计数/落盘/锚定方式全链路（缺 jsdom 则跳过）。
+
+    这条是「引用点不了」的回归闸：历史 bug 是 insertTag/removeTag 里写了
+    `box.value`（div 没有 .value → undefined），insertTag 抛 reading 'length'、
+    removeTag 静默失效；以及正则删短标签会吃掉长标签前缀。
+    """
+    nm = os.path.join(ROOT, "node_modules")
+    if not os.path.isdir(os.path.join(nm, "jsdom")):
+        pytest.skip("未安装 jsdom（repo/node_modules 缺失）")
+    script = os.path.join(ROOT, "tests", "js", "prompt_editor_check.js")
+    env = dict(os.environ, NODE_PATH=nm)
+    r = subprocess.run([NODE, script], capture_output=True, text=True, timeout=90, env=env)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
 
 
 def test_editor_source_points():

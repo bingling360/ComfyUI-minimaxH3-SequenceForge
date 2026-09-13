@@ -768,6 +768,10 @@ def add_routes(routes):
             tags = [t.strip() for t in str(fields.get("tags") or "").split(",") if t.strip()]
             desc, link_dir = str(fields.get("desc") or ""), str(fields.get("link_dir") or "")
             alias = str(fields.get("alias") or "")
+            # 落点与镜像开关：multipart 走文本字段（旧实现只读 JSON 分支的 data，
+            # 于是浏览器上传永远拿不到 mirror —— 「上传只会进全局库」的根因）
+            mirror_raw = str(fields.get("mirror") or "")
+            dest = str(fields.get("dest") or "")
         else:
             # JSON：input 内文件（防穿越 + realpath 复核，与 import_asset 同口径）
             f = str(data.get("src") or "").strip().replace("\\", "/")
@@ -795,6 +799,8 @@ def add_routes(routes):
             tags = [str(t).strip() for t in tags if str(t).strip()]
             desc, link_dir = str(data.get("desc") or ""), str(data.get("link_dir") or "")
             alias = str(data.get("alias") or "")
+            mirror_raw = str(data.get("mirror") or "")
+            dest = str(data.get("dest") or "")
         try:
             lib_root = asset_store.library_root()
             if tmp_path and data is None:
@@ -826,38 +832,61 @@ def add_routes(routes):
         except Exception as e:
             return _err(f"入库失败：{type(e).__name__}: {e}", code="UPLOAD_FAILED", status=500)
         out = {"ok": True, "entry": entry}
-        if link_dir:
+        # 落点 dest（前端按当前 scope 传）：
+        #   global  —— 只进全局库（跨项目复用，不碰任何项目）
+        #   project —— 全局库一份 + 项目 assets/ 一份（登记 manifest，可用 @别名 引用）
+        #   finals  —— 全局库一份 + 项目 finals/ 一份（成片库，目录扫描即见）
+        # 缺省（空）= 给了 link_dir 就按 project（兼容旧调用）
+        dest = str(dest or "").strip().lower()
+        if dest not in ("global", "project", "finals"):
+            dest = "project" if link_dir else "global"
+        mirror_on = str(mirror_raw or "").lower() in ("1", "true", "yes")
+        if dest == "project":
+            mirror_on = True
+        out["dest"] = dest
+        if link_dir and dest != "global":
             if not projects.safe_name(link_dir):
                 return _err("无效的 link_dir（项目目录名）", code="BAD_NAME", status=400)
             if projects.read_project(link_dir) is None:
                 return _err("链接项目不存在（没有 manifest，先新建或跑一段）",
                              code="NOT_FOUND", status=404)
-            lbl = alias.strip()[:24] or os.path.splitext(entry["orig_name"])[0][:24]
-            try:
-                mf = projects.link_asset(link_dir, entry["asset_id"], lbl, kind,
-                                         (data or {}).get("base_revision")
-                                         if isinstance(data, dict) else None)
-            except ValueError as e:
-                msg = str(e)
-                if msg.startswith("REVISION_CONFLICT"):
-                    return _rev_conflict(link_dir, msg)
-                return _err(msg, code="BAD_REQUEST", status=400)
-            if mf is None:
-                return _err("链接失败（项目不存在）", code="NOT_FOUND", status=404)
-            out["manifest"] = mf
-            out["alias"] = lbl
-            # mirror=1：上传即落项目（项目自包含）—— 再拷一份进 assets/ 并登记 manifest。
-            # 全局库那份保留（跨项目复用），项目这份保证"删项目不连累别人 / 项目自包含"。
-            if str((data or {}).get("mirror") or "").lower() in ("1", "true", "yes"):
+            if dest == "finals":
+                # 成片库是目录扫描型：拷进 finals/ 即可见，不登记进资产清单
                 try:
+                    src_abs = os.path.join(lib_root, *str(entry["file"]).split("/"))
+                    out["stored"] = h3lib.store_to_finals(
+                        link_dir, src_abs, entry.get("orig_name") or "")
                     h3lib.invalidate(link_dir)
-                    out["mirrored"] = h3lib.mirror_to_project(
-                        link_dir,
-                        {"scope": "global", "kind": kind, "name": lbl,
-                         "file": entry["file"]},
-                        lbl)
                 except ValueError as e:
-                    out["mirror_error"] = str(e)
+                    out["store_error"] = str(e)
+            else:
+                lbl = alias.strip()[:24] or os.path.splitext(entry["orig_name"])[0][:24]
+                try:
+                    mf = projects.link_asset(link_dir, entry["asset_id"], lbl, kind,
+                                             (data or {}).get("base_revision")
+                                             if isinstance(data, dict) else None)
+                except ValueError as e:
+                    msg = str(e)
+                    if msg.startswith("REVISION_CONFLICT"):
+                        return _rev_conflict(link_dir, msg)
+                    return _err(msg, code="BAD_REQUEST", status=400)
+                if mf is None:
+                    return _err("链接失败（项目不存在）", code="NOT_FOUND", status=404)
+                out["manifest"] = mf
+                out["alias"] = lbl
+                # mirror：上传即落项目（项目自包含）—— 再拷一份进 assets/ 并登记 manifest。
+                # 全局库那份保留（跨项目复用），项目这份保证"删项目不连累别人 / 项目自包含"。
+                if mirror_on:
+                    try:
+                        h3lib.invalidate(link_dir)
+                        out["mirrored"] = h3lib.mirror_to_project(
+                            link_dir,
+                            {"scope": "global", "kind": kind, "name": lbl,
+                             "file": entry["file"]},
+                            lbl)
+                    except ValueError as e:
+                        out["mirror_error"] = str(e)
+                h3lib.invalidate(link_dir)   # 拷完再刷一次：新文件立即可见
         status = 200
         return web.json_response(out, status=status)
 
@@ -1327,6 +1356,7 @@ def add_routes(routes):
         if it is None:
             return _err("素材不存在", code="NOT_FOUND", status=404)
         mf = projects.read_project(dir_name) if dir_name else None
+        old = str(it.get("name") or "").strip()
 
         def _rev_err(e):
             msg = str(e)
@@ -1334,13 +1364,35 @@ def add_routes(routes):
                 return _err(msg, code="REVISION_CONFLICT", status=409)
             return _err(msg, code="BAD_ARGS", status=400)
 
-        # 1) 项目链接条目：必须走 link_asset —— save_assets 不写 asset_links，
-        #    之前用它改链接别名，改动直接被丢掉（改名"没用"的根因）。
+        # 0) 重名预检：别名是引用命名空间（@别名），撞名会让引用指向错素材
+        if mf is not None and old != alias:
+            for a in (mf.get("assets") or []):
+                if isinstance(a, dict) and str(a.get("label")) == alias:
+                    return _err(f"已有同名素材「{alias}」：@别名 会指向它，请换个名字",
+                                code="DUP_ALIAS", status=400)
+            for L in (mf.get("asset_links") or []):
+                if isinstance(L, dict) and str(L.get("alias")) == alias:
+                    return _err(f"已有同名素材「{alias}」：@别名 会指向它，请换个名字",
+                                code="DUP_ALIAS", status=400)
+
+        # 1) 项目链接（asset_links.alias）+ 项目资产（assets[].label）**两处都改**。
+        #    只改一处时显示名（apply_aliases 取 assets.label）纹丝不动 ——
+        #    「点了改名没反应」的根因就在这里（上传即镜像的素材两处同名）。
+        revision = None
+        touched = False
         link = None
         for L in (mf or {}).get("asset_links") or []:
-            if isinstance(L, dict) and str(L.get("alias")) == it["name"]:
+            if isinstance(L, dict) and str(L.get("alias")) == old:
                 link = L
                 break
+        assets = None
+        hit_asset = False
+        if mf is not None:
+            assets = [dict(a) if isinstance(a, dict) else a for a in (mf.get("assets") or [])]
+            for a in assets:
+                if isinstance(a, dict) and str(a.get("label")) == old:
+                    a["label"] = alias
+                    hit_asset = True
         if link is not None:
             try:
                 out = projects.link_asset(
@@ -1351,30 +1403,26 @@ def add_routes(routes):
                 return _rev_err(e)
             if out is None:
                 return _err("改名失败（链接条目）", code="BAD_ARGS", status=400)
+            revision = out.get("revision")
+            touched = True
+        if hit_asset:
+            try:
+                # 链接那步已经 +1 revision，这里不能再带旧 base_revision 去比对
+                out = projects.save_assets(dir_name, assets, None)
+            except ValueError as e:
+                return _rev_err(e)
+            if out is None:
+                return _err("改名失败", code="BAD_ARGS", status=400)
+            revision = out.get("revision")
+            touched = True
+        if touched:
             h3lib.invalidate(dir_name)
             return web.json_response({"ok": True, "alias": alias,
-                                      "revision": out.get("revision")})
+                                      "renamed": {"link": link is not None,
+                                                  "asset": hit_asset},
+                                      "revision": revision})
 
-        # 2) 项目资产条目：改 label 后全量写回
-        if mf is not None:
-            assets = [dict(a) if isinstance(a, dict) else a for a in (mf.get("assets") or [])]
-            hit = False
-            for a in assets:
-                if isinstance(a, dict) and str(a.get("label")) == it["name"]:
-                    a["label"] = alias
-                    hit = True
-            if hit:
-                try:
-                    out = projects.save_assets(dir_name, assets, data.get("base_revision"))
-                except ValueError as e:
-                    return _rev_err(e)
-                if out is None:
-                    return _err("改名失败", code="BAD_ARGS", status=400)
-                h3lib.invalidate(dir_name)
-                return web.json_response({"ok": True, "alias": alias,
-                                          "revision": out.get("revision")})
-
-        # 3) 没有链接的全局库条目：改库内显示名
+        # 2) 没登记进项目的全局库条目：改库内显示名
         if it["scope"] == "global" and it.get("asset_id"):
             root = h3lib._library_root()
             if not root:

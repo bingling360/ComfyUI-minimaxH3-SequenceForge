@@ -18,7 +18,8 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WANT_FUNCS = ("_normalize_order", "_kind_tokens", "_apply_label_tokens",
-               "_reference_tags_minimal", "_uncovered_tags")
+               "_reference_tags_minimal", "_uncovered_tags",
+               "_clean_frame_file", "_parse_frame_imgs")
 # `@标签` 语法把原来的 _LABEL_TOKEN 拆成「括号写法 + @写法」两个正则
 _WANT_VARS = ("_REF_BRACKET", "_REF_AT")
 
@@ -43,15 +44,16 @@ def kern():
 
 
 def test_minimal_block_shape(kern):
+    """官方 subject_definitions 句式：<Picture N> 自己当主语，后接「is the ...」。"""
     out = kern._reference_tags_minimal(
         [("image", "角色1"), ("video", "片"), ("audio", "乐")])
     assert out.splitlines() == [
-        "[References]",
-        "<Picture 1> = 角色1",
-        "<Video 1> = 片",
-        "<Audio 1> = 乐",
+        '<Picture 1> is the reference image "角色1".',
+        '<Video 1> is the reference video "片".',
+        '<Audio 1> is the reference audio "乐".',
     ]
-    assert "subject_definitions" not in out and "is the" not in out
+    # 自造赋值表（`token = 别名` / [References] 头）已废止
+    assert "[References]" not in out and " = " not in out
 
 
 def test_missing_tags_filled(kern):
@@ -63,8 +65,9 @@ def test_missing_tags_filled(kern):
     assert uncovered == ["片", "乐"]
     head = kern._reference_tags_minimal(
         [(k, lbl) for k, lbl in kern._normalize_order(order) if lbl in uncovered])
-    assert "<Video 1> = 片" in head and "<Audio 1> = 乐" in head
-    assert "角色1" not in head.splitlines()[1]  # 已覆盖的不重复声明
+    assert head.splitlines() == ['<Video 1> is the reference video "片".',
+                                 '<Audio 1> is the reference audio "乐".']
+    assert "角色1" not in head  # 已覆盖的不重复声明
 
 
 def test_picture_prefix_trap(kern):
@@ -84,6 +87,29 @@ def test_all_typed_passthrough(kern):
 def test_unknown_label_points(kern):
     with pytest.raises(ValueError, match="未知素材标签"):
         kern._apply_label_tokens("见 [[谁]]", [("image", "A")])
+
+
+def test_repeat_refs_keep_single_token(kern):
+    """同一素材在一段里引用多次：编号仍只占一个 <Picture k>（重复=正文写多次）。"""
+    order = [("image", "女主"), ("image", "女主"), ("image", "背景")]
+    mapping = kern._kind_tokens(kern._normalize_order(order))
+    assert mapping == {"女主": "<Picture 1>", "背景": "<Picture 2>"}
+    full = kern._apply_label_tokens("开头 @女主 站着，结尾又回到 @女主", order)
+    assert full.count("<Picture 1>") == 2      # 正文里出现两次 → 参考两次
+    assert "<Picture 2>" not in full
+
+
+def test_parse_frame_imgs(kern):
+    """段级首尾帧参考图：{first,end} 相对路径，拒穿越。"""
+    segs = [{"frame_img": {"first": "assets/a.png"}},
+            {},
+            {"frame_img": {"end": "assets\\b.png", "first": "../evil.png"}}]
+    got = kern._parse_frame_imgs(segs, 3)
+    assert got == [("assets/a.png", ""), ("", ""), ("", "assets/b.png")]
+    # 段数不足时按 n 补齐；非法路径一律清空
+    assert kern._parse_frame_imgs(segs, 1) == [("assets/a.png", "")]
+    assert kern._clean_frame_file("a/b/c.png") == ""
+    assert kern._clean_frame_file("assets/ok.png") == "assets/ok.png"
 
 
 def test_old_header_gone():

@@ -289,6 +289,33 @@ def _parse_frame_refs(segments, n, has_first, has_end):
     return picked, explicit
 
 
+def _clean_frame_file(rel):
+    """段级首尾帧参考图的文件名归一：项目内相对路径（最多两级，拒穿越）。"""
+    parts = [p for p in str(rel or "").replace("\\", "/").split("/") if p and p != "."]
+    if not parts or len(parts) > 2 or ".." in parts:
+        return ""
+    if any((":" in p) or p.startswith(".") for p in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _parse_frame_imgs(segments, n):
+    """段级首尾帧参考图：segments[i]["frame_img"] = {"first": 文件, "end": 文件}。
+
+    与「素材库打标」的旧链路（chain_head_label / chain_tail_label，链级）区分：
+    这是**每段各自指定**的首/尾帧参考图（提示词框资产引用栏的「首帧图/尾帧图」
+    按钮选出来的项目内图片），首段的首帧图同时充当 i2v 起手帧、末段的尾帧图
+    充当 FL2VA 剧情终点锚；中段则作为段头/段尾身份锚注入。
+    """
+    out = []
+    for i in range(n):
+        seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
+        raw = seg.get("frame_img")
+        raw = raw if isinstance(raw, dict) else {}
+        out.append((_clean_frame_file(raw.get("first")), _clean_frame_file(raw.get("end"))))
+    return out
+
+
 _REDO_MODES = ("双锚", "仅锚上段", "仅锚下段", "无锚")
 
 
@@ -575,10 +602,16 @@ def _normalize_order(label_order):
 
 
 def _kind_tokens(label_order):
-    """[(kind, 标签)] -> 按类别独立编号的 {标签: token}（图 <Picture k> / 视 <Video k> / 音 <Audio j>）。"""
+    """[(kind, 标签)] -> 按类别独立编号的 {标签: token}（图 <Picture k> / 视 <Video k> / 音 <Audio j>）。
+
+    同一标签重复出现（一段内引用多次）**只编号一次**：编号是素材的身份，不是
+    出现次数；重复引用靠正文里多写几次 @标签（编译后同一个 <Picture k> 出现多次）。
+    """
     counters = {"image": 0, "video": 0, "audio": 0}
     mapping = {}
     for kind, lbl in label_order:
+        if lbl in mapping:
+            continue
         counters[kind] = counters.get(kind, 0) + 1
         token = {"image": "<Picture {}>", "video": "<Video {}>", "audio": "<Audio {}>"}.get(kind)
         if token is None:
@@ -607,16 +640,27 @@ def _apply_label_tokens(prompt, label_order):
 
 
 def _reference_tags_minimal(label_order):
-    """段首最小引用声明（接线语义）：每资源一行 token = 别名，不写散文。
+    """段首最小引用声明：每资源一行**官方 subject_definitions 句式**，不写散文。
+
+    官方 skill 的引用声明是「<Picture 1> is ...」这种定义句（`<Picture N>` 自己
+    就是主语，后接它是什么 / 扮演什么角色），不是 `token = 别名` 的赋值表 ——
+    赋值表是自造格式，模型只能当普通文本读。这里按官方句式补最小声明：
+    `<Picture 1> is the reference image "女主".`（类 noun 由 token 类别决定）。
 
     H3 模型硬约束：软引用必须在文本里出现 <Picture k> 等 tag，模型才会真正
-    使用对应素材（官方模板亦然）。勾选了引用但正文没写 tag 时，只补这份映射表、
-    不再自动生成英文 subject_definitions 长文；写了 tag 的段保持原样直通。
+    使用对应素材（官方模板亦然）。勾选了引用但正文没写 tag 时，只补这几行声明、
+    不再自动生成英文长文；写了 tag 的段保持原样直通。
     无 ComfyUI 可单测（纯函数，仅依赖 _normalize_order/_kind_tokens）。
     """
+    # 官方句式里 <Picture>/<Video>/<Audio> 各有一个固定的英文名词
+    noun = {"Picture": "reference image", "Video": "reference video",
+            "Audio": "reference audio"}
     mapping = _kind_tokens(_normalize_order(label_order))
-    lines = [f"{tok} = {lbl}" for lbl, tok in mapping.items()]
-    return "[References]\n" + "\n".join(lines)
+    lines = []
+    for lbl, tok in mapping.items():
+        cls = tok[1:].split(" ")[0] if tok.startswith("<") else ""
+        lines.append(f'{tok} is the {noun.get(cls, "reference asset")} "{lbl}".')
+    return "\n".join(lines)
 
 
 def _uncovered_tags(full, mapping):
@@ -1284,8 +1328,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 此处只定布尔语义供下文排布。
         _head_lib = chain_head_label if (首帧图片 is None and chain_head_label) else None
         _tail_lib = chain_tail_label if (尾帧图片 is None and chain_tail_label) else None
-        has_first_eff = 首帧图片 is not None or _head_lib is not None
-        has_end_eff = 尾帧图片 is not None or _tail_lib is not None
+        # 段级首尾帧参考图（提示词框「首帧图/尾帧图」按钮：项目内图片，按段指定）。
+        # 首段的首帧图 = i2v 起手帧、末段的尾帧图 = FL2VA 剧情终点锚（与旧链级语义
+        # 对齐），因此这里优先把它们提升为链级 首帧图片/尾帧图片（旧槽位为空时）。
+        seg_frame_imgs = _parse_frame_imgs(segments, len(seg_prompts))
+        _fi_first = seg_frame_imgs[0][0] if seg_frame_imgs else ""
+        _fi_end = seg_frame_imgs[-1][1] if seg_frame_imgs else ""
+        # 段级（新入口）优先于库内旧标注：用户既然在段卡里显式选了图，就以它为准
+        _head_seg = _fi_first if (首帧图片 is None and _fi_first) else None
+        _tail_seg = _fi_end if (尾帧图片 is None and _fi_end) else None
+        has_first_eff = 首帧图片 is not None or _head_lib is not None or _head_seg is not None
+        has_end_eff = 尾帧图片 is not None or _tail_lib is not None or _tail_seg is not None
 
         # 段级首尾帧图引用（类似多参段级素材勾选）：决定每段是否参考首帧/尾帧图片。
         # 缺省=旧行为（首段 i2v 参考首帧图、末段参考尾帧图终点锚）；显式勾选可为
@@ -1325,7 +1378,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 链路自动推导（无手动模式）：有有效引用即走 ref conditioning；首帧可与
         # 引用共存（头锚 keyframe 叠加，不再互斥报错）。「生成模式」控件已废弃，
         # 仅为旧工作流占位，后端不再读取。
-        if 起始视频 is not None and (首帧图片 is not None or chain_head_label is not None):
+        if 起始视频 is not None and (首帧图片 is not None or chain_head_label is not None
+                                     or _head_seg):
             raise ValueError("起始视频（序章）与首帧图（i2v 起始）不能同时使用：两者都定义第 1 段的视觉起点")
 
         if str(宽高比) != "自定义":
@@ -1674,6 +1728,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if seg_fr_explicit[i] and seg_frame_refs[i] != _default_frame_refs(
                     i, len(seg_prompts), has_first_eff, has_end_eff):
                 tag = f"fr:{','.join(seg_frame_refs[i])}|{tag}"
+            # 段级首尾帧参考图：换了图就该重做本段（旧存档无该键=零影响）
+            _fi = seg_frame_imgs[i] if i < len(seg_frame_imgs) else ("", "")
+            if _fi[0] or _fi[1]:
+                tag = f"fimg:{_fi[0]}:{_fi[1]}|{tag}"
             seg_hashes.append(checkpoint.prompt_hash(tag))
 
         # 插入段哈希 = 文件指纹（mtime+size）：换文件/同名覆盖上传 → 从该段起重跑
@@ -1862,13 +1920,52 @@ class H3SeamlessChainSampler(io.ComfyNode):
             return _load_input_image(fn, _project_root_for_assets())
 
         _ensure_pool_tensors()
-        # 标注锚汇入旧槽位（旧槽位有值则优先，保证旧链零变化）
+        # 段级首尾帧参考图（提示词框按钮，新入口）优先：首段首帧图 = i2v 起手帧、
+        # 末段尾帧图 = FL2VA 剧情终点锚；其次才是库内旧标注锚（旧链零变化）
+        if 首帧图片 is None and _head_seg:
+            首帧图片 = _load_input_image(_head_seg, _project_root_for_assets())
+            report.append(f"段1 首帧图「{_store_short(_head_seg)}」→ i2v 起手帧")
+        if 尾帧图片 is None and _tail_seg:
+            尾帧图片 = _load_input_image(_tail_seg, _project_root_for_assets())
+            report.append(f"末段尾帧图「{_store_short(_tail_seg)}」→ FL2VA 剧情终点锚")
+        # 库内旧标注锚汇入旧槽位（槽位有值则优先）
         if 首帧图片 is None and _head_lib is not None:
             首帧图片 = _load_anchor_image_file(pool_file_of[_head_lib], _head_lib)
             report.append(f"资产标注「首帧图」→「{_store_short(_head_lib)}」（链首锚来源）")
         if 尾帧图片 is None and _tail_lib is not None:
             尾帧图片 = _load_anchor_image_file(pool_file_of[_tail_lib], _tail_lib)
             report.append(f"资产标注「尾帧图」→「{_store_short(_tail_lib)}」（链尾锚来源）")
+        # 其余段（含首/末段自身的段头/段尾锚）：按文件缓存编码，各文件只编一次
+        _frm_cache = {}
+
+        def _frame_img_latent(fn):
+            if not fn:
+                return None
+            if fn not in _frm_cache:
+                try:
+                    _im = _load_input_image(fn, _project_root_for_assets())
+                except Exception as e:
+                    raise ValueError(f"段级首尾帧参考图「{fn}」加载失败：{e}")
+                _frm_cache[fn] = video_vae.encode(_center_cover(_im[:1], width, height))
+            return _frm_cache[fn]
+
+        seg_head_img_latent = [None] * len(seg_prompts)
+        seg_end_img_latent = [None] * len(seg_prompts)
+        for _i, (_f, _e) in enumerate(seg_frame_imgs):
+            if _i >= len(seg_prompts):
+                break
+            if _f and not (_i == 0 and _head_seg):
+                seg_head_img_latent[_i] = _frame_img_latent(_f)
+            if _e and not (_i == len(seg_prompts) - 1 and _tail_seg):
+                seg_end_img_latent[_i] = _frame_img_latent(_e)
+        if any(seg_head_img_latent) or any(seg_end_img_latent):
+            _fs = [str(i + 1) for i, v in enumerate(seg_head_img_latent) if v is not None]
+            _es = [str(i + 1) for i, v in enumerate(seg_end_img_latent) if v is not None]
+            report.append("段级首尾帧参考图："
+                          + ("、".join(f"段{n}头锚" for n in _fs) if _fs else "")
+                          + (" · " if _fs and _es else "")
+                          + ("、".join(f"段{n}尾锚" for n in _es) if _es else "")
+                          + "（身份锚 keyframe 注入）")
 
         if 每段尾帧锚定 is not None:
             tail_anchor_latent = video_vae.encode(_center_cover(每段尾帧锚定[:1], width, height))
@@ -2505,8 +2602,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             skip_f, _seg_extra = bridge.resolve_crop(_soft_hold, _eff_fr, _has_src)
             # 首帧图段级引用（中段）：头锚 latent——生成段注入 cond，回放段二采补渲染同用
             #（定义在 replay 分支之前：两路都消费；独立镜头段照常注入，本段主动锚）
-            _head_kf = head_frame_latent \
-                if (i > 0 and seg_first_on[i] and head_frame_latent is not None) else None
+            # 段级首帧参考图优先（本段自己指定的图），否则回落到链级首帧图头锚
+            _head_kf = (seg_head_img_latent[i] if i < len(seg_head_img_latent) else None) \
+                or (head_frame_latent
+                    if (i > 0 and seg_first_on[i] and head_frame_latent is not None) else None)
             _seg_t.update(cond=0.0, sample=0.0, decode=0.0)
             _soft_note = ""   # 软桥报告后缀（只有采样段装配成功才非空；回放段为空）
             if replay:
@@ -2567,9 +2666,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 锚定来源：普通段 = 段属性（unlink 屏蔽上桥、尾帧图/每段尾帧锚定收尾）；
                 # 重摇段 = 四种锚定模式（本次重做的临时策略，独立于段属性 unlink）——
                 # 显式身份锚（尾帧图/每段尾帧锚定/首帧图）不受模式影响，模式只控制接缝锚
+                # 段级尾帧参考图优先（本段自己指定的图），其次链级尾帧图，再回落段尾锚
+                _seg_end_img = seg_end_img_latent[i] if i < len(seg_end_img_latent) else None
                 if _redo_mode is not None:
-                    _user_tail = end_frame_latent \
-                        if (seg_end_on[i] and end_frame_latent is not None) else _seg_tail_anchor(i)
+                    _user_tail = _seg_end_img or (
+                        end_frame_latent
+                        if (seg_end_on[i] and end_frame_latent is not None) else _seg_tail_anchor(i))
                     if _redo_mode in ("双锚", "仅锚上段"):
                         # unlink 前段没为它留 guide（陈旧），需直读前段存档现算尾桥
                         eff_guide = _redo_prev_bridge(g) if seg_unlink[i] else guide
@@ -2588,8 +2690,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 尾帧图片（FL2VA 剧情终点/段级尾锚）：勾了尾帧图的段末帧 keyframe
                     # = 尾帧图 latent（同位置唯一锚，优先于段尾锚）；未勾段回落
                     # 段 tail_src（资产图/latent），再回退旧全局尾帧锚定
-                    _tail_kf = end_frame_latent if (seg_end_on[i] and end_frame_latent is not None) \
-                        else _seg_tail_anchor(i)
+                    _tail_kf = _seg_end_img or (
+                        end_frame_latent if (seg_end_on[i] and end_frame_latent is not None)
+                        else _seg_tail_anchor(i))
                 if eff_guide is not None or _tail_kf is not None or _head_kf is not None:
                     # 实验 E1：强化引导桥——把单桥展开为滑窗/重叠 keyframe 序列。
                     # 全关时 e1_kfs=None，_apply_guide 走现状单桥路径（零影响）。
@@ -2911,9 +3014,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     _up_guide_kf, _up_tail_kf = eff_guide, _tail_kf
                 else:
                     _up_guide_kf = None if seg_unlink[i] else guide
-                    _up_tail_kf = end_frame_latent \
-                        if (seg_end_on[i] and end_frame_latent is not None) \
-                        else _seg_tail_anchor(i)
+                    _up_tail_kf = _seg_end_img or (
+                        end_frame_latent
+                        if (seg_end_on[i] and end_frame_latent is not None)
+                        else _seg_tail_anchor(i))
                 hi_ready, hi_tried = _up_hi(g, video_t, audio_t, "prompt", i,
                                             _up_guide_kf, _up_tail_kf, _head_kf,
                                             cur_seed, skip_f, frames.shape[0],

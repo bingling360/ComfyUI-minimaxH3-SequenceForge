@@ -285,6 +285,7 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
     by_id = (registry or {}).get("by_id") or {}
     by_alias = (registry or {}).get("by_alias") or {}
     errors, order = [], []
+    seen = {}          # asset_id -> order 下标：同一素材重复引用只编号一次
     for r in refs or []:
         key, use = _ref_key(r)
         if not key:
@@ -294,7 +295,16 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
             errors.append({"code": "E_REF_UNKNOWN",
                            "message": f"段{seg_no} 引用未知资产「{key}」"})
             continue
-        order.append((rec, use))
+        # 同一素材在一段内可被引用多次（refs 里出现 N 次 = 正文里写 N 次 @别名）：
+        # 编号仍只占一个 <Picture k>，重复项只累加次数，不新开编号。
+        hit = seen.get(rec["asset_id"])
+        if hit is None:
+            seen[rec["asset_id"]] = len(order)
+            order.append((rec, use))
+        else:
+            rec0, use0 = order[hit]
+            if not use0 and use:
+                order[hit] = (rec0, use)
     counts = {}
     for rec, _use in order:
         counts[rec["kind"]] = counts.get(rec["kind"], 0) + 1

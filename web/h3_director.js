@@ -648,9 +648,16 @@ function getDs(node) {
                 soundscape: typeof s?.soundscape === "string" ? s.soundscape : "",
                 music: typeof s?.music === "string" ? s.music : "",
                 seconds: (isFinite(sec) && sec > 0) ? Math.min(15, Math.max(0.5, sec)) : null,
+                /* refs 允许重复：同一素材引用 N 次（正文写 N 个 @别名）——不能用 Set 去重 */
                 refs: Array.isArray(s?.refs)
                     ? s.refs.map((r) => String((r && typeof r === "object") ? (r.asset || r.id || r.label || "") : r))
                         .filter((l) => validLabels.has(l) || validIds.has(l)) : [],
+                /* 段级首尾帧参考图（提示词框按钮选的项目内图片）：{first,end} 相对路径 */
+                frame_img: (s?.frame_img && typeof s.frame_img === "object")
+                    ? {
+                        first: String(s.frame_img.first || "").trim().replace(/\\/g, "/"),
+                        end: String(s.frame_img.end || "").trim().replace(/\\/g, "/"),
+                    } : null,
                 unlink: !!s?.unlink,
                 disabled: !!s?.disabled,
                 auto_ref: (s?.auto_ref === null || s?.auto_ref === undefined) ? null : !!s.auto_ref,
@@ -882,33 +889,66 @@ function setSegmentSeconds(node, idx, v) {
  *  勾选时按类别校验官方单段上限（图9/视3/音3），超限拦截并提示。
  *  P5 显性语义：勾选即在段正文末尾补可见 @标签（取消勾选不删正文，防丢字）；
  *  调用方 blur 先于 click 触发，主框未落盘的输入已先行 flush，无竞态。 */
-function toggleSegmentRef(node, idx, label) {
+/** 同一素材在一段内可被引用多次（refs 里出现 N 次 = 正文里写 N 次 @别名，
+ *  编译后是同一个 <Picture k> 出现 N 次）。上限：素材个数按官方 9/3/3（去重算），
+ *  单素材重复次数另有软上限，防手抖点爆。 */
+const REF_REPEAT_MAX = 9;
+
+function refCount(seg, label) {
+    return (Array.isArray(seg?.refs) ? seg.refs : []).filter((l) => l === label).length;
+}
+
+/** 加一次引用（+1）。超限弹提示并返回 false。 */
+function addSegmentRef(node, idx, label) {
     const ds = getDs(node);
-    if (idx < 0 || idx >= (ds.segments || []).length) return;
+    if (idx < 0 || idx >= (ds.segments || []).length) return false;
     const seg = ds.segments[idx];
     if (!Array.isArray(seg.refs)) seg.refs = [];
-    const pos = seg.refs.indexOf(label);
-    if (pos >= 0) {
-        seg.refs.splice(pos, 1);
-    } else {
-        const asset = (ds.ref_assets || []).find((a) => a.label === label);
-        const kind = asset ? asset.kind : "image";
-        const sameKind = seg.refs.filter((l) => {
+    const asset = (ds.ref_assets || []).find((a) => a.label === label);
+    const kind = asset ? asset.kind : "image";
+    const uniq = new Set(seg.refs);
+    if (!uniq.has(label)) {
+        const sameKind = [...uniq].filter((l) => {
             const a = (ds.ref_assets || []).find((x) => x.label === l);
             return a && a.kind === kind;
         }).length;
         if (sameKind >= KIND_CAPS[kind]) {
             alert(`本段引用${KIND_NAME[kind]}素材已达官方上限 ${KIND_CAPS[kind]} 个：请先取消一个再勾选「${label}」`);
-            return;
-        }
-        seg.refs.push(label);
-        const cur = String((ds.prompts || [])[idx] || "");
-        if (!cur.includes(`@${label}`)) {
-            if (!Array.isArray(ds.prompts)) ds.prompts = [];
-            ds.prompts[idx] = cur + (cur && !/\s$/.test(cur) ? " " : "") + `@${label}`;
+            return false;
         }
     }
+    if (refCount(seg, label) >= REF_REPEAT_MAX) {
+        alert(`「${label}」在本段已引用 ${REF_REPEAT_MAX} 次（同一段上限）：先减一次再加`);
+        return false;
+    }
+    seg.refs.push(label);
+    const cur = String((ds.prompts || [])[idx] || "");
+    if (!cur.includes(`@${label}`)) {
+        if (!Array.isArray(ds.prompts)) ds.prompts = [];
+        ds.prompts[idx] = cur + (cur && !/\s$/.test(cur) ? " " : "") + `@${label}`;
+    }
     setDs(node, ds);
+    return true;
+}
+
+/** 减一次引用（-1）；减到 0 即从本段移除。 */
+function removeSegmentRef(node, idx, label) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return false;
+    const seg = ds.segments[idx];
+    if (!Array.isArray(seg.refs)) seg.refs = [];
+    if (refCount(seg, label) <= 1) seg.refs = seg.refs.filter((l) => l !== label);
+    else seg.refs.splice(seg.refs.lastIndexOf(label), 1);
+    setDs(node, ds);
+    return true;
+}
+
+/** 旧调用的兼容入口：有则清空、无则加一次（语义 = 切换） */
+function toggleSegmentRef(node, idx, label) {
+    const ds = getDs(node);
+    const seg = (ds.segments || [])[idx];
+    if (seg && refCount(seg, label) > 0) return removeSegmentRef(node, idx, label);
+    return addSegmentRef(node, idx, label);
 }
 
 /** 勾选/取消本段的首尾帧图引用（仅首帧模式有首帧/尾帧图）。
@@ -2621,6 +2661,11 @@ async function flushPrompts(node, dir) {
         latent_save: (s.latent_save && typeof s.latent_save === "object") ? s.latent_save : undefined,
         latent_ref: (s.latent_ref && typeof s.latent_ref === "object") ? s.latent_ref : undefined,
         tail_src: (s.tail_src && typeof s.tail_src === "object") ? s.tail_src : undefined,
+        /* 段级首尾帧参考图（提示词框按钮选的项目内图片） */
+        frame_img: (s.frame_img && typeof s.frame_img === "object") ? {
+            first: String(s.frame_img.first || "").trim().replace(/\\/g, "/"),
+            end: String(s.frame_img.end || "").trim().replace(/\\/g, "/"),
+        } : undefined,
         v2mode: V2_MODES.includes(s.v2mode) ? s.v2mode : null,
     } : null);
     try {
@@ -2700,42 +2745,11 @@ async function switchProject(dir) {
             ds.prompts = texts;
             ds.segments = segs.length ? segs : Array.from({ length: texts.length }, () => defaultSegment());
             ds.inserts = inserts;
-            /* 资产库按项目绑定：池子以本项目 manifest["assets"] 为准（上传/入库/
-             * 调入时已同步登记），切项目即换池，不再跨项目共享 */
-            ds.ref_assets = (mf.assets || [])
-                .filter((a) => a && a.file && a.label)
-                .map((a) => ({
-                    file: String(a.file),
-                    kind: KIND_LIST.includes(a.kind) ? a.kind : "image",
-                    label: String(a.label),
-                    asset_id: "",
-                    roles: Array.isArray(a.roles) ? a.roles.filter(
-                        (r) => r === "首帧图" || r === "尾帧图") : [],
-                }));
-            /* P3：合并服务端 asset_links（alias 与 legacy label 冲突时链接胜出，
-             * 与后端 by_alias 首胜口径一致；file 取全局库回填） */
-            try {
-                if (window.H3Api?.assetLinks) {
-                    const lr = await window.H3Api.assetLinks(dir);
-                    const links = (lr.body?.ok && lr.body.links) || [];
-                    if (links.length) {
-                        const byLabel = new Map(ds.ref_assets.map((a) => [a.label, a]));
-                        for (const L of links) {
-                            const alias = String(L.alias || "");
-                            if (!alias) continue;
-                            byLabel.set(alias, {
-                                file: String(L.file || ""),
-                                kind: KIND_LIST.includes(L.kind) ? L.kind : "image",
-                                label: alias,
-                                asset_id: String(L.asset_id || ""),
-                                roles: Array.isArray(L.roles) ? L.roles.filter(
-                                    (r) => r === "首帧图" || r === "尾帧图") : [],
-                            });
-                        }
-                        ds.ref_assets = [...byLabel.values()].filter((a) => a.file);
-                    }
-                }
-            } catch (e) { console.warn("[h3-director] assetLinks merge failed:", e); }
+            /* 资产库按项目绑定：池子以本项目 manifest["assets"] + asset_links 为准
+             * （上传/入库/调入时已同步登记），切项目即换池，不再跨项目共享。
+             * 与 hydratePool 共用同一构造函数 —— 两处口径不同就会出现「切了项目
+             * 引用栏不换」的偏差。 */
+            ds.ref_assets = poolFromManifest(mf, await fetchAssetLinks(dir));
             if (stale()) return;
             // 槽位索引态必须清：重摇标记/二采勾选按槽位存，带到新项目会重做错段
             ds.redo_segs = [];
@@ -3313,6 +3327,19 @@ function injectStyles() {
     .h3d-chipbtn{padding:2px 9px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+    .h3d-chipminus{padding:2px 6px;margin-left:-3px;border:1px solid #3a352c;border-radius:9px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;line-height:1;font-family:inherit}
+    .h3d-chipminus:hover{border-color:#9a4144;color:#f0a0a4}
+    .h3d-frmbtns{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+    .h3d-frm{padding:2px 9px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit}
+    .h3d-frm:hover{filter:brightness(1.25)}
+    .h3d-frm.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
+    .h3d-frmgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;max-height:46vh;overflow:auto;margin:8px 0 4px}
+    .h3d-frmtile{display:flex;flex-direction:column;gap:4px;padding:5px;border:1px solid #332f27;border-radius:8px;background:#1b1a16;cursor:pointer;min-width:0}
+    .h3d-frmtile:hover{border-color:#46604f}
+    .h3d-frmtile.on{border-color:#316dca;box-shadow:0 0 0 1px #316dca inset}
+    .h3d-frmtile img{width:100%;height:64px;object-fit:cover;border-radius:5px;background:#262319}
+    .h3d-frmico{height:64px;display:grid;place-items:center;font-size:22px;opacity:.7}
+    .h3d-frmname{font-size:10.5px;color:#cdd9e1;word-break:break-all;text-align:center}
     .h3d-hubrow{display:flex;gap:8px;flex-wrap:wrap}
     .h3d-hubbtn{flex:1;min-width:120px;padding:10px;border:1px solid #37332b;border-radius:9px;background:#181712;color:var(--h3d-bone);cursor:pointer;font-size:13px;font-family:inherit;text-align:center}
     .h3d-hubbtn:hover{border-color:var(--h3d-cyan)}
@@ -3909,6 +3936,123 @@ function assetPreviewUrl(dir, file, asset_id) {
     const f = String(file || "").replace(/\\/g, "/");
     if (f.startsWith("assets/")) return viewUrl(`h3_projects/${dir}`, f);
     return inputViewUrl(f);
+}
+
+/* ---------- 段级首尾帧参考图（提示词框「首帧图/尾帧图」按钮） ----------
+ * 标注入口从素材库挪到这里：每段各自指定一张项目内的图片作首/尾帧参考。
+ * 首段首帧图 = i2v 起手帧、末段尾帧图 = FL2VA 剧情终点锚；其余段 = 段头/段尾
+ * 身份锚（keyframe 注入）。选中的图同时进本段引用（正文补 @别名）。 */
+function frameNameOf(file) {
+    return String(file || "").split("/").pop() || "";
+}
+
+function setSegmentFrameImg(node, idx, key, file) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return false;
+    const seg = ds.segments[idx];
+    const cur = (seg.frame_img && typeof seg.frame_img === "object") ? { ...seg.frame_img } : {};
+    if (file) cur[key] = String(file);
+    else delete cur[key];
+    seg.frame_img = (cur.first || cur.end) ? cur : null;
+    /* 注意：这里**不**把图加进本段 refs —— 首/尾帧图是"锚点"不是"素材引用"。
+     * 加进 refs 会让首段走 Ref2V（多参）分支，反而丢掉 i2v 起手帧语义。 */
+    setDs(node, ds);
+    return true;
+}
+
+/** 选图弹窗：项目里的图片 + 现场上传 + 清除。 */
+function openFramePicker(node, idx, key, name, done) {
+    const dir = getDirValue(node);
+    if (!dir) { alert("先在「存档目录」选一个项目"); return; }
+    const ds = getDs(node);
+    const seg = (ds.segments || [])[idx] || defaultSegment();
+    const curFile = (seg.frame_img || {})[key] || "";
+    const imgs = (ds.ref_assets || []).filter((a) => (a.kind || "image") === "image");
+    /* 参考图可能不在池子里（直接落 assets/ 的文件）：补一条候选项 */
+    if (curFile && !imgs.some((a) => a.file === curFile)) {
+        imgs.push({ file: curFile, kind: "image", label: frameNameOf(curFile), asset_id: "" });
+    }
+
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog");
+    dialog.innerHTML = `<h3>🖼 本段${name}参考</h3>
+        <p class="h3d-lead">选一张项目里的图片，作为第 ${idx + 1} 段的${name}锚点。
+        ${key === "first"
+            ? "首段：i2v 起手帧（画面从这张图开始）；中段：段头身份锚（keyframe 注入，抑制长链漂移）。"
+            : "末段：FL2VA 剧情终点锚；其它段：该段末帧锚（同位置唯一锚，优先于段尾锚）。"}
+        它不进素材引用编号（是锚点，不是被引用的素材）。</p>`;
+    const grid = el("div", "h3d-frmgrid");
+    const mkTile = (a) => {
+        const t = el("div", "h3d-frmtile" + (a.file === curFile ? " on" : ""));
+        const im = document.createElement("img");
+        im.loading = "lazy";
+        im.src = assetPreviewUrl(dir, a.file, a.asset_id);
+        im.onerror = () => { im.replaceWith(el("span", "h3d-frmico", "🖼")); };
+        t.append(im, el("div", "h3d-frmname", escapeHtml(a.label || frameNameOf(a.file))));
+        t.onclick = () => {
+            setSegmentFrameImg(node, idx, key, a.file);
+            overlay.remove();
+            if (typeof done === "function") done();
+        };
+        return t;
+    };
+    for (const a of imgs) grid.append(mkTile(a));
+    if (!imgs.length) {
+        grid.append(el("div", "h3d-empty", "项目里还没有图片：用下面的「上传一张」先传进来"));
+    }
+    dialog.append(grid);
+
+    const row = el("div", "h3d-dialog-row");
+    const upBtn = el("button", "h3d-btn", "＋ 上传一张");
+    upBtn.type = "button";
+    upBtn.title = "上传并入库（全局库一份 + 本项目 assets/ 一份），然后直接用作本段参考";
+    upBtn.onclick = () => {
+        const inp = document.createElement("input");
+        inp.type = "file";
+        inp.accept = "image/*";
+        inp.onchange = async () => {
+            const f = (inp.files || [])[0];
+            if (!f) return;
+            try {
+                const H3Assets = window.H3Assets;
+                if (!H3Assets?.uploadDirect) throw new Error("上传接口不可用");
+                const alias = f.name.replace(/\.[^.]+$/, "").slice(0, 24);
+                const res = await H3Assets.uploadDirect(f, {
+                    kind: "image", alias, dest: "project", link_dir: dir, mirror: "1",
+                });
+                if (!res?.ok) throw new Error("上传返回异常");
+                const file = res?.mirrored?.file || res?.stored?.file || "";
+                if (!file) throw new Error(res?.mirror_error || "上传后没拿到项目内路径");
+                setSegmentFrameImg(node, idx, key, String(file).startsWith("assets/")
+                    ? file : `assets/${String(file).split("/").pop()}`);
+                overlay.remove();
+                if (typeof done === "function") done();
+                scheduleRefresh(300);
+            } catch (e) {
+                alert(`上传失败：${e?.message || e}`);
+            }
+        };
+        inp.click();
+    };
+    const clearBtn = el("button", "h3d-btn h3d-btn-danger", "清除");
+    clearBtn.type = "button";
+    clearBtn.disabled = !curFile;
+    clearBtn.onclick = () => {
+        setSegmentFrameImg(node, idx, key, "");
+        overlay.remove();
+        if (typeof done === "function") done();
+    };
+    const cancel = el("button", "h3d-btn", "取消");
+    cancel.type = "button";
+    cancel.onclick = () => overlay.remove();
+    if (curFile) row.append(clearBtn);
+    row.append(upBtn, cancel);
+    dialog.append(row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+    document.body.append(overlay);
+    cancel.focus();
 }
 
 /* 资产标注切换：同 role 全库唯一，改标自动取消上一张 */
@@ -4986,30 +5130,67 @@ function buildCards(data) {
                 tabbar.append(b);
             }
             body.append(tabbar);
-            /* 统一引用条（tab 外常驻）：chip 亮=本段已调度，点按即切换调度（可取消）；
-             * 主框下打开调度时若文本缺 @标签 则顺手插入；具象化下同步追加参考条目。
-             * 标注徽标与资产库一致。 */
+            /* 统一引用条（tab 外常驻）：
+             * chip 点一次 = 引用一次（显示 ×N），同一个素材可以在一段里引用多次
+             * —— 正文里就写 N 个 @别名，编译后是同一个 <Picture k> 出现 N 次；
+             * chip 旁的「−」减一次（减到 0 = 本段不再引用它）。
+             * 素材个数上限仍按官方 9/3/3（去重算），重复次数另有软上限。
+             * 末尾两个按钮：本段的首帧图 / 尾帧图参考（从项目里的图片选或现传）。 */
             if (node && it.idx !== undefined && pool.length) {
                 const refbar = el("div", "h3d-refrow");
                 refbar.append(el("label", "", "资产引用"));
-                const segNow = (data.ds.segments || [])[it.idx] || defaultSegment();
-                const schedNow = new Set(segNow.refs || []);
+                const counter = el("span", "h3d-secs-hint", "");
+                /* 官方 tag 预览：按「本段勾选顺序」对三类各自独立编号（与后端
+                 * compile_refs 同口径，重复引用只占一个编号）—— 让用户直接看到
+                 * @女主 会变成 <Picture 1>，写几次就出现几次。 */
+                const TOK_FMT = { image: "<Picture {}>", video: "<Video {}>", audio: "<Audio {}>" };
+                const paintChip = (rec, n, token) => {
+                    const { c, a, roles } = rec;
+                    c.classList.toggle("on", n > 0);
+                    c.textContent = `${n > 0 ? "✓" : "＋"}@${a.label}${roles}${n > 1 ? ` ×${n}` : ""}`;
+                    c.title = `${KIND_NAME[a.kind] || ""}「${a.label}」${roles}：`
+                        + (n > 0
+                            ? `本段已引用 ${n} 次${token ? `（正文里每个 @${a.label} 都会编译成 ${token}）` : ""}`
+                            : "本段未引用")
+                        + "\n点一次 = 加一次引用（正文补一个 @标签）；右侧「−」减一次。"
+                        + "\n同一素材在一段里可以引用多次（例如开头和结尾都提到它）。";
+                };
+                const chips = [];
+                const paintAll = () => {
+                    const seg = (getDs(node).segments || [])[it.idx] || defaultSegment();
+                    const refs = seg.refs || [];
+                    const cnt = { image: 0, video: 0, audio: 0 };
+                    const tokens = {};
+                    for (const l of new Set(refs)) {          // 编号按素材，不看重复
+                        const hit = pool.find((x) => x.label === l);
+                        if (!hit) continue;
+                        const k = hit.kind || "image";
+                        if (cnt[k] === undefined) cnt[k] = 0;
+                        cnt[k] += 1;
+                        tokens[l] = String(TOK_FMT[k] || TOK_FMT.image).replace("{}", cnt[k]);
+                    }
+                    for (const rec of chips) {
+                        paintChip(rec, refCount(seg, rec.a.label), tokens[rec.a.label]);
+                        rec.minus.style.display = refCount(seg, rec.a.label) > 0 ? "" : "none";
+                    }
+                    const nAsset = new Set(refs).size;
+                    counter.textContent = nAsset
+                        ? `已引用 ${nAsset} 个素材（共 ${refs.length} 次 · 图${cnt.image}/${KIND_CAPS.image}·视${cnt.video}/${KIND_CAPS.video}·音${cnt.audio}/${KIND_CAPS.audio}）`
+                        : "本段未引用素材";
+                };
                 for (const a of pool) {
                     const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
-                    const on = schedNow.has(a.label);
-                    const c = el("button", "h3d-chipbtn" + (on ? " on" : ""), `${on ? "✓" : "＋"}@${a.label}${roles}`);
+                    const c = el("button", "h3d-chipbtn");
                     c.type = "button";
-                    c.title = `${KIND_NAME[a.kind] || ""}「${a.label}」${roles}：${on ? "已调度，再点取消" : "未调度，点击调度"}` +
-                        "（主框下打开时自动补 @标签 到文本；具象化下同步加参考条目）";
+                    c.dataset.ref = String(a.label || "");
+                    const minus = el("button", "h3d-chipminus", "−");
+                    minus.type = "button";
+                    minus.title = `「${a.label}」减一次引用（减到 0 = 本段不再引用）`;
+                    const rec = { c, minus, a, roles };
+                    chips.push(rec);
                     c.onclick = () => {
-                        const cur = ((getDs(node).segments || [])[it.idx] || {}).refs || [];
-                        const has = cur.includes(a.label);
-                        if (has) {
-                            toggleSegmentRef(node, it.idx, a.label);
-                            scheduleRefresh(80);
-                            return;
-                        }
-                        toggleSegmentRef(node, it.idx, a.label);
+                        if (!addSegmentRef(node, it.idx, a.label)) return;
+                        paintAll();                 // 先让 chip 状态即时落地
                         if (curTab === "v2") {
                             setPromptV2Field(node, it.idx, (pv) => {
                                 pv.references = Array.isArray(pv.references) ? pv.references : [];
@@ -5018,15 +5199,53 @@ function buildCards(data) {
                                 }
                             });
                         } else if (curTab !== "set") {
-                            if (!String(ta.value || "").includes(`@${a.label}`)) {
-                                insertAtCursor(ta, `@${a.label}`);
-                                try { debouncePromptWrite(node, it.idx, ta.value); } catch (e) {}
-                            }
+                            /* 每点一次就往正文加一个 @标签：写几次 = 引用几次（官方
+                             * <Picture k> 在正文里出现几次，模型就参考几次） */
+                            insertAtCursor(ta, (ta.value && !/[\s,，。;；\n]$/.test(ta.value.slice(-1)) ? " " : "") + `@${a.label}`);
+                            try { debouncePromptWrite(node, it.idx, ta.value); } catch (e) {}
                         }
-                        scheduleRefresh(120);
+                        scheduleRefresh(240);
                     };
-                    refbar.append(c);
+                    minus.onclick = () => {
+                        removeSegmentRef(node, it.idx, a.label);
+                        /* 正文同步删掉一个 @标签（次数与正文保持一致） */
+                        if (curTab !== "set" && String(ta.value || "").includes(`@${a.label}`)) {
+                            const at = ta.value.lastIndexOf(`@${a.label}`);
+                            ta.value = ta.value.slice(0, at) + ta.value.slice(at + a.label.length + 1);
+                            try { debouncePromptWrite(node, it.idx, ta.value); } catch (e) {}
+                        }
+                        paintAll();
+                        scheduleRefresh(240);
+                    };
+                    refbar.append(c, minus);
                 }
+                paintAll();
+                refbar.append(counter);
+                /* 段级首尾帧参考图：从项目里的图片选（或现传一张），作为本段的
+                 * 首帧 / 尾帧参考（段头 / 段尾身份锚；首段首帧图 = i2v 起手帧）。 */
+                const frameBtns = el("div", "h3d-frmbtns");
+                const FRAME_KEYS = [["first", "首帧图"], ["end", "尾帧图"]];
+                const paintFrameBtns = () => {
+                    frameBtns.replaceChildren();
+                    const seg = (getDs(node).segments || [])[it.idx] || defaultSegment();
+                    const fi = seg.frame_img || {};
+                    for (const [key, name] of FRAME_KEYS) {
+                        const has = !!fi[key];
+                        const b = el("button", "h3d-btn h3d-frm" + (has ? " on" : ""),
+                            `${has ? "🖼" : "＋"}${name}${has ? `（${frameNameOf(fi[key])}）` : ""}`);
+                        b.type = "button";
+                        b.title = has
+                            ? `本段${name}参考：${fi[key]}（点开可换一张 / 清除）`
+                            : `选一张项目里的图片当本段${name}参考（也可现场上传）`;
+                        b.onclick = () => openFramePicker(node, it.idx, key, name, () => {
+                            paintFrameBtns();
+                            scheduleRefresh(240);
+                        });
+                        frameBtns.append(b);
+                    }
+                };
+                paintFrameBtns();
+                refbar.append(frameBtns);
                 /* 引用语模板：把现成句式插入主提示词光标处 */
                 const tpl = document.createElement("select");
                 tpl.className = "h3d-reftpl";
@@ -6832,11 +7051,68 @@ function openExpandModal(node, segIdx, pv0) {
 /* ---------- 刷新 ---------- */
 
 /* ---------- 池子 hydration（项目清单 → 节点 widget） ----------
- * 素材库里的「调入项目 / 上传 / 改名」都只写 manifest，不回填 widget 的话，
+ * 素材库里的「调入项目 / 上传 / 改名 / 删除」都只写 manifest，不回填 widget 的话，
  * 段卡的引用勾选（h3d-refchip）与提示词框的 @ 补全就看不到新素材 ——
- * 「素材进了项目库却不能在提示词里用」就是这个。按 revision 节流，不每次重写。 */
+ * 「素材进了项目库却不能在提示词里用」就是这个。
+ *
+ * 关键：**manifest 是唯一真相，池子按它整体重建**（旧实现只做增量追加，于是
+ * 改名=旧标签残留 + 新标签入池、删除=永远留着、切项目=旧池带过来）。
+ * 同名冲突时 asset_links 胜出（与后端 by_alias 首胜口径一致）。
+ * 按 dir + revision + 池签名节流，签名不变不写 widget（不打断正在打字的人）。 */
 let _poolRev = "";
-async function hydratePool() {
+let _poolDir = "";
+
+const _rolesOf = (r) => (Array.isArray(r) ? r.map(String)
+    .filter((x) => x === "首帧图" || x === "尾帧图") : []);
+
+/** manifest.assets + asset_links -> 规范化池子（权威源，不含 widget 里的残留） */
+function poolFromManifest(mf, links) {
+    const byLabel = new Map();
+    const put = (label, ent) => { if (label) byLabel.set(String(label), ent); };
+    for (const a of ((mf && mf.assets) || [])) {
+        if (!a || !a.file || !a.label) continue;
+        put(a.label, {
+            file: String(a.file),
+            kind: KIND_LIST.includes(a.kind) ? a.kind : "image",
+            label: String(a.label),
+            asset_id: "",
+            roles: _rolesOf(a.roles),
+        });
+    }
+    for (const L of links || []) {
+        const alias = String((L && L.alias) || "");
+        if (!alias) continue;
+        put(alias, {
+            file: String((L && L.file) || ""),
+            kind: KIND_LIST.includes(L && L.kind) ? L.kind : "image",
+            label: alias,
+            asset_id: String((L && L.asset_id) || ""),
+            roles: _rolesOf(L && L.roles),
+        });
+    }
+    return [...byLabel.values()].filter((a) => a.file);
+}
+
+/** 池子指纹：只有它变了才写回 widget（避免无谓重绘/丢焦） */
+function poolSig(pool) {
+    return (pool || []).map((a) => [
+        String((a && a.label) || ""), String((a && a.file) || ""),
+        String((a && a.kind) || "image"), String((a && a.asset_id) || ""),
+        _rolesOf(a && a.roles).join("·"),
+    ].join(">")).join(";");
+}
+
+async function fetchAssetLinks(dir) {
+    try {
+        if (window.H3Api && typeof window.H3Api.assetLinks === "function") {
+            const r = await window.H3Api.assetLinks(dir);
+            return (r && r.body && r.body.ok && r.body.links) || [];
+        }
+    } catch (e) { /* 拿不到链接就只用 manifest.assets，不阻断刷新 */ }
+    return [];
+}
+
+async function hydratePool(force) {
     const node = findNode();
     if (!node) return;
     const dir = getDirValue(node);
@@ -6845,26 +7121,18 @@ async function hydratePool() {
     try {
         mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
     } catch (e) { return; }
-    const rev = `${dir}:${(mf && mf.revision) || 0}`;
-    if (_poolRev === rev) return;
-    const ds = getDs(node);
-    const pool = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
-    const seen = new Set(pool.map((a) => String((a && a.label) || "")));
-    let changed = false;
-    for (const a of ((mf && mf.assets) || [])) {
-        if (!a || !a.label || !a.file || seen.has(String(a.label))) continue;
-        pool.push({
-            file: String(a.file), kind: a.kind || "image", label: String(a.label),
-            asset_id: "", roles: Array.isArray(a.roles) ? a.roles : [],
-        });
-        seen.add(String(a.label));
-        changed = true;
-    }
+    const links = await fetchAssetLinks(dir);
+    const pool = poolFromManifest(mf, links);
+    const dirChanged = _poolDir !== dir;
+    const sig = poolSig(pool);
+    const rev = `${dir}:${(mf && mf.revision) || 0}:${sig}`;
+    if (!force && !dirChanged && _poolRev === rev) return;
+    _poolDir = dir;
     _poolRev = rev;
-    if (changed) {
-        ds.ref_assets = pool;
-        setDs(node, ds);
-    }
+    const ds = getDs(node);
+    if (poolSig(ds.ref_assets) === sig) return;
+    ds.ref_assets = pool;
+    setDs(node, ds);
 }
 
 async function refresh() {

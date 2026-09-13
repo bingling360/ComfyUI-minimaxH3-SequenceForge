@@ -107,6 +107,64 @@
     return A;
   }
 
+  /* ---------- 自建输入弹窗 ----------
+   * 不用 window.prompt：ComfyUI 前端 / 部分嵌入壳会吞掉原生弹窗
+   * （点了按钮毫无反应，且没有任何报错 —— 「改名没用」的另一种表现）。 */
+  function askText(opt) {
+    const o = opt || {};
+    return new Promise((resolve) => {
+      const ov = el("div", "h3l-modal");
+      const box = el("div", "h3l-modalbox");
+      box.append(el("h3", "", esc(o.title || "")));
+      if (o.hint) box.append(el("p", "h3l-modalhint", esc(o.hint)));
+      const inp = el("input", "h3l-input");
+      inp.type = "text";
+      inp.value = String(o.value == null ? "" : o.value);
+      if (o.maxLength) inp.maxLength = Number(o.maxLength);
+      inp.placeholder = String(o.placeholder || "");
+      box.append(inp);
+      const row = el("div", "h3l-modalrow");
+      const ok = el("button", "h3l-btn h3l-btn-cta", esc(o.okText || "确定"));
+      const no = el("button", "h3l-btn", "取消");
+      ok.type = "button"; no.type = "button";
+      row.append(no, ok);
+      box.append(row);
+      ov.append(box);
+      const done = (v) => {
+        ov.remove();
+        document.removeEventListener("keydown", onKey);
+        resolve(v);
+      };
+      const onKey = (e) => {
+        if (e.key === "Escape") done(null);
+        else if (e.key === "Enter") done(inp.value);
+      };
+      ok.onclick = () => done(inp.value);
+      no.onclick = () => done(null);
+      ov.addEventListener("pointerdown", (e) => { if (e.target === ov) done(null); });
+      document.body.append(ov);
+      document.addEventListener("keydown", onKey);
+      inp.focus();
+      inp.select();
+    });
+  }
+
+  /** 星级行：瓦片/预览器共用；点当前星级=清除（0 星）。 */
+  function starRow(rating, onPick, small) {
+    const r = Number(rating) || 0;
+    const box = el("div", "h3l-stars" + (small ? " sm" : ""));
+    for (let i = 1; i <= 5; i++) {
+      const s = el("span", i <= r ? "on" : "", "★");
+      s.title = `${i} 星` + (i === r ? "（再点清除评分）" : "");
+      s.onclick = (e) => {
+        e.stopPropagation();
+        if (typeof onPick === "function") onPick(i === r ? 0 : i);
+      };
+      box.append(s);
+    }
+    return box;
+  }
+
   /* ---------- 样式（自带一套，不依赖导演台） ---------- */
 
   function injectStyles() {
@@ -171,8 +229,17 @@
 .h3l-vrow b{color:#d9d4c9;font-weight:600}
 .h3l-vact{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
 .h3l-stars{display:flex;gap:2px}
-.h3l-stars span{cursor:pointer;font-size:17px;color:#5c574d}
+.h3l-stars span{cursor:pointer;font-size:17px;color:#5c574d;line-height:1}
 .h3l-stars span.on{color:#e9c07a}
+.h3l-stars.sm span{font-size:13px}
+.h3l-stars span:hover{color:#e9c07a}
+.h3l-modal{position:fixed;inset:0;z-index:1000010;background:#000000b8;display:flex;align-items:center;justify-content:center;padding:18px}
+.h3l-modalbox{width:min(460px,100%);background:#1b1a16;border:1px solid #46604f;border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:9px;box-shadow:0 14px 40px #000c}
+.h3l-modalbox h3{margin:0;font-size:14.5px;color:#f0ece2;word-break:break-all}
+.h3l-modalhint{margin:0;font-size:12px;color:#8a857b;line-height:1.5;white-space:pre-wrap}
+.h3l-input{border:1px solid #3a352c;border-radius:8px;background:#211f1a;color:#d9d4c9;padding:8px 10px;font-size:13px;font-family:inherit;outline:none}
+.h3l-input:focus{border-color:#a8d8bd}
+.h3l-modalrow{display:flex;gap:8px;justify-content:flex-end;margin-top:2px}
 .h3l-toast{position:fixed;right:22px;top:22px;z-index:1000009;max-width:min(460px,80vw);padding:11px 15px;border:1px solid #46604f;border-radius:10px;background:#16241c;color:#c9f0d8;font:13px/1.55 "Microsoft YaHei UI","Segoe UI",sans-serif;box-shadow:0 8px 28px #000b;white-space:pre-wrap;word-break:break-word}
 .h3l-toast.err{border-color:#9a4144;background:#2c1618;color:#f3b6ba}
 `;
@@ -241,7 +308,12 @@
       const b = el("button", "h3l-scope" + (S.scope === k ? " on" : ""),
         esc(zh) + (k === "all" ? "" : `<em>${n}</em>`));
       b.type = "button";
-      b.onclick = () => { S.scope = k; S.sel.clear(); fetchPage(false); };
+      b.onclick = () => {
+        S.scope = k;
+        S.sel.clear();
+        if (typeof S.paintUpBtn === "function") S.paintUpBtn();   // 上传落点跟着库变
+        fetchPage(false);
+      };
       S.scopeBox.append(b);
     }
     if (S.collections.length) {
@@ -264,9 +336,11 @@
       box.append(b);
     };
     const roles = it.roles || [];
-    if (it.kind === "image" && (it.scope === "project" || it.scope === "global")) {
-      mk("首帧图", roles.includes("首帧图"), () => actRole(it, "首帧图"));
-      mk("尾帧图", roles.includes("尾帧图"), () => actRole(it, "尾帧图"));
+    /* 首尾帧标注已挪到导演台「提示词框 · 资产引用」栏（每段两个按钮，按段指定），
+     * 素材库不再打标——旧标注仍会显示徽标，且旧项目照常生效（后端未删）。 */
+    if (roles.length) {
+      mk(`✓ ${roles.join("·")}`, true,
+        () => say(`「${it.name}」带有旧的首尾帧标注：现在请在导演台每段的「资产引用」栏指定首/尾帧图`));
     }
     if (it.scope === "global") mk("调入项目", false, () => actMirror(it));
     if (it.scope === "finals") mk("调入项目", false, () => actToAssets(it));
@@ -280,6 +354,19 @@
     return box;
   }
 
+  /** 写评分：成功后就地重画（不整页重拉，滚动位置与勾选都保住）。 */
+  async function setRating(it, val, repaint) {
+    const A = api();
+    try {
+      const r = await A.libRate(S.dir, it.id, val);
+      if (!r.body?.ok) { fail(A.errText(r, "评分失败")); return; }
+      it.rating = Number(r.body.rating) || 0;
+      if (typeof repaint === "function") repaint();
+    } catch (e) {
+      fail(`评分失败：${e?.message || e}`);
+    }
+  }
+
   function tileFor(it) {
     const t = el("div", "h3l-tile" + (S.sel.has(it.id) ? " sel" : ""));
     t.dataset.id = it.id;
@@ -288,12 +375,20 @@
     th.dataset.src = api().libRawUrl(S.dir, it.id);
     th.dataset.kind = it.kind;
     th.dataset.thumb = api().libThumbUrl(S.dir, it.id);
-    if (it.rating) th.append(el("span", "h3l-star", "★" + it.rating));
     if ((it.roles || []).length) {
       th.append(el("span", "h3l-role", esc(it.roles.join("·"))));
     }
     t.append(th);
     t.append(el("div", "h3l-name", esc(it.name)));
+    /* 星级常驻瓦片：不用进预览器才能打分（点当前星级=清除） */
+    let stars = null;
+    const paintStars = () => {
+      const row = starRow(it.rating, (v) => setRating(it, v, paintStars), true);
+      if (stars) stars.replaceWith(row);
+      stars = row;
+    };
+    paintStars();
+    t.append(stars);
     const bits = [KIND_CN[it.kind] || it.kind];
     if (it.size) bits.push(fmtSize(it.size));
     if (it.mtime) bits.push(fmtTime(it.mtime));
@@ -346,17 +441,21 @@
         const d = en.target;
         io.unobserve(d);
         const kind = d.dataset.kind;
+        // 角标（角色标注）是建瓦片时就挂上的，replaceChildren 会一并抹掉 —— 留住
+        const badges = [...d.children].filter(
+          (n) => n.classList && (n.classList.contains("h3l-role")
+            || n.classList.contains("h3l-star")));
         if (kind === "image") {
           const im = document.createElement("img");
           im.loading = "lazy";
           im.src = d.dataset.thumb;
           im.onerror = () => { im.remove(); };
-          d.replaceChildren(im);
+          d.replaceChildren(im, ...badges);
         } else if (kind === "video") {
           const v = document.createElement("video");
           v.muted = true; v.preload = "metadata"; v.src = d.dataset.src;
           v.onerror = () => v.remove();
-          d.replaceChildren(v);
+          d.replaceChildren(v, ...badges);
         }
       }
     }, { root: S.grid, rootMargin: "240px" });
@@ -396,10 +495,7 @@
       m.append(menuItem("👁 预览", () => openViewer(it)));
       m.append(el("div", "h3l-sep"));
     }
-    if (it.kind === "image" && !many) {
-      m.append(menuItem("🎬 标为首帧图", () => actRole(it, "首帧图")));
-      m.append(menuItem("🏁 标为尾帧图", () => actRole(it, "尾帧图")));
-    }
+    /* 首尾帧标注已挪到导演台「提示词框 · 资产引用」栏（按段指定），此处不再打标 */
     if (!many) {
       m.append(el("div", "h3l-sep"));
       m.append(menuItem("⭐ 评分…", () => actRate(it)));
@@ -484,19 +580,13 @@
     for (const [k, v2] of rows) {
       side.append(el("div", "h3l-vrow", `<b>${esc(k)}</b>：${esc(v2)}`));
     }
-    const stars = el("div", "h3l-stars");
-    for (let i = 1; i <= 5; i++) {
-      const sp = el("span", i <= (it.rating || 0) ? "on" : "", "★");
-      sp.onclick = async () => {
-        const r = await A.libRate(S.dir, it.id, i === it.rating ? 0 : i);
-        if (r.body?.ok) {
-          it.rating = r.body.rating;
-          stars.querySelectorAll("span").forEach((n, idx) => n.classList.toggle("on", idx < it.rating));
-          renderGrid();
-        }
-      };
-      stars.append(sp);
-    }
+    let stars = null;
+    const paintStars = () => {
+      const row = starRow(it.rating, (v) => { setRating(it, v, paintStars); });
+      if (stars) stars.replaceWith(row);
+      stars = row;
+    };
+    paintStars();
     side.append(stars);
 
     const acts = el("div", "h3l-vact");
@@ -536,6 +626,11 @@
 
   function after(what) {
     say(what);
+    notify();
+  }
+
+  /** 通知导演台刷新（素材库改了工程数据：池子/标注/引用都要跟着变）。 */
+  function notify() {
     if (typeof S.onChanged === "function") { try { S.onChanged(); } catch (e) { /* 可选 */ } }
   }
 
@@ -547,21 +642,39 @@
     fetchPage(false);
   }
 
-  async function actRate(it) {
-    const v = window.prompt(`给「${it.name}」评分（0-5，0 清除）`, String(it.rating || 0));
-    if (v === null) return;
-    const A = api();
-    const r = await A.libRate(S.dir, it.id, Number(v) || 0);
-    if (!r.body?.ok) { fail(A.errText(r, "评分失败")); return; }
-    after("评分已保存");
-    fetchPage(false);
+  /** 评分弹窗（瓦片星条之外的大号入口，右键菜单用）。 */
+  function actRate(it) {
+    const ov = el("div", "h3l-modal");
+    const box = el("div", "h3l-modalbox");
+    box.append(el("h3", "", esc(`给「${it.name}」评分`)));
+    box.append(el("p", "h3l-modalhint", "点星星即打分，点当前星级 = 清除评分。"));
+    let row = null;
+    const paint = () => {
+      const r = starRow(it.rating, (v) => { setRating(it, v, paint); });
+      if (row) row.replaceWith(r);
+      row = r;
+    };
+    paint();
+    box.append(row);
+    const rw = el("div", "h3l-modalrow");
+    const close = el("button", "h3l-btn", "完成");
+    close.type = "button";
+    close.onclick = () => ov.remove();
+    rw.append(close);
+    box.append(rw);
+    ov.append(box);
+    ov.addEventListener("pointerdown", (e) => { if (e.target === ov) ov.remove(); });
+    document.body.append(ov);
   }
 
   async function actTag(it) {
-    const v = window.prompt(
-      `给「${it.name}」打标签（逗号分隔）。\n`
-      + "标签是你自己的分类（例：角色 / 场景 / 道具 / 用过），用来筛选和检索素材。",
-      (it.tags || []).join(","));
+    const v = await askText({
+      title: `给「${it.name}」打标签`,
+      hint: "逗号分隔。标签是你自己的分类（例：角色 / 场景 / 道具 / 用过），用来筛选和检索素材。",
+      value: (it.tags || []).join(","),
+      placeholder: "角色,场景,用过",
+      okText: "保存",
+    });
     if (v === null) return;
     const tags = String(v).split(/[,，]/).map((s) => s.trim()).filter(Boolean);
     const A = api();
@@ -572,12 +685,23 @@
   }
 
   async function actAlias(it) {
-    const v = window.prompt(`「${it.name}」的新显示名（<=24 字）`, it.name);
-    if (v === null || !String(v).trim()) return;
+    const v = await askText({
+      title: `重命名「${it.name}」`,
+      hint: "这个名字就是提示词里 @别名 用的名字（<=24 字）。\n"
+        + "改名后段落里已勾选的引用会跟着换成新名字。",
+      value: it.name,
+      maxLength: 24,
+      placeholder: "新显示名",
+      okText: "改名",
+    });
+    if (v === null) return;
+    const name = String(v).trim();
+    if (!name || name === it.name) return;
     const A = api();
-    const r = await A.libAlias(S.dir, it.id, String(v).trim());
+    const r = await A.libAlias(S.dir, it.id, name);
     if (!r.body?.ok) { fail(A.errText(r, "重命名失败")); return; }
-    after("已重命名");
+    it.name = name;
+    after(`已重命名为「${name}」：提示词里写 @${name} 即可引用`);
     fetchPage(false);
   }
 
@@ -655,6 +779,7 @@
     S.sel.clear();
     say(`已删除 ${(r.body.deleted || []).length} 个` +
         ((r.body.skipped || []).length ? `，跳过 ${r.body.skipped.length} 个` : ""));
+    notify();          // 项目里没了：导演台的引用栏/提示词补全要同步
     fetchPage(false);
   }
 
@@ -725,10 +850,28 @@
     };
     bar.append(multiBtn);
 
+    /* 上传落点 = 当前所在库（切 scope 时按钮文案跟着变）：
+     *   全局库 → 只进全局库一份（跨项目复用，不碰任何项目）
+     *   项目资产 → 全局库一份 + 本项目 assets/ 一份（登记清单，可直接 @别名 引用）
+     *   成片     → 全局库一份 + 本项目 finals/ 一份（目录扫描即见）
+     *   全部/latent → 按项目资产处理 */
     const upBtn = el("button", "h3l-btn h3l-btn-cta", "＋ 上传");
     upBtn.type = "button";
-    upBtn.title = "在「全局库」scope 上传 = 只进全局库一份（跨项目复用）；"
-      + "在其它 scope 上传 = 全局库一份 + 本项目 assets/ 一份（项目自包含）。";
+    const DEST_CN = { global: "全局库", project: "项目资产", finals: "成片库" };
+    const destOf = (scope) => (scope === "global" ? "global"
+      : (scope === "finals" ? "finals" : "project"));
+    const paintUpBtn = () => {
+      const dest = destOf(S.scope);
+      upBtn.textContent = `＋ 上传到${DEST_CN[dest] || "项目资产"}`;
+      upBtn.title = dest === "global"
+        ? "当前在「全局库」：只进全局库一份（跨项目复用，不碰任何项目）；"
+          + "要落进项目请切到「项目资产」再传。"
+        : dest === "finals"
+          ? "当前在「成片」：全局库存一份 + 本项目 finals/ 一份。"
+          : "当前在「项目资产」：全局库存一份（跨项目复用）+ 本项目 assets/ 一份"
+            + "并登记进清单，提示词里写 @别名 即可引用。";
+    };
+    paintUpBtn();
     upBtn.onclick = () => {
       const inp = document.createElement("input");
       inp.type = "file";
@@ -736,11 +879,12 @@
       inp.onchange = async () => {
         const files = [...(inp.files || [])];
         if (!files.length) return;
-        const A0 = api();
-        // 落点按当前 scope 决定：
-        //   全局库 → 只进全局库一份（跨项目复用，不碰任何项目）
-        //   其它   → 全局库一份 + 项目 assets/ 一份（项目自包含，删项目不影响全局库）
-        const onlyGlobal = S.scope === "global";
+        let dest = destOf(S.scope);
+        if (dest !== "global" && !S.dir) {
+          say("没有打开的项目：这次先只进全局库（切到项目库再传可落到项目里）");
+          dest = "global";
+        }
+        const onlyGlobal = dest === "global";
         let ok = 0;
         for (const f of files) {
           try {
@@ -749,10 +893,11 @@
             const kind = H3Assets.guessKind(f);
             const alias = f.name.replace(/\.[^.]+$/, "").slice(0, 24);
             const opt = onlyGlobal
-              ? { kind, alias }
-              : { kind, alias, link_dir: S.dir, mirror: "1" };
+              ? { kind, alias, dest: "global" }
+              : { kind, alias, dest, link_dir: S.dir, mirror: "1" };
             const res = await H3Assets.uploadDirect(f, opt);
             if (!res?.ok) throw new Error("上传返回异常");
+            if (res.store_error) fail(`${f.name}：${res.store_error}`);
             ok++;
           } catch (e) { fail(`「${f.name}」上传失败：${e?.message || e}`); }
         }
@@ -760,14 +905,18 @@
         if (onlyGlobal) {
           say(`已上传 ${ok} 个到全局库（跨项目可复用）\n要落进当前项目，点瓦片上的「调入项目」`);
         } else {
-          say(`已上传 ${ok} 个：全局库一份 + 本项目 assets/ 一份\n提示词里写 @别名 即可引用`);
+          say(`已上传 ${ok} 个到${DEST_CN[dest]}：全局库一份 + 本项目一份`
+            + (dest === "project" ? "\n提示词里写 @别名 即可引用" : ""));
+          if (typeof S.onChanged === "function") {
+            try { S.onChanged(); } catch (e) { /* 通知导演台刷新（可选） */ }
+          }
         }
-        void A0;
         fetchPage(false);
       };
       inp.click();
     };
     bar.append(upBtn);
+    S.paintUpBtn = paintUpBtn;
 
     const scanBtn = el("button", "h3l-btn", "↻ 重新扫描");
     scanBtn.type = "button";

@@ -384,8 +384,12 @@ _REF_AT = re.compile(
 def compute_refs(manifest, items) -> dict:
     """按项目 manifest 算每个素材被哪几段引用 -> {标识: [段号]}。
 
-    三种来源与旧前端 segUsage 同口径：段 refs 勾选、提示词里的 `[[标签]]`、
+    三种来源与旧前端 segUsage 同口径：段 refs 勾选、提示词里的 `[[标签]]` / `@标签`、
     asset_links 里的角色标记（首帧图/尾帧图算全段引用）。
+
+    段 refs 有两条落点：运行期写的 manifest["segments"][i]["refs"] 与导演台回写的
+    manifest["seg_fields"][i]["refs"]（后者才是常写的一条，按全局槽位对齐，与
+    prompts 同索引）—— 两处都读，否则「段卡勾了引用、素材库却不显示被引用」。
     """
     if not isinstance(manifest, dict):
         return {}
@@ -406,20 +410,40 @@ def compute_refs(manifest, items) -> dict:
         if seg_no not in it["refs"]:
             it["refs"].append(seg_no)
 
+    def refs_at(i):
+        """第 i 段（全局槽位）勾选的引用：segments + seg_fields 两处合并。"""
+        out = []
+        s = segs[i] if i < len(segs) and isinstance(segs[i], dict) else {}
+        if isinstance(s.get("refs"), list):
+            out.extend(s["refs"])
+        f = fields[i] if i < len(fields) and isinstance(fields[i], dict) else {}
+        if isinstance(f.get("refs"), list):
+            out.extend(f["refs"])
+        return out
+
+    def tail_at(i):
+        s = segs[i] if i < len(segs) and isinstance(segs[i], dict) else {}
+        f = fields[i] if i < len(fields) and isinstance(fields[i], dict) else {}
+        for src in (s, f):
+            ts = src.get("tail_src")
+            if isinstance(ts, dict) and ts.get("asset"):
+                return ts["asset"]
+        return ""
+
     prompts = manifest.get("prompts") or []
     segs = manifest.get("segments") or []
-    n = max(len(prompts), len(segs))
+    fields = manifest.get("seg_fields") or []
+    n = max(len(prompts), len(segs), len(fields))
     for i in range(n):
-        seg = segs[i] if i < len(segs) and isinstance(segs[i], dict) else {}
-        for r in seg.get("refs") or []:
+        for r in refs_at(i):
             key = (r.get("asset") or r.get("id") or r.get("label")) if isinstance(r, dict) else r
             touch(key, i + 1)
+        ts = tail_at(i)
+        if ts:
+            touch(ts, i + 1)
         txt = str(prompts[i] if i < len(prompts) else "")
         for lbl in (_REF_BRACKET.findall(txt) + _REF_AT.findall(txt)):
             touch(lbl, i + 1)
-        ts = seg.get("tail_src")
-        if isinstance(ts, dict) and ts.get("asset"):
-            touch(ts["asset"], i + 1)
 
     for e in items:
         for role in e.get("roles") or []:
@@ -707,6 +731,31 @@ def mirror_to_project(project, item, label=None) -> dict:
     if out is None:
         raise ValueError("写入项目清单失败")
     return {"file": rel, "label": lbl, "kind": kind, "revision": out.get("revision")}
+
+
+def store_to_finals(project, src_abs, name=None) -> dict:
+    """把文件拷进项目 finals/（成片库）：同名加 _2 不覆盖，返回 {file, name}。
+
+    上传落点为「成片」时用：成片库是目录扫描型（不走 manifest），拷进去即可见。
+    """
+    proj = str(project or "").strip()
+    if (not proj or proj.startswith(".") or ".." in proj
+            or "/" in proj or "\\" in proj or ":" in proj):
+        raise ValueError("无效的项目目录名")
+    if not src_abs or not os.path.isfile(src_abs):
+        raise ValueError("源文件不存在（入库后的全局库文件缺失）")
+    d = os.path.join(_project_root(proj), "finals")
+    os.makedirs(d, exist_ok=True)
+    want = str(name or os.path.basename(src_abs)).replace("\\", "/").split("/")[-1]
+    if not safe_rel(want) or "/" in want or not os.path.splitext(want)[1]:
+        want = os.path.basename(src_abs)
+    stem, ext = os.path.splitext(want)
+    cand, k = want, 2
+    while os.path.exists(os.path.join(d, cand)):
+        cand = f"{stem}_{k}{ext}"
+        k += 1
+    shutil.copy2(src_abs, os.path.join(d, cand))
+    return {"file": f"finals/{cand}", "name": cand}
 
 
 def resolve_item_path(item, project=None) -> str:

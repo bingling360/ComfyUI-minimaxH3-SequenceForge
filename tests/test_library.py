@@ -185,6 +185,21 @@ def test_compute_refs(proj):
     assert bg["refs"] == [2]          # 来自段 refs
 
 
+def test_compute_refs_reads_seg_fields(proj):
+    """导演台回写的 refs 落在 seg_fields（不是运行期的 segments）—— 两处都要算，
+    否则「段卡勾了引用、素材库却显示没被引用」。"""
+    items = L.build_index(proj)
+    mf = {
+        "assets": [{"label": "girl", "file": "assets/girl.png", "kind": "image"}],
+        "prompts": ["开场", "继续", "收尾"],
+        "seg_fields": [{"refs": []}, {"refs": ["girl"]}, {"refs": ["girl"]}],
+    }
+    L.apply_aliases(items, mf)
+    L.compute_refs(mf, items)
+    girl = [e for e in items if e["name"] == "girl"][0]
+    assert girl["refs"] == [2, 3]
+
+
 def test_apply_roles(proj):
     items = L.build_index(proj)
     mf = {"assets": [{"label": "女主", "file": "assets/girl.png",
@@ -266,6 +281,28 @@ def test_mirror_to_project(proj, tmp_path, monkeypatch):
     item2 = dict(item, file="images/nope.png")
     with pytest.raises(ValueError):
         L.mirror_to_project("demo", item2)
+
+
+def test_store_to_finals(proj, tmp_path):
+    """上传落点=成片：拷进 finals/（目录扫描即见），同名不覆盖。"""
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"video")
+    r = L.store_to_finals(proj, str(src), "成片.mp4")
+    assert r["file"] == "finals/成片.mp4"
+    dst = tmp_path / "h3_projects" / "demo" / "finals" / "成片.mp4"
+    assert dst.is_file()
+    # 同名再加 _2，不覆盖
+    src.write_bytes(b"video2")
+    r2 = L.store_to_finals(proj, str(src), "成片.mp4")
+    assert r2["file"] == "finals/成片_2.mp4"
+    assert dst.read_bytes() == b"video"
+    # 非法项目名 / 缺源文件
+    with pytest.raises(ValueError):
+        L.store_to_finals("", str(src))
+    with pytest.raises(ValueError):
+        L.store_to_finals(proj, str(tmp_path / "nope.mp4"))
+    # 成片 scope 立即可见
+    assert "finals/成片.mp4" in [e["file"] for e in L.scan_scope("finals", proj)]
 
 
 def test_invalidate(proj):

@@ -119,8 +119,8 @@ def check_segment_refs(items: list, refs: list, seg_no: int = 1) -> list:
     by_label = {a["label"]: a for a in items}
     errors = []
     order = []
-    for r in refs or []:
-        lbl = str(r).strip()
+    # 同一标签重复引用只算一个素材（编号/上限按素材个数算，重复=正文里多写一次）
+    for lbl in dict.fromkeys(str(r).strip() for r in refs or []):
         if lbl not in by_label:
             errors.append({"code": "E_REF_UNKNOWN",
                            "message": f"段{seg_no} 引用未知标签「{lbl}」"})

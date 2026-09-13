@@ -88,6 +88,36 @@ def checkpoint():
     return _load_top("checkpoint", os.path.join(ROOT, "checkpoint.py"))
 
 
+@pytest.fixture(scope="session")
+def hub():
+    return _load_top("asset_hub", os.path.join(ROOT, "asset_hub.py"))
+
+
+# ---- 重复引用（同一素材在一段里引用多次） ----
+
+def test_compile_refs_repeat_dedupes_token(store):
+    """refs 里同一素材出现多次：只占一个编号，不新开 <Picture k>。"""
+    reg = store.build_registry(None, None, [
+        {"label": "女主", "kind": "image", "file": "assets/a.png"},
+        {"label": "背景", "kind": "image", "file": "assets/b.png"},
+    ])
+    r = store.compile_refs(reg, ["女主", "女主", "背景", "女主"])
+    assert r["ok"]
+    assert [b["token"] for b in r["blocks"]] == ["<Picture 1>", "<Picture 2>"]
+    assert r["tag_map"]["女主"] == "<Picture 1>"
+
+
+def test_check_segment_refs_repeat_not_over_limit(hub):
+    """重复引用不占素材个数：9 张图各引用多次仍算 9 个（不误报超限）。"""
+    items = [{"label": f"图{i}", "kind": "image", "file": f"assets/{i}.png"}
+             for i in range(9)]
+    refs = [f"图{i}" for i in range(9)] * 3          # 27 条引用，仍是 9 个素材
+    assert hub.check_segment_refs(items, refs, 1) == []
+    items10 = items + [{"label": "图9", "kind": "image", "file": "assets/9.png"}]
+    errs = hub.check_segment_refs(items10, [x["label"] for x in items10], 1)
+    assert errs and errs[0]["code"] == "E_MEDIA_LIMIT"
+
+
 # ---- 迁移 ----
 
 def test_legacy_migrate_stable_and_dedupe(store):

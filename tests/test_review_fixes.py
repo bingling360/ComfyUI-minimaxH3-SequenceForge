@@ -207,5 +207,8 @@ def test_staged_unique_name():
 def test_roles_sync_points():
     d = _director_src()
     # roles 透传（getDs 读 / setDs 写）——旧三库面板下线后仍在
-    assert "roles: Array.isArray(a.roles) ? a.roles.filter(" in d
-    assert "roles: Array.isArray(L.roles) ? L.roles.filter(" in d
+    assert "roles: Array.isArray(a.roles)" in d
+    assert 'r === "首帧图" || r === "尾帧图"' in d
+    # 切项目 / 池子 hydration 共用同一个构造函数，roles 归一在其中（_rolesOf）
+    assert "function poolFromManifest(mf, links)" in d
+    assert "_rolesOf(a.roles)" in d and "_rolesOf(L && L.roles)" in d

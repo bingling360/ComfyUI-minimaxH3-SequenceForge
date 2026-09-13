@@ -365,9 +365,24 @@ def _clean_seg_field(raw) -> dict | None:
     out["disabled"] = (not auto_seq) if auto_seq is not None else bool(raw.get("disabled"))
     out["auto_ref"] = auto_ref
     out["auto_seq"] = auto_seq
+    # 段引用允许重复（同一素材在一段内引用 N 次 = 正文里写 N 次 @别名），
+    # 上限按去重后的素材个数算（见 nodes 组装期），这里原样保留重复项。
     refs = raw.get("refs")
     out["refs"] = [str(x) for x in refs if isinstance(x, (str, int))][:64] \
         if isinstance(refs, list) else []
+    # 段级首尾帧参考图（提示词框「首帧图/尾帧图」按钮选的项目内图片）：
+    # 只留 {first,end} 两个相对路径键，防穿越
+    fi = raw.get("frame_img")
+    if isinstance(fi, dict):
+        keep = {}
+        for k in ("first", "end"):
+            parts = [p for p in str(fi.get(k) or "").replace("\\", "/").split("/")
+                     if p and p != "."]
+            if parts and len(parts) <= 2 and ".." not in parts \
+                    and not any((":" in p) or p.startswith(".") for p in parts):
+                keep[k] = "/".join(parts)
+        if keep:
+            out["frame_img"] = keep
     fr = raw.get("frame_refs")
     out["frame_refs"] = [str(x) for x in fr if isinstance(x, (str, int))][:4] \
         if isinstance(fr, list) else None

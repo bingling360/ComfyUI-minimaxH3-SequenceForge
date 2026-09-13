@@ -124,7 +124,8 @@
     return res.body;
   }
 
-  // 上传即入库（单次往返）：file + kind + link_dir/alias → {entry, manifest, alias}
+  // 上传即入库（单次往返）：file + kind + dest/link_dir/alias → {entry, manifest, alias}
+  // dest: global（只进全局库）| project（+ 项目 assets/ 并登记）| finals（+ 项目 finals/）
   async function uploadDirect(file, opts) {
     const H3Api = window.H3Api;
     if (!H3Api) throw new Error("H3Api 未加载");
@@ -135,6 +136,7 @@
     if (o.kind) fd.append("kind", o.kind);
     if (o.tags) fd.append("tags", o.tags);
     if (o.desc) fd.append("desc", o.desc);
+    if (o.dest) fd.append("dest", o.dest);
     if (o.link_dir) fd.append("link_dir", o.link_dir);
     if (o.alias) fd.append("alias", o.alias);
     if (o.mirror) fd.append("mirror", "1");

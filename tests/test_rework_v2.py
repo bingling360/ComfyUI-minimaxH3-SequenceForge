@@ -386,12 +386,18 @@ def test_v2_section_wired():
 
 
 def test_transcode_jobs_normalized():
+    """内联转码 UI 已按设计下线（见 test_frontend_p3::test_director_no_inline_transcode）。
+
+    保留此用例是为了钉死「不再回潮」：getDs 不得再归一化 transcode_jobs，
+    后台任务区/转码子面板也不得再出现。后端 latent_tools/nodes 仍支持，
+    但前端只做引用与打标，不再内联跑转码。
+    """
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
-    # getDs 必须白名单归一化 transcode_jobs（畸形条目丢弃，防脏数据常驻 widget）
-    assert "transcode_jobs: (Array.isArray(raw.transcode_jobs)" in d
-    assert '.slice(0, 32)' in d
-    for branch in ['"图像+音频"', '"仅图像"', '"仅音频"']:
-        assert branch in d
+    for gone in ["transcode_jobs", "renderServerJobs", "renderTranscodeJobs", "h3d-jstat"]:
+        assert gone not in d, gone
+    # 转码分支口径仍在后端生效（latent_tools/routes/nodes）
+    lt = open(os.path.join(ROOT, "latent_tools.py"), encoding="utf-8").read()
+    assert '分支="图像+音频"' in lt
 
 
 def test_expander_offline():
@@ -422,14 +428,47 @@ def test_v2_group_form_wired():
     assert "function setPromptV2Field(node, idx, mutate" in d
     assert "function debouncePromptV2Write" in d
     assert "function getSegPromptV2" in d
-    # 五组中文标题齐全（官方字段名口径）
+    # 四组中文标题齐全（官方字段名口径）；源码覆盖已迁出到主框结果区
     for g in ["画面 · 风格/构图/环境/光照/角色/道具", "镜头 ×", "声音 · overall_soundscape",
-              "参考 · subject_definitions", "高级 · 源码覆盖"]:
+              "参考 · subject_definitions"]:
         assert g in d, g
-    # 五模式：模式选择 + 手动覆写 + 对齐指令预览 + 编译透传 mode
+    assert "高级 · 源码覆盖" not in d, "源码覆盖应已移除"
+    assert "源码覆盖 · 直接改写最终结果" not in d, "源码覆盖应已彻底移除"
+    assert "清除覆盖" in d, "残留 override_text 应可一键清除"
+    # 模式改为按本段数据自动判定（不再给手动下拉），符号保留供兼容；编译仍透传 mode
     for sym in ["V2_MODES", "effV2Mode", "defaultV2Mode", "setV2Mode",
                 "v2InstrPreview", "v2mode", "assignV2FromText"]:
         assert sym in d or sym in p, sym
+    # 具象化精简：画面合并为 visual 单框；每镜低频项收进「更多」
+    for sym in ["pv0.visual", '"visual"', "更多 · 换镜时间"]:
+        assert sym in d, sym
+    # 主框三段式：①中文意图 → ②剧本 → ③结果（只有 ③ 进模型）
+    for sym in ["① 中文意图（不进模型 · 可用 @素材）", "② 剧本（扩写产物 · 可手工改）",
+                "③ 结果（最终进模型）", "同步到具象化", "← 从具象化同步",
+                "✨ 提示词优化 → 结果"]:
+        assert sym in d, sym
+    assert "gMore.append(gMoreBody)" in d, "镜头「更多」内容没挂进 details"
+    # 复位后开合状态要记下来（否则加对白/重建会被 details 默认收起打断）
+    assert "const _v2Open = new Map();" in d, "缺 details 开合记忆"
+    assert 'function v2Details(key, cls, summaryHtml, defOpen)' in d, "缺 v2Details 工厂"
+    assert '_v2Open.set(key, g.open)' in d, "toggle 未记录开合"
+    for k in ["v2${segIdx}", "pic${segIdx}", "shot${segIdx}", "snd${segIdx}", "ref${segIdx}",
+              "more${segIdx}_${si}"]:
+        assert k in d, k
+    # 重建只在会丢东西时才问（否则 confirm 抢焦点导致输入框卡住）
+    assert "hasNote" in d and "按当前素材调度重建引用列表" in d, "重建应改为条件确认"
+    # 模式必须按本段数据自动判定，不能写死
+    for m in ['"T2VA"', '"I2VA"', '"L2VA"', '"FL2VA"']:
+        assert "return " + m + ";" in d, "defaultV2Mode 缺分支 " + m
+    assert "未检测到首帧/尾帧图" in d, "无锚时应给说明而非报错"
+    assert "需要首帧图＋尾帧图" not in d, "旧的强制文案应移除"
+    # 素材调度 ⇄ 官方引用双向同步（否则前后端模式判定打架）
+    assert "function v2RefsFromSchedule(" in d
+    assert "function syncV2RefsFromSchedule(" in d
+    assert "syncV2RefsFromSchedule(node, idx);" in d
+    assert "const want = v2RefsFromSchedule(data.ds, segIdx);" in d
+    for t in ["<Picture ", "<Video ", "<Audio "]:
+        assert t in d, t
     # 中文显示 ⇄ 英文存储：运镜/说话人/语言/任务类型映射齐全
     for sym in ["V2_CAM_ZH", "V2_AMP_ZH", "V2_SPD_ZH", "V2_TASK_ZH", "V2_MARKER_ZH",
                 "zhSpeaker", "enSpeaker", "zhLang", "enLang", "zhTasks", "enTasks", "mkMapSel"]:
@@ -513,8 +552,8 @@ def test_segment_tabs_and_optimizer_ui():
     assert "segMediaInfo" in d and "openSegViewer" in d and "h3d-viewer" in d
     assert "▶ 预览" in d
     assert "grid-template-columns:minmax(0,1fr)" in d
-    # 双写同步
-    assert "同步到主框" in d and "从v2同步" in d
+    # 双写同步（具象化 ⇄ 结果框，文案已统一为「具象化」）
+    assert "同步到主框" in d and "从具象化同步" in d and "同步到具象化" in d
     # AI优化条（自研后端）
     for sym in ["paintOptbar", "runOptForSegment", "openOptSettings", "opt_hist",
                 "optimizer-config", "/h3chain/optimize"]:

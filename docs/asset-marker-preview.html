@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>素材标识预览 · H3 导演台</title>
+<style>
+  :root{
+    --h3d-bone:#d6d3cc; --h3d-muted:#8b8578;
+    --bg:#1c1b18; --panel:#20262e; --panel2:#181712; --line:#37332b; --line2:#3a352c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:26px 30px 60px;background:var(--bg);color:var(--h3d-bone);
+       font:13px/1.7 "Microsoft YaHei UI","Segoe UI",system-ui,sans-serif}
+  h1{font-size:16px;margin:0 0 4px;letter-spacing:.4px}
+  .sub{color:var(--h3d-muted);font-size:12px;margin-bottom:22px}
+  h2{font-size:13px;margin:26px 0 10px;color:#c9c4ba;font-weight:700}
+  h2 span{color:var(--h3d-muted);font-weight:400;font-size:11.5px;margin-left:8px}
+  .card{border:1px solid #444c56;border-radius:8px;background:var(--panel);padding:12px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .cap{color:var(--h3d-muted);font-size:11px;margin-bottom:5px}
+  code{color:#9fd6b8;font:11.5px ui-monospace,Consolas;background:#0000;padding:0}
+  .note{color:var(--h3d-muted);font-size:11.5px;margin-top:6px}
+  .old{opacity:.55;text-decoration:line-through}
+  .del{color:#f0a0a4}
+
+  /* ===== 以下 CSS 与 web/h3_director.js 内 <style> 保持一致（改动请两边同步） ===== */
+  .h3d-rta{display:block;min-height:84px;padding:8px 9px;border:1px solid #444c56;border-radius:6px;
+           background:#2d333b;white-space:pre-wrap;word-break:break-word;font:12.5px/1.65 "Microsoft YaHei UI","Segoe UI",sans-serif}
+  .h3d-rtag{display:inline-flex;align-items:center;gap:4px;margin:0 2px;padding:0 3px 0 4px;border:1px solid #2f6e57;
+            border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;vertical-align:baseline}
+  .h3d-rtag>.h3d-thumb{width:15px;height:15px;border-radius:5px;object-fit:cover;background:#0d0c0a;flex:none;pointer-events:none;outline:1px solid #2f6e5799;outline-offset:-1px}
+  .h3d-rtag>.h3d-kindmark{font-size:12px;line-height:1;flex:none;pointer-events:none;opacity:.95}
+  .h3d-rtagx{display:inline-block;padding:0 5px;border-radius:9px;background:transparent;color:#7fe0b0cc;cursor:pointer;font-size:10.5px;line-height:1.6}
+
+  .h3d-refrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:7px 8px;border:1px solid #37332b;border-radius:7px;background:#181712}
+  .h3d-refchip{display:inline-flex;gap:5px;align-items:center;padding:3px 8px 3px 3px;border:1px solid #3a352c;border-radius:12px;background:#25221c;color:#a8a294;cursor:pointer;font-size:11px;font-family:inherit}
+  .h3d-refchip.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+  .h3d-refchip .h3d-thumb{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
+  .h3d-refchip.on .h3d-thumb{outline-color:#2f6e57}
+  .h3d-secs-hint{color:var(--h3d-muted);font:10px ui-monospace,Consolas;white-space:nowrap}
+
+  .h3d-chipbtn{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 3px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit;max-width:240px}
+  .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+  .h3d-chipbtn>.h3d-thumb{width:18px;height:18px;border-radius:7px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
+  .h3d-chipbtn.on>.h3d-thumb{outline-color:#2f6e57}
+  .h3d-chipbtn>.h3d-kindmark{font-size:14px;line-height:1;flex:none;padding:0 1px}
+  .h3d-chipbtn-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+  .h3d-chipminus{padding:2px 6px;margin-left:-3px;border:1px solid #3a352c;border-radius:9px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;line-height:1;font-family:inherit}
+  .h3d-kindmark{font-size:12px;line-height:1}
+</style>
+</head>
+<body>
+
+<h1>素材标识预览</h1>
+<div class="sub">离线对照页 —— CSS 与 <code>web/h3_director.js</code> 的 <code>&lt;style&gt;</code> 逐条对齐，改样式时两边一起改。<br>
+缩略图是占位图；真实环境里图片/视频首帧由素材本身渲染，音频固定是音符图标。</div>
+
+<h2>① 提示词正文里的绿框 <span>图=缩略图 · 视频=首帧 · 音频=音符</span></h2>
+<div class="card">
+  <div class="cap">一段正文（绿框是原子节点，退格整块删；末尾 ✕ 只取消这一处引用）</div>
+  <div class="h3d-rta"><span class="h3d-rtag"><img class="h3d-thumb" alt=""
+      src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60'><rect width='60' height='60' fill='%231e3b52'/><circle cx='42' cy='18' r='9' fill='%23f2d38a'/><path d='M0 46 L20 28 L34 40 L48 26 L60 38 L60 60 L0 60 Z' fill='%233f6f57'/></svg>">女主<span class="h3d-rtagx">✕</span></span>站在窗前，镜头缓推。<br>
+  <span class="h3d-rtag"><img class="h3d-thumb" alt=""
+      src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60'><rect width='60' height='60' fill='%234a2f52'/><polygon points='24,18 24,42 44,30' fill='%23ffffff'/></svg>">雨夜街景<span class="h3d-rtagx">✕</span></span>的运镜与上一段衔接。<br>
+  <span class="h3d-rtag"><span class="h3d-kindmark">🎵</span>主题曲<span class="h3d-rtagx">✕</span></span>作为背景音乐铺底。</div>
+  <div class="note">对比：<span class="old">@女主</span> <span class="old">@雨夜街景</span> <span class="old">@主题曲</span>
+  —— 旧写法是纯文本 <code>@别名</code>，三类完全同款，且与正文的其它字混在一起；现在三类一眼可分。<br>
+  注意：<code>@</code> 在 <b>序列化文本</b> 里仍然保留（后端 <code>compile_refs</code> 靠它编译成
+  <code>&lt;Picture k&gt;/&lt;Video k&gt;/&lt;Audio k&gt;</code>），只是不再画到用户眼前。</div>
+</div>
+
+<h2>② 引用条上的 chip <span>已勾选 = 绿底 ✓</span></h2>
+<div class="card">
+  <div class="h3d-refrow">
+    <button class="h3d-chipbtn on"><img class="h3d-thumb" alt=""
+      src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60'><rect width='60' height='60' fill='%231e3b52'/><circle cx='42' cy='18' r='9' fill='%23f2d38a'/><path d='M0 46 L20 28 L34 40 L48 26 L60 38 L60 60 L0 60 Z' fill='%233f6f57'/></svg>"><span class="h3d-chipbtn-text">✓ 女主【人物】</span></button>
+    <button class="h3d-chipbtn on"><img class="h3d-thumb" alt=""
+      src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60'><rect width='60' height='60' fill='%234a2f52'/><polygon points='24,18 24,42 44,30' fill='%23ffffff'/></svg>"><span class="h3d-chipbtn-text">✓ 雨夜街景 ×2</span></button>
+    <button class="h3d-chipbtn"><span class="h3d-kindmark">🎵</span><span class="h3d-chipbtn-text">＋ 主题曲</span></button>
+    <span class="h3d-chipminus">✕</span>
+  </div>
+  <div class="note">未勾选是暗底「＋ 名字」，勾选后转绿底「✓ 名字」；同名多次引用显示 <code>×N</code>。</div>
+</div>
+
+<h2>③ 分段素材调度 chip <span>同一套标识，尺寸略大</span></h2>
+<div class="card">
+  <div class="h3d-refrow">
+    <button class="h3d-refchip on"><img class="h3d-thumb" alt=""
+      src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60'><rect width='60' height='60' fill='%232f4a3a'/><rect x='10' y='12' width='40' height='26' fill='%23a8d8bd'/><rect x='18' y='44' width='24' height='6' fill='%23a8d8bd'/></svg>">海报板</button>
+    <button class="h3d-refchip"><span class="h3d-kindmark">🎵</span>主题曲</button>
+    <span class="h3d-secs-hint">图1/9 视0/3 音1/3</span>
+  </div>
+  <div class="note">音频没有画面，所以三类里只有它保留图标（🎵）；图片和视频一律给缩略图。</div>
+</div>
+
+<h2>④ 兜底行为 <span>取不到预览地址时绝不生成错图</span></h2>
+<div class="card">
+  <div class="row">
+    <span class="cap" style="margin:0">全局库路径但拿不到 asset_id →</span>
+    <span class="h3d-rtag"><span class="h3d-kindmark">🎞</span>某视频<span class="h3d-rtagx">✕</span></span>
+    <span class="h3d-rtag"><span class="h3d-kindmark">🖼</span>某图片<span class="h3d-rtagx">✕</span></span>
+    <span class="h3d-rtag"><span class="h3d-kindmark">🎵</span>某音频<span class="h3d-rtagx">✕</span></span>
+  </div>
+  <div class="note">旧实现在这种情况下会回落到 input 目录拼路径 → 缩略图张冠李戴（就是"缩略图跟原素材不匹配"）。<br>
+  现在一律换成类别图标（🖼/🎞/🎵），宁可没有缩略图，也不显示别人的图。</div>
+</div>
+
+</body>
+</html>

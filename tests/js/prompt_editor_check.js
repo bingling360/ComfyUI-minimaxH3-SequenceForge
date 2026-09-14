@@ -48,11 +48,29 @@ function extractDecl(name, open, close) {
     throw new Error("括号不配平 " + name);
 }
 
+/** 抓单行 const（正则常量等）——从源码原样取，避免测试与实现脱节。 */
+function extractConstLine(name) {
+    const re = new RegExp("^const " + name + " = .*$", "m");
+    const m = re.exec(src);
+    if (!m) throw new Error("未找到常量 " + name);
+    return m[0];
+}
+
 const code = [
     extractDecl("KIND_CAPS", "{", "}"),
     extractDecl("KIND_NAME", "{", "}"),
+    extractDecl("KIND_ICON", "{", "}"),
+    extractDecl("KIND_TOKEN", "{", "}"),
     "const REF_REPEAT_MAX = 9;",
     extractDecl("REF_TEMPLATES", "[", "]"),
+    extractConstLine("_CHIP_EXT_RE"),
+    extractFn("chipLabelText"),
+    extractConstLine("_LIB_REL_RE"),
+    extractFn("viewUrl"),
+    extractFn("inputViewUrl"),
+    extractFn("assetPreviewUrl"),
+    extractFn("buildAssetThumb"),
+    extractFn("thumbSig"),
     extractFn("refsFromText"),
     extractFn("createPromptEditor"),
     extractFn("syncRefsFromText"),
@@ -88,7 +106,7 @@ const make = new Function("window", "document", "Event", "alert", "getDs", "setD
     "cancelPromptWrite", "schedulePromptFlush", "scheduleRefresh", "setLed",
     code + "\nreturn { createPromptEditor, canAddRef, addSegmentRef, removeSegmentRef," +
     " applyPromptEdit, applyRefAnchorToV2, syncRefsFromText, refsFromText, refCount," +
-    " REF_TEMPLATES };");
+    " REF_TEMPLATES, KIND_ICON, thumbSig };");
 const M = make(window, window.document, window.Event, alert, getDs, setDs,
     cancelPromptWrite, schedulePromptFlush, scheduleRefresh, setLed);
 
@@ -238,6 +256,33 @@ ta5.removeOneTag(ta5.el.querySelector(".h3d-rtag"));
 eq(ta5.tagCount("阿依"), 1, "removeOneTag 只取一处");
 ta5.removeTag("阿依");
 eq(ta5.tagCount("阿依"), 0, "removeTag 清全部");
+
+/* ⑭ 绿框标识跟活数据走（本轮新增）：素材在库里换类别/换文件后 redrawIcons() 要换掉
+ * 标识节点；且必须**幂等** —— 签名没变时不能重建节点（卡片轻量重绘会反复调它，
+ * 每次都重建 <video> 会让首帧反复重解码）。 */
+let liveInfo = { 素材: { kind: "image", file: "assets/x.png", asset_id: "" } };
+const ta6 = M.createPromptEditor({
+    value: "@素材 出现",
+    labels: () => Object.keys(liveInfo),
+    assets: () => liveInfo,
+    dir: () => "proj1",
+    onRemove: () => {},
+});
+window.document.body.append(ta6.el);
+const tag6 = ta6.el.querySelector(".h3d-rtag");
+eq(tag6.querySelector(":scope > .h3d-thumb").tagName, "IMG", "初始图片绿框给 img 缩略图");
+const nodeBefore = tag6.querySelector(":scope > .h3d-thumb");
+ta6.redrawIcons();
+eq(tag6.querySelector(":scope > .h3d-thumb"), nodeBefore, "签名没变：redrawIcons 不重建节点（幂等）");
+
+liveInfo = { 素材: { kind: "audio", file: "assets/x.wav", asset_id: "" } };   // 库里改成音频
+ta6.redrawIcons();
+eq(tag6.querySelector(":scope > .h3d-thumb"), null, "换类别后旧 img 应被摘掉");
+const mk6 = tag6.querySelector(":scope > .h3d-kindmark");
+ok(!!mk6, "换类别后应换成类别图标");
+eq(mk6 && mk6.textContent, M.KIND_ICON.audio, "音频类别图标=音符");
+eq(tag6.dataset.label, "素材", "redrawIcons 不得动 dataset.label（序列化口径不变）");
+eq(ta6.value, "@素材 出现", "redrawIcons 不得动正文文本");
 
 if (fails.length) {
     console.error("FAIL:\n - " + fails.join("\n - "));

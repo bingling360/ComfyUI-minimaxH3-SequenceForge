@@ -69,7 +69,10 @@ def default_shot(index=1):
 
 
 def default_prompt():
-    return {"intent_zh": "", "medium_style": "", "composition": "",
+    """visual = 画面整述（导演台合并框：风格/构图/环境/光照/角色/道具写在一处）。
+
+    有值时优先于下面六个分立字段；六个旧字段保留只为兼容旧存档，界面已不再暴露。"""
+    return {"intent_zh": "", "visual": "", "medium_style": "", "composition": "",
             "environment": "", "lighting": "", "characters": "", "props": "",
             "shots": [default_shot(1)], "diegetic_music": "", "soundscape": "",
             "non_diegetic_music": "", "references": [], "subjects": [],
@@ -81,7 +84,7 @@ def clean_prompt(raw):
     out = default_prompt()
     if not isinstance(raw, dict):
         return out
-    for k in ("intent_zh", "medium_style", "composition", "environment", "lighting",
+    for k in ("intent_zh", "visual", "medium_style", "composition", "environment", "lighting",
               "characters", "props", "diegetic_music", "soundscape",
               "non_diegetic_music", "summary_override"):
         out[k] = _s(raw.get(k))[:2000] if isinstance(raw.get(k), str) else ""
@@ -259,10 +262,12 @@ def compose_description(prompt, *, instruction_lines=(), duration=None):
     shots = prompt.get("shots") or []
     if not shots:
         return "\n".join(instruction_lines) if instruction_lines else ""
-    scene = " ".join(x for x in (_sentence(v) for v in (
-        prompt.get("medium_style"), prompt.get("composition"),
-        prompt.get("environment"), prompt.get("lighting"),
-        prompt.get("characters"), prompt.get("props"))) if x)
+    scene = _s(prompt.get("visual")).strip()
+    if not scene:
+        scene = " ".join(x for x in (_sentence(v) for v in (
+            prompt.get("medium_style"), prompt.get("composition"),
+            prompt.get("environment"), prompt.get("lighting"),
+            prompt.get("characters"), prompt.get("props"))) if x)
     times = [0.0] + [s.get("start_seconds") for s in shots[1:]]
     if any(t is None for t in times[1:]):
         gap = (duration or float(len(shots))) / max(1, len(shots))

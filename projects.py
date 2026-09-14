@@ -335,7 +335,10 @@ def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
     return manifest
 
 
-_SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music")
+# intent_zh 是段级中文意图：主框上半区输入，不进模型，只给人和 AI 扩写看。
+# 结果稿仍是 prompts[idx]，后端取值链路不变。
+_SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music",
+                   "intent_zh", "script")
 
 
 def _clean_seg_field(raw) -> dict | None:

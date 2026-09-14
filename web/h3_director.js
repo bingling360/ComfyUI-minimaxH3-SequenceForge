@@ -309,6 +309,22 @@ function cleanLabel(text) {
     return String(text ?? "").trim().replace(/[[\]]/g, "").slice(0, 24);
 }
 
+/** 纯展示用：把标签里夹带的「(.png|.jpg|.mp4|.wav|.webp…)」格式后缀去掉。
+ *  别名落库时本来就只截 stem（store_to_project / move_media 等都会去后缀），
+ *  但偶尔老 manifest 里有从旧版保留下来的「标签.扩展」式数据；Electron 桌面端
+ *  把原文件名拖进上传框时，偶尔会把扩展名带进来。这一层只在**显示**剥掉，原
+ *  文不动，避免改坏后端的别名命名空间（lookup 仍按原 alias 走）。
+ *
+ *  白名单常见音视/图像格式扩展（不区分大小写）：图片 png/jpg/jpeg/gif/webp/bmp/
+ *  tiff/heic；视频 mp4/mov/webm/mkv/avi/wmv/flv/m4v；音频 wav/mp3/ogg/flac/
+ *  m4a/aac/opus。其它（如「v1.0」「1.0」「2.5」）一律不动。 */
+const _CHIP_EXT_RE = /\.(png|jpg|jpeg|gif|webp|bmp|tiff|heic|mp4|mov|webm|mkv|avi|wmv|flv|m4v|wav|mp3|ogg|flac|m4a|aac|opus)$/i;
+function chipLabelText(s) {
+    const t = String(s == null ? "" : s).trim();
+    if (!t) return "";
+    return t.replace(_CHIP_EXT_RE, "").trim() || t;
+}
+
 function uniqueLabelFrom(taken, base) {
     if (!taken.has(base)) return base;
     let n = 2;
@@ -349,6 +365,12 @@ function createPromptEditor(opts) {
     box.spellcheck = false;
     const labelsOf = () => (typeof o.labels === "function" ? o.labels() : (o.labels || []))
         .map(String).filter(Boolean);
+    /* 别名 -> 素材信息 {kind, file, asset_id}：绿框要按它挑缩略图/图标。
+     * 没有就给空对象，makeTag 兜底为 image。pool 改变时这块也要保持"活的"
+     * ——同样读 getDs(node).ref_assets，不能用建卡那一刻的快照。
+     * （早期版本只传 kind，够挑图标但不够拼缩略图地址。） */
+    const infoOf = () => (typeof o.assets === "function" ? o.assets() : (o.assets || {})) || {};
+    const dirOf = () => (typeof o.dir === "function" ? o.dir() : (o.dir || "")) || "";
 
     /* —— 序列化：DOM → 纯文本（绿框还原成 @别名；块级换行补 \n） —— */
     function ser(node) {
@@ -373,7 +395,21 @@ function createPromptEditor(opts) {
         sp.title = `@${label}：本段引用的素材（编译为官方 <Picture/Video/Audio k>）`
             + "\n右侧 ✕ = 只取消**这一处**引用（同一素材引用 N 次就点 N 下，一次少一处）；"
             + "要一次清掉本段对它的全部引用，用引用条上 chip 旁边的 ✕。";
-        sp.append(document.createTextNode("@" + label));
+        /* 视觉上用「缩略图/类别图标 + 别名」替代原本的 `@别名`：@ 是 prompt 文本的
+         * 语法标记（序列化时仍然由 ser() 在前面补 `@`，落到 ds.prompts 仍是
+         * `@alias`），但在一个"看起来就是标签"的盒子里再写一遍 `@` 既冗余又占地方。
+         * 图/视给缩略图（视频=浏览器首帧），音频给音符，一眼能分三类。 */
+        const info = infoOf()[label] || {};
+        const ainfo = {
+            kind: String(info.kind || "image"),
+            file: String(info.file || ""),
+            asset_id: String(info.asset_id || ""),
+        };
+        sp.dataset.thumbSig = thumbSig(ainfo);
+        sp.append(buildAssetThumb(dirOf(), ainfo));
+        /* 显示剥掉夹带的格式后缀（chipLabelText）：dataset.label 保持原值，
+         * 序列化/匹配仍按原别名走，只是不把 ".png" 摆到用户眼前。 */
+        sp.append(document.createTextNode(chipLabelText(label)));
         /* ✕ 用 span 而不是 <button>：contenteditable 内的交互元素在 Chromium 下
          * 行为不一致（button 的 click 有时被选区逻辑吃掉 → "点了没反应"）。
          * 直接吃 mousedown：不依赖 click 配对，也不会因为重绘换节点而丢事件。 */
@@ -643,6 +679,41 @@ function createPromptEditor(opts) {
         tagCount,
         normalizeLoose,
         setLabels(fn) { o.labels = fn; },
+        setAssets(fn) { o.assets = fn; },
+        setDir(fn) { o.dir = fn; },
+        /** 库里改了素材（换类别/换文件）后刷新绿框的缩略图/图标：保留焦点与光标，
+         * 只换标识节点，不动正文（dataset.label 与序列化文本都不变）。
+         * 幂等：签名（kind|file|asset_id）没变就整段跳过 —— 卡片轻量重绘会反复调它，
+         * 不设这个闸门的话每次重绘都要重建 <video>，首帧会反复重解码。 */
+        redrawIcons() {
+            try {
+                const had = box.contains(document.activeElement);
+                const at = had ? caret() : null;
+                let changed = 0;
+                for (const n of box.querySelectorAll(".h3d-rtag")) {
+                    const lb = n.dataset && n.dataset.label;
+                    if (!lb) continue;
+                    const info = infoOf()[lb] || {};
+                    const ainfo = {
+                        kind: String(info.kind || "image"),
+                        file: String(info.file || ""),
+                        asset_id: String(info.asset_id || ""),
+                    };
+                    const sig = thumbSig(ainfo);
+                    if (n.dataset.thumbSig === sig
+                        && n.querySelector(":scope > .h3d-thumb, :scope > .h3d-kindmark")) {
+                        continue;                        // 标识没变：不碰 DOM
+                    }
+                    const next = buildAssetThumb(dirOf(), ainfo);
+                    const cur = n.querySelector(":scope > .h3d-thumb, :scope > .h3d-kindmark");
+                    if (cur) cur.replaceWith(next);
+                    else n.prepend(next);
+                    n.dataset.thumbSig = sig;
+                    changed++;
+                }
+                if (had && at != null && changed) placeCaret(Math.min(at, ser(box).length));
+            } catch (e) { /* 失焦等边界态不影响主流程 */ }
+        },
     };
     /* 粘贴只收纯文本：防 HTML 注入 / 样式污染 */
     box.addEventListener("paste", (e) => {
@@ -987,7 +1058,11 @@ function defaultUpscale() {
 function defaultSegment() {
     // 双按钮（null=跟随全局默认开）：auto_ref=false≈旧unlink，auto_seq=false≈旧disabled；
     // latent_ref（null=跟随全局尾部N帧注入），latent_save（null=默认全存）。
-    return { scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, auto_ref: null, auto_seq: null, frame_refs: null, prompt_v2: null, latent_save: null, latent_ref: null, tail_src: null, v2mode: null };
+    /* 主框三段式（都**不进模型**，只有 ds.prompts[idx] 进模型）：
+     *   intent_zh = 中文意图（支持 @素材，给人和 AI 看）
+     *   script    = AI 扩写产物（官方格式剧本，可人工改）
+     * 与 prompt_v2.intent_zh 是两回事：后者是具象化内部字段。 */
+    return { intent_zh: "", script: "", scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, auto_ref: null, auto_seq: null, frame_refs: null, prompt_v2: null, latent_save: null, latent_ref: null, tail_src: null, v2mode: null };
 }
 
 function segAutoRef(seg) {
@@ -1433,8 +1508,10 @@ function applyRefAnchorToV2(node, idx, label, tplDef, roles) {
 function toggleSegmentRef(node, idx, label) {
     const ds = getDs(node);
     const seg = (ds.segments || [])[idx];
-    if (seg && refCount(seg, label) > 0) return removeSegmentRef(node, idx, label);
-    return addSegmentRef(node, idx, label);
+    const r = (seg && refCount(seg, label) > 0)
+        ? removeSegmentRef(node, idx, label)
+        : addSegmentRef(node, idx, label);
+    return r;
 }
 
 /** 勾选/取消本段的首尾帧图引用（仅首帧模式有首帧/尾帧图）。
@@ -2146,6 +2223,38 @@ function debouncePromptV2Write(node, idx, key, value) {
  * 默认跟随导演台：多参→Ref2VA，其余→FL2VA（无帧时 FL2VA 编译即退化为纯文本三字段，与 T2VA 等效）。
  * seg.v2mode = null 即自动（跟随），手动选定后存段级，随 ds 持久化。 */
 const V2_MODES = ["FL2VA", "Ref2VA"];
+
+/* details 开合状态记忆：卡片任何操作后都会全量重建 DOM，新建的 details 默认收起，
+ * 于是不记住开合就会表现为「点＋对白后莫名切走」「点完按钮面板自己合上」。
+ * key 带段号（必要时带镜号）避免不同段/镜互相串。 */
+const _v2Open = new Map();
+function v2Details(key, cls, summaryHtml, defOpen) {
+    const g = el("details", cls);
+    g.open = _v2Open.has(key) ? _v2Open.get(key) : !!defOpen;
+    g.innerHTML = `<summary>${summaryHtml}</summary>`;
+    g.addEventListener("toggle", () => _v2Open.set(key, g.open));
+    return g;
+}
+
+/** 由「分段素材调度」算出本段应有的官方引用标签（按 kind 分别编号 <Picture/Video/Audio k>）。 */
+function v2RefsFromSchedule(ds, segIdx) {
+    const seg = ((ds && ds.segments) || [])[segIdx] || {};
+    const pool = (ds && ds.ref_assets) || [];
+    const cnt = { image: 0, video: 0, audio: 0 };
+    const out = [];
+    for (const label of (seg.refs || [])) {
+        const a = pool.find((x) => x && (x.label === label || x.asset_id === label));
+        const kind = (a && KIND_LIST.includes(a.kind)) ? a.kind : "image";
+        cnt[kind] = (cnt[kind] || 0) + 1;
+        out.push({ label: `<${KIND_TOKEN[kind]} ${cnt[kind]}>`, src: label });
+    }
+    return out;
+}
+
+/* 注：这里**不**做 seg.refs → pv.references 的自动同步。
+ * 具象化是独立于主提示词的微调工具：它的引用只由它自己的参考组管理，
+ * 主框三栏（意图/剧本/结果）的引用不会写进来。想导入主框的调度结果，
+ * 用参考组里的「按素材调度重建」显式按钮——用户主动才发生。 */
 const V2_MODE_ZH = { FL2VA: "首尾帧", Ref2VA: "全参考" };
 const V2_TASK_TYPES = ["keyframe completion", "reference generation", "video editing",
     "video continuation", "audio reuse", "audio reference"];
@@ -2203,12 +2312,24 @@ function enTasks(str) {
 }
 
 function defaultV2Mode(ds, segIdx) {
-    // 去模式跟随：按本段实际引用自动判定（有勾选/文本@标签即 Ref2VA，否则 FL2VA）
+    /* 必须与后端 prompts.detect_mode 同口径，否则前端传过去的 mode 与后端
+     * 自动判定不一致，会多报一条 W_MODE_OVERRIDE 警告。
+     * 有参考/主体 → Ref2VA；否则按首尾帧**实际有无**分 FL2VA / I2VA / L2VA / T2VA。
+     * 不能一律给 FL2VA —— 文生视频、单首帧、单尾帧都是合法模式。 */
     const seg = (ds?.segments || [])[segIdx];
+    const pv = seg && typeof seg.prompt_v2 === "object" ? seg.prompt_v2 : null;
+    const nRefs = pv ? (pv.references || []).length + (pv.subjects || []).length : 0;
+    if (nRefs) return "Ref2VA";
     if (seg && Array.isArray(seg.refs) && seg.refs.length) return "Ref2VA";
     const txt = String(((ds?.prompts || [])[segIdx]) || "");
     if (/\[\[.+\]\]/.test(txt)) return "Ref2VA";
-    return "FL2VA";
+    const nP = (ds?.prompts || []).length;
+    const hasStart = !!ds?.first_frame && segIdx === 0;
+    const hasEnd = !!ds?.end_frame && segIdx === nP - 1;
+    if (hasStart && hasEnd) return "FL2VA";
+    if (hasStart) return "I2VA";
+    if (hasEnd) return "L2VA";
+    return "T2VA";
 }
 
 /** 本段生效模式：手动值合法即用，否则跟随导演台默认 */
@@ -2236,7 +2357,11 @@ function v2InstrPreview(mode, seconds, hasStart, hasEnd) {
     if ((mode === "L2VA" || mode === "FL2VA") && hasEnd)
         lines.push(`For the target video, at ${dur} seconds into the target video, <Picture 1> (from [Shot N]) is fully referenced.`);
     if (!lines.length) {
-        return "⚠ 首尾帧模式需要首帧图＋尾帧图：请先上传，否则编译校验会报错";
+        /* 不再是"必须上传首尾帧"：没有锚就按纯文本起片，这是合法模式。
+         * 上传后这里会自动补出对齐行。 */
+        return mode === "FL2VA"
+            ? "未检测到首帧/尾帧图，本次按纯文本起片（无对齐指令）；上传后自动补对齐行"
+            : "无对齐指令（本段没有可用的首尾帧锚，纯文本起片）";
     }
     return lines.join("\n");
 }
@@ -2363,9 +2488,12 @@ function optRestoreMaps(node, ds) {
     } catch (e) { /* 忽略 */ }
 }
 
-async function runOptForSegment(node, idx, ta, ui) {
+async function runOptForSegment(node, idx, ta, ui, srcTa) {
     if (_optBusy && _optBusy.node === node && _optBusy.idx === idx) return;
-    const before = ta ? ta.value : "";
+    /* srcTa = 优化源（② 剧本框）；缺省即用 ta（③ 结果框自身）。
+     * 结果只写回 ta，源保持不动，方便换参数反复重优化。 */
+    const src = srcTa || ta;
+    const before = src ? src.value : "";
     if (!before || !before.trim()) { alert("提示词为空，无需优化"); return; }
     let settings;
     try { settings = optGetSettings(node); }
@@ -2675,18 +2803,25 @@ function paintOptbar(optbar, node, data, idx, ta) {
         optRestoreMaps(node, data.ds);
         const key = node ? `${node.id}:${idx}` : "";
         const shown = key ? _optShown.get(key) : null;
-        const bOpt = el("button", "h3d-btn h3d-btn-cyan", "✨ 优化");
-        bOpt.title = "自研后端优化：当前主框文本+段引用图 → 官方结构，回填主框＋具象化";
-        const bSet = el("button", "h3d-btn", "⚙");
-        bSet.title = "提示词优化设置";
+        /* 优化入口已移到 ② 剧本区（剧本 → 结果），这里只留原稿切换与双向同步 */
         const bReset = el("button", "h3d-btn", shown === "before" ? "优化稿" : "原稿");
         bReset.title = "原稿 ⇄ 优化稿切换";
         bReset.style.display = shown ? "" : "none";
-        const bFromV2 = el("button", "h3d-btn", "从具象化同步");
-        bFromV2.title = "把具象化分组编译成官方文本覆盖主框";
-        const ui = { btn: bOpt, reset: bReset, name: null };
-        bOpt.onclick = () => runOptForSegment(node, idx, ta, ui);
-        bSet.onclick = () => openOptSettings(node);
+        const bFromV2 = el("button", "h3d-btn", "← 从具象化同步");
+        bFromV2.title = "把具象化分组编译成官方文本，覆盖结果框";
+        const bToV2 = el("button", "h3d-btn", "同步到具象化 →");
+        bToV2.title = "把结果框文本解析回具象化分组，方便逐项微调后再同步回来";
+        bToV2.onclick = () => {
+            try {
+                const text = String(ta && ta.value ? ta.value : "").trim();
+                if (!text) { alert("结果框为空，没有可同步的内容"); return; }
+                applyAiToV2(node, idx, text);
+                flushPrompts(node);
+                setLed("idle", `第 ${idx + 1} 段结果已同步到具象化`);
+                scheduleRefresh(80);
+            } catch (e) { alert(`同步到具象化失败：${e.message || e}`); }
+        };
+        const ui = { btn: null, reset: bReset, name: null };
         bReset.onclick = () => optToggle(node, idx, ta, ui);
         bFromV2.onclick = async () => {
             try {
@@ -2706,7 +2841,7 @@ function paintOptbar(optbar, node, data, idx, ta) {
                 scheduleRefresh(200);
             } catch (e) { alert(`同步失败：${e.message || e}`); }
         };
-        optbar.append(bOpt, bSet, bReset, bFromV2);
+        optbar.append(bReset, bFromV2, bToV2);
     } catch (e) { console.warn("[h3-director] paintOptbar failed:", e); }
 }
 
@@ -3745,7 +3880,11 @@ function injectStyles() {
     .h3d-rta{display:block;min-height:84px;max-height:40vh;overflow:auto;white-space:pre-wrap;word-break:break-word;cursor:text}
     .h3d-rta:empty:before{content:attr(data-ph);color:#7d8695;pointer-events:none}
     .h3d-rta-off{color:#636e7b;cursor:not-allowed;background:#22272e}
-    .h3d-rtag{display:inline-flex;align-items:center;gap:3px;margin:0 2px;padding:0 3px 0 7px;border:1px solid #2f6e57;border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;vertical-align:baseline;user-select:all}
+    .h3d-rtag{display:inline-flex;align-items:center;gap:4px;margin:0 2px;padding:0 3px 0 4px;border:1px solid #2f6e57;border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;vertical-align:baseline;user-select:all}
+    /* 绿框里的标识：缩略图（图/视首帧）或音符图标。pointer-events:none 防误拖。
+     * outline 描一圈内缘（不占布局、不改变尺寸）—— 缩略图压在深色底上时边缘不发虚。 */
+    .h3d-rtag>.h3d-thumb{width:15px;height:15px;border-radius:5px;object-fit:cover;background:#0d0c0a;flex:none;pointer-events:none;outline:1px solid #2f6e5799;outline-offset:-1px}
+    .h3d-rtag>.h3d-kindmark{font-size:12px;line-height:1;flex:none;pointer-events:none;opacity:.95}
     .h3d-rtagx{display:inline-block;padding:0 5px;border-radius:9px;background:transparent;color:#7fe0b0cc;cursor:pointer;font-size:10.5px;line-height:1.6;user-select:none}
     .h3d-rtagx:hover{background:#3a1a1c;color:#f0a0a4}
     .h3d-fixfocus{font-size:11px;padding:3px 8px;opacity:.75}
@@ -3826,12 +3965,18 @@ function injectStyles() {
     .h3d-refchip{display:inline-flex;gap:5px;align-items:center;padding:3px 8px 3px 3px;border:1px solid #3a352c;border-radius:12px;background:#25221c;color:#a8a294;cursor:pointer;font-size:11px;font-family:inherit}
     .h3d-refchip:hover{border-color:#46604f}
     .h3d-refchip.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
-    .h3d-refchip img{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#0d0c0a}
+    .h3d-refchip .h3d-thumb{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
+    .h3d-refchip.on .h3d-thumb{outline-color:#2f6e57}
     .h3d-reftpl{max-width:118px;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:3px 4px;font-size:11px;outline:none;margin-left:auto}
     .h3d-reftpl:focus{border-color:#a8d8bd}
-    .h3d-chipbtn{padding:2px 9px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit}
+    .h3d-chipbtn{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 3px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit;max-width:240px}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+    /* chip 首位的标识：缩略图 18x18 圆角块（图 / 视频首帧），音频是音符图标。 */
+    .h3d-chipbtn>.h3d-thumb{width:18px;height:18px;border-radius:7px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
+    .h3d-chipbtn.on>.h3d-thumb{outline-color:#2f6e57}
+    .h3d-chipbtn>.h3d-kindmark{font-size:14px;line-height:1;flex:none;padding:0 1px}
+    .h3d-chipbtn-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
     .h3d-chipminus{padding:2px 6px;margin-left:-3px;border:1px solid #3a352c;border-radius:9px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;line-height:1;font-family:inherit}
     .h3d-chipminus:hover{border-color:#9a4144;color:#f0a0a4}
     .h3d-chipminus.off{opacity:.4}
@@ -3996,6 +4141,10 @@ function injectStyles() {
     .h3d-v2group>summary::-webkit-details-marker{display:none}
     .h3d-v2group>summary::before{content:"▸ ";font-size:10px}
     .h3d-v2group[open]>summary::before{content:"▾ "}
+    .h3d-ppane{margin-bottom:8px}
+    .h3d-ppane>.h3d-v2grid{padding:2px 8px 8px}
+    .h3d-ppane .h3d-rta{min-height:150px;max-height:55vh}
+    .h3d-shot-more{margin-top:6px}
     .h3d-v2grid{display:grid;gap:7px;padding:0 10px 10px}
     .h3d-v2f{width:100%;border:1px solid #2a3438;border-radius:6px;background:#1b2126;color:var(--h3d-bone);padding:6px 8px;font-size:12px;outline:none;font-family:inherit}
     .h3d-v2f:focus{border-color:#6cb6ff;box-shadow:0 0 0 2px #6cb6ff33}
@@ -4450,12 +4599,69 @@ function foldBox(id, title, defaultOpen) {
 /* 资产库：链路说明 + 旧槽迁移 + 素材池（标注/引用/移除/剪辑/转码/入库）+ 登记表
  * 原左栏「素材池 · 分段处理中心」与模式条已并入本页；无模式门槛，链路后端自动推导。
  * repaint=重绘本页（标注切换/删卡/入库后调用）。 */
-/* 资产预览地址：asset_id（全局库）> assets/…（项目 output）> 其余（input） */
+/* 资产预览地址：asset_id（全局库）> assets/…（项目 output）> 其余（input）
+ *
+ * 注意「全局库相对路径」这一档（images/ videos/ audios/，见 asset_store.register_content
+ * 的 kind 目录）：asset_links 回填的 file 就是这种，它们**不在项目里、也不在 input 里**，
+ * 只能按 asset_id 走 /h3chain/library_file 取。旧实现把它们回落到 inputViewUrl，
+ * 于是缩略图实际指向了 ComfyUI input 目录下的同名文件 —— 找不到就裂图，
+ * 找到了就是张冠李戴（线下报的「缩略图跟原素材对不上」）。取不到就返回空串，
+ * 由调用方（buildAssetThumb）回落类别图标，绝不显示错图。 */
+const _LIB_REL_RE = /^(images|videos|audios)\//;
 function assetPreviewUrl(dir, file, asset_id) {
     if (asset_id && window.H3Api?.libraryFileUrl) return window.H3Api.libraryFileUrl(asset_id);
     const f = String(file || "").replace(/\\/g, "/");
     if (f.startsWith("assets/")) return viewUrl(`h3_projects/${dir}`, f);
+    if (_LIB_REL_RE.test(f)) return "";          // 全局库路径且无 asset_id：取不到
     return inputViewUrl(f);
+}
+
+/** 标识签名：kind|file|asset_id 三者任一变了才需要重建标识节点。
+ *  redrawIcons 挂在卡片轻量重绘上（聚焦期间会反复跑），签名相同就直接跳过，
+ *  否则每次重绘都重建 <video> 会让首帧反复重新解码、闪一下。 */
+function thumbSig(a) {
+    return [
+        String((a && a.kind) || "image"),
+        String((a && a.file) || ""),
+        String((a && a.asset_id) || ""),
+    ].join("\u0001");
+}
+
+/** 素材标识（缩略图 / 类别图标）统一构造 —— 引用条 chip、分段调度 chip、正文绿框共用。
+ *  图/视给缩略图（视频走浏览器解码首帧，后端 make_thumb 目前只做图片，没有 ffmpeg 兜底），
+ *  音频给音符图标（音频本来就没有画面）。取不到地址一律回落图标而不是错图。
+ *  尺寸由外层容器用后代选择器控制（.h3d-chipbtn .h3d-thumb / .h3d-rtag .h3d-thumb …）。 */
+function buildAssetThumb(dir, a) {
+    const kind = String((a && a.kind) || "image");
+    const url = assetPreviewUrl(dir, a && a.file, a && a.asset_id);
+    const mkIcon = () => {
+        const ic = document.createElement("span");
+        ic.className = "h3d-kindmark";
+        ic.textContent = KIND_ICON[kind] || KIND_ICON.image;
+        ic.title = KIND_NAME[kind] || "";
+        return ic;
+    };
+    if (kind === "audio" || !url) return mkIcon();
+    if (kind === "video") {
+        /* 首帧当封面：preload=metadata 只解码头信息，#t=0.1 让浏览器把首帧渲染出来
+         * （与素材库瓦片同一套做法，不依赖后端的 ffmpeg 抽帧）。 */
+        const v = document.createElement("video");
+        v.className = "h3d-thumb";
+        v.muted = true;
+        v.preload = "metadata";
+        v.playsInline = true;
+        v.setAttribute("aria-hidden", "true");
+        v.src = url + (url.includes("#") ? "" : "#t=0.1");
+        v.onerror = () => { try { v.replaceWith(mkIcon()); } catch (e) { v.remove(); } };
+        return v;
+    }
+    const im = document.createElement("img");
+    im.className = "h3d-thumb";
+    im.loading = "lazy";
+    im.alt = "";
+    im.src = url;
+    im.onerror = () => { try { im.replaceWith(mkIcon()); } catch (e) { im.remove(); } };
+    return im;
 }
 
 /* ---------- 段级首尾帧参考图（提示词框「首帧图/尾帧图」按钮） ----------
@@ -4811,32 +5017,28 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         const effMode = effV2Mode(data.ds, segIdx);
         const isManual = V2_MODES.includes(seg.v2mode);
         const isRef = effMode === "Ref2VA";
-        const det = el("details", "h3d-seg-panel h3d-v2panel" + (hasV2 ? " has-content" : ""));
-        det.open = hasV2;
-        det.innerHTML = `<summary>具象化 · ${escapeHtml(V2_MODE_ZH[effMode] || effMode)}`
-            + ` <span class="h3d-chip">${isManual ? "手动" : "自动（按引用判定）"}</span>`
-            + `${hasV2 ? ' <span class="h3d-chip cyan">已启用</span>' : ' <span class="h3d-chip">未启用·用旧字段</span>'}</summary>`;
+        const det = v2Details(`v2${segIdx}`,
+            "h3d-seg-panel h3d-v2panel" + (hasV2 ? " has-content" : ""),
+            `具象化微调 · ${escapeHtml(V2_MODE_ZH[effMode] || effMode)}`
+            + `${hasV2 ? ' <span class="h3d-chip cyan">已启用</span>' : ' <span class="h3d-chip">未启用·用旧字段</span>'}`,
+            hasV2);
         const vbody = el("div", "h3d-seg-body");
 
-        /* 模式行：手动覆写 + 对齐指令预览（base 系）/ 六段式提示（Ref2VA） */
+        /* 判定行：输出结构由本段数据推导（有参考/主体 → 六段式，否则三段式），
+         * 不再提供手动下拉——想改判定就去增删参考素材，而不是选模式。
+         * 旧存档的 seg.v2mode 仍读，仅用于提示「曾经的手动值已忽略」。 */
         {
             const mrow = el("div", "h3d-v2row");
-            const msel = document.createElement("select");
-            msel.className = "h3d-v2f";
-            const autoLabel = `自动（${V2_MODE_ZH[defaultV2Mode(data.ds, segIdx)] || ""}）`;
-            for (const [v, t] of [["", autoLabel],
-                ...V2_MODES.map((m) => [m, V2_MODE_ZH[m] || m])]) {
-                const op = document.createElement("option");
-                op.value = v; op.textContent = t;
-                if ((seg.v2mode || "") === v) op.selected = true;
-                msel.append(op);
-            }
-            msel.title = "默认跟随导演台（多参→全参考，其余→首尾帧）；手动选定后编译与校验按该模式";
-            msel.addEventListener("change", () => setV2Mode(node, segIdx, msel.value || null));
-            mrow.append(el("label", "h3d-seg-label", "模式"), msel);
-            if (autoMode !== effMode && !isManual)
-                mrow.append(el("span", "h3d-secs-hint",
-                    `内容判定为${V2_MODE_ZH_ALL[autoMode] || autoMode}，已按导演台取${V2_MODE_ZH[effMode] || effMode}`));
+            const nRefs = (pv0.references || []).length + (pv0.subjects || []).length;
+            const why = isRef
+                ? `本段有 ${nRefs} 个参考条目`
+                : ((hasStart || hasEnd) ? "本段无参考，按首尾帧" : "本段无参考、无首尾帧");
+            let hint = (isRef
+                ? "六段式（主体定义 → 总结 → 保留分析 → 详细描述 → 环境音 → 配乐）"
+                : "三段式（整体描述 → 环境音 → 配乐）") + ` · ${why}`;
+            if (isManual) hint += " · 旧存档的手动模式已忽略，现按数据判定";
+            mrow.append(el("label", "h3d-seg-label", "输出结构"));
+            mrow.append(el("span", "h3d-secs-hint", hint));
             vbody.append(mrow);
             const prev = el("pre", "h3d-v2out", "");
             if (isRef) {
@@ -4911,49 +5113,35 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 }));
         };
 
-        // —— 画面组 ——
-        const gPic = el("details", "h3d-v2group");
-        gPic.open = hasV2;
-        gPic.innerHTML = "<summary>画面 · 风格/构图/环境/光照/角色/道具（拼入首镜开头）</summary>";
+        // —— 画面组（合并为单个 visual 框：风格/构图/环境/光照/角色/道具写在一处）——
+        const gPic = v2Details(`pic${segIdx}`, "h3d-v2group",
+            "画面 · 风格/构图/环境/光照/角色/道具（拼入首镜开头）", hasV2);
         const gPicBody = el("div", "h3d-v2grid");
-        const PIC_FIELDS = [
-            ["intent_zh", "中文意图", "给扩写或人工看的中文描述，不进入最终英文"],
-            ["medium_style", "媒介风格", "例：Live-action cinematic"],
-            ["composition", "构图", "例：medium shot, eye-level"],
-            ["environment", "环境", "旧场景直迁"],
-            ["lighting", "光照", "例：neon reflections on wet asphalt"],
-            ["characters", "角色", "旧角色直迁"],
-            ["props", "道具", "例：paper umbrella, convenience store bags"],
-        ];
-        for (const [k, zh, ph] of PIC_FIELDS) {
-            gPicBody.append(mkLabel(`${zh}（${k}）`));
-            const ta = mkTa(pv0[k] || "", ph,
-                (v) => debouncePromptV2Write(node, segIdx, k, v),
-                (v) => {
-                    const t = _taTimers.get(`pv${segIdx}_${k}`);
-                    if (t) { clearTimeout(t); _taTimers.delete(`pv${segIdx}_${k}`); }
-                    setPromptV2Field(node, segIdx, (pv) => { pv[k] = v; });
-                    scheduleRefresh(200);
-                });
-            gPicBody.append(ta);
-        }
-        // —— AI扩写行：直调 /h3chain/expand，先出确认卡，确认后才回填分组
-        {
-            const aiRow = el("div", "h3d-v2row");
-            const aiBtn = el("button", "h3d-btn", "［AI扩写］中文意图 → 官方格式");
-            aiBtn.title = "按 MiniMax 官方 h3-prompt-writing 格式编译：先给意图确认卡，确认后回填镜头/环境音/配乐";
-            const aiHint = el("span", "h3d-secs-hint", "意图 → 确认卡 → 回填");
-            aiRow.append(aiBtn, aiHint);
-            gPicBody.append(aiRow);
-            aiBtn.onclick = () => openExpandModal(node, segIdx, pv0);
+        gPicBody.append(mkLabel("画面整述（visual）"));
+        gPicBody.append(mkTa(pv0.visual || "",
+            "例：Live-action cinematic，medium shot，夜晚便利店门口，霓虹倒映在积水里，撑伞的女孩，纸伞",
+            (v) => debouncePromptV2Write(node, segIdx, "visual", v),
+            (v) => {
+                const t = _taTimers.get(`pv${segIdx}_visual`);
+                if (t) { clearTimeout(t); _taTimers.delete(`pv${segIdx}_visual`); }
+                setPromptV2Field(node, segIdx, (pv) => { pv.visual = v; });
+                scheduleRefresh(200);
+            }));
+        /* 旧存档的六个分立字段不再有输入口，但有值时仍参与编译（后端 visual 为空才回退），
+         * 这里点一句，避免用户以为数据被丢了。 */
+        const legacyPic = ["medium_style", "composition", "environment",
+            "lighting", "characters", "props"].filter((k) => String(pv0[k] || "").trim());
+        if (legacyPic.length && !String(pv0.visual || "").trim()) {
+            gPicBody.append(el("div", "h3d-secs-hint",
+                `旧存档拆在 ${legacyPic.length} 个分立字段（${legacyPic.join(" / ")}），仍会参与编译；填入上方合并框后以合并框为准`));
         }
         gPic.append(gPicBody);
         vbody.append(gPic);
 
         // —— 镜头组（Shots） ——
-        const gShot = el("details", "h3d-v2group");
-        gShot.open = hasV2;
-        gShot.innerHTML = `<summary>镜头 ×${(pv0.shots || []).length} · → ${isRef ? "detailed_description（详细描述）" : "integrated_multimodal_description（整体描述）"}：画面＋运镜＋对白＋屏显＋剧中乐＋本镜引用</summary>`;
+        const gShot = v2Details(`shot${segIdx}`, "h3d-v2group",
+            `镜头 ×${(pv0.shots || []).length} · → ${isRef ? "detailed_description（详细描述）" : "integrated_multimodal_description（整体描述）"}：画面＋运镜＋对白＋屏显＋剧中乐＋本镜引用`,
+            hasV2);
         const gShotBody = el("div", "h3d-v2grid");
         const MOVES = HP.CAMERA_MOVES || [""];
         const AMPS = HP.CAMERA_AMPS || ["", "small", "large"];
@@ -5004,8 +5192,16 @@ function renderPromptV2Panel(body, node, data, segIdx) {
             }, "运镜速度"));
             box.append(mkLabel("运镜（类型 / 幅度 / 速度）"));
             box.append(camRow);
+            /* 低频项收进「更多」：换镜时间 / 对白 / 屏显 / 剧中乐 / 引用标签。
+             * 默认折叠——主界面每镜只剩「画面描述 + 运镜」两项。 */
+            const nDg = (sh.dialogues || []).length;
+            const nSt = (sh.screen_texts || []).length;
+            const gMore = v2Details(`more${segIdx}_${si}`, "h3d-v2group h3d-shot-more",
+                "更多 · 换镜时间 / 对白" + (nDg ? ` ×${nDg}` : "")
+                + " / 屏显" + (nSt ? ` ×${nSt}` : "") + " / 剧中乐 / 引用", false);
+            const gMoreBody = el("div", "h3d-v2grid");
             if (si > 0) {
-                box.append(mkLabel("换镜时间（秒，空=自动均分）"));
+                gMoreBody.append(mkLabel("换镜时间（秒，空=自动均分）"));
                 const num = document.createElement("input");
                 num.type = "number"; num.className = "h3d-v2f"; num.min = "0"; num.step = "0.1";
                 num.value = (sh.start_seconds === null || sh.start_seconds === undefined) ? "" : String(sh.start_seconds);
@@ -5017,10 +5213,10 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     });
                     scheduleRefresh(80);
                 });
-                box.append(num);
+                gMoreBody.append(num);
             }
             // 对白
-            box.append(mkLabel(`对白 ×${(sh.dialogues || []).length}（说话人 / 语言 / 内容 / 语气 / 旁白）`));
+            gMoreBody.append(mkLabel(`对白 ×${(sh.dialogues || []).length}（说话人 / 语言 / 内容 / 语气 / 旁白）`));
             (sh.dialogues || []).forEach((d, di) => {
                 const dbox = el("div", "h3d-shot");
                 const r1 = el("div", "h3d-v2row");
@@ -5064,7 +5260,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     scheduleRefresh(60);
                 };
                 dbox.append(drm);
-                box.append(dbox);
+                gMoreBody.append(dbox);
             });
             const addD = el("button", "h3d-btn", "＋ 对白");
             addD.style.cssText = "padding:3px 8px;font-size:11px;justify-self:start";
@@ -5072,11 +5268,14 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 setPromptV2Field(node, segIdx, (pv) => {
                     (pv.shots[si].dialogues = pv.shots[si].dialogues || []).push({ speaker: "S1", language: "Chinese", text: "", delivery: "", voiceover: false });
                 });
+                /* 重建后保持展开，否则刚加的对白连同「更多」一起被收起来 */
+                _v2Open.set(`more${segIdx}_${si}`, true);
+                _v2Open.set(`shot${segIdx}`, true);
                 scheduleRefresh(60);
             };
-            box.append(addD);
-            box.append(mkLabel("屏显文字（一行一条）"));
-            box.append(mkTa((sh.screen_texts || []).join("\n"), "如 OPEN 24H",
+            gMoreBody.append(addD);
+            gMoreBody.append(mkLabel("屏显文字（一行一条）"));
+            gMoreBody.append(mkTa((sh.screen_texts || []).join("\n"), "如 OPEN 24H",
                 (v) => {
                     const k = `pv${segIdx}_sh${si}_st`;
                     const t = _taTimers.get(k);
@@ -5094,16 +5293,18 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     });
                     scheduleRefresh(200);
                 }));
-            box.append(mkLabel("本镜剧中音乐（空省略）"));
-            box.append(mkInp(sh.diegetic_music || "", "如 radio plays softly", (v) => {
+            gMoreBody.append(mkLabel("本镜剧中音乐（空省略）"));
+            gMoreBody.append(mkInp(sh.diegetic_music || "", "如 radio plays softly", (v) => {
                 setPromptV2Field(node, segIdx, (pv) => { pv.shots[si].diegetic_music = v; });
             }));
-            box.append(mkLabel("本镜引用标签（逗号分隔）"));
-            box.append(mkInp((sh.ref_usage || []).join(", "), "如 角色1, 场景1", (v) => {
+            gMoreBody.append(mkLabel("本镜引用标签（逗号分隔）"));
+            gMoreBody.append(mkInp((sh.ref_usage || []).join(", "), "如 角色1, 场景1", (v) => {
                 setPromptV2Field(node, segIdx, (pv) => {
                     pv.shots[si].ref_usage = String(v).split(/[,，、;；]+/).map((x) => x.trim()).filter(Boolean).slice(0, 32);
                 });
             }));
+            gMore.append(gMoreBody);
+            box.append(gMore);
             gShotBody.append(box);
         });
         const addShot = el("button", "h3d-btn h3d-btn-cyan", "＋ 加一镜");
@@ -5120,8 +5321,9 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         vbody.append(gShot);
 
         // —— 声音组 ——
-        const gSnd = el("details", "h3d-v2group");
-        gSnd.innerHTML = "<summary>声音 · overall_soundscape / non_diegetic_music（无配乐写 N/A；剧中音乐写进各镜头）</summary>";
+        const gSnd = v2Details(`snd${segIdx}`, "h3d-v2group",
+            "声音 · overall_soundscape / non_diegetic_music（无配乐写 N/A；剧中音乐写进各镜头）",
+            false);
         const gSndBody = el("div", "h3d-v2grid");
         for (const [k, zh, ph] of [["soundscape", "环境音", "环境＋动作音（对白禁入此）"], ["non_diegetic_music", "背景配乐", "角色听不到的配乐，无则 N/A"]]) {
             gSndBody.append(mkLabel(`${zh}（${k}）`));
@@ -5138,9 +5340,8 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         vbody.append(gSnd);
 
         // —— 参考组（仅 Ref2VA 可见；官方六段式之 subject_definitions / summary / retention_analysis）——
-        const gRef = el("details", "h3d-v2group");
-        gRef.open = hasV2;
-        gRef.innerHTML = "<summary>参考 · subject_definitions / summary / retention_analysis</summary>";
+        const gRef = v2Details(`ref${segIdx}`, "h3d-v2group",
+            "参考 · subject_definitions / summary / retention_analysis", hasV2);
         const gRefBody = el("div", "h3d-v2grid");
         gRefBody.append(mkLabel(`主体定义 ×${(pv0.subjects || []).length}（<Subject N>）`));
         (pv0.subjects || []).forEach((st, ti) => {
@@ -5164,31 +5365,49 @@ function renderPromptV2Panel(body, node, data, segIdx) {
             scheduleRefresh(60);
         };
         gRefBody.append(addSub);
-        gRefBody.append(mkLabel(`素材引用 ×${(pv0.references || []).length}（<Picture / Video / Audio N>）`));
-        (pv0.references || []).forEach((r, ri) => {
-            const row = el("div", "h3d-v2row");
-            row.append(mkInp(r.label || "", "标签，如 <Picture 1>", (v) => {
-                setPromptV2Field(node, segIdx, (pv) => { pv.references[ri].label = String(v).slice(0, 64); });
-            }));
-            row.append(mkInp(r.note || "", "说明", (v) => {
-                setPromptV2Field(node, segIdx, (pv) => { pv.references[ri].note = String(v).slice(0, 200); });
-            }));
-            const rm = el("button", "h3d-btn h3d-btn-danger", "✕");
-            rm.style.cssText = "padding:3px 8px;flex:none";
-            rm.onclick = () => {
-                setPromptV2Field(node, segIdx, (pv) => { pv.references.splice(ri, 1); });
-                scheduleRefresh(60);
+        /* 素材引用：由「分段素材调度」的勾选自动生成（按 kind 分别编号
+         * <Picture/Video/Audio k>，与后端 by_alias 同口径），不再手填标签。
+         * note 仍可写，存在 pv.references 里按 label 匹配。 */
+        {
+            const want = v2RefsFromSchedule(data.ds, segIdx);
+            const stored = Array.isArray(pv0.references) ? pv0.references : [];
+            gRefBody.append(mkLabel(`素材引用 ×${want.length}（按素材调度自动生成）`));
+            if (!want.length) {
+                gRefBody.append(el("div", "h3d-secs-hint",
+                    "未调度素材：在下方「分段素材调度」勾选后自动生成，无需手填标签"));
+            }
+            for (const w of want) {
+                const row = el("div", "h3d-v2row");
+                row.append(el("span", "h3d-chip", escapeHtml(`${w.label} ← ${w.src}`)));
+                const hit = stored.find((r) => r && r.label === w.label);
+                row.append(mkInp(hit ? (hit.note || "") : "", "说明（可选）", (v) => {
+                    setPromptV2Field(node, segIdx, (pv) => {
+                        const list = Array.isArray(pv.references) ? pv.references : (pv.references = []);
+                        const at = list.findIndex((r) => r && r.label === w.label);
+                        const note = String(v).slice(0, 200);
+                        if (at >= 0) list[at].note = note;
+                        else list.push({ label: w.label, note });
+                    });
+                }));
+                gRefBody.append(row);
+            }
+            const rebuild = el("button", "h3d-btn", "↻ 按素材调度重建");
+            rebuild.style.cssText = "padding:3px 8px;font-size:11px;justify-self:start";
+            rebuild.title = "清空现有引用条目，按当前勾选的素材重新生成标签（已写的说明会清空）";
+            rebuild.onclick = () => {
+                /* 没写说明就不弹窗打断：confirm 关闭后焦点常落空，
+                 * 紧接着点输入框会点空一拍，表现成"输入框卡住"。 */
+                const hasNote = (pv0.references || [])
+                    .some((r) => r && String(r.note || "").trim());
+                if (hasNote && !confirm("按当前素材调度重建引用列表？已写的说明会清空。")) return;
+                setPromptV2Field(node, segIdx, (pv) => {
+                    pv.references = want.map((w) => ({ label: w.label, note: "" }));
+                });
+                _v2Open.set(`ref${segIdx}`, true);
+                scheduleRefresh(80);
             };
-            row.append(rm);
-            gRefBody.append(row);
-        });
-        const addRef = el("button", "h3d-btn", "＋ 引用");
-        addRef.style.cssText = "padding:3px 8px;font-size:11px;justify-self:start";
-        addRef.onclick = () => {
-            setPromptV2Field(node, segIdx, (pv) => { (pv.references = pv.references || []).push({ label: "", note: "" }); });
-            scheduleRefresh(60);
-        };
-        gRefBody.append(addRef);
+            gRefBody.append(rebuild);
+        }
         /* 分段素材调度：本段实际喂 conditioning 的资产集合（单段上限 图9/视3/音3）。
          * 缺省（全空）= 只用提示词文本 @标签 出现的；与上方参考条目是两回事：
          * 上方管官方六段式文本，下面管本段 conditioning 调度。 */
@@ -5209,16 +5428,11 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
                     chip.type = "button";
                     chip.title = `${KIND_NAME[k]}素材${roles}：勾选后本段 conditioning 引用（同类按勾选顺序编号 <${KIND_TOKEN[k]} k>），正文自动补 @标签；单段上限 图${KIND_CAPS.image}/视${KIND_CAPS.video}/音${KIND_CAPS.audio}`;
-                    if (k === "image") {
-                        const im = document.createElement("img");
-                        im.loading = "lazy";
-                        im.src = assetPreviewUrl(getDirValue(node), a.file);
-                        im.onerror = () => im.remove();
-                        chip.append(im);
-                    } else {
-                        chip.insertAdjacentHTML("afterbegin", `<span class="h3d-kindmark">${KIND_ICON[k]}</span>`);
-                    }
-                    chip.append(document.createTextNode(a.label + roles));
+                    /* 标识统一走 buildAssetThumb：图片=缩略图、视频=首帧、音频=音符图标。 */
+                    chip.append(buildAssetThumb(getDirValue(node), a));
+                    /* 显示时把夹带的格式后缀剥掉（详见 chipLabelText 注释）。alias 落库
+                     * 早就去扩展名了；这里是给老 manifest / 边缘路径兜底。 */
+                    chip.append(document.createTextNode(chipLabelText(a.label) + roles));
                     chip.onclick = () => { toggleSegmentRef(node, segIdx, a.label); scheduleRefresh(80); };
                     sched.append(chip);
                 });
@@ -5327,19 +5541,8 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         /* 参考组仅 Ref2VA 挂载（base 模式数据保留，切换回来仍在） */
         if (isRef) vbody.append(gRef);
 
-        // —— 高级组 ——
-        const gAdv = el("details", "h3d-v2group");
-        gAdv.innerHTML = "<summary>高级 · 源码覆盖（官方字段直写，校验严格）</summary>";
-        const gAdvBody = el("div", "h3d-v2grid");
-        gAdvBody.append(mkLabel("源码覆盖（空=不用；首行须为官方字段名）"));
-        gAdvBody.append(mkTa(pv0.override_text || "", "integrated_multimodal_description: ...", (v) => {
-            debouncePromptV2Write(node, segIdx, "override_text", v || null);
-        }, (v) => {
-            setPromptV2Field(node, segIdx, (pv) => { pv.override_text = v.trim() ? v : null; });
-            scheduleRefresh(200);
-        }));
-        gAdv.append(gAdvBody);
-        vbody.append(gAdv);
+        /* 高级组已移除：源码覆盖（override_text）不是"浏览"也不是"微调"，
+         * 它是直接改写最终结果，归入主框的「结果浏览框」里作为直接编辑入口。 */
         void bindTop;
 
         // —— 动作行：编译预览/启用/同步旧字段 ——
@@ -5631,6 +5834,25 @@ function buildCards(data) {
                     if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
                     return (arr || []).map((a) => a.label);
                 },
+                /* 别名 -> 素材信息 {kind,file,asset_id}（绿框据此挑缩略图/图标）。
+                 * 同样读活的节点状态——上传/换类别后旧绿框的标识能立刻对得上。 */
+                assets: () => {
+                    let arr = data.ds.ref_assets;
+                    if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
+                    const m = {};
+                    for (const a of (arr || [])) {
+                        if (a && a.label) {
+                            m[a.label] = {
+                                kind: a.kind || "image",
+                                file: String(a.file || ""),
+                                asset_id: String(a.asset_id || ""),
+                            };
+                        }
+                    }
+                    return m;
+                },
+                /* 项目目录：拼项目内 assets/… 的预览地址用（读活的控件值）。 */
+                dir: () => getDirValue(node),
                 onRemove: (label) => {
                     if (!node || it.idx === undefined) return;
                     /* 正文是唯一真相：applyPromptEdit 按新正文重算 refs，正好少一处。
@@ -5710,16 +5932,41 @@ function buildCards(data) {
                  * compile_refs 同口径，重复引用只占一个编号）—— 让用户直接看到
                  * @女主 会变成 <Picture 1>，写几次就出现几次。 */
                 const TOK_FMT = { image: "<Picture {}>", video: "<Video {}>", audio: "<Audio {}>" };
+                /* —— 单 chip 内部结构（缩略图/图标 + 名字 + ✓/＋ + 计数） ——
+                 * 不再是「✓ @label」裸文本：@ 在这里**没有语义**——这个 chip 不在
+                 * prompt 正文里，它只是引用条上的勾选钮。标识统一走 buildAssetThumb：
+                 * 图片=缩略图、视频=首帧、音频=音符图标。 */
+                const buildChipBody = (c, a) => {
+                    const oldIco = c.querySelector(":scope > .h3d-thumb, :scope > .h3d-kindmark");
+                    if (oldIco) oldIco.remove();
+                    const oldText = c.querySelector(":scope > .h3d-chipbtn-text");
+                    if (oldText) oldText.remove();
+                    c.append(buildAssetThumb(getDirValue(node), a));
+                    const txt = document.createElement("span");
+                    txt.className = "h3d-chipbtn-text";
+                    c.append(txt);
+                    c.dataset.thumbSig = thumbSig(a);        // 记签名：换类别/换文件时好重建
+                };
                 const paintChip = (rec, n, token) => {
                     const { c, a, roles } = rec;
                     c.classList.toggle("on", n > 0);
-                    c.textContent = `${n > 0 ? "✓" : "＋"}@${a.label}${roles}${n > 1 ? ` ×${n}` : ""}`;
+                    /* 标识签名变了（库里换类别/换文件）→ 重建标识；签名没变则一次都不碰
+                     * DOM（旧实现只看"有没有标识节点"，换类别后 chip 图标会一直停在旧样式）。 */
+                    if (c.dataset.thumbSig !== thumbSig(a)
+                        || !c.querySelector(":scope > .h3d-thumb, :scope > .h3d-kindmark, :scope > .h3d-chipbtn-text")) {
+                        buildChipBody(c, a);
+                    }
+                    const lbl = chipLabelText(a.label) || a.label || "素材";
+                    const txt = c.querySelector(":scope > .h3d-chipbtn-text")
+                        || c.appendChild(Object.assign(document.createElement("span"),
+                            { className: "h3d-chipbtn-text" }));
+                    txt.textContent = `${n > 0 ? "✓ " : "＋ "}${lbl}${roles}${n > 1 ? ` ×${n}` : ""}`;
                     const armedName = (REF_TEMPLATES[refTpl] || [])[0] || "裸引用（不加描述）";
-                    c.title = `${KIND_NAME[a.kind] || ""}「${a.label}」${roles}：`
+                    c.title = `${KIND_NAME[a.kind] || ""}「${lbl}」${roles}：`
                         + (n > 0
                             ? `本段已引用 ${n} 次${token ? `（正文里每个 @${a.label} 都会编译成 ${token}）` : ""}`
                             : "本段未引用")
-                        + "\n点一次 = 在提示词框里插一个绿框（正文补一个 @标签，点两次=引用两次）；"
+                        + "\n点一次 = 在提示词框里插一个绿框（图标+别名，点两次=引用两次）；"
                         + "右侧 ✕（或右键本 chip）= 取消本段对它的全部引用。"
                         + "\n（正文里绿框自带的 ✕ 是「只取消那一处」，点一次少一处。）"
                         + `\n当前锚定方式「${armedName}」：点它会按这个方式写入正文。`;
@@ -5785,6 +6032,9 @@ function buildCards(data) {
                     const c = el("button", "h3d-chipbtn");
                     c.type = "button";
                     c.dataset.ref = String(a.label || "");
+                    /* 一次建好"图标 + 文本"骨架：paintChip 只更新文本，不再重建 DOM，
+                     * 这样 chip 不会因为 paint 闪烁，鼠标悬停/焦点也保得住。 */
+                    buildChipBody(c, a);
                     const minus = el("button", "h3d-chipminus", "✕");
                     minus.type = "button";
                     minus.title = `取消本段对「${a.label}」的全部引用（正文里的绿框一起清掉；`
@@ -5866,6 +6116,9 @@ function buildCards(data) {
                     let fixed = false;
                     try { fixed = ta.normalizeLoose(); } catch (e) { fixed = false; }
                     if (fixed && node && it.idx !== undefined) applyPromptEdit(node, it.idx, ta);
+                    /* 绿框标识跟着活数据走：素材在库里换了类别/文件后，这里把旧绿框的
+                     * 缩略图/图标换掉（幂等，没变就整段跳过，不会反复重建 <video>）。 */
+                    try { ta.redrawIcons(); } catch (e) { /* 边界态忽略 */ }
                     paintAll();
                     paintFrameBtns();
                 };
@@ -5895,12 +6148,143 @@ function buildCards(data) {
                 refbar.append(tpl);
                 body.append(refbar);
             }
-            paneMain.append(ta.el || ta);
-            /* AI优化工具条：优化/设置/原稿切换/从v2同步（双写入口） */
+            /* 主框三段式：① 中文意图 → ② 剧本（扩写产物） → ③ 结果（进模型）。
+             * 只有 ③ 进模型（ds.prompts[idx]），①②都只是给人/AI 看的中间稿。 */
+            const segNow = (data.ds.segments || [])[it.idx] || {};
+            const canEdit = !!node && it.idx !== undefined;
+            /* 别名表读**活的**节点状态（与结果框同口径），@补全与绿框才跟得上素材变动 */
+            const liveLabels = () => {
+                let arr = data.ds.ref_assets;
+                if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
+                return (arr || []).map((a) => a.label);
+            };
+            const liveAssets = () => {
+                let arr = data.ds.ref_assets;
+                if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
+                const m = {};
+                for (const a of (arr || [])) {
+                    if (a && a.label) {
+                        m[a.label] = { kind: a.kind || "image", file: String(a.file || ""),
+                            asset_id: String(a.asset_id || "") };
+                    }
+                }
+                return m;
+            };
+            /* 可折叠编辑区：三段统一外观，点标题栏收起/展开 */
+            const mkPane = (title, open) => {
+                const g = el("details", "h3d-v2group h3d-ppane");
+                g.open = !!open;
+                g.innerHTML = `<summary>${escapeHtml(title)}</summary>`;
+                const b = el("div", "h3d-v2grid");
+                g.append(b);
+                return { g, body: b };
+            };
+
+            /* ---- ① 中文意图：最需要 @素材的一段（指定这段参考谁）---- */
+            const pIntent = mkPane("① 中文意图（不进模型 · 可用 @素材）", true);
+            const intentTa = createPromptEditor({
+                value: String(segNow.intent_zh || ""),
+                labels: liveLabels,
+                assets: liveAssets,
+                dir: () => getDirValue(node),
+                /* 意图不参与 conditioning，绿框 ✕ 只改文本、不动 seg.refs */
+                onRemove: () => {
+                    if (canEdit) setSegmentField(node, it.idx, "intent_zh", intentTa.value);
+                    scheduleRefresh(200);
+                },
+            });
+            intentTa.placeholder = "一句话说清这段要什么：场景、人物、动作、情绪、镜头感觉。"
+                + "例：夜晚便利店门口，@角色1 撑伞等车，霓虹倒映在积水里，缓慢推近。";
+            if (canEdit) {
+                intentTa.addEventListener("input",
+                    () => setSegmentField(node, it.idx, "intent_zh", intentTa.value));
+                intentTa.addEventListener("blur", () => {
+                    setSegmentField(node, it.idx, "intent_zh", intentTa.value);
+                    scheduleRefresh(200);
+                });
+                attachAtComplete(intentTa, node);
+            } else {
+                intentTa.disabled = true;
+            }
+            pIntent.body.append(intentTa.el || intentTa);
+            const intentBar = el("div", "h3d-actions");
+            const bExpand = el("button", "h3d-btn h3d-btn-cyan", "✨ AI扩写 → 剧本");
+            bExpand.title = "按中文意图生成官方格式剧本：先出确认卡，确认后写进「② 剧本」。"
+                + "输出语言跟随优化设置里的「输出语言 / 规则文件」";
+            bExpand.disabled = !canEdit;
+            bExpand.onclick = () => openExpandModal(node, it.idx,
+                (segNow.prompt_v2 && typeof segNow.prompt_v2 === "object") ? segNow.prompt_v2 : null);
+            const bOptSet = el("button", "h3d-btn", "⚙");
+            bOptSet.title = "提示词优化设置（输出语言 / 规则文件 / 服务商）";
+            bOptSet.onclick = () => openOptSettings(node);
+            intentBar.append(bExpand, bOptSet);
+            pIntent.body.append(intentBar);
+            paneMain.append(pIntent.g);
+
+            /* ---- ② 剧本：AI 扩写产物，可手工改后再优化 ---- */
+            const pScript = mkPane("② 剧本（扩写产物 · 可手工改）", true);
+            const scriptTa = createPromptEditor({
+                value: String(segNow.script || ""),
+                labels: liveLabels,
+                assets: liveAssets,
+                dir: () => getDirValue(node),
+                onRemove: () => {
+                    if (canEdit) setSegmentField(node, it.idx, "script", scriptTa.value);
+                    scheduleRefresh(200);
+                },
+            });
+            scriptTa.placeholder = "点上方「✨ AI扩写」生成，或直接粘贴官方格式剧本"
+                + "（integrated_multimodal_description: …）";
+            if (canEdit) {
+                scriptTa.addEventListener("input",
+                    () => setSegmentField(node, it.idx, "script", scriptTa.value));
+                scriptTa.addEventListener("blur", () => {
+                    setSegmentField(node, it.idx, "script", scriptTa.value);
+                    scheduleRefresh(200);
+                });
+                attachAtComplete(scriptTa, node);
+            } else {
+                scriptTa.disabled = true;
+            }
+            pScript.body.append(scriptTa.el || scriptTa);
+            const scriptBar = el("div", "h3d-actions");
+            const bOptRun = el("button", "h3d-btn h3d-btn-cyan", "✨ 提示词优化 → 结果");
+            bOptRun.title = "把剧本优化成最终结果写进「③ 结果」；剧本本身保留，可反复重优化";
+            bOptRun.disabled = !canEdit;
+            bOptRun.onclick = () => runOptForSegment(node, it.idx, ta, { btn: bOptRun }, scriptTa);
+            scriptBar.append(bOptRun);
+            pScript.body.append(scriptBar);
+            paneMain.append(pScript.g);
+
+            /* ---- ③ 结果：最终进模型文本 ---- */
+            const pResult = mkPane("③ 结果（最终进模型）", true);
+            pResult.body.append(ta.el || ta);
+            /* 结果工具条：原稿切换 / 双向同步具象化（优化入口在 ② 剧本区） */
             const optbar = el("div", "h3d-actions");
             optbar.dataset.optbar = String(it.idx);
-            paneMain.append(optbar);
+            pResult.body.append(optbar);
+            paneMain.append(pResult.g);
             try { paintOptbar(optbar, node, data, it.idx, ta); } catch (e) {}
+
+            /* 源码覆盖已彻底移除（有结果框就够了）。旧存档若残留 override_text，
+             * 它会取代一切编译结果——必须让用户看见并能一键清掉，否则是个暗坑。 */
+            {
+                const pvNow = (segNow.prompt_v2 && typeof segNow.prompt_v2 === "object")
+                    ? segNow.prompt_v2 : null;
+                if (pvNow && String(pvNow.override_text || "").trim()) {
+                    const row = el("div", "h3d-v2row");
+                    row.append(el("span", "h3d-secs-hint",
+                        "本段残留「源码覆盖」文本，编译时会取代上面所有内容。"));
+                    const clr = el("button", "h3d-btn h3d-btn-danger", "清除覆盖");
+                    clr.style.cssText = "padding:2px 8px;font-size:11px";
+                    clr.onclick = () => {
+                        setPromptV2Field(node, it.idx, (p) => { p.override_text = null; });
+                        scheduleRefresh(80);
+                    };
+                    row.append(clr);
+                    pResult.body.append(row);
+                }
+            }
 
             /* 引用调度已迁入具象化参考组（分段素材调度，933 上限）；引用语模板已并入上方统一引用条 */
 
@@ -7571,6 +7955,13 @@ function applyH3TextToSeg(node, segIdx, h3Text) {
 /** AI 扩写弹窗：填中文意图 → 出确认卡 → 确认回填 / 提意见修订 / 换风格重来。 */
 function openExpandModal(node, segIdx, pv0) {
     if (document.querySelector(".h3d-overlay")) return;
+    /* 扩写与优化共用同一份导演台设置：传 null 会让后端走 optimizer.py 的
+     * DEFAULT_CONFIG 常量（语言/规则都不跟随用户选择），必须显式传进来。 */
+    let settings;
+    try { settings = optGetSettings(node); }
+    catch (e) { alert(`加载优化配置失败：${e.message}`); return; }
+    if (settings.mode === "local" && !settings.local_model) { openOptSettings(node); return; }
+    if (settings.mode !== "local" && !settings.api_key) { openOptSettings(node); return; }
     const ds = getDs(node);
     const seg = (ds.segments || [])[segIdx] || {};
     const pv = seg.prompt_v2 || pv0 || {};
@@ -7590,7 +7981,7 @@ function openExpandModal(node, segIdx, pv0) {
     ta.className = "h3d-mpta";
     ta.spellcheck = false;
     ta.placeholder = "一句话说清这段要什么：场景、人物、动作、情绪、镜头感觉。例：夜晚便利店门口，女孩撑伞等车，霓虹倒映在积水里，缓慢推近。";
-    ta.value = String(pv.intent_zh || "").trim();
+    ta.value = String(seg.intent_zh || pv.intent_zh || "").trim();
     const cardBox = el("pre", "h3d-cardbox", "");
     cardBox.style.display = "none";
     const info = el("div", "h3d-mpinfo", "");
@@ -7622,7 +8013,7 @@ function openExpandModal(node, segIdx, pv0) {
         try {
             const duration = Number(seg.seconds) || 5;
             const res = await window.H3Api.expand({
-                config: null,                       // null = 走服务端已保存的优化设置
+                config: settings,                   // 跟随导演台设置：输出语言 / 规则文件
                 prompt: String(ta.value || "").trim(),
                 duration,
                 mode,
@@ -7660,10 +8051,19 @@ function openExpandModal(node, segIdx, pv0) {
     applyBtn.onclick = () => {
         if (!curH3) return;
         if (!applyH3TextToSeg(node, segIdx, curH3)) { err.textContent = "没解析出可回填的字段"; return; }
-        /* 意图也存回，方便下次续改 */
-        setPromptV2Field(node, segIdx, (p) => { p.intent_zh = String(ta.value || "").trim(); });
+        /* 意图存两处：段级（主框上半区，下次续改直接带出来）+ v2 内部（兼容旧路径） */
+        const intent = String(ta.value || "").trim();
+        setSegmentField(node, segIdx, "intent_zh", intent);
+        setPromptV2Field(node, segIdx, (p) => { p.intent_zh = intent; });
+        /* 扩写产物进 ② 剧本框；③ 结果框若还空就顺带填上，
+         * 免得「扩写完了这段仍是空的」。正式定稿走 ② 的「提示词优化」。 */
+        setSegmentField(node, segIdx, "script", curH3);
+        const dsNow = getDs(node);
+        if (!String((dsNow.prompts || [])[segIdx] || "").trim()) {
+            setPromptText(node, segIdx, curH3);
+        }
         flushPrompts(node);
-        setLed("idle", `第 ${segIdx + 1} 段已按官方格式回填`);
+        setLed("idle", `第 ${segIdx + 1} 段剧本已生成，可在 ② 改后点「提示词优化」定稿`);
         overlay.remove();
         scheduleRefresh(60);
     };
@@ -7712,7 +8112,12 @@ function poolFromManifest(mf, links) {
             roles: _rolesOf(L && L.roles),
         });
     }
-    return [...byLabel.values()].filter((a) => a.file);
+    /* 有 asset_id 的链接条目**即使 file 为空也要留下**：file 是后端从全局库按
+     * asset_id 回填的，全局库不可用时（try_library_root 定位失败 / 条目还没进库）
+     * 就回填不到 —— 旧实现在这里按 file 过滤，于是「从全局库调进来的视频、音频、
+     * 部分图片在引用条里一个都不出现」。有 asset_id 时预览走 libraryFileUrl(asset_id)，
+     * 寻址照样正确；只有既无 file 又无 asset_id 的才是真·无效条目。 */
+    return [...byLabel.values()].filter((a) => a.file || a.asset_id);
 }
 
 /** 池子指纹：只有它变了才写回 widget（避免无谓重绘/丢焦） */

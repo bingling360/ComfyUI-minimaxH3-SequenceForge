@@ -6141,8 +6141,8 @@ function buildCards(data) {
              * 只有「③ 结果」那条进模型（ds.prompts + seg.refs，走官方 9/3/3）；
              * ①② 只是标注，写完只落在自己的正文里。 */
             const refBars = [];
-            /* 活素材池：三栏引用条都按它算别名，上传/改名/删素材后立即跟上 */
-            const liveAssets = () => {
+            /* 活素材池（**数组**）：三栏引用条按它算引用；注意别和下面的别名表 liveAssets 撞名 */
+            const poolNow = () => {
                 if (!node) return pool;
                 try { return (getDs(node).ref_assets || []); } catch (e) { return pool; }
             };
@@ -6235,7 +6235,7 @@ function buildCards(data) {
                 title: "引用素材 · 意图",
                 editor: canEdit ? intentTa : null,
                 readRefs: () => refsFromText(String((canEdit ? intentTa.value : segNow.intent_zh) || ""),
-                    liveAssets()),
+                    poolNow()),
                 commit: (ed) => {
                     setSegmentField(node, it.idx, "intent_zh", ed.value);
                     scheduleRefresh(200);
@@ -6288,7 +6288,7 @@ function buildCards(data) {
                 title: "引用素材 · 剧本",
                 editor: canEdit ? scriptTa : null,
                 readRefs: () => refsFromText(String((canEdit ? scriptTa.value : segNow.script) || ""),
-                    liveAssets()),
+                    poolNow()),
                 commit: (ed) => {
                     setSegmentField(node, it.idx, "script", ed.value);
                     scheduleRefresh(200);
@@ -6312,7 +6312,7 @@ function buildCards(data) {
             const refResult = mkRefBar({
                 title: "引用素材",
                 editor: canEdit ? ta : null,
-                readRefs: () => refsFromText(String(ta.value || ""), liveAssets()),
+                readRefs: () => refsFromText(String(ta.value || ""), poolNow()),
                 commit: (ed) => applyPromptEdit(node, it.idx, ed),
                 gate: true, showFrames: true, tplKey: it.idx,
             });

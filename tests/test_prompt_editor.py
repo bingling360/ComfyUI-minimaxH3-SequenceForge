@@ -234,3 +234,41 @@ def test_three_pane_refbars_independent():
     assert 'if (seg && Array.isArray(seg.refs) && seg.refs.length) return ' + chr(34) + 'Ref2VA' + chr(34) + ';' not in d
     # 优化器任务判定与 defaultV2Mode 同口径（不再写死 FL2VA）
     assert "return defaultV2Mode(ds, idx);" in d
+
+
+def test_director_js_module_syntax():
+    """前端 JS 按 **ES module** 解析必须无错（浏览器就是这么加载的）。
+
+    回归：曾在段卡作用域里重复声明 const liveAssets ——  按
+    **script** 解析放过了这个早期错误，浏览器按 module 解析直接 SyntaxError，
+    整个导演台（连左侧入口）都不会出现。所以校验必须走 .mjs / module 模式。
+    """
+    if not NODE:
+        pytest.skip('"未找到 node"')
+    tmp = os.path.join(ROOT, '_h3_module_syntax_check.mjs')
+    try:
+        shutil.copyfile(DIRECTOR, tmp)
+        r = subprocess.run([NODE, '--check', tmp], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stdout + chr(10) + r.stderr
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def test_director_js_module_syntax():
+    """前端 JS 按 **ES module** 解析必须无错（浏览器就是这么加载的）。
+
+    回归：曾在段卡作用域里重复声明 const liveAssets ——  按
+    **script** 解析放过了这个早期错误，浏览器按 module 解析直接 SyntaxError，
+    整个导演台（连左侧入口）都不会出现。所以校验必须走 .mjs / module 模式。
+    """
+    if not NODE:
+        pytest.skip('"未找到 node"')
+    tmp = os.path.join(ROOT, '_h3_module_syntax_check.mjs')
+    try:
+        shutil.copyfile(DIRECTOR, tmp)
+        r = subprocess.run([NODE, '--check', tmp], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stdout + chr(10) + r.stderr
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)

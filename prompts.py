@@ -36,7 +36,11 @@ _FIELD_LINE_RE = re.compile(
     r"|subject_definitions|summary|retention_analysis|detailed_description)\s*:\s*", re.I)
 _KF_RE = re.compile(
     r"For the target video, at ([0-9.]+) seconds into the target video, "
-    r"<(Picture|Video|Audio|Subject)\s+(\d+)> \(from \[Shot (\d+)\]\) is fully referenced\.")
+    r"<(Picture|Video|Audio|Subject)\s+(\d+)> \(from \[Shot (\d+)\]\) is fully referenced\."
+    # 官方 FL2VA / L2VA 对齐句（base-en.txt 2.1）：整行一条，必须一并识别，
+    # 否则 L2VA 句里的 [Shot N] 会被当成真镜头，触发 E_SHOT_ORDER。
+    r"|How the reference pictures align with the target video — [^\n]*?"
+    r"mark of the target video\.")
 _SHOT_RE = re.compile(r"\[Shot\s+(\d+)\](?:\s*At\s+(\d\d):(\d\d)\.(\d\d\d))?")
 _D_TAG_RE = re.compile(r"<d>\[(.+?)\](.*?)</d>", re.S)
 _SPEAKER_RE = re.compile(r"\(S\d+(?:,S\d+)*\)")
@@ -46,6 +50,16 @@ _OFFICIAL_FIELD_RE = re.compile(
 
 KEYFRAME_LINE = ("For the target video, at {t:.2f} seconds into the target video, "
                  "{label} (from [Shot {shot}]) is fully referenced.")
+# 官方 FL2VA 对齐句（base-en.txt 2.1）：一条句子同时锚住首帧（0.00s）与尾帧（本段时长）。
+# 官方用裸词 Picture 1 / Picture 2（不带尖括号）、Shot 不带方括号，逐字照抄。
+FL2VA_HEAD = ("How the reference pictures align with the target video — "
+              "Picture 1 (from Shot {first_shot}) aligns with the 0.00-second mark "
+              "of the target video; Picture 2 (from Shot {last_shot}) aligns with "
+              "the {t:.2f}-second mark of the target video.")
+# 官方 L2VA 对齐句（base-en.txt 2.1）：只有末帧锚，标签带尖括号、Shot 带方括号。
+L2VA_HEAD = ("How the reference pictures align with the target video — "
+             "<Picture 1> (from [Shot {shot}]) aligns with the {t:.2f}-second mark "
+             "of the target video.")
 
 
 def _s(v, d=""):
@@ -382,10 +396,14 @@ def compile_segment(prompt_raw, *, seconds=5.0, has_start=False, has_end=False, 
     n_shots = len(prompt.get("shots") or [])
     if mode in ("I2VA", "L2VA", "FL2VA"):
         dur = float(seconds or 5.0)
-        if mode in ("I2VA", "FL2VA") and has_start:
+        n = max(1, n_shots)
+        if mode == "FL2VA" and has_start and has_end:
+            # 官方 FL2VA：一条对齐句说完首尾两锚，尾帧锚是本段的 S.SS（不是全片总时长）
+            kf_lines.append(FL2VA_HEAD.format(first_shot=1, last_shot=n, t=dur))
+        elif mode in ("L2VA", "FL2VA") and has_end:
+            kf_lines.append(L2VA_HEAD.format(shot=n, t=dur))
+        elif mode in ("I2VA", "FL2VA") and has_start:
             kf_lines.append(keyframe_line(0.0, "<Picture 1>", 1))
-        if mode in ("L2VA", "FL2VA") and has_end:
-            kf_lines.append(keyframe_line(dur, "<Picture 1>", max(1, n_shots)))
     if mode == "Ref2VA":
         fields = compose_reference(prompt, duration=seconds)
     else:

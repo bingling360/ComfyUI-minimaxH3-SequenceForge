@@ -950,32 +950,7 @@ function buildRefBar(RB) {
             paintAll();
             /* 段级首尾帧参考图：从项目里的图片选（或现传一张），作为本段的
              * 首帧 / 尾帧参考（段头 / 段尾身份锚；首段首帧图 = i2v 起手帧）。 */
-            const frameBtns = el("div", "h3d-frmbtns");
-            const FRAME_KEYS = [["first", "首帧图"], ["end", "尾帧图"]];
-            const paintFrameBtns = () => {
-                frameBtns.replaceChildren();
-                const seg = (getDs(node).segments || [])[segIdx] || defaultSegment();
-                const fi = seg.frame_img || {};
-                for (const [key, name] of FRAME_KEYS) {
-                    const has = !!fi[key];
-                    const b = el("button", "h3d-btn h3d-frm" + (has ? " on" : ""),
-                        `${has ? "🖼" : "＋"}${name}${has ? `（${frameNameOf(fi[key])}）` : ""}`);
-                    b.type = "button";
-                    b.title = has
-                        ? `本段${name}参考：${fi[key]}（点开可换一张 / 清除）`
-                        : `选一张项目里的图片当本段${name}参考（也可现场上传）`;
-                    b.addEventListener("mousedown", (e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        openFramePicker(node, segIdx, key, name, () => {
-                            paintFrameBtns();
-                            scheduleRefresh(240);
-                        });
-                    });
-                    frameBtns.append(b);
-                }
-            };
-            if (RB.showFrames) { paintFrameBtns(); refbar.append(frameBtns); }
+            if (RB.showFrames) refbar.append(mkFrameBtns(node, segIdx, () => scheduleRefresh(240)));
                             /* 锚定方式（引用语）：**先选方式，再点参考素材** —— 点哪个素材就按该方式
              * 把句式写进正文（`场景以 @X 为准…`）。
              * 选择是"常驻模式"（切段/重绘后仍保持）；默认「裸引用（不加描述）」= 只插
@@ -2546,6 +2521,19 @@ function enTasks(str) {
         .filter(Boolean).map((x) => zh2en[x] || x).slice(0, 8);
 }
 
+/** 本段有没有首帧锚 / 尾帧锚 —— 全项目唯一口径，必须与节点实跑一致
+ *  （nodes.py:1923 起：段级 frame_img 优先，其次全局 first_frame/end_frame 只对首/末段生效）。
+ *  凡是要算 has_start / has_end 的地方都走这里，别再各写一遍。 */
+function segHasFrames(ds, segIdx) {
+    const seg = (ds?.segments || [])[segIdx] || {};
+    const fi = (seg.frame_img && typeof seg.frame_img === "object") ? seg.frame_img : {};
+    const nP = (ds?.prompts || []).length;
+    return {
+        has_start: !!(String(fi.first || "").trim() || (ds?.first_frame && segIdx === 0)),
+        has_end: !!(String(fi.end || "").trim() || (ds?.end_frame && segIdx === nP - 1)),
+    };
+}
+
 function defaultV2Mode(ds, segIdx) {
     /* 必须与后端 prompts.detect_mode 同口径，否则前端传过去的 mode 与后端
      * 自动判定不一致，会多报一条 W_MODE_OVERRIDE 警告，模板也会选错。
@@ -2558,9 +2546,7 @@ function defaultV2Mode(ds, segIdx) {
      * 段**已启用**具象化时 ensurePromptV2 返回它自己的 prompt_v2，
      * 主框引用不参与判定 —— 三栏引用照样互不串味。 */
     const seg = (ds?.segments || [])[segIdx] || {};
-    const nP = (ds?.prompts || []).length;
-    const hasStart = !!ds?.first_frame && segIdx === 0;
-    const hasEnd = !!ds?.end_frame && segIdx === nP - 1;
+    const { has_start: hasStart, has_end: hasEnd } = segHasFrames(ds, segIdx);
     const HP = window.H3Prompts || {};
     if (HP.detectMode && HP.ensurePromptV2) {
         const pv = HP.ensurePromptV2(Object.assign({}, seg, { prompt: (ds?.prompts || [])[segIdx] || "" }));
@@ -2591,16 +2577,32 @@ function setV2Mode(node, idx, mode) {
     scheduleRefresh(80);
 }
 
-/** 对齐指令行预览（与后端 prompts.py keyframe_line 同公式；FL2VA 官方另有一套
- *  对齐句式，后端当前用两条 keyframe 行简化表达，预览以实际编译结果为准） */
-function v2InstrPreview(mode, seconds, hasStart, hasEnd) {
+/** 官方对齐指令行（与后端 prompts.py 同口径：FL2VA 单句双锚、L2VA 末帧句、
+ *  I2VA keyframe_line；时长一律取本段 seconds）。无锚时返回空数组。 */
+function v2InstrLines(mode, seconds, hasStart, hasEnd, nShots) {
     const dur = (Number(seconds) || 5.0).toFixed(2);
+    const n = Math.max(1, Number(nShots) || 1);
+    if (mode === "T2VA" || mode === "Ref2VA") return [];
+    if (mode === "FL2VA" && hasStart && hasEnd) {
+        return [`How the reference pictures align with the target video — `
+            + `Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; `
+            + `Picture 2 (from Shot ${n}) aligns with the ${dur}-second mark of the target video.`];
+    }
+    if ((mode === "L2VA" || mode === "FL2VA") && hasEnd) {
+        return [`How the reference pictures align with the target video — `
+            + `<Picture 1> (from [Shot ${n}]) aligns with the ${dur}-second mark of the target video.`];
+    }
+    if ((mode === "I2VA" || mode === "FL2VA") && hasStart) {
+        return [`For the target video, at 0.00 seconds into the target video, `
+            + `<Picture 1> (from [Shot 1]) is fully referenced.`];
+    }
+    return [];
+}
+
+/** 面板里的对齐指令预览：v2InstrLines 为空时给人话解释，不返回指令。 */
+function v2InstrPreview(mode, seconds, hasStart, hasEnd, nShots) {
     if (mode === "T2VA") return "无对齐指令（纯文本起片，直接写三核心字段）";
-    const lines = [];
-    if ((mode === "I2VA" || mode === "FL2VA") && hasStart)
-        lines.push(`For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.`);
-    if ((mode === "L2VA" || mode === "FL2VA") && hasEnd)
-        lines.push(`For the target video, at ${dur} seconds into the target video, <Picture 1> (from [Shot N]) is fully referenced.`);
+    const lines = v2InstrLines(mode, seconds, hasStart, hasEnd, nShots);
     if (!lines.length) {
         /* 不再是"必须上传首尾帧"：没有锚就按纯文本起片，这是合法模式。
          * 上传后这里会自动补出对齐行。 */
@@ -2664,6 +2666,43 @@ async function optImageToDataUrl(url) {
             fr.readAsDataURL(blob);
         });
     } catch (e) { return null; }
+}
+
+/** 收集本段要喂给 AI 的图：先首尾帧锚（结构锚，模型必须先看见起点与终点），
+ *  再是本段引用的素材。统一按 <Picture N> 顺序编号。
+ *  以前每张图的 label 都写死成 <picture>：多图时系统提示里出现重复标签，
+ *  模型分不清谁是谁，也就谈不上"参考首帧写一条运动路径"。
+ *  首尾帧取自段级 frame_img，其次全局 first_frame / end_frame（与 segHasFrames 同口径）。
+ *  返回 { media, note }，note 是给模型的角色说明。 */
+async function collectSegMedia(node, ds, idx) {
+    const seg = (ds.segments || [])[idx] || {};
+    const fi = (seg.frame_img && typeof seg.frame_img === "object") ? seg.frame_img : {};
+    const nP = (ds.prompts || []).length;
+    const firstFile = String(fi.first || "").trim()
+        || (idx === 0 ? String(ds.first_frame || "").trim() : "");
+    const endFile = String(fi.end || "").trim()
+        || (idx === nP - 1 ? String(ds.end_frame || "").trim() : "");
+    const picks = [];
+    if (firstFile) picks.push({ file: firstFile, asset_id: "", role: "本段首帧（0.00s 起点锚）" });
+    if (endFile) picks.push({ file: endFile, asset_id: "", role: "本段尾帧（终点锚）" });
+    const pool = ds.ref_assets || [];
+    for (const key of ((Array.isArray(seg.refs) ? seg.refs : []).slice(0, 8))) {
+        const hit = pool.find((a) => a && (a.label === key || a.asset_id === key));
+        if (!hit || hit.kind !== "image") continue;
+        picks.push({ file: hit.file, asset_id: hit.asset_id || "", role: `参考素材「${hit.label}」` });
+    }
+    const media = [];
+    const notes = [];
+    for (const asset of picks) {
+        if (media.length >= 8) break;
+        const dataUrl = await optImageToDataUrl(
+            assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
+        if (!dataUrl) continue;
+        const tag = `<Picture ${media.length + 1}>`;
+        media.push({ kind: "image", label: tag, images: [dataUrl] });
+        notes.push(`${tag} = ${asset.role}`);
+    }
+    return { media, note: notes.length ? `随图说明：${notes.join("；")}。` : "" };
 }
 
 async function optFetchRuleFiles() {
@@ -2753,22 +2792,16 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
         const ds = getDs(node);
         const seg = (ds.segments || [])[idx] || {};
         const secs = seg.seconds || 5;
-        const refs = Array.isArray(seg.refs) ? seg.refs : [];
-        const media = [];
-        if (settings.read_media !== false) {
-            const poolList = ds.ref_assets || [];
-            for (const key of refs.slice(0, 8)) {
-                const asset = poolList.find((a) => a && (a.label === key || a.asset_id === key));
-                if (!asset || asset.kind !== "image") continue;
-                const dataUrl = await optImageToDataUrl(
-                    assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
-                media.push({ kind: "image", label: `<picture>`, images: dataUrl ? [dataUrl] : [] });
-            }
-        }
+        /* 图 = 首尾帧锚 + 本段参考素材（collectSegMedia 统一编号并给出角色说明） */
+        const mm = settings.read_media !== false
+            ? await collectSegMedia(node, ds, idx) : { media: [], note: "" };
         await optFetchRuleFiles();
         const body = {
-            prompt: before, task: optTaskForMode(ds, idx), duration: Number(secs) || 5,
-            media, context: { main_mode: optTaskForMode(ds, idx) }, config: settings,
+            /* 角色说明只进请求、不落库：优化器会像规则文件一样把它消费掉，
+             * 原稿（before）与写回的 prompt 都不受影响。 */
+            prompt: mm.note ? `${mm.note}\n${before}` : before,
+            task: optTaskForMode(ds, idx), duration: Number(secs) || 5,
+            media: mm.media, context: { main_mode: optTaskForMode(ds, idx) }, config: settings,
         };
         if (!window.H3Api?.optimize) throw new Error("h3_api.js 未更新（缺 optimize）");
         const r = await window.H3Api.optimize(body);
@@ -3070,13 +3103,16 @@ function paintOptbar(optbar, node, data, idx, ta) {
             try {
                 const ds = getDs(node);
                 const fseg = (ds.segments || [])[idx] || {};
-                const pv = fseg.prompt_v2;
-                if (!pv) { alert("本段尚未启用 v2，先到具象化页点启用"); return; }
-                const nP = (ds.prompts || []).length;
+                /* 没有「启用」按钮了：没存过 prompt_v2 就现场从旧字段迁一份来编译
+                 * （与具象化页编辑即启用的行为一致，不再拦一道） */
+                const pv = (fseg.prompt_v2 && typeof fseg.prompt_v2 === "object")
+                    ? fseg.prompt_v2
+                    : (window.H3Prompts?.ensurePromptV2 ? window.H3Prompts.ensurePromptV2(fseg) : null);
+                if (!pv) { alert("本段没有可编译的内容"); return; }
+                const fr = segHasFrames(ds, idx);
                 const r = await window.H3Api.compilePreview({
                     prompt: pv, seconds: Number(fseg.seconds) || 5.0,
-                    has_start: !!ds.first_frame && idx === 0,
-                    has_end: !!ds.end_frame && idx === nP - 1,
+                    has_start: fr.has_start, has_end: fr.has_end,
                     mode: effV2Mode(ds, idx) });
                 if (!r.body?.compiled?.prompt_text) throw new Error(window.H3Api.errText(r, "编译无文本"));
                 ta.value = r.body.compiled.prompt_text;
@@ -4226,6 +4262,8 @@ function injectStyles() {
     .h3d-chipminus.off{opacity:.4}
     .h3d-chipminus.off:hover{opacity:1}
     .h3d-frmbtns{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+    .h3d-anchorbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:5px;padding:6px 8px;border:1px solid #33302a;border-radius:7px;background:#191814}
+    .h3d-anchorbar>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
     .h3d-frm{padding:2px 9px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit}
     .h3d-frm:hover{filter:brightness(1.25)}
     .h3d-frm.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
@@ -4927,7 +4965,86 @@ function setSegmentFrameImg(node, idx, key, file) {
     /* 注意：这里**不**把图加进本段 refs —— 首/尾帧图是"锚点"不是"素材引用"。
      * 加进 refs 会让首段走 Ref2V（多参）分支，反而丢掉 i2v 起手帧语义。 */
     setDs(node, ds);
+    /* 锚点变了，结果框里那句对齐指令必须跟着变：清了锚还留着
+     * "Picture 1 aligns with the 0.00-second mark"，等于告诉模型去参考一张
+     * 已经不存在的图。对齐行是编译产物不是手写的，可以放心重写。 */
+    resyncAlignmentLines(node, idx);
     return true;
+}
+
+/* 官方对齐指令行的整行匹配（与后端 prompts._KF_RE 同口径） */
+const KF_ALIGN_RE = /^(?:For the target video, at [0-9.]+ seconds into the target video, <(?:Picture|Video|Audio|Subject)\s+\d+> \(from \[Shot \d+\]\) is fully referenced\.|How the reference pictures align with the target video — .*mark of the target video\.)$/;
+
+/** 按当前锚点重写结果框里的对齐指令行：清了锚就摘掉，还有锚就按新锚重写。
+ *  只动 integrated_multimodal_description 开头那几句，正文一个字不碰。
+ *  原本没有对齐行、现在也不需要 → 直接返回，不打扰手写的文本。 */
+function resyncAlignmentLines(node, idx) {
+    try {
+        const ds = getDs(node);
+        const text = String((ds.prompts || [])[idx] || "");
+        if (!text.trim()) return;
+        const lines = text.split("\n");
+        let prefix = null, inline = "", sawAlign = false;
+        const before = [], body = [];
+        for (const l of lines) {
+            if (prefix === null) {
+                const m = /^(integrated_multimodal_description:)(.*)$/.exec(l);
+                if (!m) { before.push(l); continue; }
+                prefix = m[1];
+                const tail = m[2].trim();
+                if (KF_ALIGN_RE.test(tail)) sawAlign = true;
+                else if (tail) inline = tail;
+                continue;
+            }
+            if (KF_ALIGN_RE.test(l.trim())) { sawAlign = true; continue; }
+            body.push(l);
+        }
+        if (prefix === null) return;                  // 不是官方字段结构 → 不碰
+        const seg = (ds.segments || [])[idx] || {};
+        const fr = segHasFrames(ds, idx);
+        const mode = effV2Mode(ds, idx);
+        const pv = window.H3Prompts?.ensurePromptV2
+            ? window.H3Prompts.ensurePromptV2(seg) : null;
+        const nShots = pv ? ((pv.shots || []).length || 1) : 1;
+        const want = v2InstrLines(mode, Number(seg.seconds) || 5.0,
+            fr.has_start, fr.has_end, nShots);
+        if (!sawAlign && !want.length) return;        // 原本没有、现在也不要 → 不动
+        const parts = want.slice();
+        if (inline) parts.push(inline);
+        parts.push(...body);
+        const head = prefix + (parts.length ? " " + parts.join("\n") : "");
+        const newText = before.concat(head).join("\n");
+        if (newText !== text) setPromptText(node, idx, newText);
+    } catch (e) { console.warn("[h3-director] resyncAlignmentLines failed:", e); }
+}
+
+/** 段级首帧图 / 尾帧图按钮组：点开选图（项目内图片或现传），已选可换可清。
+ *  主提示词框（结果栏）与具象化共用同一套入口 —— 首/尾帧锚定是段级运行参数，
+ *  一个段只有一组，不该在两个面板各改各的。 */
+function mkFrameBtns(node, segIdx, onChange) {
+    const box = el("div", "h3d-frmbtns");
+    const paint = () => {
+        box.replaceChildren();
+        const seg = (getDs(node).segments || [])[segIdx] || defaultSegment();
+        const fi = seg.frame_img || {};
+        for (const [key, name] of [["first", "首帧图"], ["end", "尾帧图"]]) {
+            const has = !!fi[key];
+            const b = el("button", "h3d-btn h3d-frm" + (has ? " on" : ""),
+                `${has ? "🖼" : "＋"}${name}${has ? `（${frameNameOf(fi[key])}）` : ""}`);
+            b.type = "button";
+            b.title = has
+                ? `本段${name}参考：${fi[key]}（点开可换一张 / 清除）`
+                : `选一张项目里的图片当本段${name}参考（也可现场上传）`;
+            b.addEventListener("mousedown", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openFramePicker(node, segIdx, key, name, () => { paint(); onChange && onChange(); });
+            });
+            box.append(b);
+        }
+    };
+    paint();
+    return box;
 }
 
 /** 选图弹窗：项目里的图片 + 现场上传 + 清除。 */
@@ -5254,9 +5371,8 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         const pv0 = (seg.prompt_v2 && typeof seg.prompt_v2 === "object")
             ? seg.prompt_v2 : (HP.ensurePromptV2 ? HP.ensurePromptV2(srcSeg) : HP.migrateLegacySeg(srcSeg));
         const hasV2 = !!(seg.prompt_v2 && typeof seg.prompt_v2 === "object");
-        const nPrompts = (data.ds.prompts || []).length;
-        const hasStart = !!data.ds.first_frame && segIdx === 0;
-        const hasEnd = !!data.ds.end_frame && segIdx === nPrompts - 1;
+        /* hasStart/hasEnd 走 segHasFrames（段级 frame_img 优先，与节点实跑同口径） */
+        const { has_start: hasStart, has_end: hasEnd } = segHasFrames(data.ds, segIdx);
         const autoMode = HP.detectMode ? HP.detectMode(pv0, { has_start: hasStart, has_end: hasEnd }) : "T2VA";
         const effMode = effV2Mode(data.ds, segIdx);
         const isManual = V2_MODES.includes(seg.v2mode);
@@ -5264,7 +5380,9 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         const det = v2Details(`v2${segIdx}`,
             "h3d-seg-panel h3d-v2panel" + (hasV2 ? " has-content" : ""),
             `具象化微调 · ${escapeHtml(V2_MODE_ZH[effMode] || effMode)}`
-            + `${hasV2 ? ' <span class="h3d-chip cyan">已启用</span>' : ' <span class="h3d-chip">未启用·用旧字段</span>'}`,
+            /* 没有「启用」概念了：改任意一个输入框就会把 v2 结构写出来，
+             * 这个徽只说明"这段此前存没存过 v2"，不阻编辑。 */
+            + `${hasV2 ? ' <span class="h3d-chip cyan">已存 v2</span>' : ' <span class="h3d-chip">未存 v2（改动即写入）</span>'}`,
             hasV2);
         const vbody = el("div", "h3d-seg-body");
 
@@ -5290,10 +5408,14 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     + "详细描述 → 环境音 → 背景配乐";
             } else {
                 prev.textContent = v2InstrPreview(effMode,
-                    Number(seg.seconds) || 5.0, hasStart, hasEnd);
+                    Number(seg.seconds) || 5.0, hasStart, hasEnd,
+                    (pv0.shots || []).length);
             }
             vbody.append(prev);
         }
+
+        /* 首/尾帧锚定不在这里重复挂：它已在卡片公共区（三页之上常驻），
+         * 一个段只有一组锚，两处都放只会互相打架。 */
 
         const mkLabel = (t) => el("label", "h3d-seg-label", escapeHtml(t));
         const mkTa = (val, ph, onInput, onBlur) => {
@@ -5583,9 +5705,13 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         gSnd.append(gSndBody);
         vbody.append(gSnd);
 
-        // —— 参考组（仅 Ref2VA 可见；官方六段式之 subject_definitions / summary / retention_analysis）——
+        // —— 参考组（常驻：官方六段式之 subject_definitions / summary / retention_analysis ＋ 素材调度）——
+        /* 以前这里 `if (isRef)` 才挂载，而 isRef 又要求 references/subjects 非空，
+         * 条目却只能在本组里加 —— 死锁：没有上传渠道就永远进不了多参。
+         * 常驻之后靠数据驱动：本组有条目 → 六段式（多参），清空 → 三段式（文/首尾帧）。 */
         const gRef = v2Details(`ref${segIdx}`, "h3d-v2group",
-            "参考 · subject_definitions / summary / retention_analysis", hasV2);
+            "参考 · 主体定义 / 总结 / 保留分析 ＋ 素材调度"
+            + "（有条目 → 多参六段式；清空 → 文/首尾帧三段式）", isRef);
         const gRefBody = el("div", "h3d-v2grid");
         gRefBody.append(mkLabel(`主体定义 ×${(pv0.subjects || []).length}（<Subject N>）`));
         (pv0.subjects || []).forEach((st, ti) => {
@@ -5782,8 +5908,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         };
         gRefBody.append(addRet);
         gRef.append(gRefBody);
-        /* 参考组仅 Ref2VA 挂载（base 模式数据保留，切换回来仍在） */
-        if (isRef) vbody.append(gRef);
+        vbody.append(gRef);
 
         /* 高级组已移除：源码覆盖（override_text）不是"浏览"也不是"微调"，
          * 它是直接改写最终结果，归入主框的「结果浏览框」里作为直接编辑入口。 */
@@ -5816,21 +5941,22 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 say([head, elines, wlines, "---", txt].filter(Boolean).join("\n"), r.body?.ok ? (warns.length ? "warn" : "ok") : "err");
             } catch (e) { say(`编译请求失败：${e?.message || e}`, "err"); }
         };
-        const bTog = el("button", "h3d-btn", hasV2 ? "清除具象化（回旧字段）" : "启用具象化（从旧字段迁移）");
-        bTog.title = hasV2 ? "删掉本段具象化结构，本段回到旧三字段迁移路径" : "从旧三字段迁移一份具象化结构存入本段，之后分组编辑即写回";
-        bTog.onclick = () => {
-            if (hasV2) {
+        /* 「启用具象化」按钮已删：setPromptV2Field 在 prompt_v2 缺失时会自动迁移创建，
+         * 改任何一个输入框就已经启用了，再摆一个启用按钮纯属自我矛盾。
+         * 「清除」保留 —— 它真能把结构删掉，让本段回到旧字段 / 以主框文本为准。
+         * 面板标题上那句「未启用·用旧字段」只是说明这段还没存过 v2，不影响编辑。 */
+        const bTog = hasV2 ? el("button", "h3d-btn", "清除具象化（回旧字段）") : null;
+        if (bTog) {
+            bTog.title = "删掉本段具象化结构，本段回到旧三字段（场景/角色/声音）路径，分组内容丢失";
+            bTog.onclick = () => {
                 if (!confirm("清除本段具象化？本段回到旧三字段（场景/角色/声音）路径，分组内容丢失。")) return;
                 const ds = getDs(node);
                 if (ds.segments[segIdx]) ds.segments[segIdx].prompt_v2 = null;
                 setDs(node, ds);
-            } else {
-                setPromptV2Field(node, segIdx, () => {}, {});
-                // setPromptV2Field 已在缺失时迁移创建
-            }
-            schedulePromptFlush();
-            scheduleRefresh(60);
-        };
+                schedulePromptFlush();
+                scheduleRefresh(60);
+            };
+        }
         const bSync = el("button", "h3d-btn h3d-btn-cyan", "同步到主框");
         bSync.title = "把当前具象化分组编译成官方文本，覆盖写回主提示词框（主框=最终进模型文本，可再手工微调）";
         bSync.onclick = async () => {
@@ -5856,7 +5982,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 scheduleRefresh(200);
             } catch (e) { say(`同步失败：${e?.message || e}`, "err"); }
         };
-        row.append(bPrev, bTog, bSync);
+        row.append(bPrev, ...(bTog ? [bTog] : []), bSync);
         vbody.append(row);
         vbody.append(out);
         det.append(vbody);
@@ -6055,6 +6181,19 @@ function buildCards(data) {
         const bridgeTxt = isDone && bridges[idx + off] != null ? `桥分 ${bridges[idx + off]}` : "";
         const meta = [seedTxt, seamTxt, bridgeTxt].filter(Boolean).join(" · ");
         if (meta) body.append(el("div", "h3d-cmeta", escapeHtml(meta)));
+
+        /* 段级首尾帧锚定（卡片公共区，在 主提示词/具象化/设置 三页之上常驻）。
+         * 以前这两个按钮挂在「③ 结果」的引用条里，可锚点是段级运行参数
+         * （节点按它注入 keyframe latent），跟"结果框引用了哪些素材"根本不是一回事，
+         * 摆在那儿会让人以为它只作用于结果框。一个段只有一组锚，放在外框才对。 */
+        if (node && it.idx !== undefined) {
+            const anchorBar = el("div", "h3d-anchorbar");
+            anchorBar.append(el("label", "", "首尾帧锚定"));
+            anchorBar.append(mkFrameBtns(node, it.idx, () => scheduleRefresh(240)));
+            anchorBar.append(el("span", "h3d-secs-hint",
+                "本段的起手帧 / 终点锚（段级，三栏共用）；清锚会同步摘掉结果框里的对齐指令"));
+            body.append(anchorBar);
+        }
 
         /* 提示词：切换式三页（主提示词/v2/设置；主框=最终进模型文本） */
         {
@@ -6325,7 +6464,9 @@ function buildCards(data) {
                 editor: canEdit ? ta : null,
                 readRefs: () => refsFromText(String(ta.value || ""), poolNow()),
                 commit: (ed) => applyPromptEdit(node, it.idx, ed),
-                gate: true, showFrames: true, tplKey: it.idx,
+                /* showFrames 已关：首/尾帧锚定搬到卡片公共区（三栏之上），
+                 * 它是段级运行参数，不属于"结果框的引用"。 */
+                gate: true, showFrames: false, tplKey: it.idx,
             });
             if (refResult) pResult.body.append(refResult);
             /* 结果工具条：原稿切换 / 双向同步具象化（优化入口在 ② 剧本区） */
@@ -8081,12 +8222,19 @@ function openExpandModal(node, segIdx, pv0) {
         setBusy(true);
         try {
             const duration = Number(seg.seconds) || 5;
+            /* 扩写从没传过 media —— 后端 service.py 早支持（payload.media），
+             * 前端漏了，于是 AI 扩写一直看不见任何图（连参考图都看不见）。
+             * 角色说明借 style_note 传：它是扩写器已有的"附加说明"通道。 */
+            const mm = settings.read_media !== false
+                ? await collectSegMedia(node, getDs(node), segIdx) : { media: [], note: "" };
             const res = await window.H3Api.expand({
                 config: settings,                   // 跟随导演台设置：输出语言 / 规则文件
                 prompt: String(ta.value || "").trim(),
                 duration,
                 mode,
                 two_step: true,
+                media: mm.media,
+                style_note: mm.note,
                 ...payload,
             });
             if (res.status >= 400 || res.body?.error) {

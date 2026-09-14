@@ -225,8 +225,11 @@ def test_three_pane_refbars_independent():
     # 只有结果栏 gate=true（官方上限 + 写 seg.refs），①② 是纯标注
     assert d.count("gate: true") == 1
     assert d.count("gate: false") == 2
-    # 只有结果栏带首尾帧按钮
-    assert d.count("showFrames: true") == 1
+    # 首尾帧按钮已从结果栏搬走：它是段级运行参数，不属于任何一栏的"引用"。
+    # 现在挂在卡片公共区（三页之上常驻），三栏一律 showFrames: false。
+    assert d.count("showFrames: true") == 0
+    assert d.count("showFrames: false") == 3
+    assert "h3d-anchorbar" in d and "mkFrameBtns(node, it.idx" in d
     # ①② 各写各的字段，不碰 seg.refs
     assert chr(34).join(['setSegmentField(node, it.idx, ', 'intent_zh', ', ed.value)']) in d
     assert chr(34).join(['setSegmentField(node, it.idx, ', 'script', ', ed.value)']) in d

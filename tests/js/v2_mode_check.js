@@ -44,23 +44,29 @@ if (!dom.window.H3Prompts || !dom.window.H3Prompts.detectMode) {
     console.error("FAIL: H3Prompts.detectMode 未挂载");
     process.exit(1);
 }
-const defaultV2Mode = dom.window.eval(extractFn("defaultV2Mode") + "\ndefaultV2Mode");
+/* segHasFrames 是 has_start / has_end 的唯一口径（段级 frame_img 优先），
+ * defaultV2Mode 依赖它，得一起 eval 进来。 */
+const defaultV2Mode = dom.window.eval(
+    extractFn("segHasFrames") + "\n" + extractFn("defaultV2Mode") + "\ndefaultV2Mode");
 if (typeof defaultV2Mode !== "function") {
     console.error("FAIL: defaultV2Mode 未取到");
     process.exit(1);
 }
 
-/* 后端同口径的参照实现（直接拿 H3Prompts，等价于 detect_mode） */
+/* 后端同口径的参照实现（直接拿 H3Prompts，等价于 detect_mode）。
+ * has_start / has_end 必须与节点实跑一致：段级 frame_img 优先，
+ * 其次才是全局 first_frame / end_frame（分别只对首段 / 末段生效）。 */
 function backendMode(ds, idx) {
     const HP = dom.window.H3Prompts;
     const seg = (ds.segments || [])[idx] || {};
     const nP = (ds.prompts || []).length;
+    const fi = (seg.frame_img && typeof seg.frame_img === "object") ? seg.frame_img : {};
     const pv = HP.compilePayload
         ? (seg.prompt_v2 || HP.migrateLegacySeg(Object.assign({}, seg, { prompt: (ds.prompts || [])[idx] || "" })))
         : seg.prompt_v2;
     return HP.detectMode(pv, {
-        has_start: !!ds.first_frame && idx === 0,
-        has_end: !!ds.end_frame && idx === nP - 1,
+        has_start: !!(String(fi.first || "").trim() || (ds.first_frame && idx === 0)),
+        has_end: !!(String(fi.end || "").trim() || (ds.end_frame && idx === nP - 1)),
     });
 }
 
@@ -112,6 +118,24 @@ const cases = [
         ds: { prompts: ["a"], end_frame: "e.png", segments: [{}] },
         idx: 0,
         want: "L2VA",
+    },
+    {
+        name: "中段有段级首帧图 → I2VA（锚定是段级的，不再只认首段的全局首帧）",
+        ds: {
+            prompts: ["a", "b", "c"], first_frame: "s.png", end_frame: "e.png",
+            segments: [{}, { frame_img: { first: "assets/mid.png" } }, {}],
+        },
+        idx: 1,
+        want: "I2VA",
+    },
+    {
+        name: "中段有段级首尾帧图 → FL2VA",
+        ds: {
+            prompts: ["a", "b", "c"],
+            segments: [{}, { frame_img: { first: "assets/m1.png", end: "assets/m2.png" } }, {}],
+        },
+        idx: 1,
+        want: "FL2VA",
     },
 ];
 

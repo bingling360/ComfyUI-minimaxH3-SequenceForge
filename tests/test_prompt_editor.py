@@ -161,7 +161,10 @@ def test_anchor_mode_source_points():
     # 引用语 = 常驻「锚定方式」模式（选方式 → 点素材 → 按方式写入正文）
     assert "const _refTpl = new Map()" in d
     assert "const REF_TPL_DEFAULT = 0" in d
-    assert "applyRefAnchorToV2(node, it.idx, a.label, tplDef || [], roles)" in d
+    # 三栏引用互不串味：主框引用条**不再**写具象化（具象化引用归它自己的参考组管）
+    assert "applyRefAnchorToV2(node, it.idx, a.label, tplDef || [], roles)" not in d
+    assert "const refBars = []" in d          # 意图/剧本/结果 各一条
+    assert "gate: true" in d                  # 只有「③ 结果」那条进模型
     assert "function applyRefAnchorToV2(node, idx, label, tplDef, roles)" in d
     # 模板带官方 retention 标记与角色句
     assert '"fully_preserved"' in d and '"partially_preserved"' in d and '"weak_reference"' in d
@@ -187,7 +190,7 @@ def test_ref_state_timely_source_points():
     assert "for (const fn of _cardPainters)" in d
     assert "registerCardPainter(repaintCard);" in d
     # ② ✕ / chip 点击立即重绘（并 guard 掉已被换掉的旧卡 DOM）
-    assert d.count("repaintCard();") >= 3
+    assert d.count("RB.repaint();") >= 2          # 三栏引用条各自即时重绘（chip/✕ 点击）
     assert "if (!ta.el || !ta.el.isConnected) return;" in d
     # ③ 别名表 + 素材池读**活**状态，不读建卡快照；晚到别名即时补框
     assert "livePool" in d
@@ -203,3 +206,31 @@ def test_clear_prompts_drops_refs():
     i = d.index("function clearPrompts(node)")
     block = d[i:i + 1400]
     assert "refs: []," in block
+
+
+def test_three_pane_refbars_independent():
+    """三栏引用条互不串味（源码点）。
+
+    ① 中文意图 / ② 剧本 / ③ 结果 各自持有一条引用栏，谁也不改谁：
+    每条只读自己正文里的 @别名（正文即真相），点 chip 只写自己的正文。
+    只有 ③ 走官方 9/3/3 上限并回写 seg.refs —— 也只有它进模型。
+    具象化的引用归它自己的参考组，不与主框三栏互写。
+    """
+    d = _src()
+    assert "function buildRefBar(RB)" in d
+    assert "const mkRefBar = (cfg) =>" in d
+    assert "const refBars = []" in d
+    # 三栏都挂上了自己的引用条
+    assert "refIntent" in d and "refScript" in d and "refResult" in d
+    # 只有结果栏 gate=true（官方上限 + 写 seg.refs），①② 是纯标注
+    assert d.count("gate: true") == 1
+    assert d.count("gate: false") == 2
+    # 只有结果栏带首尾帧按钮
+    assert d.count("showFrames: true") == 1
+    # ①② 各写各的字段，不碰 seg.refs
+    assert chr(34).join(['setSegmentField(node, it.idx, ', 'intent_zh', ', ed.value)']) in d
+    assert chr(34).join(['setSegmentField(node, it.idx, ', 'script', ', ed.value)']) in d
+    # 具象化模式判定不再吃主框的 seg.refs
+    assert 'if (seg && Array.isArray(seg.refs) && seg.refs.length) return ' + chr(34) + 'Ref2VA' + chr(34) + ';' not in d
+    # 优化器任务判定与 defaultV2Mode 同口径（不再写死 FL2VA）
+    assert "return defaultV2Mode(ds, idx);" in d

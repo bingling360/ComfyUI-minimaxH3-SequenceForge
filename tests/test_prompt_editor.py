@@ -272,3 +272,21 @@ def test_director_js_module_syntax():
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def test_v2_mode_detection_runtime_jsdom():
+    '''jsdom 真跑具象化模式判定：前端 defaultV2Mode 必须与后端 detect_mode 同口径。
+
+    这条是「未启用具象化就漏判成 T2VA」的回归闸：段没有 prompt_v2 时，后端
+    compilePayload 会 migrateLegacySeg 把 seg.refs 迁成 references → Ref2VA，
+    前端若只读 seg.prompt_v2（null）就会判 T2VA，两边打架（多报
+    W_MODE_OVERRIDE + 模板选错）。修法：前端直接复用 H3Prompts.detectMode，
+    入参也走 ensurePromptV2。
+    '''
+    nm = os.path.join(ROOT, "node_modules")
+    if not os.path.isdir(os.path.join(nm, "jsdom")):
+        pytest.skip("未安装 jsdom（repo/node_modules 缺失）")
+    script = os.path.join(ROOT, "tests", "js", "v2_mode_check.js")
+    env = dict(os.environ, NODE_PATH=nm)
+    r = subprocess.run([NODE, script], capture_output=True, text=True, timeout=90, env=env)
+    assert r.returncode == 0, r.stdout + chr(10) + r.stderr

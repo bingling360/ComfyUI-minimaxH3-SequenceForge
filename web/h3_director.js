@@ -2548,18 +2548,29 @@ function enTasks(str) {
 
 function defaultV2Mode(ds, segIdx) {
     /* 必须与后端 prompts.detect_mode 同口径，否则前端传过去的 mode 与后端
-     * 自动判定不一致，会多报一条 W_MODE_OVERRIDE 警告。
-     * 有参考/主体 → Ref2VA；否则按首尾帧**实际有无**分 FL2VA / I2VA / L2VA / T2VA。
-     * 不能一律给 FL2VA —— 文生视频、单首帧、单尾帧都是合法模式。 */
-    const seg = (ds?.segments || [])[segIdx];
-    const pv = seg && typeof seg.prompt_v2 === "object" ? seg.prompt_v2 : null;
-    const nRefs = pv ? (pv.references || []).length + (pv.subjects || []).length : 0;
-    /* 具象化有自己的参考组（pv.references / pv.subjects），主框正文与
-     * seg.refs **都不参与**它的模式判定 —— 三栏引用互不串味。 */
-    if (nRefs) return "Ref2VA";
+     * 自动判定不一致，会多报一条 W_MODE_OVERRIDE 警告，模板也会选错。
+     * 直接用 H3Prompts.detectMode（它就是 detect_mode 的镜像），**入参也要
+     * 跟后端一致**：pv 走 ensurePromptV2 —— 段未启用具象化时它会
+     * migrateLegacySeg，把主框的 seg.refs 迁成 references，于是这类段会
+     * 正确判成 Ref2VA。
+     * 此前这里只读 seg.prompt_v2，没启用时 pv=null → 漏判：前端 T2VA、
+     * 后端 Ref2VA，既报警告又用错模板（三段式 vs 六段式）。
+     * 段**已启用**具象化时 ensurePromptV2 返回它自己的 prompt_v2，
+     * 主框引用不参与判定 —— 三栏引用照样互不串味。 */
+    const seg = (ds?.segments || [])[segIdx] || {};
     const nP = (ds?.prompts || []).length;
     const hasStart = !!ds?.first_frame && segIdx === 0;
     const hasEnd = !!ds?.end_frame && segIdx === nP - 1;
+    const HP = window.H3Prompts || {};
+    if (HP.detectMode && HP.ensurePromptV2) {
+        const pv = HP.ensurePromptV2(Object.assign({}, seg, { prompt: (ds?.prompts || [])[segIdx] || "" }));
+        return HP.detectMode(pv, { has_start: hasStart, has_end: hasEnd });
+    }
+    /* 兜底（H3Prompts 未加载）：与 detect_mode 同规则 */
+    const pv = seg.prompt_v2 && typeof seg.prompt_v2 === "object" ? seg.prompt_v2 : null;
+    const nRefs = pv ? (pv.references || []).length + (pv.subjects || []).length
+        : (Array.isArray(seg.refs) ? seg.refs.length : 0);
+    if (nRefs) return "Ref2VA";
     if (hasStart && hasEnd) return "FL2VA";
     if (hasStart) return "I2VA";
     if (hasEnd) return "L2VA";

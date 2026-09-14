@@ -429,8 +429,9 @@ def test_v2_group_form_wired():
     assert "function debouncePromptV2Write" in d
     assert "function getSegPromptV2" in d
     # 四组中文标题齐全（官方字段名口径）；源码覆盖已迁出到主框结果区
+    # （参考组标题已从中英混排改为全中文，断言跟着改，别再拿旧字符串钉）
     for g in ["画面 · 风格/构图/环境/光照/角色/道具", "镜头 ×", "声音 · overall_soundscape",
-              "参考 · subject_definitions"]:
+              "参考 · 主体定义 / 总结 / 保留分析"]:
         assert g in d, g
     assert "高级 · 源码覆盖" not in d, "源码覆盖应已移除"
     assert "源码覆盖 · 直接改写最终结果" not in d, "源码覆盖应已彻底移除"

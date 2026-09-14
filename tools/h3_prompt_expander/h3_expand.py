@@ -46,10 +46,12 @@ def load_prompts():
     return intent, compile_, dialect
 
 
-def chat(model, messages, cfg, media=None):
+def chat(model, messages, cfg, media=None, temperature=None):
     """LLM 调用：摊平 OpenAI 风格 messages，交给 optimizer 的三协议通道。
 
     cfg 必填——通道、服务商、协议、模型全部由它决定。
+    temperature 必须透传：历史 bug 是这里没往下传，HTTP 体里恒为 0.2，
+    于是 strict/balanced/creative 三档风格只差一句提示词，采样温度从未变过。
     """
     system_parts, user_parts = [], []
     for m in messages or []:
@@ -58,7 +60,8 @@ def chat(model, messages, cfg, media=None):
             continue
         (system_parts if m.get("role") == "system" else user_parts).append(content)
     return _opt_backend.generate_json(cfg, "\n\n".join(system_parts),
-                                      "\n\n".join(user_parts), media=media)
+                                      "\n\n".join(user_parts), media=media,
+                                      temperature=temperature)
 
 
 def build_single_system(intent_sys, compile_sys, dialect):
@@ -209,7 +212,7 @@ def expand_once(raw_zh, duration, mode, model, temperature, max_repairs,
             obj = chat(model,
                        [{"role": "system", "content": intent_sys + "\n\n" + compile_sys},
                         {"role": "user", "content": REPAIR_TMPL.format(errors=errs, last=last[:6000])}],
-                       cfg, media=media)
+                       cfg, media=media, temperature=temperature)
             verdict = validate_envelope(obj)
             repairs += 1
         return obj, verdict, repairs
@@ -220,7 +223,7 @@ def expand_once(raw_zh, duration, mode, model, temperature, max_repairs,
                    [{"role": "system", "content": comp["compile_system"]},
                     {"role": "user", "content": "已确认的意图 IR（不许质疑，直接编译）：\n"
                      + json.dumps(intent, ensure_ascii=False) + "\n" + user_msg}],
-                   cfg, media=media)
+                   cfg, media=media, temperature=temperature)
         if "intent" not in obj:
             obj = {"intent": intent, "pe": obj.get("pe", obj)}
         obj, verdict, repairs = _validate_and_repair(obj, temperature)
@@ -228,18 +231,22 @@ def expand_once(raw_zh, duration, mode, model, temperature, max_repairs,
         obj = chat(model,
                    [{"role": "system", "content": comp["single_system"]},
                     {"role": "user", "content": user_msg}],
-                   cfg, media=media)
+                   cfg, media=media, temperature=temperature)
         obj, verdict, repairs = _validate_and_repair(obj, temperature)
     else:
         # 双跳：先理解，后编译（贵一倍，意图锁定更稳）
         o1 = chat(model,
                   [{"role": "system", "content": intent_sys}, {"role": "user", "content": user_msg}],
-                  cfg, media=media)
+                  cfg, media=media, temperature=temperature)
         intent = o1.get("intent", o1)
+        # 第二跳必须把 user_msg 一起发回：它带着 duration、style_note（随图说明）、
+        # 预处理 notes 与场景包。历史 bug 只发了 intent IR —— 图传上去了、
+        # 「哪张图是谁」的说明却在第二跳丢了，模型对着一堆无序图猜。
         o2 = chat(model,
                   [{"role": "system", "content": comp["compile_system"]},
-                   {"role": "user", "content": "意图 IR：\n" + json.dumps(intent, ensure_ascii=False)}],
-                  cfg, media=media)
+                   {"role": "user", "content": "意图 IR（不许质疑，直接编译）：\n"
+                    + json.dumps(intent, ensure_ascii=False) + "\n\n" + user_msg}],
+                  cfg, media=media, temperature=temperature)
         pe = o2.get("pe", o2)
         obj = {"intent": intent, "pe": pe}
         obj, verdict, repairs = _validate_and_repair(obj, temperature)
@@ -265,7 +272,7 @@ def revise_envelope(obj, revision, model, temperature, max_repairs, cfg=None, me
                        [{"role": "system", "content": intent_sys + "\n\n" + compile_sys},
                         {"role": "user", "content": REVISE_TMPL.format(
                             revision=revision, last=last[:6000], errors=errs)}],
-                       cfg, media=media)
+                       cfg, media=media, temperature=temperature)
         current_verdict = validate_envelope(current)
         repairs += 1
         if current_verdict["ok"]:

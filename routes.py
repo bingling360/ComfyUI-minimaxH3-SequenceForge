@@ -77,6 +77,8 @@ ROUTES = [
     ("POST", "/h3chain/upscale_reset"),
     ("POST", "/h3chain/redo_cancel"),
     ("POST", "/h3chain/expand"),
+    ("POST", "/h3chain/expand_multi"),
+    ("POST", "/h3chain/optimize_multi"),
     ("POST", "/h3chain/expand_validate"),
     ("GET", "/h3chain/lib_list"),
     ("GET", "/h3chain/lib_item"),
@@ -1064,6 +1066,52 @@ def add_routes(routes):
             return _err(f"扩写失败：{e}", code="EXPAND_FAILED", status=500)
         return web.json_response(result)
 
+    async def expand_multi(request):
+        """剧本扩写（多段）：总意图 -> N 段中文剧本（内容发散，不带官方格式）。
+
+        与 /h3chain/expand 的区别：expand 是「意图 -> 官方格式」的编译器（单段），
+        这里是「意图 -> 一大段剧本」的内容发散器，支持时长范围与多段。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            svc = _load_expander()
+        except Exception as e:
+            return _err(f"扩写模块未就绪：{e}", code="EXPAND_UNAVAILABLE", status=500)
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, svc.screenplay_via_config, data.get("config"), data)
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="EXPAND_FAILED", status=502)
+        except Exception as e:
+            return _err(f"剧本扩写失败：{e}", code="EXPAND_FAILED", status=500)
+        return web.json_response(result)
+
+    async def optimize_multi(request):
+        """多段提示词优化：把 N 段剧本逐段压成 H3 官方格式并校验。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _opt.optimize_multi_once, data.get("config"), data)
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="OPTIMIZE_FAILED", status=502)
+        except Exception as e:
+            return _err(f"多段优化失败：{e}", code="OPTIMIZE_FAILED", status=500)
+        return web.json_response({"ok": bool(result.get("ok")), **result})
+
     async def expand_validate(request):
         """只校验已有信封（不调 LLM）：给前端"校验"按钮用。"""
         try:
@@ -1796,6 +1844,8 @@ def add_routes(routes):
         ("GET", "/h3chain/optimizer-config", optimizer_config),
         ("POST", "/h3chain/optimize", optimize),
         ("POST", "/h3chain/expand", expand),
+        ("POST", "/h3chain/expand_multi", expand_multi),
+        ("POST", "/h3chain/optimize_multi", optimize_multi),
         ("POST", "/h3chain/expand_validate", expand_validate),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),

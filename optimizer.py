@@ -52,11 +52,25 @@ PROVIDERS = {
 
 RULE_OPTIONS = (
     "auto",
+    "minimaxh3_base_prompt_writing_zh.txt",
+    "minimaxh3_base_prompt_writing.txt",
     "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
     "minimaxh3_custom_ref2v_prompt_writing.txt",
     "minimaxh3_official_ref2v_prompt_writing.txt",
     "none",
 )
+
+# 规则文件按模式分流：官方 base（T2VA/I2VA/FL2VA/L2VA）与全参考（Ref2VA）是两套
+# 完全不同的字段集（三字段 vs 六字段）与标签语法（<Picture N> vs <Subject N>）。
+# 历史 bug：auto + 中文一律注入"自定义中文版"——那是一份**全参考四字段**规则，
+# 且注入语写着"此规则优先于其他通用格式要求"，于是给常规段优化时模型同时收到
+# 两条互相矛盾的最高优先级指令，产出 summary/detailed_description + <@名字>/
+# <#名字:对话> 这类非官方语法。这里按 task 选文件，从根上分流。
+REF_TASKS = ("REF2VA", "HYBRID")
+RULE_BASE = {"中文": "minimaxh3_base_prompt_writing_zh.txt",
+             "English": "minimaxh3_base_prompt_writing.txt"}
+RULE_REF = {"中文": "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
+            "English": "minimaxh3_custom_ref2v_prompt_writing.txt"}
 
 # 本地模型句柄进程内缓存：同一模型只加载一次（加载一次几十秒，反复加载会拖死节点）
 _GGUF_CACHE: dict = {}
@@ -84,17 +98,21 @@ def load_rule_files() -> dict:
     return out
 
 
-def pick_rule_text(settings: dict | None, files: dict | None) -> str | None:
+def pick_rule_text(settings: dict | None, files: dict | None, task: str | None = None) -> str | None:
+    """按「显式选择 > 语言+模式」选规则文件。
+
+    task 为 None 时按常规（base）处理——调用方应显式传 task（见 optimize_once）。
+    """
     sel = str((settings or {}).get("rule_file") or "auto")
     if sel == "none":
         return None
     files = files if isinstance(files, dict) else load_rule_files()
     if sel != "auto":
         return files.get(sel)
-    lang = str((settings or {}).get("output_language") or "中文")
-    name = ("minimaxh3_custom_ref2v_prompt_writing_zh.txt"
-            if lang == "中文" else "minimaxh3_custom_ref2v_prompt_writing.txt")
-    return files.get(name)
+    lang = "中文" if str((settings or {}).get("output_language") or "中文") == "中文" else "English"
+    is_ref = str(task or "").upper() in REF_TASKS
+    table = RULE_REF if is_ref else RULE_BASE
+    return files.get(table[lang]) or files.get(RULE_REF[lang])
 
 
 def normalize_config(raw: dict | None) -> dict:
@@ -290,7 +308,8 @@ def _endpoint_for(cfg: dict) -> str:
     return f"{base}/chat/completions"
 
 
-def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tokens: int) -> str:
+def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tokens: int,
+                  temperature: float = 0.2) -> str:
     if not cfg.get("api_key"):
         raise ValueError("未配置 API Key（请在优化设置里填写，或改用本地模型）")
     if not cfg.get("api_url") or not cfg.get("model"):
@@ -346,7 +365,7 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
         "model": cfg["model"],
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": content2}],
-        "max_tokens": max_tokens, "temperature": 0.2},
+        "max_tokens": max_tokens, "temperature": _temp(temperature)},
         headers={"Authorization": f"Bearer {cfg['api_key']}"})
     try:
         text = str(res["choices"][0]["message"]["content"] or "").strip()
@@ -355,6 +374,20 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
     if not text:
         raise RuntimeError("LLM 返回空文本")
     return text
+
+
+def _temp(v, default: float = 0.2) -> float:
+    """温度归一：未给/非法回落默认值，钳到 [0, 2]。
+
+    历史 bug：三档风格（strict/balanced/creative）的 temperature 只写在提示词里，
+    HTTP 请求体里写死 0.2，采样温度从未真正变过。这里统一收口。"""
+    try:
+        t = float(v)
+    except (TypeError, ValueError):
+        return default
+    if t < 0:
+        return 0.0
+    return min(2.0, t)
 
 
 def _media_images(media: list) -> list:
@@ -383,7 +416,8 @@ def _b64_to_pil(data_url: str):
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
 
-def _local_generate(cfg: dict, system: str, user_prompt: str, media: list) -> str:
+def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
+                    temperature: float = 0.2) -> str:
     """本地视觉模型推理（GGUF / Transformers 两路），进程内缓存句柄避免重复加载。"""
     sel = str(cfg.get("local_model") or "").strip()
     if not sel:
@@ -417,7 +451,7 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list) -> st
         res = llm.create_chat_completion(
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": content}],
-            max_tokens=int(cfg.get("max_tokens") or 4096), temperature=0.2)
+            max_tokens=int(cfg.get("max_tokens") or 4096), temperature=_temp(temperature))
         return str(res["choices"][0]["message"]["content"] or "").strip()
 
     # ---- Transformers 路径（AutoModelForImageTextToText + 进程内缓存）----
@@ -452,7 +486,8 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list) -> st
 
 
 def generate_text(config_in: dict | None, system: str, user_prompt: str,
-                  media: list | None = None, max_tokens: int | None = None) -> str:
+                  media: list | None = None, max_tokens: int | None = None,
+                  temperature: float | None = None) -> str:
     """通用文本生成入口：复用本模块的三协议云通道 + 本地通道。
 
     供 h3_prompt_expander 等上层工具调用，避免各自维护一套 HTTP 客户端。
@@ -472,15 +507,17 @@ def generate_text(config_in: dict | None, system: str, user_prompt: str,
         except (TypeError, ValueError):
             pass
     media = media if isinstance(media, list) else []
+    temp = _temp(temperature)
     if cfg.get("mode") == "local":
-        return _local_generate(cfg, system, user_prompt, media)
-    return _api_generate(cfg, system, user_prompt, media, int(cfg.get("max_tokens") or 4096))
+        return _local_generate(cfg, system, user_prompt, media, temp)
+    return _api_generate(cfg, system, user_prompt, media, int(cfg.get("max_tokens") or 4096), temp)
 
 
 def generate_json(config_in: dict | None, system: str, user_prompt: str,
-                  media: list | None = None, max_tokens: int | None = None) -> dict:
+                  media: list | None = None, max_tokens: int | None = None,
+                  temperature: float | None = None) -> dict:
     """generate_text 的 JSON 版：容忍 ```json 围栏与前后废话，截取最大 JSON 段。"""
-    text = generate_text(config_in, system, user_prompt, media, max_tokens)
+    text = generate_text(config_in, system, user_prompt, media, max_tokens, temperature)
     m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
     if m:
         text = m.group(1)
@@ -512,12 +549,82 @@ def optimize_once(config_in: dict | None, payload: dict | None) -> str:
     labels = [str(m.get("label")) for m in media if isinstance(m, dict) and m.get("label")]
     context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
     system = build_system_prompt(task, duration, labels, cfg.get("output_language"), context)
-    # 规则文件强注入（最高优先级）
-    rule_text = pick_rule_text(cfg, None)
+    # 规则文件强注入（最高优先级）：按模式分流，别再给常规段喂全参考规则
+    rule_text = pick_rule_text(cfg, None, task)
     if rule_text:
         user_prompt = ("请严格按照以下《提示词撰写规则》重写用户提供的视频提示词，"
                        "此规则优先于其他通用格式要求：\n\n" + rule_text +
                        "\n\n===== 待重写的用户提示词 =====\n" + user_prompt)
     if cfg.get("mode") == "local":
-        return _local_generate(cfg, system, user_prompt, media)
-    return _api_generate(cfg, system, user_prompt, media, int(cfg.get("max_tokens") or 4096))
+        return _local_generate(cfg, system, user_prompt, media,
+                               _temp(payload.get("temperature")))
+    return _api_generate(cfg, system, user_prompt, media, int(cfg.get("max_tokens") or 4096),
+                         _temp(payload.get("temperature")))
+
+
+def _validate_optimized(text: str, mode: str, seconds: float) -> dict:
+    """给优化结果补一道官方格式校验（历史缺口：优化结果从来不校验）。
+
+    优化产出的是**文本**，用 prompts.parse_override 解析官方字段头，再走
+    validate_compiled。解析/导入失败不阻断（校验只是提示层）。
+    """
+    try:
+        import prompts as _prompts
+    except Exception:
+        return {"ok": True, "errors": [], "warnings": []}
+    try:
+        parsed, order, _preamble = _prompts.parse_override(text)
+        compiled = {"mode": mode, "duration": float(seconds or 5.0), "fields": parsed,
+                    "prompt_text": text, "warnings": [], "diagnostics": {},
+                    "override": True}
+        return _prompts.validate_compiled(compiled)
+    except Exception:
+        return {"ok": True, "errors": [], "warnings": []}
+
+
+def optimize_multi_once(config_in: dict | None, payload: dict | None) -> dict:
+    """多段一次性优化：把 N 段剧本（自由格式）逐段压成 H3 官方格式并校验。
+
+    payload:
+      segments: [{prompt, seconds, task, media?}]  —— prompt 是该段剧本正文
+      task / media: 缺省值（各段未给时用它）
+    返回 {ok, segments:[{index, seconds, task, result, errors, warnings, ok}], meta}
+    ok = 所有非空段都通过官方校验（空段跳过不计）。
+    """
+    cfg = normalize_config(config_in)
+    payload = payload if isinstance(payload, dict) else {}
+    segs = payload.get("segments")
+    if not isinstance(segs, list) or not segs:
+        raise ValueError("segments 为空：至少要给一段剧本")
+    if len(segs) > 24:
+        raise ValueError(f"段数 {len(segs)} 过多，一次最多 24 段")
+    shared_media = payload.get("media") if isinstance(payload.get("media"), list) else []
+    out, all_ok = [], True
+    for i, s in enumerate(segs):
+        s = s if isinstance(s, dict) else {}
+        script = str(s.get("prompt") or "").strip()
+        task = str(s.get("task") or payload.get("task") or "T2VA")
+        try:
+            seconds = float(s.get("seconds") or 5.0)
+        except (TypeError, ValueError):
+            seconds = 5.0
+        if not script:
+            out.append({"index": i, "seconds": seconds, "task": task, "result": "",
+                        "skipped": True, "errors": [], "warnings": [], "ok": True})
+            continue
+        text = optimize_once(cfg, {
+            "prompt": script, "task": task, "duration": seconds,
+            "media": s.get("media") if isinstance(s.get("media"), list) else shared_media,
+            "context": {"main_mode": task},
+        })
+        verdict = _validate_optimized(text, task, seconds)
+        ok = bool(verdict.get("ok"))
+        all_ok = all_ok and ok
+        out.append({"index": i, "seconds": seconds, "task": task, "result": text,
+                    "skipped": False, "errors": verdict.get("errors") or [],
+                    "warnings": verdict.get("warnings") or [], "ok": ok})
+    return {"ok": all_ok, "segments": out,
+            "meta": {"count": len(out),
+                     "failed": sum(1 for x in out if not x.get("ok")),
+                     "mode": "local" if cfg.get("mode") == "local" else "api",
+                     "model": cfg.get("model") or ""}}

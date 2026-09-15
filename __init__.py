@@ -10,11 +10,21 @@ try:
     from .bundle import H3AssetBundle
     from .latent_tools import H3LatentExtract, H3LatentUpscale
 
+    # Enhance-A-Video / FETA 子节点（eav_feta.py，自包含，不依赖本项目其它模块）。
+    # 单独 try：这个模块导入失败也不影响上面几个主节点的加载。
+    try:
+        from .eav_feta import H3EAVFetaPatch, H3EAVFetaReport
+        _EAV_NODES = [H3EAVFetaPatch, H3EAVFetaReport]
+    except Exception:
+        _EAV_NODES = []
+        print("[ComfyUI_H3_SeamlessChain] EAV/FETA 子节点加载失败（其余节点不受影响）。详细错误：")
+        traceback.print_exc()
+
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
             # P4d：H3AssetHub（被 Bundle 取代）、H3MediaToLatent（被自动专跑取代）已删除
             return [H3SeamlessChainSampler, H3SeamDoctor, H3AssetBundle,
-                    H3LatentExtract, H3LatentUpscale]
+                    H3LatentExtract, H3LatentUpscale] + _EAV_NODES
 
         async def add_routes(self, routes):
             # 新版 ComfyUI / Comfy Desktop 官方路径：框架直接传入 routes 对象

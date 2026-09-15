@@ -4,8 +4,12 @@
 续跑时重解码秒级回放，结果与一次跑完逐帧一致（种子序列由 manifest 权威记录）。
 
 v2：指纹只覆盖共享参数（不含提示词、不含种子），改某段提示词仍指向同一条链；
-提示词按段存哈希，改了第 N 段 -> reroll_start 找到首个不一致段，从该段起重做
-（段 N 的锚定依赖段 N-1 尾帧，其后段必然级联重做）。
+提示词按段存哈希，改了第 N 段 -> 找到变更区间重建（见下）。
+
+v4（2026-09-16 修正旧注释）：**重做不需要级联。** 段 N 可用双锚对齐邻居——
+上锚取段 N-1 存档 latent 的尾部，下锚取段 N+1 存档 latent 的头部（`_redo_next_anchor`）。
+所以下游段已经生成好的前提下，改某段只重建该段即可，不必连带其后的段。
+真·唯一硬约束只有分辨率（C/H/W 不同则桥拼不上）。
 
 v3：存档根目录迁至 output/h3_projects/<项目名>/（游戏式一项目一文件夹），
 manifest 增加 title/created_at/updated_at/finals 键；旧 checkpoints 目录不读不写。
@@ -125,9 +129,21 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     """
     out = dict(manifest)
     out["done"] = start
-    # 链结构变化（提示词改/手动重跑/调序）使重摇标记的槽位语义作废，一并清空
+    # 重摇标记只清「被重做区间覆盖」的槽位：slot >= start 的段本来就要重做，
+    # 标记无意义 → 清；slot < start 的段保留存档、标记仍然有效 → 必须留
+    #（与调用方对 inserts 的过滤同口径，见 nodes.py 存档续跑处）。
+    # 旧实现无条件清空：改靠后的段会误杀靠前的重摇标记（10 段全完成 → 标段 3
+    # 重摇 → 改段 8 提示词使 start=7 → 段 3 标记被连带清掉）。
     if out.get("redo_queue"):
-        out["redo_queue"] = []
+        _kept = []
+        for _x in out["redo_queue"]:
+            try:
+                _s = int(_x[0])
+            except (TypeError, ValueError, IndexError):
+                continue          # 顺带滤掉畸形条目
+            if _s < start:
+                _kept.append(_x)
+        out["redo_queue"] = _kept
     for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts",
                 "seams", "bridge_scores", "anchors", "seam_metrics"):
         if key in out:

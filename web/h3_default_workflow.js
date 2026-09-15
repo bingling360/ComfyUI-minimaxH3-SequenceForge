@@ -238,6 +238,11 @@ window.H3_DEFAULT_WORKFLOW = {
           "name": "资产包",
           "type": "STRING",
           "link": 37
+        },
+        {
+          "name": "二采模型",
+          "type": "MODEL",
+          "link": null
         }
       ],
       "outputs": [

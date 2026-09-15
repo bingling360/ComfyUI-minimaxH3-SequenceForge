@@ -851,6 +851,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图同用"),
                 io.Audio.Input("起始视频音轨", optional=True,
                                tooltip="序章原声（与起始视频配对，建议同源 LoadVideo 拆出；不接则序章按静音处理）"),
+                io.Model.Input("二采模型", optional=True,
+                               tooltip="高清精化二采专用 UNET（神经放大 → 高清 latent 低强度重采样）。"
+                                       "不接=沿用一采「模型」（旧行为）。只作用于高清精化二采；"
+                                       "一采、E4 缝区过渡重采样、接缝重摇仍用一采模型。"
+                                       "可接不同量化 + 不同 LoRA 的独立链（UNETLoader → LoraLoader → 本槽）；"
+                                       "t2v/i2v 用 fl2va、r2v 用 ref2va，别混接。"
+                                       "换二采模型不会自动重做已有高清分段——要重做请设「重跑起始段」"),
                 # P4d：画布媒体/提示词入口已删除（首帧/尾帧/尾锚图片、提示词组 autogrow）——
                 # 素材与提示词只走资产包/Bundle/导演台状态。起始视频（序章）是唯一的画布
                 # 媒体入口（无导演台等价字段，保留）。旧工作流残留连线加载时自动忽略。
@@ -872,7 +879,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
-                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准", 资产包=""):
+                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准", 资产包="",
+                二采模型=None):
         # P4d：画布媒体/提示词/参考入口已从 schema 删除，对应形参一并移除；
         # 起始视频（序章）是唯一的画布媒体入口，保留。
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
@@ -1266,6 +1274,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
             except ValueError as e:
                 _up_err = str(e)
                 up_cfg = None
+            # 加载完立刻卸回 CPU：load_net 提到主循环前只为 fail-fast（权重缺失当场
+            # 降级，不让每段反复撞同一个错），不是要让放大网络常驻 GPU——它落在 GPU
+            # 只是 resolve_device 的副产品。放大网络是裸 nn.Module，ComfyUI 的
+            # free_memory 看不见它，留在 GPU 会白白挤占一采显存（首段最明显：
+            # 一采 UNET + net + 高清 latent 同时驻留 = 全链峰值）。
+            # 二采通道（upscale.render_latent）发现它在 CPU 会自行腾挪并搬回 GPU，
+            # 首段因此与后续段走同一条路径——否则首段是全链唯一不腾挪的一段。
+            # 代价：每段一次 net 回搬（约 200-300MB，PCIe 毫秒级），后续段本来就有。
+            if up_net is not None:
+                up_net.cpu()
 
         # 一采编码档位：基础链分段/成片的编码质量（二采开启时其高清产物同名覆盖，本档自然失效）
         _benc = str(一采编码 or "").strip()
@@ -1503,6 +1521,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append("实验性功能：后端已强制关闭（H3_EXPERIMENTS=0）")
         elif exp.enabled:
             report.append(exp.describe())
+        # 二采模型来源与结构签名（一次算好，逐段复用）：未接「二采模型」槽时沿用
+        # 一采模型——此时签名即一采模型的签名。签名只用于报告标注与 manifest 留痕，
+        # 不进 params_hash：换二采模型不会自动重做已有高清分段。
+        _up_model = 模型 if 二采模型 is None else 二采模型
+        _up_tag = upscale.model_tag(_up_model) if _up_model is not None else ""
+        # 一采/二采是否是两份独立权重：True 时每段二采入口先卸一采（见 _up_hi）。
+        # 同 base 的克隆（只差 LoRA）不卸——卸了等于把二采自己搬走，纯浪费。
+        _up_swap = upscale.models_distinct(模型, _up_model)
+        _up_swap_logged = [False]
+        if up_cfg:
+            _up_src = "独立「二采模型」槽" if 二采模型 is not None else "沿用一采「模型」"
+            report.append(f"二采模型：{_up_src}" + (f"（{_up_tag}）" if _up_tag else "")
+                          + ("；与一采非同源，每段二采前先卸一采（换页次数不变，"
+                             "只把空闲显存并成整块）" if _up_swap else ""))
         # 软桥能力探测：只在开关打开时探测并报告（全关时报告与旧版逐行一致）。
         # 等级 0 = 本机 ComfyUI 不支持逐 token 掩码 -> 整链自动回退现状路径。
         _sb_level, _sb_reason = 0, "未启用"
@@ -2253,19 +2285,43 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 bh = f"{full_hashes[g]}|{cur_seed}"   # 本段当前身份（回放段与 manifest 记录一致）
             else:
                 bh = upscale.base_hash(manifest, g) if isinstance(manifest, dict) else ""
+            # 换过二采模型时提示（只提示，不参与上面的 record_stale 判定）
+            _mm = upscale.model_mismatch_note(manifest, g, _up_tag)
+            if _mm:
+                report.append(_mm)
             if not upscale.record_stale(manifest, root, up_cfg, g, bh):
                 return True, False
+            if _up_swap:
+                # 二采是另一份权重：先把一采模型（连带 CLIP/VAE）整块卸回 CPU，
+                # 再交给 render_segment。换页次数并不因此减少（下段一采仍要载回），
+                # 收益只在两处：①空闲显存是一整块，ComfyUI「够用就停」不会留下
+                # 一采残部造成碎片；②preflight 量到的空闲对应真实状态，账目可信。
+                # 顺序同其它腾挪点：unload → gc → empty_cache（反序收不回）。
+                try:
+                    import comfy.model_management
+                    comfy.model_management.unload_all_models()
+                    gc.collect()
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    if not _up_swap_logged[0]:
+                        _up_swap_logged[0] = True
+                        print(f"[H3二采] 段{g + 1}：二采为独立模型，已先卸载一采模型腾整块显存"
+                              "（每段 2 次 UNET 级换页，属预期代价）", flush=True)
+                except Exception:
+                    pass
             try:
                 # 返回 (高清尾帧 CPU tensor, 最新存档状态)：尾帧暂无消费方
                 # （跨段连续性仍走基础 latent 桥），只回填存档状态进 manifest
                 _, proj_upscale = upscale.render_segment(
-                    模型, clip, video_vae, audio_vae, negative, up_cfg, up_net,
+                    _up_model, clip, video_vae, audio_vae, negative, up_cfg, up_net,
                     root, g, video_t, audio_t, kind, idx,
                     seg_prompts, seg_label_orders, pool_tensors, refs,
                     首帧图片 if (kind == "prompt" and idx == 0 and seg_first_on[0]) else None,
                     guide_kf, tail_kf, head_kf, cur_seed,
                     skip_f, vis_len,
-                    wav, rate, bh, report, 采样器, 调度器)
+                    wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag)
                 return True, False
             except upscale.UpscaleAbortError:
                 raise   # 预检/二采显存致命：报告已 append，终止整链，不降级
@@ -3253,6 +3309,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 转码专跑不碰它们，生成链照常连线不受影响。
             kwargs.setdefault("模型", None)
             kwargs.setdefault("文本编码器", None)
+            kwargs.setdefault("二采模型", None)
             return cls._execute_inner(*args, **kwargs)
         finally:
             _ckpt.unmark_busy()

@@ -27,6 +27,7 @@
 """
 
 import gc
+import hashlib
 import os
 import time
 
@@ -888,6 +889,119 @@ def _unet_size_gb(model):
     return v
 
 
+def _patch_digest(obj, n=256):
+    """patch 张量轻量校验和：取前 n 个元素求和（区分同名 LoRA 的不同权重）。
+
+    只读极小切片，成本可忽略；非张量/异常一律返回 ""（退化为不计入签名）。
+    """
+    try:
+        if isinstance(obj, torch.Tensor):
+            v = obj.detach().reshape(-1)[:n].float().sum().item()
+            return f"{v:.6g}"
+    except Exception:
+        pass
+    return ""
+
+
+def model_tag(model):
+    """二采模型结构签名（8 位 hex）——供报告标注与「换过模型」提示使用。
+
+    刻意不缓存：按 id 缓存有 id 复用隐患（_UNET_SIZE_CACHE 那份是历史包袱，
+    此处不复制），而每段算一次的开销只有一次参数量求和 + patches 切片，可忽略。
+
+    只取结构性特征，不依赖 ModelPatcher 暴露权重文件名（ComfyUI 并不保存）：
+    类 / 参数总量 / dtype 集合（区分 fp16·bf16·fp8·GGUF 等量化）/ 首张量形状 /
+    patches 键集合与其强度与轻量校验和（区分 LoRA 种类与强度）/ object_patches 键。
+    任一环节异常都返回 ""（退化为无标注，绝不因此中断二采）。
+    """
+    try:
+        dm = model.model.diffusion_model
+        ps = list(dm.parameters())
+        if not ps:
+            return ""
+        parts = [
+            type(dm).__name__,
+            str(sum(int(p.numel()) for p in ps)),
+            ",".join(sorted({str(p.dtype) for p in ps})),
+            str(tuple(ps[0].shape)),
+        ]
+        patches = getattr(model, "patches", None) or {}
+        try:
+            items = sorted(((str(k), v) for k, v in patches.items()),
+                           key=lambda kv: kv[0])
+        except Exception:
+            items = []
+        parts.append(f"{len(items)}:{items[0][0] if items else ''}"
+                     f":{items[-1][0] if items else ''}")
+        for _k, _lst in items[:8]:
+            try:
+                if not _lst:
+                    continue
+                it = _lst[0]
+                # ComfyUI patch 项形如 [strength, weight, strength_model]
+                parts.append(f"{float(it[0]):.6g}")
+                if len(it) > 1:
+                    parts.append(_patch_digest(it[1]))
+                if len(it) > 2:
+                    parts.append(f"{float(it[2]):.6g}")
+            except Exception:
+                continue
+        obj_patches = getattr(model, "object_patches", None) or {}
+        try:
+            parts.append(",".join(sorted(str(k) for k in obj_patches.keys())[:4]))
+        except Exception:
+            pass
+        return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()[:8]
+    except Exception:
+        return ""
+
+
+def models_distinct(a, b):
+    """两个 ModelPatcher 是否是「真·两份权重」（True → 切换时值得先卸载对方）。
+
+    二采接了独立模型时，每段要「卸 A 载 B / 卸 B 载 A」两次 UNET 级换页；
+    在二采入口先卸一采，只是为了让空闲显存成一整块、且让 preflight 量到真实
+    空闲——**换页次数不变**。所以同源时做这件事是纯浪费，必须判掉：
+
+    - 同一对象（`a is b`，未接「二采模型」槽）：False；
+    - 同一份权重的不同壳（`clone_base_uuid` 相同，典型 = 只差 LoRA 的克隆）：False
+      ——它们共享底层权重，卸 a 等于把 b 也搬走，紧接着又要装回来；
+    - 拿不到 `clone_base_uuid`（老版本 ComfyUI / 非 ModelPatcher）：保守返回 True
+      ——此时至多多一次换页，不会出错；判成 False 才会让显存碎片问题留着。
+
+    纯函数，不触碰权重、不需要 torch。
+    """
+    if a is None or b is None or a is b:
+        return False
+    ua = getattr(a, "clone_base_uuid", None)
+    ub = getattr(b, "clone_base_uuid", None)
+    if ua is None or ub is None:
+        return True
+    try:
+        return ua != ub
+    except Exception:
+        return True
+
+
+def model_mismatch_note(manifest, g, tag):
+    """段 g 的存档高清产物由另一个二采模型生成时的提示行（None=无冲突无需提示）。
+
+    只提示，不参与 record_stale 判定——按既定口径，模型身份不进 params_hash，
+    换二采模型不会自动重做已有高清分段；要重做请手动设「重跑起始段」。
+    """
+    if not tag or not isinstance(manifest, dict):
+        return None
+    segs = _records(manifest)
+    rec = segs[g] if g < len(segs) else None
+    if not isinstance(rec, dict):
+        return None
+    old = rec.get("model")
+    if not old or old == tag:
+        return None
+    return (f"⚠ 段{g + 1} 存档高清产物由另一个二采模型生成（{old}→{tag}）——"
+            f"沿用旧产物，不自动重做；要重做请设「重跑起始段」")
+
+
 _CANVAS_ABORT_MP = 12.0    # 二采画布超此（MP）→ 硬停（VAE 解码 + 显存双重爆点）
 _ACTIVATION_FACTOR = 4.0   # 采样峰值激活 ≈ 初始高清 latent 体积 × 系数（经验折中）
 _SAFE_MARGIN_GB = 1.0      # 显存账目安全余量（避免贴着上沿静默崩）
@@ -1534,6 +1648,25 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                             f"设备清单：{_inventory()}") from e2
                     raise
             raise
+        except (ValueError, AttributeError, TypeError, NotImplementedError) as e:
+            # 二采独立模型（不同量化 / 上游挂过第三方补丁节点）时，模型构造类补丁
+            # 会抛构造类异常：_stg_model 检测到已有 sampler_post_cfg_function 或
+            # double_block replacement 直接抛错（拒绝叠加），_shifted_model 读
+            # model_config 也可能失败。这些都不是致命错误——shift/STG/时间偏置只是
+            # 画质微调，砍掉换「这一段能出高清」。
+            # UpscaleAbortError 是 RuntimeError 子类、不在此列，OOM 与预检硬停
+            # 仍按既定语义上抛，不会被这里吞掉。
+            if not (sh > 0.0 or stg > 0.0 or tb > 0.0):
+                raise
+            if report is not None:
+                report.append(f"⚠ 段{seg_no} 精化补丁与本二采模型不兼容"
+                              f"（{type(e).__name__}: {e}）——"
+                              "已去除 shift/STG/时间偏置，用原模型重试")
+            print(f"[H3二采] 段{seg_no}：{type(e).__name__}（精化补丁与本模型不兼容），"
+                  "去除克隆/补丁用原模型重试…", flush=True)
+            gc.collect()
+            torch.cuda.empty_cache()
+            return _attempt(plain=True)
 
     def _deliver(sampled_dict):
         """精化输出 → 交付 latent：频域细节混合（mix）→ latent 锐化（sharpen）
@@ -1599,8 +1732,12 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    seg_prompts, seg_label_orders, pool_tensors, refs,
                    first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
                    skip_f, vis_len,
-                   wav, sample_rate, bh, report, 采样器, 调度器):
+                   wav, sample_rate, bh, report, 采样器, 调度器, model_tag=None):
     """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪）。
+
+    model_tag：二采模型结构签名（model_tag()），仅用于报告标注与写进
+    manifest.upscale.segs[g].model 留痕——不进 params_hash，换模型不会
+    触发既有高清分段重做（要重做请设「重跑起始段」）。
 
     主循环逐段调用（采样定稿/回放载入之后、基础段落盘之前）：分段视频与
     缩略图沿用基础段同名（单份产物——seg_NNN.mp4 即高清结果），另存尾帧锚
@@ -1678,7 +1815,8 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
           f"（总耗时 {time.perf_counter() - t0:.0f}s）", flush=True)
     _sig, _tier, _mo = resolve_refine_sigma(cfg, video_t)
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh,
-                            hf_gain=hf_gain, motion=_mo, sharp=sharp)
+                            hf_gain=hf_gain, motion=_mo, sharp=sharp,
+                            model_tag=model_tag)
     _n, _d = tail_refine_args(_sig, cfg["steps"])   # _n=执行步数，_d=σ 起点
     _tb = float(cfg.get("time_bias") or 0.0)
     _mix = float(cfg.get("mix") or 0.0)
@@ -1713,7 +1851,8 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   + (f" · {_enc}编码" if _enc != "标准" else "")
                   + ((f" · {(_sam + '/' + _sch).rstrip('/')}")
                      if (_sam or _sch) else "")
-                  + (" · 重试取优" if retried else ""))
+                  + (" · 重试取优" if retried else "")
+                  + (f" · 二采模型{model_tag}" if model_tag else ""))
     _te = _timing.get("te_hit")
     _te_txt = "" if _te is None else ("（TE命中）" if _te else "（TE未命中）")
     report.append(f"⏱ 段{g + 1} 二采分解：神经放大 {_timing.get('up', 0.0):.0f}s · "
@@ -1733,18 +1872,22 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
 
 def write_record(root, g, cfg, seed, size, bh, hf_gain=None, motion=None,
-                 sharp=None):
+                 sharp=None, model_tag=None):
     """段 g 高清渲染记录原子写盘（重读 manifest 防竞态覆盖并发进度）。
 
     bh=该段基础身份指纹（调用方用本地 full_hashes/seeds 现算，不依赖磁盘
     manifest 的写入时机）；hf_gain=细节增益 / motion=段运动量 / sharp=像素域
     清晰度（均仅记录供 ab_report 复盘与自适应阈值校准，不参与重做判定）；
+    model_tag=二采模型结构签名，**仅留痕不进 hash**——_record_valid 只比
+    hash/base_hash，故换二采模型不会让既有记录失效（不自动重做）。
     返回最新 upscale dict（调用方回填 proj_upscale，后续主循环的 manifest
     快照写盘才不会把记录冲掉）。
     """
     ph = params_hash(cfg)
     rec = {"hash": ph, "base_hash": bh, "seed": seed, "done": True,
            "files": checkpoint.upscale_files(g), "size": list(size)}
+    if model_tag:
+        rec["model"] = model_tag
     if hf_gain is not None:
         rec["hf_gain"] = round(float(hf_gain), 4)
     if motion is not None:

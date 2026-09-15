@@ -121,8 +121,13 @@ def _assert_frozen(wf):
     # P4d：画布媒体/提示词条目已删除，只剩模型链 + 序章 + 资产包
     assert sorted(i.get("name") for i in sampler.get("inputs", [])) == sorted([
         "模型", "文本编码器", "视频VAE", "音频VAE",
-        "起始视频", "起始视频音轨", "资产包",
+        "起始视频", "起始视频音轨", "资产包", "二采模型",
     ])
+    # 「二采模型」：可选 MODEL 槽，默认不接线（不接=沿用一采「模型」）
+    _up = [i for i in sampler.get("inputs", []) if i.get("name") == "二采模型"]
+    assert len(_up) == 1
+    assert _up[0].get("type") == "MODEL"
+    assert _up[0].get("link") is None
     for i in sampler.get("inputs", []):
         name = i.get("name") or ""
         if name in ("起始视频", "起始视频音轨"):

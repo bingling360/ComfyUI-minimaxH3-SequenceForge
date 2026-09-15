@@ -183,6 +183,41 @@ def _dedupe_assets(items: list) -> list:
     return out
 
 
+def _unique_label(base, taken, cap=24):
+    """taken 之外找一个不冲突标签，**保证能停**（详见 library.unique_label）。
+
+    历史坑：写成 `while lbl in taken: lbl = f"{base}{n}"[:cap]`，当 base 已满 cap
+    个字符时截断后恒等于 base → 死循环 → aiohttp 事件循环被占死 → 整个 ComfyUI
+    卡住（导演台、队列、所有接口全挂）。标签上限 24，中文名很容易凑满。
+    """
+    b = str(base or "").strip()[:cap] or "素材"
+    taken = {str(t) for t in (taken or ()) if t}
+    if b not in taken:
+        return b
+    stem = b[:max(1, int(cap) - 3)]
+    n = 2
+    while n < 10000:
+        cand = f"{stem}{n}"[:cap]
+        if cand not in taken:
+            return cand
+        n += 1
+    import time as _t
+    return (f"{stem}{int(_t.time() % 100000)}")[:cap]
+
+
+def _unique_filename(directory, want, sep="_"):
+    """directory 里找一个不冲突文件名（同名加 _2），**保证能停**。"""
+    d, w = str(directory or ""), str(want or "")
+    stem, ext = os.path.splitext(w)
+    cand, k = w, 2
+    guard = 0
+    while os.path.exists(os.path.join(d, cand)) and guard < 10000:
+        cand = f"{stem}{sep}{k}{ext}"
+        k += 1
+        guard += 1
+    return cand
+
+
 def save_assets(name: str, assets, base_revision=None):
     """资产库持久化：manifest["assets"] 全量覆盖写，revision+1，乐观锁可选。
 
@@ -999,20 +1034,13 @@ def import_asset(name, src_file, label="", kind="image", roles=None, base_revisi
         kk = "image"
     adir = os.path.join(root, "assets")
     os.makedirs(adir, exist_ok=True)
-    base, ext = os.path.splitext(parts[-1])
-    cand, k = parts[-1], 2
-    while os.path.exists(os.path.join(adir, cand)):
-        cand = f"{base}_{k}{ext}"
-        k += 1
+    cand = _unique_filename(adir, parts[-1])
     shutil.copy2(src_abs, os.path.join(adir, cand))
     dest_rel = f"assets/{cand}"
     taken = {a["label"] for a in (manifest.get("assets") or [])
              if isinstance(a, dict) and a.get("label")}
     lbl = str(label or "").strip()[:24] or os.path.splitext(cand)[0][:24]
-    _b, _n = lbl, 2
-    while lbl in taken:
-        lbl = f"{_b}{_n}"[:24]
-        _n += 1
+    lbl = _unique_label(lbl, taken)
     ent = {"label": lbl, "kind": kk, "file": dest_rel}
     if isinstance(roles, list):
         kept = [str(r).strip() for r in roles if str(r).strip() in ("首帧图", "尾帧图")]

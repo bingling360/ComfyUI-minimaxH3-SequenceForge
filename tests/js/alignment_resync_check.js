@@ -53,6 +53,10 @@ dom.window.eval(`
         _writes.push(text);
         (_ds.prompts = _ds.prompts || [])[idx] = text;
     }
+    /* 补回对齐行后会顺手同步屏幕上的编辑器 —— 这里桩掉（同步是纯 UI 副作用） */
+    var _editorSyncs = [];
+    function syncPromptEditor(node, idx, text) { _editorSyncs.push(text); return true; }
+    function scheduleRefresh() {}
 `);
 
 const resync = dom.window.eval([
@@ -104,6 +108,13 @@ const cases = [
         name: "原本没有对齐行且当前也无锚 → 不碰手写文本",
         ds: mkDs(null, "", "", `${HEAD} ${BODY}`),
         want: null,
+    },
+    /* AI 提示词优化的产物只有官方三字段，**不含**对齐行：整段写回就把锚冲掉了。
+     * 优化后必须能按当前锚点补回（runOptForSegment / applyMasterPrompt 都会调）。 */
+    {
+        name: "优化覆盖后（正文无对齐行但有锚）→ 补回 I2VA 句",
+        ds: mkDs({ first: "a.png" }, "a.png", "", `${HEAD} ${BODY}`),
+        want: `${HEAD} ${I2}\n${BODY}`,
     },
 ];
 

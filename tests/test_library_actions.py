@@ -357,3 +357,58 @@ def test_upload_dest_finals(handlers, proj, tmp_path, monkeypatch):
     assert res.data["stored"]["file"] == "finals/clip.mp4"
     assert (proj["root"] / "finals" / "clip.mp4").is_file()
     assert not res.data.get("manifest")
+
+
+# ---- 标签唯一化：不能死循环 ----
+
+def test_unique_label_stops_when_base_fills_cap(h3lib):
+    """base 已占满 24 字也必须能停（旧实现截断后恒等于 base → 死循环 → 整台卡死）。
+
+    真实触发：前端 alias = 文件名主干.slice(0, 24)。中文名很容易凑满 24 字，
+    于是「在没有清理旧图的时候再传一张同名前缀的图」就会把 aiohttp 事件循环
+    占死 —— 导演台、队列、所有 /h3chain 接口一起无响应（只能杀进程）。
+    """
+    base = "角" * 24
+    got = h3lib.unique_label(base, {base})
+    assert got and got != base and len(got) <= 24
+    # 连撞 3 次也得各自不同
+    taken = {base}
+    seen = set()
+    for _ in range(3):
+        g = h3lib.unique_label(base, taken)
+        assert g not in seen
+        seen.add(g)
+        taken.add(g)
+
+
+def test_unique_label_plain_case_unchanged(h3lib):
+    """不冲突时原样返回；短名冲突按 base2/base3 递增（旧行为保持不变）。"""
+    assert h3lib.unique_label("女主", set()) == "女主"
+    assert h3lib.unique_label("女主", {"女主"}) == "女主2"
+    assert h3lib.unique_label("女主", {"女主", "女主2"}) == "女主3"
+
+
+def test_upload_twice_with_same_long_alias_no_hang(handlers, proj, tmp_path, monkeypatch):
+    """同 24 字前缀连续上传两张：第二张必须拿到不同标签，接口必须返回（不能挂）。"""
+    import asset_store as AS
+    monkeypatch.setattr(AS, "library_root", lambda *a, **k: str(tmp_path / "lib"))
+    sys.modules["asset_store"] = AS
+    fn = handlers[("POST", "/h3chain/library_upload")]
+    long_alias = "角" * 30          # 前端 slice(0,24) 之后与下一张完全相同
+
+    def _up(name, payload):
+        return asyncio.run(fn(_MultipartReq([
+            _Field("kind", b"image"),
+            _Field("dest", b"project"),
+            _Field("link_dir", b"demo"),
+            _Field("alias", long_alias.encode("utf-8")),
+            _Field("file", payload, filename=name),
+        ])))
+
+    r1 = _up("long_one.png", b"png-bytes-111")
+    assert r1.status == 200, r1.data
+    r2 = _up("long_two.png", b"png-bytes-222")
+    assert r2.status == 200, r2.data
+    assert r2.data["stored"]["label"] != r1.data["stored"]["label"]
+    labels = [a["label"] for a in proj["state"]["mf"]["assets"]]
+    assert len(labels) == len(set(labels)), labels

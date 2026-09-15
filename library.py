@@ -75,6 +75,52 @@ def safe_rel(rel) -> str:
     return "/".join(parts)
 
 
+ASSET_LABEL_MAX = 24
+
+
+def unique_label(base, taken, cap=ASSET_LABEL_MAX):
+    """在 taken 之外找一个不冲突的标签，**保证能停**。
+
+    致命陷阱（曾经就踩过）：`while lbl in taken: lbl = f"{base}{n}"[:cap]`。
+    当 base 本身已经等于 cap 个字符时，截断后 `f"{base}{n}"[:cap] == base`，
+    lbl 永远不变 —— 死循环。aiohttp 是单事件循环，这个 while 一旦转起来，
+    整个 ComfyUI（导演台、队列、所有 /h3chain 接口）全部卡死，只能杀进程。
+    标签上限 24 而中文文件名很容易就凑满 24 字，所以这不是理论问题：
+    上传两个同名前缀 ≥24 字的图片就会触发。
+
+    修法：先把 base 截到 cap - 3（给后缀留位），再递增；并设硬上限兜底。
+    """
+    b = str(base or "").strip()[:cap] or "素材"
+    taken = {str(t) for t in (taken or ()) if t}
+    if b not in taken:
+        return b
+    room = max(1, int(cap) - 3)
+    stem = b[:room]
+    n = 2
+    while n < 10000:
+        cand = f"{stem}{n}"[:cap]
+        if cand not in taken:
+            return cand
+        n += 1
+    # 兜底：极端情况下（库里已有一万个同名）退化为时间戳，绝不再循环
+    import time as _t
+    return (f"{stem}{int(_t.time() % 100000)}")[:cap]
+
+
+def unique_filename(directory, want, sep="_"):
+    """在 directory 里找一个不冲突的文件名，**保证能停**（同名加 _2/_3…）。"""
+    d = str(directory or "")
+    w = str(want or "")
+    stem, ext = os.path.splitext(w)
+    cand, k = w, 2
+    guard = 0
+    while os.path.exists(os.path.join(d, cand)) and guard < 10000:
+        cand = f"{stem}{sep}{k}{ext}"
+        k += 1
+        guard += 1
+    return cand
+
+
 def _atomic_write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp_", suffix=".part")
@@ -836,20 +882,14 @@ def mirror_to_project(project, item, label=None) -> dict:
     want = os.path.basename(want)
     if not os.path.splitext(want)[1]:
         want += ext
-    cand, k = want, 2
-    while os.path.exists(os.path.join(adir, cand)):
-        cand = f"{os.path.splitext(want)[0]}_{k}{ext}"
-        k += 1
+    cand = unique_filename(adir, want)
     shutil.copy2(src, os.path.join(adir, cand))
     rel = f"assets/{cand}"
     assets = [dict(a) if isinstance(a, dict) else a for a in (manifest.get("assets") or [])]
     taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
     lbl = (str(label or item.get("name") or os.path.splitext(cand)[0])).strip()[:24]
     lbl = lbl or os.path.splitext(cand)[0][:24]
-    b, n = lbl, 2
-    while lbl in taken:
-        lbl = f"{b}{n}"[:24]
-        n += 1
+    lbl = unique_label(lbl, taken)
     assets.append({"label": lbl, "kind": kind, "file": rel})
     out = _pj.save_assets(name, assets, None)
     if out is None:
@@ -883,20 +923,13 @@ def store_to_project(project, src_abs, name=None, kind="image", label=None) -> d
     want = os.path.basename(str(name or os.path.basename(src_abs))).replace("\\", "/").split("/")[-1]
     if not safe_rel(want) or not os.path.splitext(want)[1]:
         want = os.path.basename(src_abs)
-    stem, k = os.path.splitext(want)[0], 2
-    cand = want
-    while os.path.exists(os.path.join(adir, cand)):
-        cand = f"{stem}_{k}{ext}"
-        k += 1
+    cand = unique_filename(adir, want)          # 同名加 _2，且保证能停
     shutil.copy2(src_abs, os.path.join(adir, cand))
     rel = f"assets/{cand}"
     assets = [dict(a) if isinstance(a, dict) else a for a in (manifest.get("assets") or [])]
     taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
     lbl = (str(label or "").strip() or os.path.splitext(cand)[0])[:24] or "素材"
-    base, n = lbl, 2
-    while lbl in taken:
-        lbl = f"{base}{n}"[:24]
-        n += 1
+    lbl = unique_label(lbl, taken)
     assets.append({"label": lbl, "kind": kk, "file": rel})
     out = _pj.save_assets(proj, assets, None)
     if out is None:
@@ -920,11 +953,7 @@ def store_to_finals(project, src_abs, name=None) -> dict:
     want = str(name or os.path.basename(src_abs)).replace("\\", "/").split("/")[-1]
     if not safe_rel(want) or "/" in want or not os.path.splitext(want)[1]:
         want = os.path.basename(src_abs)
-    stem, ext = os.path.splitext(want)
-    cand, k = want, 2
-    while os.path.exists(os.path.join(d, cand)):
-        cand = f"{stem}_{k}{ext}"
-        k += 1
+    cand = unique_filename(d, want)
     shutil.copy2(src_abs, os.path.join(d, cand))
     return {"file": f"finals/{cand}", "name": cand}
 

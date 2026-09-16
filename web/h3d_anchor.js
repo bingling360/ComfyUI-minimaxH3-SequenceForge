@@ -156,8 +156,9 @@
       ".h3d-anchor-card{border:1px solid #3f4854;border-radius:9px;background:#1b2027;padding:10px;display:flex;flex-direction:column;gap:10px}",
       ".h3d-anchor-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
       ".h3d-anchor-head .h3d-anchor-id{font:700 11px ui-monospace,Consolas;color:var(--h3d-copper)}",
-      ".h3d-anchor-three{display:grid;grid-template-columns:1fr 1fr 230px;gap:10px}",
-      "@media (max-width:760px){.h3d-anchor-three{grid-template-columns:1fr}}",
+      // 段卡里的可用宽度很窄（还要跟段卡其它块并排），横向三栏 + 230px 侧栏会被压扁，
+      // 所以统一上下堆叠：源轨 → 目标轨 → 体检。宽屏下也一样，保持一种读法。
+      ".h3d-anchor-three{display:grid;grid-template-columns:1fr;gap:8px}",
       ".h3d-track{border:1px solid #2c3a4a;border-radius:8px;background:#161b21;padding:8px}",
       ".h3d-track h5{margin:0 0 6px;font-size:11px;color:var(--h3d-muted);font-weight:600}",
       ".h3d-strip{position:relative;height:56px;border-radius:6px;overflow:hidden;background:linear-gradient(90deg,#222a33,#2b3540,#222a33);border:1px solid #313b46;user-select:none;touch-action:none}",

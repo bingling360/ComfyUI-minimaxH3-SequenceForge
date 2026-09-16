@@ -7112,6 +7112,11 @@ function buildCards(data) {
                     scheduleRefresh(60);
                 };
                 lsGrid.append(el("span", "h3d-secs-hint", "保存模式"), modeSel);
+                // 分两组显隐：范围/尾部模式才需要填帧号；分开存只在"确实要落的模式"下有意义。
+                // 原先 5 个字段（mode/起/止/尾/split_av）全铺在一个扁平 grid 里，
+                // 既看不懂哪个跟哪个有关，也把后端字段直接暴露给了用户。
+                const lsNums = el("div", "h3d-adv-grid");
+                const lsSplit = el("div", "h3d-adv-grid");
                 for (const [key, txt] of [["start_f", "起始帧"], ["end_f", "结束帧"], ["tail_f", "尾部帧数"]]) {
                     const inp = document.createElement("input");
                     inp.type = "number";
@@ -7128,7 +7133,7 @@ function buildCards(data) {
                         setSegmentField(node, it.idx, "latent_save", cur);
                         scheduleRefresh(60);
                     };
-                    lsGrid.append(el("span", "h3d-secs-hint", txt), inp);
+                    lsNums.append(el("span", "h3d-secs-hint", txt), inp);
                 }
                 const splitRow = el("label", "h3d-unlink");
                 const splitCb = document.createElement("input");
@@ -7143,8 +7148,16 @@ function buildCards(data) {
                     setSegmentField(node, it.idx, "latent_save", cur);
                     scheduleRefresh(60);
                 };
-                lsGrid.append(splitRow);
-                lsBox.append(lsGrid);
+                lsSplit.append(splitRow);
+                // 只有「范围 / 尾部」才需要帧号；「全部」也允许分开存但不需要帧号
+                const _syncLs = () => {
+                    const m = modeSel.value;
+                    lsNums.style.display = (m === "range" || m === "tail") ? "grid" : "none";
+                    lsSplit.style.display = (m === "follow" || m === "off") ? "none" : "grid";
+                };
+                _syncLs();
+                modeSel.addEventListener("change", _syncLs);
+                lsBox.append(lsGrid, lsNums, lsSplit);
                 paneSet.append(lsBox);
                 // —— 手动锚定（双轨时间线，见 web/h3d_anchor.js）：anchor 存 ds.segments[i].anchors，
                 //    随 save_prompts 一起落盘；模块未加载（如旧前端）则跳过，不影响其余设置 ——

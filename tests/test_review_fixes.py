@@ -108,11 +108,15 @@ def _director_src():
 
 def test_store_first_pool_and_tail():
     src = _nodes_src()
-    # 旧 bug 门控必须消失（两处：引用集加载 + 尾锚现加载）
+    # 旧 bug 门控必须消失（引用集加载 + 锚点图片现加载）
     assert "if _fn is None and _AS is not None:" not in src
-    # 新顺序：注册表查找无条件先行
+    # 新顺序：注册表查找无条件先行（不依赖 pool 文件名是否存在）
     assert "((_reg_ld.get(\"by_id\") or {}).get(_lbl)" in src
-    assert "((_reg_t.get(\"by_alias\") or {}).get(lbl)" in src
+    # 尾锚现加载已随手动锚定重构搬进 _anchor_image：同一不变量（注册表按 by_alias/by_id
+    # 双键查找），只是变量名从 _reg_t 简化为 _reg。
+    assert "def _anchor_image(" in src
+    assert "((_reg.get(\"by_alias\") or {}).get(label)" in src
+    assert "(_reg.get(\"by_id\") or {}).get(label)" in src
 
 
 def test_global_file_pool_resolves(store):

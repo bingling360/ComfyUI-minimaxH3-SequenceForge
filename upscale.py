@@ -1444,8 +1444,16 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             up_head = upscale_video(head_kf_latent.to(dev, torch.float32),
                                     net, eff_scale, cfg["arch"],
                                     hw=(h2, w2), chunk=cfg.get("chunk", True))
-        cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(
-            cond, up_guide, length, tail_kf_latent=up_tail, head_kf_latent=up_head)
+        # 汇总成 keyframe 列表再注入（_apply_guide 现在只收列表）：桥 → 头锚@0 → 尾锚@末
+        _up_kfs = []
+        if up_guide is not None:
+            _up_kfs.append(up_guide)
+        if up_head is not None:
+            _up_kfs.append({"resolved_frame_index": 0, "latent": up_head})
+        if up_tail is not None:
+            _up_kfs.append({"resolved_frame_index": length - 1, "latent": up_tail})
+        if _up_kfs:
+            cond = plugin_nodes.H3SeamlessChainSampler._apply_guide(cond, _up_kfs, length)
 
     # 放大网络工作完毕，卸回 CPU 释放显存给高清重采样（纯精化模式无网络可卸）
     if net is not None:

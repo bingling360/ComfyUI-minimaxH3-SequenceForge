@@ -147,13 +147,6 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
         up2 = dict(up)
         up2["segs"] = list(up.get("segs"))[:start]
         out["upscale"] = up2
-    # 全局记忆锚来自首段：整链重做（start==0）时旧锚必然失效，连同存档记录一并清除；
-    # start>0 时首段保留，记忆锚沿用（由 E2 注入逻辑负责按新链首段重建）。
-    if start == 0:
-        out.pop("memory_anchor", None)
-        old_ma = os.path.join(root, "memory_anchor.pt")
-        if os.path.exists(old_ma):
-            os.remove(old_ma)
     save_manifest(root, out)
     pat = re.compile(r"seg_(\d{3,})\.(?:pt|mp4)$")
     thumb_pat = re.compile(r"thumb_(\d{3,})\.png$")
@@ -308,41 +301,6 @@ def load_segment(root: str, idx: int):
     with open(seg_path(root, idx), "rb") as f:
         payload = torch.load(f, map_location="cpu", weights_only=True)
     return payload["video"], payload["audio"]
-
-
-def memory_anchor_path(root: str) -> str:
-    """E2 全局记忆锚文件：整链首段开头 mem_t 个 token 的视频 latent 的 CPU 落盘。"""
-    return os.path.join(root, "memory_anchor.pt")
-
-
-def save_memory_anchor(root: str, video_t, mem_t: int, mem_hash: str) -> str:
-    """E2：首段视频 latent 开头 mem_t token 落盘为全局记忆锚，返回记录串。
-
-    mem_hash 由调用方以该段 latent 计算（参与 manifest 新键 memory_anchor，
-    首段重做/实验指纹变化即整链重做，anchor 自动重建）。
-    """
-    import torch
-
-    mt = max(1, min(int(mem_t), video_t.shape[2]))
-    # 用 SpooledTemporaryFile 原子写（与 save_segment 同法）
-    payload = video_t[:, :, :mt, :, :].detach().cpu().clone()
-    buf = tempfile.SpooledTemporaryFile(max_size=64 << 20)
-    torch.save(payload, buf)
-    buf.seek(0)
-    _atomic_write(memory_anchor_path(root), buf.read())
-    buf.close()
-    return json.dumps({"hash": mem_hash, "mem_t": mt}, ensure_ascii=False)
-
-
-def load_memory_anchor(root: str):
-    """读回首段记忆锚视频 latent（CPU 张量，调用方按需 .to(device)）。文件缺失返回 None。"""
-    import torch
-
-    p = memory_anchor_path(root)
-    if not os.path.exists(p):
-        return None
-    with open(p, "rb") as f:
-        return torch.load(f, map_location="cpu", weights_only=True)
 
 
 def upscale_files(idx: int) -> dict:

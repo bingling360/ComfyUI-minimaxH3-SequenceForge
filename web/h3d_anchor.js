@@ -22,6 +22,14 @@
     if (!ctx || typeof ctx.setAnchors !== "function") {
       throw new Error("锚定面板缺少宿主写入器（h3_director.js 的 buildAnchorPanel 接线不完整）");
     }
+    // 单一真相：end_f 恒等于 start_f + window。存储里这两个字段曾各自被 6 处代码写，
+    // 于是出现「帧[68,63)」这种反区间、以及"5帧"和"39帧窗"同时出现在一行里。
+    // 在唯一出口处夹一次，比去追每一处写入便宜也可靠。
+    (arr || []).forEach((a) => {
+      if (!a || !a.src) return;
+      a.src.start_f = Math.max(0, Number(a.src.start_f) || 0);
+      a.src.end_f = a.src.start_f + (Number(a.window) || 0);
+    });
     ctx.setAnchors(arr);   // 宿主内部走 setSegmentField（已进段哈希 / 防抖落盘）
   }
 
@@ -171,8 +179,9 @@
     const rf = resolveFrame(anchor, targetFrames);
     const span = anchor.window;
     const kindTxt = { both: "图像+音频", video: "仅图像", audio: "仅音频" }[anchor.branches.av] || "图像+音频";
-    const sf = anchor.src.start_f, ef = anchor.src.end_f;
-    const win = (sf == null || ef == null) ? "全" : `帧[${sf},${ef})`;
+    const sf = Math.max(0, Number(anchor.src.start_f) || 0);
+    const ef = sf + span;          // 派生（end_f 不是独立真相，见 setAnchorsOf）
+    const win = `帧[${sf},${ef})`;
     return `锚点：源 ${srcLabel} ${win} → 本段帧 ${rf}，${span} 帧窗，${kindTxt}`;
   }
 
@@ -188,16 +197,26 @@
     box.innerHTML = '<summary>📌 手动锚定（双轨时间线）</summary>';
 
     const grid = el("div", "h3d-anchor-grid");
-    anchors.forEach((a, i) => grid.append(renderAnchorCard({ ...ctx, anchor: a, anchors, index: i })));
+    // 本地重建列表：新增/删除必须**当场**看见。只靠宿主 refresh() 不够——它刷的是
+    // 整个导演台，段卡里这一块不一定会重挂（实测症状：点了没反应，切屏回来才有，
+    // 有时切屏也没用）。seg 是同一对象引用，重读 seg.anchors 即最新。
+    const renderList = () => {
+      const list = Array.isArray(seg.anchors) ? seg.anchors : [];
+      grid.innerHTML = "";
+      list.forEach((a, i) => grid.append(renderAnchorCard(
+        { ...ctx, anchor: a, anchors: list, index: i, rebuildList: renderList })));
+    };
+    renderList();
     box.append(grid);
 
     const addWrap = el("div", "h3d-anchor-add");
     const add = el("button", "h3d-btn", "＋ 新增锚定");
     add.title = "新增一条 anchor（同源可多条；head/mid/tail 落点各自自由）";
     add.onclick = () => {
-      const cur = anchors.slice();
+      const cur = (Array.isArray(seg.anchors) ? seg.anchors : []).slice();
       cur.push(newAnchor());
       setAnchorsOf(ctx, cur);
+      renderList();                 // 当场重建（宿主 refresh 不一定重挂这一块）
       (refresh || (() => {}))();
     };
     addWrap.append(add);
@@ -220,8 +239,10 @@
     const del = el("button", "h3d-btn h3d-btn-danger", "✕ 删除");
     del.style.marginLeft = "auto";
     del.onclick = () => {
-      const cur = anchors.filter((x) => x !== anchor);
+      const cur = (Array.isArray(data.ds.segments[idx].anchors)
+        ? data.ds.segments[idx].anchors : []).filter((x) => x !== anchor);
       setAnchorsOf(ctx, cur);
+      if (typeof ctx.rebuildList === "function") ctx.rebuildList();
       (refresh || (() => {}))();
     };
     head.append(del);
@@ -274,8 +295,17 @@
   function fillSrcTrack(ctx, spec, sources, host) {
     const { anchor, node, idx, data, refresh } = ctx;
     const src = findSource(sources, anchor);
-    const totalFrames = (src && Number.isFinite(src.frames)) ? src.frames : (anchor.src.end_f || anchor.window);
+    // 每次填充先清空：否则 rebuildCard / 切来源会在同一条轨上**再叠一层**
+    //（实测症状：切一次来源就多一条轨道，分不清到底在看哪一段）
+    host.innerHTML = "";
+    host.append(el("h5", "", "① 源轨 · 从素材选哪一段"));
     const strip = el("div", "h3d-strip");
+    // 轨长只能是**源的真实帧数**。拿 anchor.src.end_f 当轨长是错的——那是"取用窗的
+    // 终点"、不是源的长度；混用会让 帧区间/帧数/刻度 三者互相矛盾（实测 帧[68,63)）。
+    // 源长度未知时退到一个至少容得下当前选取的宽度，绝不产生反区间。
+    const totalFrames = (src && Number.isFinite(src.frames))
+      ? src.frames
+      : Math.max(anchor.window, (Math.max(0, Number(anchor.src.start_f) || 0)) + anchor.window);
     // 三级降级 ①：有 contact sheet 直接裁格显示（零 VAE）
     if (src && src.sheet) {
       const im = document.createElement("img");
@@ -374,8 +404,9 @@
     const info = el("div", "h3d-infoline");
     const updateInfo = () => {
       const fps = anchor.src.src_fps;
-      const s = anchor.src.start_f || 0, e = anchor.src.end_f || (s + anchor.window);
       const span = anchor.window;
+      const s = Math.max(0, Number(anchor.src.start_f) || 0);
+      const e = s + span;          // 派生，不读存储的 end_f（曾与 start_f/window 互相矛盾）
       let secTxt;
       if (fps == null) {
         secTxt = "?s";
@@ -520,8 +551,8 @@
       if (v === anchor.src.kind) o.selected = true;
       sel.append(o);
     }
-    sel.onchange = () => {
-      // 切来源：重置 src 元信息（ref/form 由后端 anchor_sources 决定；这里先置空待下拉选择具体条目）
+    sel.onchange = async () => {
+      // 切来源：重置 src 元信息（ref/规格由后端 anchor_sources 决定，先置空待选具体条目）
       anchor.src.kind = sel.value;
       anchor.src.ref = "";
       anchor.src.start_f = 0;
@@ -529,7 +560,11 @@
       anchor.src.src_fps = null;
       anchor.src.meta_ok = false;
       commit();
-      // 切来源后重拉源清单并刷新整卡
+      // 必须**重拉**源清单：sources 只含上一批 kind，不重拉的话切到任何新来源
+      // 条目都是「（无可用条目）」——这正是"看不懂怎么选素材"的直接原因。
+      // sources 是 fillSideCol 的形参，同一闭包内重写，rebuildCard 即可读到新值。
+      const ns = await fetchSources(dirOf(ctx), idx + 1).catch(() => null);
+      if (ns) sources = ns;
       rebuildCard();
     };
     selRow.append(el("span", "h3d-secs-hint", "来源"), sel);

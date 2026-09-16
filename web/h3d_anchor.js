@@ -234,8 +234,9 @@
       const cur = (Array.isArray(seg.anchors) ? seg.anchors : []).slice();
       cur.push(newAnchor());
       setAnchorsOf(ctx, cur);
-      renderList();                 // 当场重建（宿主 refresh 不一定重挂这一块）
-      (refresh || (() => {}))();
+      renderList();                 // 当场重建
+      // 不再调宿主 refresh()：它会**全量重刷导演台**，把本面板刚渲染的 DOM 连同
+      // 正在进行的异步填充一起推倒，结果是"点了没反应，退出重进才出现轨道"。
     };
     addWrap.append(add);
     box.append(addWrap);
@@ -261,7 +262,7 @@
         ? data.ds.segments[idx].anchors : []).filter((x) => x !== anchor);
       setAnchorsOf(ctx, cur);
       if (typeof ctx.rebuildList === "function") ctx.rebuildList();
-      (refresh || (() => {}))();
+      // 同「新增」：本地重建，不惊动宿主
     };
     head.append(del);
     card.append(head);
@@ -291,7 +292,7 @@
     return card;
 
     /* 写回：改完即时落盘 + 刷新；用现有 setSegmentField，不另造保存 */
-    function commit() { setAnchorsOf(ctx, anchors.slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, anchors.slice()); if (typeof ctx.__rebuildCard === "function") ctx.__rebuildCard(); }
   }
 
   async function fetchSources(dir, seg1based, kind) {
@@ -479,7 +480,7 @@
       host.append(gp);
     }
 
-    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); if (typeof ctx.__rebuildCard === "function") ctx.__rebuildCard(); }
   }
 
   function fillTgtTrack(ctx, spec, host) {
@@ -606,7 +607,7 @@
       strip.addEventListener("pointerup", up);
     });
 
-    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); if (typeof ctx.__rebuildCard === "function") ctx.__rebuildCard(); }
   }
 
   function fillSideCol(ctx, spec, sources, host) {
@@ -729,7 +730,10 @@
     }
     host.append(checks);
 
-    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); if (typeof ctx.__rebuildCard === "function") ctx.__rebuildCard(); }
+    // 把本地重建能力挂到 ctx：其余两个轨（以及本轨）的 commit() 靠它做一致性刷新，
+    // 取代原先"每次改动都让宿主全量重刷"的做法。每次 rebuildCard 都会重设，幂等。
+    ctx.__rebuildCard = () => rebuildCard();
     function rebuildCard() {
       // 来源/条目切换后重建整卡（spec 已缓存，直接同步填充）
       const card = host.closest(".h3d-anchor-card");

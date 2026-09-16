@@ -30,7 +30,16 @@
       a.src.start_f = Math.max(0, Number(a.src.start_f) || 0);
       a.src.end_f = a.src.start_f + (Number(a.window) || 0);
     });
-    ctx.setAnchors(arr);   // 宿主内部走 setSegmentField（已进段哈希 / 防抖落盘）
+    ctx.setAnchors(arr);   // 宿主内部走 setSegmentField（写进节点 widget）
+    // ★ 写透本面板手里的副本：getDs(node) 每次都是 `JSON.parse(w.value)` 出来的**新对象**，
+    //   而 setSegmentField 写的是它自己那一个，本面板的 ctx.data.ds 仍旧指向旧对象。
+    //   不写透的话，紧接着的 renderList()/体检/目标轨读到的全是**陈旧数据**——症状就是
+    //   「点了新增没反应，退出导演台再进来才出现」（重进时整卡重建才拿到新 JSON）。
+    //   这是刷新问题的真正根因，不是 DOM 被推倒（那只是表象）。
+    if (ctx.data && ctx.data.ds && Array.isArray(ctx.data.ds.segments)
+        && ctx.data.ds.segments[ctx.idx]) {
+      ctx.data.ds.segments[ctx.idx].anchors = arr;
+    }
   }
 
   /* ---- 后端接口（与 h3_api.js 同款前缀处理：优先 ComfyUI api.fetchApi，否则直 fetch） ---- */

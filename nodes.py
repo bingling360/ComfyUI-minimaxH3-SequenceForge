@@ -1418,8 +1418,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 ea = None
             return ev, ea
 
-        def _anchor_image(label):
-            """素材标签 -> 单帧图片张量（[1,H,W,3]）。未知标签/非图片直接抛。"""
+        def _anchor_asset(label, want_kind):
+            """锚点素材标签 -> (绝对路径 | None, pool 文件名 | None)。
+
+            标签寻址走 P2 三级寻址（asset_store 注册表 by_alias / by_id -> 绝对路径），
+            注册表未命中才回落 pool 文件名（input 目录 / 项目 assets）。图片与视频共用
+            这一条通路：原先只有图片有，视频被写死走 `_load_input_video`（只认 ComfyUI
+            input 目录），于是项目 assets/ 与素材库里的视频根本接不进来。
+
+            未知标签、类型不符一律硬抛——手动锚是显式意图，静默换源等于「设了锚不生效」。
+            """
             _rec = None
             if label not in pool_labels and _AS is not None:
                 _reg, _ = _asset_registry()
@@ -1427,24 +1435,44 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         or (_reg.get("by_id") or {}).get(label))
             if label not in pool_labels and _rec is None:
                 raise ValueError(f"锚点引用了未知素材标签「{label}」：可用标签 {pool_labels}")
-            if pool_kind.get(label, (_rec or {}).get("kind")) != "image":
-                raise ValueError(f"锚点「{label}」不是图片素材（锚只收图片或图像 latent）")
+            _kind = pool_kind.get(label, (_rec or {}).get("kind"))
+            if _kind != want_kind:
+                raise ValueError(f"锚点「{label}」的素材类型是 {_kind or '未知'}，"
+                                 f"不是 {want_kind}（源类型与素材类型必须一致）")
+            _abs = None
+            if _AS is not None and _rec is not None:
+                _reg2, _libroot = _asset_registry()
+                _abs = _AS.resolve_absolute(_rec, _project_root_for_assets(), _libroot)
+            return _abs, pool_file_of.get(label)
+
+        def _anchor_image(label):
+            """素材标签 -> 单帧图片张量（[1,H,W,3]）。未知标签/非图片直接抛。"""
+            _abs, _fn = _anchor_asset(label, "image")
             _ensure_pool_tensors()
             img = pool_tensors["image"].get(label)
             if img is None:
-                _abs = None
-                if _AS is not None and _rec is not None:
-                    _reg2, _libroot = _asset_registry()
-                    _abs = _AS.resolve_absolute(_rec, _project_root_for_assets(), _libroot)
-                if _abs is not None:
-                    img = _decode_image_file(_abs)
-                else:
-                    _fn = pool_file_of.get(label)
-                    if _fn is None:
-                        raise ValueError(f"锚点「{label}」找不到对应文件")
-                    img = _load_input_image(_fn, _project_root_for_assets())
+                if _abs is None and _fn is None:
+                    raise ValueError(f"锚点「{label}」找不到对应文件")
+                img = (_decode_image_file(_abs) if _abs is not None
+                       else _load_input_image(_fn, _project_root_for_assets()))
                 pool_tensors["image"][label] = img
             return img
+
+        def _anchor_video(label):
+            """素材标签 -> (帧张量, 音轨)。未知标签/非视频直接抛。
+
+            与 _anchor_image 同一条寻址通路，所以素材库（项目 assets/ 、全局库）里的
+            视频都能作锚源；_decode_video_file 只收绝对路径，不经过 input 目录。
+            """
+            _abs, _fn = _anchor_asset(label, "video")
+            _ensure_pool_tensors()
+            hit = pool_tensors["video"].get(label)
+            if hit is not None:
+                return hit
+            if _abs is None and _fn is None:
+                raise ValueError(f"锚点「{label}」找不到对应视频文件")
+            return (_decode_video_file(_abs, label) if _abs is not None
+                    else _load_input_video(_fn, _project_root_for_assets()))
 
         def _resolve_anchor_latent(a):
             """anchor 源 -> (video_dev, audio_dev|None)，已确保 C/H/W 与本链一致。
@@ -1476,10 +1504,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                      "frames": latent_t_to_frames(int(ev.shape[2])),
                      "fps": a["src"]["src_fps"], "reencodable": False})
             elif kind == "segment":
-                _pn = str(ref or "")
-                if not (_pn.startswith("seg_") and _pn.endswith(".pt")) or not root:
-                    raise ValueError(f"段源引用非法：{ref!r}（须为 seg_NNN 形式）")
-                ev, ea = (t.to("cpu") for t in checkpoint.load_segment(root, int(_pn[4:-3])))
+                # 段源 ref 的规范形式是 `seg_NNN`（anchors.py §3 文档、routes.anchor_sources、
+                # tests/test_anchors.py 三处一致）。此前这里多要一个 ".pt" 后缀、按
+                # `_pn[4:-3]` 切片取段号，于是面板里选出来的段源**必然**报错。
+                _pn = str(ref or "").strip()
+                _num = _pn[4:] if _pn.startswith("seg_") else ""
+                if not _num.isdigit() or not root:
+                    raise ValueError(f"段源引用非法：{ref!r}（须为 seg_NNN 形式，如 seg_003）")
+                ev, ea = (t.to("cpu") for t in checkpoint.load_segment(root, int(_num)))
                 anchors.resolve_anchor_source(
                     a, chain_chw,
                     {"shape": tuple(ev.shape),
@@ -1487,7 +1519,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                      "fps": 24.0, "reencodable": False})
             elif kind in ("video", "image"):
                 if kind == "video":
-                    _imgs, _aud = _load_input_video(ref, _project_root_for_assets())
+                    _imgs, _aud = _anchor_video(ref)
                 else:
                     _imgs, _aud = _anchor_image(ref), None
                 _total = int(_imgs.shape[0])

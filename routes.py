@@ -1895,34 +1895,78 @@ def add_routes(routes):
             "branches": list(h3anchors.BRANCHES),
         })
 
-    _VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
+    def _source_meta(abs_path, item_kind, root):
+        """单个素材文件 -> 源轨元信息 {frames,tokens,w,h,fps,sheet,meta_ok}；读不出 None。
 
-    def _probe_media_meta(path):
-        """容器元信息读 fps / 总帧数（**不解码**）；读不到返回 None。
-
-        只读 stream 头，代价极小；拿不到就返回 None，让前端把 meta_ok 标 false
-        并降级到「刻度条 + 数字」，而不是编一个假帧数（规划 §8：显示错的时长
-        比不显示更糟）。
+        只探测用户点选的**那一个**文件，不扫目录、不建索引：帧数/尺寸/帧率是源轨刻度
+        与越界体检的输入，只能由后端按同一套安全解析规则给出。编一个假值把时长显示错，
+        比不显示更糟（规划 §8）。
         """
-        try:
-            import av
-            with av.open(path) as c:
-                vs = next((x for x in c.streams if x.type == "video"), None)
-                if vs is None:
-                    return None
-                fps = float(vs.average_rate) if vs.average_rate else None
-                n = int(vs.frames) if vs.frames else 0
-                if n <= 0 and vs.duration and vs.time_base and fps:
-                    n = int(float(vs.duration * vs.time_base) * fps)
-                return {"fps": fps, "frames": (n or None)}
-        except Exception:
-            return None
+        if item_kind == "latent":
+            info = _latent_shape(abs_path)
+            if not info:
+                return None
+            sheet = h3lib.sheet_path_for(abs_path)
+            return {"frames": info[0], "tokens": info[1], "w": info[2], "h": info[3],
+                    "fps": None, "meta_ok": True,
+                    "sheet": (os.path.relpath(sheet, root).replace("\\", "/")
+                              if os.path.isfile(sheet) else None)}
+        if item_kind == "image":
+            try:
+                from PIL import Image
+                with Image.open(abs_path) as im:
+                    w, h = im.size
+            except Exception:
+                return None
+            return {"frames": 1, "tokens": None, "w": int(w), "h": int(h),
+                    "fps": None, "sheet": None, "meta_ok": True}
+        if item_kind == "video":
+            try:
+                import av
+                with av.open(abs_path) as c:
+                    vs = next((x for x in c.streams if x.type == "video"), None)
+                    if vs is None:
+                        return None
+                    fps = float(vs.average_rate) if vs.average_rate else None
+                    n = int(vs.frames) if vs.frames else 0
+                    if n <= 0 and vs.duration and vs.time_base and fps:
+                        n = int(float(vs.duration * vs.time_base) * fps)
+                    return {"frames": (n or None), "tokens": None,
+                            "w": int(vs.width or 0) or None,
+                            "h": int(vs.height or 0) or None,
+                            "fps": fps, "sheet": None, "meta_ok": n > 0}
+            except Exception:
+                return None
+        return None
+
+    def _find_lib_item(dir_name, ref):
+        """库条目 id / asset_id / 别名 / 相对 file -> (条目, 失败原因)。"""
+        r = str(ref or "")
+        for e in _indexed(dir_name):
+            if r and r in (str(e.get("id") or ""), str(e.get("asset_id") or ""),
+                           str(e.get("name") or ""), str(e.get("file") or "")):
+                return e, ""
+        return None, f"素材库里找不到「{ref}」（可能已被删除或改名）"
+
+    def _anchor_ref_of(item):
+        """库条目 -> anchor.src.ref（执行期 nodes.py 能寻址的标识）。
+
+        latent 用 `latent/<名>.pt`（_load_library_latent 认这个形式）；其余优先 asset_id
+        —— 全局库与项目链接在**执行期只按 asset_id 注册**（注册表 by_alias 里只有旧
+        label / 链接别名），拿 orig_name 当标签会查不到。项目目录直接扫到的文件没有
+        asset_id 时才回落别名（name 就是清单里的 label）。
+        """
+        if item.get("kind") == "latent":
+            return "latent/" + os.path.basename(str(item.get("file") or ""))
+        return str(item.get("asset_id") or "").strip() or str(item.get("name") or "").strip()
 
     async def anchor_sources(request):
-        """源轨的可选源清单：上段尾 / 已完成段 / latent 库 / 视频 / 图片（规划 §5 ①）。
+        """源轨源清单：已完成段 + 项目 latent；给了 `ref=` 则把它对应的素材条目并进来。
 
-        视频与图片**只在客户端指定 kind 时才枚举**：它们的候选项要扫盘 + 读容器头，
-        每次调用都全量扫是浪费；前端切到那一类时再拉即可。
+        **不枚举素材**：图片/视频一律从素材库（web/h3_library.js 的挑选模式）选，
+        本接口只回答「你选的那个素材是多少帧 / 多大 / 多少 fps」。此前在这里扫
+        ComfyUI input 目录枚举视频、从 manifest["assets"] 枚举图片，方向是错的：
+        那等于另造一个素材库，与全局库/项目库两套数据必然漂移。
         """
         q = request.query
         dir_name = str(q.get("dir") or "")
@@ -1937,14 +1981,20 @@ def add_routes(routes):
             seg_no = 0
         segs = _seg_sources(root)
         srcs = []
-        # 上段尾：本段的前一个槽位（序章占 0 号，故 slot = seg_no - 2）
-        prev_slot = seg_no - 2
+        # 上段尾：本段的前一个**全局槽位**。有「序章」时槽号整体后移一位（序章占 0 号），
+        # 少算这个偏移就会把「上段尾」指到序章上（前端据此预填「上一段」）。
+        # 这个条目保留只为**旧存档回显**：UI 已不提供该选项（用户明确说冗余——
+        # 「有上段的选择就行了」，选上一段拿到的就是同一份 latent）；后端仍把
+        # prev_tail 当隐式默认段首桥（没有显式 head anchor 时才走）。
+        prev_slot = seg_no - 2 + (1 if man.get("has_prologue") else 0)
         for e in segs:
             if e["slot"] == prev_slot:
                 srcs.append({**e, "kind": "prev_tail", "ref": "",
-                             "label": f"上段尾（段 {prev_slot + 1}）"})
+                             "label": f"上段尾（{e['label']}）"})
                 break
-        srcs.extend(e for e in segs if e["slot"] != prev_slot)
+        # 段列表给全（含上一段）：用户要选上一段时，它必须真的在「段」下拉里，
+        # 否则会出现"说是让我选上一段，可列表里根本没有"。
+        srcs.extend(segs)
         for rec in (man.get("latents") or []):
             if not isinstance(rec, dict) or not rec.get("file"):
                 continue
@@ -1968,41 +2018,41 @@ def add_routes(routes):
                           if os.path.isfile(sheet) else None),
                 "meta_ok": info is not None,
             })
-        # ---- 视频源：ComfyUI input 目录里的视频 ----
-        # 为什么是 input 目录而不是项目 assets：`_load_input_video` 走的是
-        # folder_paths 的注释路径解析（input 目录），老的「插入视频」用的就是同一批
-        # 素材（导演台 stage 过去的 h3_staged/ 也在其中）。项目 assets 里的视频要接
-        # 进解析器得改 nodes.py 的加载顺序，属另一件事，这里不擅自扩大。
-        if str(q.get("kind") or "") == "video":
-            try:
-                import folder_paths
-                in_dir = folder_paths.get_input_directory()
-            except Exception:
-                in_dir = ""
-            for name in sorted(os.listdir(in_dir)) if in_dir and os.path.isdir(in_dir) else []:
-                if not name.lower().endswith(_VIDEO_EXTS):
-                    continue
-                meta = _probe_media_meta(os.path.join(in_dir, name)) or {}
-                srcs.append({
-                    "slot": None, "kind": "video", "ref": name, "label": name,
-                    "frames": meta.get("frames"), "tokens": None,
-                    "w": None, "h": None, "fps": meta.get("fps"),
-                    "sheet": None, "meta_ok": meta.get("frames") is not None,
-                })
-
-        # ---- 图片源：项目素材库里 kind=image 的条目（按标签寻址，_anchor_image 认标签）----
-        if str(q.get("kind") or "") == "image":
-            for a in (man.get("assets") or []):
-                if not isinstance(a, dict) or a.get("kind") != "image":
-                    continue
-                lbl = str(a.get("label") or a.get("asset_id") or "").strip()
-                if not lbl:
-                    continue
-                srcs.append({
-                    "slot": None, "kind": "image", "ref": lbl, "label": lbl,
-                    "frames": 1, "tokens": None, "w": None, "h": None, "fps": None,
-                    "sheet": None, "meta_ok": True,
-                })
+        # ---- 面板里刚选中的那一个素材（可从全局库/项目库/成片/latent 任一处来）----
+        want_ref = str(q.get("ref") or "")
+        if want_ref:
+            item, why = _find_lib_item(dir_name, want_ref)
+            if item is None:
+                return _err(why, code="NOT_FOUND", status=404)
+            item_kind = str(item.get("kind") or "")
+            if item_kind not in ("image", "video", "latent"):
+                return _err(f"「{item.get('name') or want_ref}」是{item_kind}素材，"
+                            "不能作锚源（锚只收图片 / 视频 / latent）",
+                            code="BAD_KIND", status=400)
+            abs_p = h3lib.resolve_item_path(item, h3lib.safe_rel(dir_name))
+            if not abs_p:
+                return _err(f"「{item.get('name') or want_ref}」的文件已不在原位"
+                            "（库里只剩条目）", code="NOT_FOUND", status=404)
+            meta = _source_meta(abs_p, item_kind, root)
+            if meta is None:
+                return _err(f"读不出「{item.get('name') or want_ref}」的帧数/尺寸"
+                            "（文件损坏，或缺 Pillow/av 解码依赖）",
+                            code="NO_META", status=409)
+            # 锚的源类型只有三个（library/video/image），latent 归 library
+            kind = "library" if item_kind == "latent" else item_kind
+            ref = _anchor_ref_of(item)
+            labels = {str(a.get("label") or "")
+                      for a in (man.get("assets") or []) if isinstance(a, dict)}
+            srcs = [s for s in srcs if not (s["kind"] == kind and s.get("ref") == ref)]
+            srcs.append({
+                "slot": None, "kind": kind, "ref": ref,
+                "label": str(item.get("name") or ref), "item_id": item.get("id"),
+                **meta,
+                # 执行期注册表只认 asset_id 与清单里的别名：两者都没有时节点侧寻址不到，
+                # 面板据此提前提示（比等到跑生成才报「未知素材标签」好得多）。
+                "resolvable": bool(str(item.get("asset_id") or "").strip())
+                              or (item.get("scope") == "project" and ref in labels),
+            })
 
         params = man.get("params") or {}
         return web.json_response({

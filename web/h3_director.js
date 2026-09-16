@@ -304,6 +304,19 @@ function snapFrames(seconds) {
     return 17 * k + 5;
 }
 
+/** 本段总帧数（像素帧）：本段设了秒数就用它，否则跟随节点「每段时长」。
+ *
+ *  与后端 nodes._snap_seconds 同公式（秒×24 → **就近**吸附 17k+5，不是向上对齐）。
+ *  段卡标题那个「≈N帧」和锚定面板的目标轨刻度都取这一个函数——这两处曾经各算一遍，
+ *  结果一边向上对齐一边就近，用户看到目标轨的总帧数跟分段时长对不上。
+ *  改公式只许改这里（连线另一头是 nodes._snap_seconds，两边必须同时改）。 */
+function segmentFrames(node, seg) {
+    const defRaw = Number(getWidgetValue(node, W_DUR));
+    const defSec = isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
+    const secs = Number(seg && seg.seconds);
+    return snapFrames((isFinite(secs) && secs > 0) ? secs : defSec);
+}
+
 /** 宽高比+百万像素 -> 显示徽章文案；自定义/非法返回 null */
 function canvasBadgeText(node) {
     const ar = String(getWidgetValue(node, W_AR) ?? "");
@@ -4348,6 +4361,10 @@ function injectStyles() {
     .h3d-secs:focus{border-color:#a8d8bd}
     .h3d-secs-hint{color:var(--h3d-muted);font:10px ui-monospace,Consolas;white-space:nowrap}
     .h3d-ppane .h3d-refrow{margin-top:2px;}
+/* 「设置」页分区：按作用面分块 + 小标题，块与块之间才有层级（原先平铺、权重一样） */
+.h3d-setsec{display:flex;flex-direction:column;gap:7px;margin-top:10px}
+.h3d-setsec-title{font-size:11px;font-weight:600;color:var(--h3d-copper);letter-spacing:.3px;border-bottom:1px solid #37332b;padding-bottom:4px}
+.h3d-setrow{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}
 .h3d-refrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:7px 8px;border:1px solid #37332b;border-radius:7px;background:#181712}
     .h3d-refrow>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
     .h3d-refchip{display:inline-flex;gap:5px;align-items:center;padding:3px 8px 3px 3px;border:1px solid #3a352c;border-radius:12px;background:#25221c;color:#a8a294;cursor:pointer;font-size:11px;font-family:inherit}
@@ -6536,12 +6553,10 @@ function buildCards(data) {
             secsInp.placeholder = String(defSec);
             secsInp.value = (segData || defaultSegment()).seconds ?? "";
             secsInp.title = "本段时长（秒）：留空=跟随右栏「每段时长」默认；内部自动吸附 17k+5 帧网格(@24fps)";
-            secsHint = el("span", "h3d-secs-hint",
-                `≈${snapFrames((segData || defaultSegment()).seconds ?? defSec)}帧`);
+            // 帧数与锚定面板目标轨同源（segmentFrames），别再各算一遍
+            secsHint = el("span", "h3d-secs-hint", `≈${segmentFrames(node, segData)}帧`);
             const syncHint = (v) => {
-                const num = Number(v);
-                const sec = (v === "" || !isFinite(num) || num <= 0) ? defSec : num;
-                secsHint.textContent = `≈${snapFrames(sec)}帧`;
+                secsHint.textContent = `≈${segmentFrames(node, { seconds: Number(v) })}帧`;
             };
             secsInp.addEventListener("input", () => syncHint(secsInp.value));
             secsInp.addEventListener("change", () => {
@@ -6883,54 +6898,86 @@ function buildCards(data) {
 
             /* 引用调度已迁入具象化参考组（分段素材调度，933 上限）；引用语模板已并入上方统一引用条 */
 
-            /* 首尾帧图段级引用：勾选本段是否参考链首/链尾锚（资产标注或旧槽位）。
-             * 未设置=默认（首段 i2v 首帧、末段尾帧终点锚，与旧档一致）；
-             * 中段勾首帧图=头部身份锚（keyframe 注入抑制长链漂移）；
-             * 任意段勾尾帧图=该段末帧锚（优先于段尾锚） */
-            if (node && it.idx !== undefined
-                    && (data.ds.first_frame || data.ds.end_frame
-                        || (data.ds.ref_assets || []).some((x) => Array.isArray(x.roles) && x.roles.length))) {
-                const seg = data.ds.segments[it.idx] || defaultSegment();
-                const n = (data.ds.prompts || data.ds.segments || []).length;
-                const def = [];
-                if (data.ds.first_frame && it.idx === 0) def.push("首帧图");
-                if (data.ds.end_frame && it.idx === n - 1) def.push("尾帧图");
-                const cur = Array.isArray(seg.frame_refs) ? seg.frame_refs : def;
-                const roleFile = (role) => {
-                    const hit = (data.ds.ref_assets || [])
-                        .find((x) => Array.isArray(x.roles) && x.roles.includes(role));
-                    return hit ? hit.file : "";
-                };
-                const row = el("div", "h3d-refrow");
-                row.append(el("label", "", "首尾帧图"));
-                [["首帧图", data.ds.first_frame || roleFile("首帧图")],
-                 ["尾帧图", data.ds.end_frame || roleFile("尾帧图")]].forEach(([name, file]) => {
-                    if (!file) return;
-                    const on = cur.includes(name);
-                    const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
-                    chip.type = "button";
-                    chip.title = name === "首帧图"
-                        ? "勾选后本段参考链首锚（资产标注/旧槽位）：首段=i2v 起手帧；中段=头部身份锚"
-                            + "（keyframe 注入，抑制长链漂移）。不勾=本段不参考首帧图"
-                        : "勾选后本段末帧锚定链尾锚（同位置唯一锚，优先于段尾锚）；"
-                            + "不勾=回落段 tail_src/旧尾帧锚定";
-                    const im = document.createElement("img");
-                    im.loading = "lazy";
-                    im.src = assetPreviewUrl(getDirValue(node), file);
-                    im.onerror = () => im.remove();
-                    chip.append(im, document.createTextNode(name));
-                    chip.onclick = () => { toggleSegmentFrameRef(node, it.idx, name); scheduleRefresh(80); };
-                    row.append(chip);
-                });
-                if (!Array.isArray(seg.frame_refs)) {
-                    row.insertAdjacentHTML("beforeend", '<span class="h3d-secs-hint">未设置=默认</span>');
-                }
-                paneSet.append(row);
-            }
-
-            /* 设置页：双按钮（分段优先，null=跟随全局默认开）+ latent 引用/保存子选项 */
+            /* ---- 「设置」页：只放段级开关，按**作用面**分两区 ----
+             *   影响本段生成：锚定 / 首尾帧图引用 / 上链与执行两个开关
+             *   只影响落盘：本段 latent 保存
+             * 原先这几块平铺在一起、权重一样，看的人分不清哪块跟哪块有关，也看不出
+             * 改哪个会改变出片、改哪个只是省磁盘。 */
             if (node && it.idx !== undefined) {
                 const seg = (data.ds.segments && data.ds.segments[it.idx]) || defaultSegment();
+                const secGen = el("div", "h3d-setsec");
+                secGen.append(el("div", "h3d-setsec-title", "影响本段生成"));
+                const secDisk = el("div", "h3d-setsec");
+                secDisk.append(el("div", "h3d-setsec-title", "只影响落盘"));
+                paneSet.append(secGen, secDisk);
+
+                /* —— 手动锚定（双轨时间线，见 web/h3d_anchor.js）：anchor 存
+                 *    ds.segments[i].anchors，随 save_prompts 一起落盘；模块未加载
+                 *    （如旧前端）则跳过，不影响其余设置 —— */
+                if (window.H3Anchor && window.H3Anchor.buildAnchorPanel) {
+                    // dir / setAnchors / frameLen 是**注入给子模块的宿主访问器**：本文件的
+                    // getDirValue / setSegmentField / segmentFrames 都是模块级函数、并不在
+                    // window 上，子模块按全局名去找会当场抛错（曾因此整块「段落卡片渲染
+                    // 失败」）。顺带把「谁先加载」这条隐式契约也消掉了。
+                    const anchorBox = window.H3Anchor.buildAnchorPanel({
+                        node, data, idx: it.idx,
+                        refresh: () => scheduleRefresh(60),
+                        dir: () => getDirValue(node),
+                        setAnchors: (arr) => setSegmentField(node, it.idx, "anchors", arr),
+                        // 本段总帧数**只从这一个函数出**（段卡标题那个「≈N帧」也是它）：
+                        // 面板曾经自己再算一遍（还用了向上对齐），于是目标轨刻度与
+                        // 分段时长对不上——同一个数只许有一个算法、一个来源。
+                        frameLen: () => segmentFrames(node, data.ds.segments[it.idx]),
+                    });
+                    if (anchorBox) secGen.append(anchorBox);
+                }
+
+                /* 首尾帧图段级引用：勾选本段是否参考链首/链尾锚（资产标注或旧槽位）。
+                 * 未设置=默认（首段 i2v 首帧、末段尾帧终点锚，与旧档一致）；
+                 * 中段勾首帧图=头部身份锚（keyframe 注入抑制长链漂移）；
+                 * 任意段勾尾帧图=该段末帧锚（优先于段尾锚） */
+                if (data.ds.first_frame || data.ds.end_frame
+                        || (data.ds.ref_assets || []).some((x) => Array.isArray(x.roles) && x.roles.length)) {
+                    const n = (data.ds.prompts || data.ds.segments || []).length;
+                    const def = [];
+                    if (data.ds.first_frame && it.idx === 0) def.push("首帧图");
+                    if (data.ds.end_frame && it.idx === n - 1) def.push("尾帧图");
+                    const cur = Array.isArray(seg.frame_refs) ? seg.frame_refs : def;
+                    const roleFile = (role) => {
+                        const hit = (data.ds.ref_assets || [])
+                            .find((x) => Array.isArray(x.roles) && x.roles.includes(role));
+                        return hit ? hit.file : "";
+                    };
+                    const row = el("div", "h3d-refrow");
+                    row.append(el("label", "", "首尾帧图"));
+                    [["首帧图", data.ds.first_frame || roleFile("首帧图")],
+                     ["尾帧图", data.ds.end_frame || roleFile("尾帧图")]].forEach(([name, file]) => {
+                        if (!file) return;
+                        const on = cur.includes(name);
+                        const chip = el("button", "h3d-refchip" + (on ? " on" : ""));
+                        chip.type = "button";
+                        chip.title = name === "首帧图"
+                            ? "勾选后本段参考链首锚（资产标注/旧槽位）：首段=i2v 起手帧；中段=头部身份锚"
+                                + "（keyframe 注入，抑制长链漂移）。不勾=本段不参考首帧图"
+                            : "勾选后本段末帧锚定链尾锚（同位置唯一锚，优先于段尾锚）；"
+                                + "不勾=回落段 tail_src/旧尾帧锚定";
+                        const im = document.createElement("img");
+                        im.loading = "lazy";
+                        im.src = assetPreviewUrl(getDirValue(node), file);
+                        im.onerror = () => im.remove();
+                        chip.append(im, document.createTextNode(name));
+                        chip.onclick = () => { toggleSegmentFrameRef(node, it.idx, name); scheduleRefresh(80); };
+                        row.append(chip);
+                    });
+                    if (!Array.isArray(seg.frame_refs)) {
+                        row.insertAdjacentHTML("beforeend", '<span class="h3d-secs-hint">未设置=默认</span>');
+                    }
+                    secGen.append(row);
+                }
+
+                /* 两个开关并成一行（分段优先，null=跟随全局默认开）——各自一行时
+                 * 光这两个开关就吃掉四行高度，而它们本来就是同一类东西。 */
+                const swRow = el("div", "h3d-setrow");
                 // —— 自动引用上段（false≈旧独立镜头：全断链硬切，改动从本段起重跑） ——
                 const refRow = el("label", "h3d-unlink");
                 const refCb = document.createElement("input");
@@ -6954,7 +7001,6 @@ function buildCards(data) {
                 if (seg.auto_ref === null || seg.auto_ref === undefined) {
                     refRow.append(el("span", "h3d-secs-hint", "跟随全局"));
                 }
-                paneSet.append(refRow, refFollow);
                 // —— 自动按序生成（false≈旧不上链：跳过执行不进成片，零成本恢复） ——
                 const seqRow = el("label", "h3d-unlink h3d-offrow");
                 const seqCb = document.createElement("input");
@@ -6977,98 +7023,65 @@ function buildCards(data) {
                 if (seg.auto_seq === null || seg.auto_seq === undefined) {
                     seqRow.append(el("span", "h3d-secs-hint", "跟随全局"));
                 }
-                paneSet.append(seqRow, seqFollow);
-                // —— 本段 latent 引用（null=跟随全局尾部N帧；分段优先） ——
-                const lr = (seg.latent_ref && typeof seg.latent_ref === "object") ? seg.latent_ref : {};
-                // —— 本段 latent 保存（null=默认全存；分段优先） ——
+                swRow.append(refRow, refFollow, seqRow, seqFollow);
+                secGen.append(swRow);
+
+                /* —— 本段 latent 保存（null=跟随默认「全存」）——
+                 * 落盘策略的底层是 {mode: all|range|tail|off, start_f, end_f, tail_f,
+                 * split_av, save_seg, save_all}，但对用户只有三件事：存全段 / 只存尾部
+                 * N 帧 / 压根不存。字段不平铺——那是把后端 schema 直接摊给人看。 */
                 const ls = (seg.latent_save && typeof seg.latent_save === "object") ? seg.latent_save : {};
                 const lsBox = el("details", "h3d-adv");
                 lsBox.innerHTML = "<summary>💾 本段 latent 保存</summary>";
                 const lsGrid = el("div", "h3d-adv-grid");
                 const modeSel = document.createElement("select");
                 modeSel.className = "h3d-select";
-                for (const [v, t] of [["follow", "跟随默认（全存）"], ["all", "全部"], ["range", "指定帧范围"], ["tail", "仅尾部"], ["off", "不保存"]]) {
+                // seed 值：旧档的 range 不在三选里，落回「存全段」显示但**不写回**——
+                // 只要用户不动它，旧设置原样生效（见下方提示行）。
+                const curMode = (ls.mode === "tail" || ls.mode === "off") ? ls.mode : "follow";
+                for (const [v, t] of [["follow", "存全段（默认）"], ["tail", "只存尾部"],
+                                      ["off", "不存（用完即弃）"]]) {
                     const o = document.createElement("option");
                     o.value = v; o.textContent = t;
-                    const curMode = ls.mode || "follow";
-                    if (v === curMode || (v === "follow" && !ls.mode)) o.selected = true;
+                    if (v === curMode) o.selected = true;
                     modeSel.append(o);
                 }
-                modeSel.title = "本段 latent 保存策略：范围=[起始帧,结束帧)，尾部=最后 N 帧";
+                modeSel.title = "本段 latent 落盘策略。存下来的 latent 是「选段 / 选 latent 作锚源」"
+                    + "与续跑沿用的原料；不存就只留在存档外的临时结果里，省磁盘但少一条退路";
+                const tailWrap = el("div", "h3d-adv-grid");
+                tailWrap.style.display = curMode === "tail" ? "grid" : "none";
+                const tailInp = document.createElement("input");
+                tailInp.type = "number";
+                tailInp.className = "h3d-secs";
+                tailInp.min = "0"; tailInp.step = "1";
+                tailInp.value = (ls.tail_f || 39);
+                tailInp.title = "只保留本段最后 N 帧的 latent（默认 39 帧 ≈ 1.6 秒 @24fps）";
+                tailInp.onchange = () => {
+                    const n = parseInt(tailInp.value, 10);
+                    setSegmentField(node, it.idx, "latent_save",
+                        { ...ls, mode: "tail", tail_f: Number.isFinite(n) && n > 0 ? n : 39 });
+                    scheduleRefresh(60);
+                };
                 modeSel.onchange = () => {
-                    if (modeSel.value === "follow") {
-                        setSegmentField(node, it.idx, "latent_save", null);
-                    } else {
-                        const cur = (data.ds.segments[it.idx].latent_save && typeof data.ds.segments[it.idx].latent_save === "object")
-                            ? { ...data.ds.segments[it.idx].latent_save } : {};
-                        cur.mode = modeSel.value;
-                        setSegmentField(node, it.idx, "latent_save", cur);
-                    }
+                    const v = modeSel.value;
+                    tailWrap.style.display = v === "tail" ? "grid" : "none";
+                    setSegmentField(node, it.idx, "latent_save",
+                        v === "follow" ? null : { ...ls, mode: v, tail_f: ls.tail_f || 39 });
                     scheduleRefresh(60);
                 };
-                lsGrid.append(el("span", "h3d-secs-hint", "保存模式"), modeSel);
-                // 分两组显隐：范围/尾部模式才需要填帧号；分开存只在"确实要落的模式"下有意义。
-                // 原先 5 个字段（mode/起/止/尾/split_av）全铺在一个扁平 grid 里，
-                // 既看不懂哪个跟哪个有关，也把后端字段直接暴露给了用户。
-                const lsNums = el("div", "h3d-adv-grid");
-                const lsSplit = el("div", "h3d-adv-grid");
-                for (const [key, txt] of [["start_f", "起始帧"], ["end_f", "结束帧"], ["tail_f", "尾部帧数"]]) {
-                    const inp = document.createElement("input");
-                    inp.type = "number";
-                    inp.className = "h3d-secs";
-                    inp.min = "0"; inp.step = "1";
-                    inp.value = ls[key] || "";
-                    inp.title = txt + "（像素帧号；范围模式用起/止，尾部模式用尾部帧数）";
-                    inp.onchange = () => {
-                        const cur = (data.ds.segments[it.idx].latent_save && typeof data.ds.segments[it.idx].latent_save === "object")
-                            ? { ...data.ds.segments[it.idx].latent_save } : { mode: "range" };
-                        const n = parseInt(inp.value, 10);
-                        cur[key] = Number.isFinite(n) && n > 0 ? n : 0;
-                        if (!cur.mode) cur.mode = "range";
-                        setSegmentField(node, it.idx, "latent_save", cur);
-                        scheduleRefresh(60);
-                    };
-                    lsNums.append(el("span", "h3d-secs-hint", txt), inp);
+                lsGrid.append(el("span", "h3d-secs-hint", "保存"), modeSel);
+                tailWrap.append(el("span", "h3d-secs-hint", "尾部帧数"), tailInp);
+                lsBox.append(lsGrid, tailWrap);
+                // 旧设置不再有编辑入口，但也不能装作没看见：说清它还在生效、怎么替换。
+                const legacyLs = [];
+                if (ls.mode === "range") legacyLs.push("指定帧范围");
+                if (ls.split_av) legacyLs.push("图像/音频分开存");
+                if (legacyLs.length) {
+                    lsBox.append(el("div", "h3d-secs-hint",
+                        `本段是旧设置「${legacyLs.join(" / ")}」：界面上不再提供这两项，`
+                        + "不动它就一直是旧设置；改选上面任一项即替换。"));
                 }
-                const splitRow = el("label", "h3d-unlink");
-                const splitCb = document.createElement("input");
-                splitCb.type = "checkbox";
-                splitCb.checked = !!ls.split_av;
-                splitRow.append(splitCb, document.createTextNode("图像/音频分开存"));
-                splitRow.title = "开=本段 latent 落两个文件（_v 图像 / _a 音频，各自登记 kind）";
-                splitCb.onchange = () => {
-                    const cur = (data.ds.segments[it.idx].latent_save && typeof data.ds.segments[it.idx].latent_save === "object")
-                        ? { ...data.ds.segments[it.idx].latent_save } : { mode: "all" };
-                    cur.split_av = splitCb.checked;
-                    setSegmentField(node, it.idx, "latent_save", cur);
-                    scheduleRefresh(60);
-                };
-                lsSplit.append(splitRow);
-                // 只有「范围 / 尾部」才需要帧号；「全部」也允许分开存但不需要帧号
-                const _syncLs = () => {
-                    const m = modeSel.value;
-                    lsNums.style.display = (m === "range" || m === "tail") ? "grid" : "none";
-                    lsSplit.style.display = (m === "follow" || m === "off") ? "none" : "grid";
-                };
-                _syncLs();
-                modeSel.addEventListener("change", _syncLs);
-                lsBox.append(lsGrid, lsNums, lsSplit);
-                paneSet.append(lsBox);
-                // —— 手动锚定（双轨时间线，见 web/h3d_anchor.js）：anchor 存 ds.segments[i].anchors，
-                //    随 save_prompts 一起落盘；模块未加载（如旧前端）则跳过，不影响其余设置 ——
-                if (window.H3Anchor && window.H3Anchor.buildAnchorPanel) {
-                    // dir / setAnchors 是**注入给子模块的宿主访问器**：本文件的 getDirValue /
-                    // setSegmentField 都是模块级函数、并不在 window 上，子模块按全局名去找
-                    // 会当场抛错（曾因此整块「段落卡片渲染失败」）。顺带把「谁先加载」
-                    // 这条隐式契约也消掉了。
-                    const anchorBox = window.H3Anchor.buildAnchorPanel({
-                        node, data, idx: it.idx,
-                        refresh: () => scheduleRefresh(60),
-                        dir: () => getDirValue(node),
-                        setAnchors: (arr) => setSegmentField(node, it.idx, "anchors", arr),
-                    });
-                    if (anchorBox) paneSet.append(anchorBox);
-                }
+                secDisk.append(lsBox);
             }
             /* v2分组进Tab（主框=最终文本，v2可改+一键同步回主框） */
             if (node && it.idx !== undefined) {

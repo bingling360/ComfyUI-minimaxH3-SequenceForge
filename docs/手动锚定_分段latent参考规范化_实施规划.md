@@ -239,6 +239,23 @@ anchor = {
 
 **token 刻度必须画出来**：宽度锁 17k+5 而 token 边界不等距，画出来约束才自解释。
 
+### §5 落地偏差（2026-09-16 晚，用户拍板）
+
+1. **来源只有两类，不是五类**：UI 上只有「**段**」（本项目已落盘的 `seg_NNN.pt`）
+   与「**素材**」（从素材库挑的图/视/latent）两档；后端 `SRC_KINDS` 仍是五个，
+   `prev_tail` 退成**隐式默认段首桥**（没有显式 head anchor 时才走），旧存档的
+   `prev_tail` 锚在 UI 里以只读项回显。用户原话：「有上段的选择就行了」。
+2. **素材一律从现有素材库挑**，不枚举 input 目录：`web/h3_library.js` 加了
+   **挑选模式**（`H3Lib.open({ onPick, pickKinds })`，单击瓦片即选中并关窗），
+   后端 `anchor_sources?ref=<库条目 id>` 只探测**那一个**文件的帧数/尺寸/帧率。
+   整目录枚举等于另造一个素材库，与全局库/项目库两套数据必然漂移。
+3. 上图里「[上段尾 ▾]」「[中间]」两处**已不按原样实现**：前者撤掉，后者改为在
+   刻度上点/拖直接定位（自动切 mid）+ 保留开头/结尾两个预设。
+4. **目标轨的"本段 N 帧"只从一处出**：`h3_director.segmentFrames(node, seg)`
+   （= 后端 `nodes._snap_seconds`，**就近**吸附 17k+5），经 `frameLen` 注入面板。
+   ⚠️ 秒→帧是**就近**不是向上对齐 —— 面板原先自己算了一遍向上对齐，
+   这就是「目标轨总帧数与分段时长对不上」的根因。
+
 ---
 
 ## 6. 实施步骤
@@ -387,7 +404,7 @@ anchor = {
 | 5 变更检测改造 | ✅ 已完成（`assert_match` 收窄 + `reroll_start` 删除 → 区间模型，已接进主编排） |
 | 6 主编排切换 | ✅ 已完成（唯一入口 `seg.anchors[]`；`_apply_guide` 重构为 keyframe 列表；实验三件套并入 anchor） |
 | 7 清理 | ✅ 已完成（19 项删除清单 + `truncate` 死键 + 窗宽双实现收敛 + `projects.py` 插入段死代码） |
-| 8 UI | ✅ 已交付（`web/h3d_anchor.js` 30KB + `h3_director.js` 接线；`node --check` 通过，**未经人工目视**） |
+| 8 UI | ✅ 已交付并完成收敛（`web/h3d_anchor.js` + `h3_director.js` 接线；来源两类 / 素材库挑选模式 / 设置页分两区 / 落盘策略三选；`node --check` + **jsdom 真 DOM 冒烟全绿**，**人工目视待 G 盘机器**） |
 
 ### 实施偏差记录（与原规划的写法不同，均已落地）
 
@@ -410,6 +427,16 @@ anchor = {
    判定能否拼接，此时宁可报错也不赌——赌输是模型层整链崩。
 6. **`window` 成为取用契约**：所有源统一裁到 `window` 对应的 token 数（取尾部），
    否则「window=1 的单帧身份锚」会退化成"整段 latent 砸在末帧上"。
+7. **段源 ref 的规范形式是 `seg_NNN`（不带 `.pt`）**：`anchors.py` §3 文档、
+   `routes.anchor_sources`、`tests/test_anchors.py` 三处一致。`nodes.py` 曾要求
+   `.pt` 后缀并按 `_pn[4:-3]` 切片取段号 —— 于是**面板里选出来的段源必然报错**，
+   本轮改为接受 `seg_NNN`。
+8. **视频锚源与图片共用一条寻址通路**：`kind="video"` 原写死走 `_load_input_video`
+   （只认 ComfyUI input 目录），项目 `assets/` 与素材库里的视频接不进来。本轮抽出
+   `_anchor_asset()`（标签/asset_id → 注册表 → 绝对路径），新增 `_anchor_video()`。
+9. **「上段尾」槽位要带序章偏移**：`prev_slot = seg_no - 2 + (has_prologue ? 1 : 0)`，
+   原先少算偏移，有序章的项目会把「上段尾」指到序章上。段列表也改为**包含上一段**
+   （原先被排除，于是"让你选上一段"但列表里根本没有）。
 
 ### 仍需现场验证（本机无 ComfyUI 运行环境）
 
@@ -636,6 +663,9 @@ tail_src, v2mode` → **新增 `anchors`**
 | 6 | 窗宽两处实现：`guides.clip_guide_frames`（官方语义）与 `grid.snap_window_down`（由 `video_latent_t` 推导） | 步骤 3 已加逐值等价断言（n=1..2000）；步骤 7 收敛为一份 |
 | 7 | `truncate` 的截断键列表含 `"anchors"`，但 manifest 从不写该键（全仓 grep `"anchors"` 在 nodes.py 零命中） | 死键；步骤 7 顺手删（步骤 6.4 会往**段哈希**写 anchors，不是 manifest） |
 | 8 | 尾锚执行期优先级：段级尾帧图 > 链级尾帧图 > `tail_src` > 全局 `last_frame` | ⚠️ 步骤 6 切换时**必须保留**——否则原本被尾帧图遮挡的 `tail_src` 会突然生效，旧链行为被改变 |
+| 9 | `nodes._resolve_anchor_latent` 的段源要求 `ref` 以 `.pt` 结尾，而 `routes` / 文档 / 测试都发 `seg_003` → 段源一选就报错 | ✅ **已修**（改为接受 `seg_NNN`） |
+| 10 | `kind="video"` 锚源写死走 `_load_input_video` → 只认 ComfyUI input 目录，项目 `assets/` 与素材库里的视频接不进来 | ✅ **已修**（抽出 `_anchor_asset`，与图片同一条寻址通路） |
+| 11 | 面板自己算本段帧数（**向上对齐** 17k+5），后端 `nodes._snap_seconds` 是**就近** → 目标轨刻度与分段时长对不上 | ✅ **已修**（统一到 `h3_director.segmentFrames`，经 `frameLen` 注入面板） |
 
 ## A.6 验收清单（步骤 6.5，逐条实测）
 

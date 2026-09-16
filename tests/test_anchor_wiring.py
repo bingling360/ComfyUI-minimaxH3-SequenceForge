@@ -148,12 +148,13 @@ def test_anchor_js_has_no_cross_module_global_calls():
 
 
 def test_director_injects_anchor_host_accessors():
-    """接线必须真的传 dir / setAnchors，否则面板一渲染就抛。"""
+    """接线必须真的传 dir / setAnchors / frameLen，否则面板一渲染就抛。"""
     src = _src("web/h3_director.js")
     i = src.index("window.H3Anchor.buildAnchorPanel(")
-    call = src[i:i + 800]
+    call = src[i:i + 1200]
     assert "dir:" in call, "buildAnchorPanel 未注入 dir"
     assert "setAnchors:" in call, "buildAnchorPanel 未注入 setAnchors"
+    assert "frameLen:" in call, "buildAnchorPanel 未注入 frameLen（本段总帧数）"
 
 
 def test_anchor_js_has_no_load_order_requirement():
@@ -194,6 +195,22 @@ def _js_code(src):
     return "\n".join(out)
 
 
+def _func_src(src, name):
+    """按缩进切出一个函数体（routes.py 是嵌套注册，def 都在 4 空格缩进下）。
+
+    用来做「这个函数里不许出现 X」这类守卫：不切范围的话，routes.py 别处
+    合法用到的同名符号会把守卫变成误报。
+    """
+    for head in (f"    async def {name}(", f"    def {name}("):
+        i = src.find(head)
+        if i < 0:
+            continue
+        nxt = min(x for x in (src.find("\n    async def ", i + 1),
+                              src.find("\n    def ", i + 1)) if x > 0)
+        return src[i:nxt]
+    raise AssertionError(f"routes.py 里找不到 {name}")
+
+
 def _find_func_anywhere(tree, name):
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == name:
@@ -222,23 +239,145 @@ def test_anchor_panel_owns_its_own_rendering():
     现在只保留 1 处宿主 refresh 调用：rebuildCard 找不到卡片时的兜底。
     """
     code = _js_code(_src("web/h3d_anchor.js"))
-    n = code.count("(refresh || (() => {}))()")
+    n = code.count("(ctx.refresh || (() => {}))()")
     assert n == 1, f"面板又有多余的宿主全量重刷调用（{n} 处，应只有 1 处兜底）"
     assert "ctx.__rebuildCard" in code, "本地重建能力未挂到 ctx，commit 无法自行刷新"
 
-# ---- 渲染所有权：面板必须自己刷新自己 ----
 
-def test_anchor_panel_owns_its_own_rendering():
-    """本地改动只许走本地重建，**不许**触发宿主全量重刷。
+# ---- 来源只有两类：段 / 素材（prev_tail 退出 UI） ----
 
-    2026-09-16 症状：点「新增锚定」后轨道不出现，要退出导演台再进才有。
-    根因：commit() 每次都调宿主的 refresh()，而它**全量重刷导演台**，把本面板刚
-    渲染的 DOM 连同正在进行的异步填充一起推倒——异步结果落在已丢弃的节点上。
-    rebuildCard() 本地重建逻辑本来就是对的，只是没被用在这条路径上。
+def test_anchor_source_kinds_are_only_segment_and_asset():
+    """来源下拉只许两类：「段」= 本项目落盘的 seg_NNN；「素材」= 素材库里挑。
 
-    现在只保留 1 处宿主 refresh 调用：rebuildCard 找不到卡片时的兜底。
+    用户 2026-09-16 明确：prev_tail 冗余——「有上段的选择就行了」。后端保留
+    prev_tail 作隐式默认段首桥（没有显式 head anchor 时才走），只是 UI 不再暴露。
+    旧存档里已有的 prev_tail 锚作为只读项回显，不得再变回一个可选项。
     """
-    code = _js_code(_src("web/h3d_anchor.js"))
-    n = code.count("(refresh || (() => {}))()")
-    assert n == 1, f"面板又有多余的宿主全量重刷调用（{n} 处，应只有 1 处兜底）"
-    assert "ctx.__rebuildCard" in code, "本地重建能力未挂到 ctx，commit 无法自行刷新"
+    src = _js_code(_src("web/h3d_anchor.js"))
+    assert '[["segment", "段"], ["asset", "素材"]]' in src, "来源下拉的两类选项被改动"
+    assert '"prev_tail（旧格式）"' in src or "上段尾（旧格式）" in src, \
+        "旧存档的 prev_tail 锚需要只读回显（否则用户看不懂那一行是什么）"
+    assert 'kind: "prev_tail"' not in src, "新建锚又默认成 prev_tail 了（应默认「段」+ 上一段）"
+
+
+def test_anchor_default_prefers_previous_segment():
+    """新建锚预填「上一段」：拿到的就是 prev_tail 那份 latent，不填则用户自己挑。"""
+    src = _js_code(_src("web/h3d_anchor.js"))
+    assert 'kind: "segment", ref: (prev && prev.ref) || ""' in src
+    assert "prevSegment" in src
+
+
+# ---- 素材一律从素材库选，不自己枚举 ----
+
+def test_anchor_assets_come_from_the_library_module():
+    """锚源素材必须走现有素材库（h3_library.js 的挑选模式），不另造枚举。"""
+    src = _js_code(_src("web/h3d_anchor.js"))
+    assert "window.H3Lib" in src and "pickKinds" in src, "锚定面板没有接素材库挑选模式"
+    assert "/h3chain/anchor_sources?dir=" in src, "锚源清单接口被改名/改形"
+    # 只看 anchor_sources 这一个函数的函数体：routes.py 别处用 get_input_directory 是
+    # 另外的接口（素材上传等），不该被这条守卫牵连。
+    body = _func_src(_src("routes.py"), "anchor_sources")
+    for dead in ("_probe_media_meta", "_VIDEO_EXTS", "get_input_directory", "os.listdir("):
+        assert dead not in body, f"anchor_sources 又在自己枚举素材（{dead}）"
+
+
+def test_anchor_sources_resolves_one_ref_meta():
+    """选完素材要由后端确认那**一个**文件的帧数/尺寸/帧率（面板刻度与体检的输入）。
+
+    这里只允许单文件元信息探测：整目录枚举是错的（那等于另造一个素材库，
+    与全局库/项目库两套数据必然漂移）。
+    """
+    routes = _src("routes.py")
+    assert "def _source_meta(" in routes
+    assert 'q.get("ref")' in routes
+    assert "def _anchor_ref_of(" in routes
+    assert "resolve_item_path(" in routes
+
+
+def test_library_module_has_a_pick_mode():
+    """素材库要能当选择器复用（一个浏览器，不是两个）。"""
+    lib = _js_code(_src("web/h3_library.js"))
+    assert "typeof o.onPick === \"function\"" in lib
+    assert "S.pick" in lib
+    assert "onPick:" in _src("web/h3d_anchor.js")
+
+
+# ---- 本段总帧数：一个数只有一个算法 ----
+
+def test_segment_frames_has_a_single_source():
+    """段卡标题的「≈N帧」与锚定面板的目标轨刻度必须同源。
+
+    面板原先自己又算一遍，而且用的是**向上对齐**——后端 nodes._snap_seconds 是
+    **就近**吸附，于是目标轨总帧数和分段时长对不上，用户以为面板坏了。
+    """
+    d = _src("web/h3_director.js")
+    a = _js_code(_src("web/h3d_anchor.js"))
+    assert "function segmentFrames(node, seg)" in d, "唯一换算函数不见了"
+    assert "frameLen: () => segmentFrames(node, data.ds.segments[it.idx])" in d, \
+        "宿主没有把本段帧数注入锚定面板"
+    assert "frameLen" in a and "snapFramesUp" not in a, \
+        "面板又开始自己算帧数（向上对齐）了"
+    assert "segFramesUp" not in a and "× 24" not in a.replace("secs * 24", ""), \
+        "面板里出现第二套秒→帧换算"
+
+
+def test_segment_metadata_is_written_with_the_prologue_offset():
+    """「上段尾」槽位必须带上序章偏移，否则有序章的项目会指到序章上。"""
+    routes = _src("routes.py")
+    assert "prev_slot = seg_no - 2 + (1 if man.get(\"has_prologue\") else 0)" in routes
+
+
+# ---- 段源 ref 的规范形式 ----
+
+def test_segment_source_ref_form_is_seg_nnn():
+    """段源 ref 的规范形式是 `seg_NNN`（anchors.py 文档 / routes / 测试三处一致）。
+
+    nodes.py 曾要求以 `.pt` 结尾、并按 `_pn[4:-3]` 切片取段号，于是面板里
+    **选出来的段源必然报错**——ref 从哪儿来都对不上。
+    """
+    assert "须为 seg_NNN 形式" in NODES
+    assert "int(_pn[4:-3])" not in NODES, "又按 .pt 后缀切片取段号了"
+    assert "seg_003" in _src("tests/test_anchors.py")
+
+
+# ---- 「设置」页：按作用面分区 + 落盘策略收敛成人话 ----
+
+def test_settings_pane_is_grouped_by_effect():
+    """设置页分两区并给小标题：影响本段生成 / 只影响落盘。
+
+    原先这几块平铺、权重一样，看不出改哪个会改变出片、改哪个只是省磁盘。
+    """
+    d = _src("web/h3_director.js")
+    assert "影响本段生成" in d and "只影响落盘" in d
+    assert "h3d-setsec-title" in d and ".h3d-setsec{" in d, "分区样式没跟上"
+    assert "secGen.append(anchorBox)" in d, "锚定面板没挂进「影响本段生成」区"
+    assert "secDisk.append(lsBox)" in d, "latent 保存没挂进「只影响落盘」区"
+
+
+def test_latent_save_is_three_human_options():
+    """latent 落盘策略收敛成三选，后端字段不平铺给用户看。
+
+    底层是 {mode: all|range|tail|off, start_f, end_f, tail_f, split_av, save_seg,
+    save_all}；界面上只该有「存全段 / 只存尾部 N 帧 / 不存」。
+    旧档的 range / split_av 不再有编辑入口，但必须留提示行说清它还在生效——
+    否则用户会以为改选项才生效、旧设置被静默丢弃。
+    """
+    d = _src("web/h3_director.js")
+    assert '["follow", "存全段（默认）"], ["tail", "只存尾部"]' in d
+    assert '"off", "不存（用完即弃）"' in d
+    # 旧控件（起始帧 / 结束帧 / 分开存开关）不得作为控件回归
+    assert d.count("起始帧") == 0 and d.count("结束帧") == 0, "后端帧号字段又铺回界面了"
+    assert d.count("图像/音频分开存") == 1, "分开存开关又回来了（只该在旧设置提示里出现一次）"
+    assert "界面上不再提供这两项" in d, "旧设置提示行被删，用户会以为旧配置失效了"
+
+
+def test_video_anchor_goes_through_the_asset_registry():
+    """视频锚源必须与图片同一条寻址通路（注册表 -> 绝对路径）。
+
+    原先 kind="video" 写死走 _load_input_video（只认 ComfyUI input 目录），
+    项目 assets/ 与素材库里的视频根本接不进来。
+    """
+    assert "def _anchor_asset(" in NODES
+    assert "def _anchor_video(" in NODES
+    assert "_anchor_video(ref)" in NODES
+    assert "_imgs, _aud = _load_input_video(ref" not in NODES

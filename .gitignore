@@ -22,3 +22,6 @@ __pycache__/
 # 系统杂物
 Thumbs.db
 .DS_Store
+
+# 生成物：由 tools/make_anchor_preview.py 从 web/ 现读现拼，不入库（必然漂移）
+tools/anchor_preview.html

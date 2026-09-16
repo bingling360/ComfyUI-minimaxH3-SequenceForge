@@ -17,6 +17,12 @@
  *   dir       项目目录名（决定 project/finals/latent 三个 scope 的数据源）
  *   seg       当前选中段（1-based），供「引用到段」用
  *   onChanged 动作改了工程数据后回调（让导演台刷新）
+ *
+ * **挑选模式**：传 `onPick(item)` 即进入挑选模式——单击瓦片 = 选中该素材并关闭，
+ * 回调收到整条库条目（id / scope / kind / file / asset_id / name）。锚定面板的
+ * 「选素材」就走这里：复用同一套搜索 / 筛选 / 四个 scope / 缩略图，**不再另造
+ * 第二个素材浏览器**（两套 UI 看同一批文件，必然漂移）。
+ *   pickKinds 限制类型下拉（如 ["image","video","latent"]——锚源只收这三类）
  */
 (function () {
   "use strict";
@@ -192,6 +198,8 @@
 .h3l-scope.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
 .h3l-scope em{font-style:normal;color:#7f7a70;margin-left:5px;font-size:11px}
 .h3l-spacer{flex:1}
+.h3l-hint{font-size:12px;color:#8f8a7d}
+.h3l-picking .h3l-tile:hover{border-color:#316dca}
 .h3l-close{width:30px;height:30px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;color:#a8a294;cursor:pointer;font-size:15px;line-height:1}
 .h3l-close:hover{border-color:#9a4144;color:#f0a0a4}
 .h3l-bar{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid #2b2822;background:#171612;flex-wrap:wrap}
@@ -422,8 +430,17 @@
     // 常用动作直接摆在瓦片上（不要藏进"双击才出现"的界面）
     t.append(tileButtons(it));
 
-    t.addEventListener("dblclick", () => openViewer(it));
+    t.addEventListener("dblclick", () => { if (!S.pick) openViewer(it); });
     t.addEventListener("click", (e) => {
+      // 挑选模式：单击即选中并关闭（瓦片上的按钮/星级都 stopPropagation，
+      // 所以「改名 / 删除 / 打分」不会误触发选中）
+      if (S.pick) {
+        const cb = S.pick, done = S.close;
+        t.classList.add("sel");
+        if (typeof done === "function") done();
+        cb(it);
+        return;
+      }
       if (S.multi) {
         if (S.sel.has(it.id)) S.sel.delete(it.id);
         else S.sel.add(it.id);
@@ -872,6 +889,7 @@
     const o = opts || {};
     if (document.querySelector(".h3l-overlay")) return;
     injectStyles();
+    const pickMode = typeof o.onPick === "function";
     S = {
       dir: String(o.dir || ""), seg: Number(o.seg) || 1,
       onChanged: o.onChanged,
@@ -879,19 +897,25 @@
       q: "", page: 1, pageSize: 60,
       items: [], total: 0, totalPages: 1, counters: {},
       sel: new Set(), multi: false, collections: [], collection: "",
+      pick: pickMode ? o.onPick : null,
+      pickKinds: Array.isArray(o.pickKinds) ? o.pickKinds : null,
       cur: null,
     };
 
-    const overlay = el("div", "h3l-overlay");
+    const overlay = el("div", "h3l-overlay" + (pickMode ? " h3l-picking" : ""));
     const box = el("div", "h3l-box");
     const head = el("div", "h3l-head");
-    head.append(el("strong", "", "🗂 素材库"));
+    head.append(el("strong", "", pickMode ? "🗂 选择素材" : "🗂 素材库"));
+    if (pickMode) {
+      head.append(el("span", "h3l-hint", "点一下素材就选中，窗口自动关闭"));
+    }
     S.scopeBox = el("div", "h3l-scopes");
     head.append(S.scopeBox, el("div", "h3l-spacer"));
     const close = el("button", "h3l-close", "✕");
     close.title = "关闭（Esc）";
     close.onclick = () => overlay.remove();
     head.append(close);
+    S.close = () => overlay.remove();
 
     const bar = el("div", "h3l-bar");
     const search = el("input", "h3l-search");
@@ -910,7 +934,11 @@
       sel.onchange = () => { S[key] = sel.value; S.sel.clear(); fetchPage(false); };
       return sel;
     };
-    bar.append(mkSel(KINDS, "kind"));
+    // 挑选模式下按 pickKinds 收窄类型下拉：锚源只收图片/视频/latent，
+    // 留着「音频」让用户点了再被后端拒，属于把错误推给下一个环节。
+    bar.append(mkSel(S.pickKinds
+      ? KINDS.filter(([v]) => v === "all" || v === "media" || S.pickKinds.includes(v))
+      : KINDS, "kind"));
     bar.append(mkSel(SORTS, "sort"));
     bar.append(mkSel(RATINGS, "minRating"));
     const ordBtn = el("button", "h3l-btn", "↓ 倒序");
@@ -931,7 +959,8 @@
       renderGrid();
       renderFoot();
     };
-    bar.append(multiBtn);
+    // 挑选模式单击就返回，不存在"选中一批"这回事
+    if (!pickMode) bar.append(multiBtn);
 
     /* 上传落点 = 当前所在库，**上传到哪里就是哪里，不顺手复制**：
      *   全局库 → 只进全局库（跨项目复用）
@@ -1043,6 +1072,7 @@
       }
     });
 
+    if (pickMode) say("点一下素材即可选中（会自动关闭本窗口）");
     await refreshCollections();
     await fetchPage(false);
     const A = api();

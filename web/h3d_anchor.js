@@ -106,6 +106,24 @@
     // 稳定唯一 id：本会话内不重复即可（后端以此做锚标识）
     return "ax_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   }
+  /* 帧数向上对齐 17k+5（与后端 grid.align_frame_count 同式）：
+   * 段长 = 时长秒数 × 24 后再对齐到 17k+5 —— 目标轨刻度必须与它一致。 */
+  /* 取不超过源帧数的最大 17k+5 档位：源比最小档还短时返回 1（单帧锚）。
+   * 原实现一律退到最小档 5，等于悄悄把"源只有 8 帧"的锚钉成 5 帧之外还要更多，
+   * 遇到图片源（1 帧）更是直接矛盾。 */
+  function snapDown(spec, frames) {
+    const ws = spec.snap_windows || [];
+    const minW = spec.min_window_frames || 5;
+    if (!Number.isFinite(frames) || frames < minW) return 1;
+    let best = 1;
+    for (const w of ws) if (w <= frames) best = w;
+    return best;
+  }
+  function snapFramesUp(n) {
+    let x = Math.max(5, Math.round(Number(n) || 0));
+    while (x % 17 !== 5) x += 1;
+    return x;
+  }
   function newAnchor() {
     return {
       id: genId(),
@@ -261,7 +279,7 @@
     // 异步填双轨：spec（常量）+ sources（该段可选源清单）
     Promise.all([
       getSpec().catch((e) => { console.error("[h3d-anchor] grid_spec 失败", e); return null; }),
-      fetchSources(dir, idx + 1).catch((e) => { console.error("[h3d-anchor] anchor_sources 失败", e); return null; }),
+      fetchSources(dir, idx + 1, anchor.src.kind).catch((e) => { console.error("[h3d-anchor] anchor_sources 失败", e); return null; }),
     ]).then(([spec, sources]) => {
       if (!spec) { srcTrack.append(el("div", "h3d-anchor-echo", "⚠ 无法获取 grid_spec（后端接口未就绪）")); return; }
       fillSrcTrack(ctx, spec, sources, srcTrack);
@@ -276,8 +294,12 @@
     function commit() { setAnchorsOf(ctx, anchors.slice()); (refresh || (() => {}))(); }
   }
 
-  async function fetchSources(dir, seg1based) {
-    const j = await _getJson("/h3chain/anchor_sources?dir=" + encodeURIComponent(dir || "") + "&seg=" + seg1based);
+  async function fetchSources(dir, seg1based, kind) {
+    // kind 只在是 video / image 时才有意义：这两类的候选项要扫盘 + 读容器头，
+    // 后端只在指定 kind 时才枚举（省掉每次调用都全量扫）
+    let u = "/h3chain/anchor_sources?dir=" + encodeURIComponent(dir || "") + "&seg=" + seg1based;
+    if (kind) u += "&kind=" + encodeURIComponent(kind);
+    const j = await _getJson(u);
     if (!j || !j.ok) throw new Error("anchor_sources 返回异常");
     return j.sources || [];
   }
@@ -440,7 +462,7 @@
           if (r && r.ok && r.sheet) {
             anchor.src.meta_ok = true;
             // 重新拉源清单刷新 sheet
-            const ns = await fetchSources(dirOf(ctx), idx + 1).catch(() => null);
+            const ns = await fetchSources(dirOf(ctx), idx + 1, anchor.src.kind).catch(() => null);
             commit();
             // 重建源轨（含新 sheet）
             host.innerHTML = ""; host.append(el("h5", "", "① 源轨 · 从素材选哪一段"));
@@ -464,12 +486,18 @@
     const { anchor, node, idx, data, refresh } = ctx;
     host.innerHTML = "";
     host.append(el("h5", "", "② 目标轨 · 钉到本段哪个位置"));
-    // 本段帧数：优先本段自己的时长，没有才退回全局 length
+    // 本段总帧数：**必须与「分段视频设置」里那一段的时长一致**。
+    // 该段设了秒数（segments[idx].seconds）就按它换算并向上对齐 17k+5——这就是
+    // 后端 seg_lengths 的算法（length if s is None else _snap_seconds(s)）；
+    // 没设才退回全局 length（帧）。原先一律用全局 length，各段时长不同时刻度是错的。
     const mf = data.mf || {};
     const p = mf.params || {};
-    const lengths = Array.isArray(mf.seg_lengths) ? mf.seg_lengths : null;
-    const segLen = (lengths && Number(lengths[idx])) || Number(p.length) || 120;
-    const totalFrames = Math.max(1, Number(segLen) || 120);
+    const seg = (data.ds.segments && data.ds.segments[idx]) || {};
+    const globalLen = Math.max(1, Number(p.length) || 120);
+    const secs = Number(seg.seconds);
+    const totalFrames = (Number.isFinite(secs) && secs > 0)
+      ? snapFramesUp(secs * 24)
+      : globalLen;
 
     const strip = el("div", "h3d-strip");
     strip.style.background = "linear-gradient(90deg,#2a2230,#342a38,#2a2230)";
@@ -496,20 +524,23 @@
       m.title = "已有锚 @" + resolveFrame(o, totalFrames);
       strip.append(m);
     });
-    // 自己的落点：画成**跨度框**而不是细线——细线看不出钉了多宽，那正是
-    // 「目标轨选择特别奇怪」的根因。框宽就是 ① 选定的窗宽。
-    const box = el("div", "h3d-selbox");
-    box.style.background = "rgba(255,176,102,.20)";
-    box.style.borderColor = "var(--h3d-warn)";
-    box.style.color = "var(--h3d-warn)";
+    // 自己的落点：**一条线**（用户明确要求：目标轨是"钉在哪一帧"，不是跨度）。
+    // 窗宽不在这里表达——它在 ① 已经用选取框画过了，这里再画一遍反而混淆。
+    const mark = el("div", "h3d-marker");
+    mark.style.background = "var(--h3d-cyan)";
+    mark.style.width = "3px";
+    const label = el("div", "h3d-ticklabel");
+    label.style.color = "var(--h3d-cyan)";
+    label.style.fontWeight = "700";
     const place = () => {
       const rf = resolveFrame(anchor, totalFrames);
-      box.style.left = (rf / totalFrames) * 100 + "%";
-      box.style.width = Math.max(2, Math.min(100, (anchor.window / totalFrames) * 100)) + "%";
-      box.textContent = "帧 " + rf;
+      const x = (rf / totalFrames) * 100;
+      mark.style.left = x + "%";
+      label.style.left = x + "%";
+      label.textContent = "帧 " + rf;
     };
     place();
-    strip.append(box);
+    strip.append(mark, label);
     host.append(strip);
 
     // 落点模式：开头/结尾是快捷预设；任意位置直接在刻度上点/拖（= mid）。
@@ -608,7 +639,7 @@
       // 必须**重拉**源清单：sources 只含上一批 kind，不重拉的话切到任何新来源
       // 条目都是「（无可用条目）」——这正是"看不懂怎么选素材"的直接原因。
       // sources 是 fillSideCol 的形参，同一闭包内重写，rebuildCard 即可读到新值。
-      const ns = await fetchSources(dirOf(ctx), idx + 1).catch(() => null);
+      const ns = await fetchSources(dirOf(ctx), idx + 1, anchor.src.kind).catch(() => null);
       if (ns) sources = ns;
       rebuildCard();
     };
@@ -642,12 +673,12 @@
       if (s) {
         anchor.src.src_fps = s.fps == null ? null : s.fps;
         anchor.src.meta_ok = !!s.meta_ok;
-        // 默认框占满源（不超窗宽档位则夹到档位）
+        // 窗宽跟着源走：源多长就用不超过它的最大档位；比最小档还短（图片=1 帧）
+        // 就取 1（单帧身份锚）。后端允许 window==1，非法档位它会硬报错。
         const frames = Number.isFinite(s.frames) ? s.frames : anchor.window;
-        const w = isSnapWindow(spec, frames) ? frames : (spec.snap_windows[0] || anchor.window);
-        anchor.window = w;
+        anchor.window = snapDown(spec, frames);
         anchor.src.start_f = 0;
-        anchor.src.end_f = Math.min(w, frames);
+        anchor.src.end_f = anchor.window;
       }
       commit();
       rebuildCard();

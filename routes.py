@@ -1895,14 +1895,42 @@ def add_routes(routes):
             "branches": list(h3anchors.BRANCHES),
         })
 
+    _VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
+
+    def _probe_media_meta(path):
+        """容器元信息读 fps / 总帧数（**不解码**）；读不到返回 None。
+
+        只读 stream 头，代价极小；拿不到就返回 None，让前端把 meta_ok 标 false
+        并降级到「刻度条 + 数字」，而不是编一个假帧数（规划 §8：显示错的时长
+        比不显示更糟）。
+        """
+        try:
+            import av
+            with av.open(path) as c:
+                vs = next((x for x in c.streams if x.type == "video"), None)
+                if vs is None:
+                    return None
+                fps = float(vs.average_rate) if vs.average_rate else None
+                n = int(vs.frames) if vs.frames else 0
+                if n <= 0 and vs.duration and vs.time_base and fps:
+                    n = int(float(vs.duration * vs.time_base) * fps)
+                return {"fps": fps, "frames": (n or None)}
+        except Exception:
+            return None
+
     async def anchor_sources(request):
-        """源轨的可选源清单：上段尾 / 已完成段 / latent 库（规划 §5 ①）。"""
+        """源轨的可选源清单：上段尾 / 已完成段 / latent 库 / 视频 / 图片（规划 §5 ①）。
+
+        视频与图片**只在客户端指定 kind 时才枚举**：它们的候选项要扫盘 + 读容器头，
+        每次调用都全量扫是浪费；前端切到那一类时再拉即可。
+        """
         q = request.query
         dir_name = str(q.get("dir") or "")
         root = _proj_root(dir_name)
         man = projects.read_project(h3lib.safe_rel(dir_name)) if dir_name else None
         if root is None or man is None:
-            return _err("项目不存在", code="NOT_FOUND", status=404)
+            return _err("项目不存在（先在顶部填「存档目录」并跑过至少一段，"
+                        "才有段/latent 可作源）", code="NOT_FOUND", status=404)
         try:
             seg_no = int(q.get("seg") or 0)      # 1-based 段号
         except (TypeError, ValueError):
@@ -1940,6 +1968,42 @@ def add_routes(routes):
                           if os.path.isfile(sheet) else None),
                 "meta_ok": info is not None,
             })
+        # ---- 视频源：ComfyUI input 目录里的视频 ----
+        # 为什么是 input 目录而不是项目 assets：`_load_input_video` 走的是
+        # folder_paths 的注释路径解析（input 目录），老的「插入视频」用的就是同一批
+        # 素材（导演台 stage 过去的 h3_staged/ 也在其中）。项目 assets 里的视频要接
+        # 进解析器得改 nodes.py 的加载顺序，属另一件事，这里不擅自扩大。
+        if str(q.get("kind") or "") == "video":
+            try:
+                import folder_paths
+                in_dir = folder_paths.get_input_directory()
+            except Exception:
+                in_dir = ""
+            for name in sorted(os.listdir(in_dir)) if in_dir and os.path.isdir(in_dir) else []:
+                if not name.lower().endswith(_VIDEO_EXTS):
+                    continue
+                meta = _probe_media_meta(os.path.join(in_dir, name)) or {}
+                srcs.append({
+                    "slot": None, "kind": "video", "ref": name, "label": name,
+                    "frames": meta.get("frames"), "tokens": None,
+                    "w": None, "h": None, "fps": meta.get("fps"),
+                    "sheet": None, "meta_ok": meta.get("frames") is not None,
+                })
+
+        # ---- 图片源：项目素材库里 kind=image 的条目（按标签寻址，_anchor_image 认标签）----
+        if str(q.get("kind") or "") == "image":
+            for a in (man.get("assets") or []):
+                if not isinstance(a, dict) or a.get("kind") != "image":
+                    continue
+                lbl = str(a.get("label") or a.get("asset_id") or "").strip()
+                if not lbl:
+                    continue
+                srcs.append({
+                    "slot": None, "kind": "image", "ref": lbl, "label": lbl,
+                    "frames": 1, "tokens": None, "w": None, "h": None, "fps": None,
+                    "sheet": None, "meta_ok": True,
+                })
+
         params = man.get("params") or {}
         return web.json_response({
             "ok": True, "sources": srcs,

@@ -773,7 +773,7 @@ def _rewrite_media_refs(manifest: dict, old_rel: str, new_rel: str) -> int:
     """manifest 内全部媒体引用 old->new 改写，返回改动条数。
 
     覆盖 videos/thumbs/finals/merges.file/merges.items[].file/clips
-    .file/.src/inserts[].file（链路一致性：移动成片库文件不断链）。
+    .file/.src（链路一致性：移动成片库文件不断链）。
     """
     n = 0
     for key in ("videos", "thumbs", "finals"):
@@ -800,10 +800,6 @@ def _rewrite_media_refs(manifest: dict, old_rel: str, new_rel: str) -> int:
             if c.get("src") == old_rel:
                 c["src"] = new_rel
                 n += 1
-    for x in (manifest.get("inserts") or []):
-        if isinstance(x, dict) and x.get("file") == old_rel:
-            x["file"] = new_rel
-            n += 1
     return n
 
 
@@ -814,7 +810,7 @@ def move_media(name, src_file, dest_lib, save_name=None, base_revision=None,
     - src_file：项目内相对路径（裸名/finals//assets/ 前缀双兼容；mp4/png/wav）。
     - dest_lib：目标库 "assets" | "finals"。
     - save_name：目标文件名（缺省=同名；同名已存在自动 _2 后缀）。
-    - manifest 内 videos/thumbs/finals/merges/clips/inserts 引用同步改写，不断链；
+    - manifest 内 videos/thumbs/finals/merges/clips 引用同步改写，不断链；
       seg_*.pt（链路 latent 存档）禁止移动（抛 ValueError）。
     - register_asset=true 且 dest=assets 时追加 manifest["assets"] 条目
       {label, kind, file}（label 缺省=文件名去扩展名，供提示词 [[标签]] 引用）。
@@ -1062,11 +1058,11 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
     params / seeds / prompt_hashes / finals / merges——运行时的重做判定依旧按
     节点控件提示词 vs prompt_hashes 逐段比对，改词段落照常自动重做。
     manifest.prompts 与磁盘段文件按全局槽位对齐（前端卡片/合并按此索引）：
-    序章项目自动补回「序章」占位头；已有插入视频段在对应槽位补回
-    「[插入视频] 文件名」占位行并计入 total——纯提示词回写不能让槽位错位。
+    序章项目自动补回「序章」占位头——纯提示词回写不能让槽位错位。
+    （「插入视频」段类型已随手动锚定重构移除，故不再有插入槽占位。）
     segments 为分段处理字段（场景/角色/环境音/配乐/时长/独立镜头/不上链/
     参考标签/首尾帧引用），与 prompts 同序（仅提示词段），存为
-    manifest["seg_fields"] 并按全局槽位对齐（序章/插入槽为 null）——
+    manifest["seg_fields"] 并按全局槽位对齐（序章槽为 null）——
     切换项目时前端据此还原各段卡片，不再丢分段字段。
     目录或 manifest 不存在（未跑过的指纹目录）返回 None，调用方按无项目跳过。
     base_revision 非空时做乐观锁：与当前 revision 不一致抛 ValueError(REVISION_CONFLICT)，
@@ -1094,20 +1090,10 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
     while len(seg_meta) < len(seg_prompts):
         seg_meta.append(None)
     off = 1 if manifest.get("has_prologue") else 0
-    ins_map = {}
-    for x in (manifest.get("inserts") or []):
-        if isinstance(x, dict) and x.get("file"):
-            try:
-                ins_map[int(x["slot"])] = str(x["file"])
-            except (TypeError, ValueError):
-                continue
     rows, fields, si = [], [], 0
-    for g in range(off + len(seg_prompts) + len(ins_map)):
+    for g in range(off + len(seg_prompts)):
         if g == 0 and off:
             rows.append("「序章（上传视频）」")
-            fields.append(None)
-        elif g in ins_map:
-            rows.append(f"[插入视频] {ins_map[g]}")
             fields.append(None)
         else:
             rows.append(seg_prompts[si])
@@ -1198,7 +1184,7 @@ def upscale_reset(name, seg):
     新方案高清分段与基础段同名合并存储（seg_NNN.mp4 即二采结果），故重置
     连同 seg mp4/缩略图/尾帧锚一起删（下次运行按记录缺失自愈重建：二采开=
     重渲染高清，二采关=回放段重编码基础分辨率）。不碰基础链的段 latent 存档
-    （seg_NNN.pt）、finals 与 merges；段号是 1-based 全局槽位（含序章/插入
+    （seg_NNN.pt）、finals 与 merges；段号是 1-based 全局槽位（含序章
     视频段，与前端段落卡片链位一致）。项目/段号非法抛 ValueError。
     """
     name = safe_name(name)
@@ -1276,7 +1262,7 @@ def redo_cancel(name, slot):
 def _merge_sources(root: str, manifest: dict, items):
     """合并清单 -> 按序绝对路径列表。非法/缺失抛 ValueError。
 
-    - {"seg": n}：n 为 1-based 全局槽位（含序章/插入视频段），映射
+    - {"seg": n}：n 为 1-based 全局槽位（含序章），映射
       manifest.videos[n-1]（seg_NNN.mp4 文件名，裸名/finals/ 前缀双兼容）——
       前端段落卡片链位即此编号。
     - {"file": f}：先查项目目录（final_* / merged_* / 任意 mp4，finals/优先），

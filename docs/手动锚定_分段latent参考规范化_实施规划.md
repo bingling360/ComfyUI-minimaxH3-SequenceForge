@@ -383,11 +383,59 @@ anchor = {
 | 1 回滚点与样本留底 | ✅ tag `pre-anchor-refactor` + 分支 `anchor-studio`（均 @ `c6b6b79`）；样本留底待做 |
 | 2 顺手修两个独立 bug | ✅ 2.1 已完成 + 回归测试 5/5 通过；**2.2 已决定并入步骤 4**（见下） |
 | 3 新基建 `anchors.py` | ✅ 已完成（67 用例全绿；`grid.py` 补档位数学，`test_anchors.py` 新建） |
-| 4 源归一化与落盘规范 | 🟡 **部分**：`anchors.resolve_anchor_source()` ✅ / contact sheet 生成器 ✅ / 4 个新接口 ✅ / `MAX_ENCODE_FRAMES` 收敛 ✅；**落盘元信息回填未接**（见下） |
+| 4 源归一化与落盘规范 | ✅ 已完成（`resolve_anchor_source` + contact sheet 生成器 + 4 个新接口 + 落盘元信息 `{fps,w,h,frames,sheet,tiles}` 同步生成 sheet） |
 | 5 变更检测改造 | ✅ 已完成（`assert_match` 收窄 + `reroll_start` 删除 → 区间模型，已接进主编排） |
-| 6 主编排切换 | ⏸ **未做**（本次未动；见下「未完成项」） |
-| 7 清理 | 🟡 **部分**：插入视频全链路（nodes/projects 前端 stub/README）✅、`truncate` 死键 ✅、窗宽双实现收敛 ✅；`latent_ref`/`tail_src`/实验三件套 **未删**（与步骤 6 同生共死） |
+| 6 主编排切换 | ✅ 已完成（唯一入口 `seg.anchors[]`；`_apply_guide` 重构为 keyframe 列表；实验三件套并入 anchor） |
+| 7 清理 | ✅ 已完成（19 项删除清单 + `truncate` 死键 + 窗宽双实现收敛 + `projects.py` 插入段死代码） |
 | 8 UI | ✅ 已交付（`web/h3d_anchor.js` 30KB + `h3_director.js` 接线；`node --check` 通过，**未经人工目视**） |
+
+### 实施偏差记录（与原规划的写法不同，均已落地）
+
+1. **落点推导归 `grid.py`**（§3 与步骤 3.2 原文冲突）：`grid` 是零依赖纯数学层，
+   `anchors` 是数据结构层，各只有一个定义。
+2. **吸附只发生在迁移，归一化不吸附**：若 `normalize_anchor` 直接吸附窗宽，
+   `validate_anchors` 的档位检查在生产路径上永远不可达——用户设 18 帧会被悄悄改成
+   5 帧（`video_latent_t(18)` 只折出 2 token = 5 帧），等于把手动锚最该避免的静默降级
+   又请回来。现在归一化只补形状，档位由校验硬报错并给出最近的两个合法档位。
+3. **步骤 5：删 `reroll_start`，区间标进重摇通道而非 truncate**。规划 §5.2 说
+   「`reroll_start` 改为返回变更区间列表」，实际做法是区间计算归
+   `anchors.change_intervals`，并把区间**标进既有的重摇通道 `redo_map`**——重摇本就是
+   「重建某段 + 锚定邻居」，正是区间重做需要的语义。于是「改段 5」只重建段 5，
+   段 1-4 与 6-N 全部沿用存档（§4.2 的孤立/连续/离散三种情形都成立）。
+   `truncate` 只保留三条显式路径：分辨率变更、序章变更、用户主动「重跑起始段」。
+4. **「沉默 = 默认」保持不变**：没有显式 head anchor 时才走默认段首桥（上段尾 + 全局 ctx
+   帧）。`unlink` 仍是「不生成默认 head anchor」的 UI 快捷开关，不引入第二套语义——
+   所以旧项目迁移后行为逐帧一致。
+5. **形状基准取 `_chain_ref`（本链任取一个 latent）**：C/H/W 是硬约束，没有基准就无法
+   判定能否拼接，此时宁可报错也不赌——赌输是模型层整链崩。
+6. **`window` 成为取用契约**：所有源统一裁到 `window` 对应的 token 数（取尾部），
+   否则「window=1 的单帧身份锚」会退化成"整段 latent 砸在末帧上"。
+
+### 仍需现场验证（本机无 ComfyUI 运行环境）
+
+步骤 6.5 的验收 6 条必须在带 GPU 的机器上实测：
+① 外部视频裁窗编码后下一段确实被带着走；② head / mid / tail 三落点都生效；
+③ A/V 三态分别生效；④ 改 anchor 触发**该段**重建、**下游不动**；
+⑤ 分辨率不匹配硬报错（不是静默回落）；⑥ 改 `steps` **不触发任何重做**。
+
+已知范围外（**非本次回归**）：二采（潜空间放大）路径仍只重注段首桥 / 头锚 / 尾锚，
+mid / tail 手动锚不参与高清重渲——与重构前 `_apply_guide` 的入参范围完全一致，
+属既有范围，需要时另行扩展。
+
+## 12. 实测证据（2026-09-16，两个提交）
+
+| 命令 | 结果 |
+|---|---|
+| `pytest tests/test_anchors.py -q` | **67 passed** |
+| `pytest tests/test_checkpoint_assert.py -q` | **11 passed** |
+| `pytest tests/test_anchor_wiring.py -q` | **13 passed**（结构守卫：钉住本次重构契约） |
+| `pytest tests/test_checkpoint_truncate.py -q` | **5 passed** |
+| `pytest tests -q --ignore=…eav_feta --ignore=…rework_v2` | **293 passed, 2 failed**（改动前基线 253 passed / 2 failed；两个失败均为函数内 `import torch`，非本次引入） |
+| `py_compile` 全部改动 .py | 全部 OK |
+| `node --check web/h3d_anchor.js` / `web/h3_director.js` | 均通过 |
+| `pytest tests -q`（不排除） | 收集期 2 error（torch），环境限制 |
+
+提交：`93fe186`（步骤 3/5/8 + 插入视频移除）、`cc93c7d`（步骤 6 主编排切换 + 4/7 收尾）。
 
 ### 步骤 2 调整说明
 
@@ -442,11 +490,26 @@ PowerShell 工具不返回 stdout，且写中文脚本会因 GBK 解析失败，
 | 远端 | `git@github.com:bingling360/ComfyUI-minimaxH3-SequenceForge.git`（SSH 通，HTTPS 不通） |
 | 当前分支 | `anchor-studio`（自 `c6b6b79` 切出） |
 | 回滚点 | tag `pre-anchor-refactor` @ `c6b6b79` |
-| 已完成 | 步骤 1（tag+分支）、2.1（`truncate` 修复 + 5 测试）、3（`anchors.py`+`grid.py`+67 测试）、5（区间重做引擎）、7 的插入视频全链路删除、8（UI） |
-| 下一步 | **步骤 6**（见 §10 未完成项 6.a–6.i）；步骤 4/7 的尾巴同表 |
+| 已完成 | 全部 8 个步骤（`93fe186` 步骤 3/5/8 + 插入视频移除；`cc93c7d` 步骤 6 主编排切换 + 4/7 收尾） |
+| 下一步 | **现场验收**：步骤 6.5 六条（§A.6）——必须在带 GPU 的机器上跑，本机无 ComfyUI 运行环境 |
 | 未做项 | 步骤 1.2 样本留底（本机 `output/h3_projects/` 为空，无旧档可归档；已决定跳过） |
 
 ## A.2 现状代码地图
+
+> ⚠️ **本图是重构前（`c6b6b79`）的快照**，行号已大幅漂移、部分条目已不存在。
+> 已完成的重构把下面这些碎片整体替换掉了，续做请以代码为准：
+>
+> | 本图条目 | 现状 |
+> |---|---|
+> | `nodes.py` 的 `seg_latent_ref` / `seg_tail_src` / `_seg_tail_anchor` / `_inject_guide` / `_eff_inject` | 已删除或改为读 `seg.anchors[]`；新入口是 `_head_anchor` / `_eff_inject` / `_resolve_anchor_latent` / `_anchor_tail` |
+> | `_apply_guide(cond, guide, …)` 九参签名 | 已重构为 `(cond, keyframes, sampled_fc)` |
+> | `checkpoint.reroll_start` | 已删除，区间计算归 `anchors.change_intervals` |
+> | `checkpoint.memory_anchor_path` / `save_memory_anchor` / `load_memory_anchor` | 已删除（E2 下线） |
+> | 实验 `e1_bridge_shard` / `e2_memory_anchor` / `mid_anchor` | 已从 `experiments.py` 删除，并入 anchor |
+> | `guides.audit_keyframes` | 不再被主路径调用（手动锚改为硬拦） |
+>
+> 仍然准确的部分：`guides.py` 的官方语义（不要改）、`grid.py` 的 17k+5 数学、
+> `latent_tools` / `media` / `library` 的函数清单。
 
 ### guides.py —— 官方锚定语义（**已对齐，不要改语义**）
 
@@ -587,58 +650,16 @@ tail_src, v2mode` → **新增 `anchors`**
 
 ```
 [x] 步骤 3  anchors.py 纯函数 + grid.py 补函数 + tests/test_anchors.py
-[~] 步骤 4  resolve_anchor_source() ✅ + 4 个新接口 ✅ + contact sheet ✅；落盘元信息回填待做（6.g）
+[x] 步骤 4  resolve_anchor_source() + 4 个新接口 + contact sheet + 落盘元信息（同步生成 sheet）
 [x] 步骤 5  区间重做引擎：assert_match 收窄 / reroll_start→anchors.change_intervals / 区间已接进主编排
-[ ] 步骤 6  主编排切换 + _apply_guide 重构为 anchor 列表 + 验收 6 条（6.a–6.i，**未做**）
-[~] 步骤 7  插入视频全链路 ✅ / truncate 死键 ✅ / 窗宽双实现收敛 ✅；latent_ref·tail_src·实验三件套待做（6.f）
+[x] 步骤 6  主编排切换 + _apply_guide 重构为 keyframe 列表 + 实验三件套并入 anchor
+[x] 步骤 7  删除清单 19 项 + truncate 死键 + 窗宽双实现收敛 + projects.py 插入段死代码
 [x] 步骤 8  UI：h3d_anchor.js（30KB）+ h3_director.js 接线 + 死 stub 清除
+[ ] 现场验收  §A.6 六条（需 GPU + ComfyUI 运行环境）
 ```
 
 **每个步骤做完跑一次**：`python -m pytest tests/test_anchors.py tests/test_checkpoint_truncate.py -q`
-
-### 未完成项（步骤 6 + 步骤 4/7 的尾巴）——续做从这里开始
-
-**为什么没做**：步骤 6 要给 `nodes.py`（3693 行）的主循环换血——新增 anchor → keyframe 的
-源解析层、把 `_apply_guide` 从「单 guide + 若干 kf」改成接受 anchor 列表、并把散落的
-`latent_ref`/`tail_src`/`mid_anchor`/`e1`/`e2` 五个消费点全部改读写 `seg.anchors[]`。
-它与步骤 7 的删除清单**同生共死**（删了旧字段就没有回退路径），且本机**跑不了 torch 测试、
-更没有 ComfyUI 运行环境**，无法做端到端验证。所以选择停在"仓库始终可编译、测试全绿"的
-位置，而不是留一个半接线的中间态。
-
-| # | 待做 | 位置 |
-|---|---|---|
-| 6.a | 新增 `_resolve_anchor(i, a)`：按 `src.kind` 分派（prev_tail / segment / library / video / image）返回 `(idx, video_latent, audio_latent)`；`video`/`image` 走 `resolve_anchor_source()` 的 `encode` 分支（帧窗解码 → `_center_cover` → `video_vae.encode`） | nodes.py 锚定组装处 |
-| 6.b | `_apply_guide` 重构为 `(cond, kfs, sampled_fc)`，`kfs = [(idx, v, a), …]`；同步改它的全部调用点（主循环 + 二采 + E4） | nodes.py:3527 与各调用点 |
-| 6.c | 段哈希：anchor 序列化进 `seg_hashes`（替换现有 `lr:` / `tail:` 标记），使改 anchor 触发**该段**重建（区间引擎已就绪，会自动接上） | nodes.py `seg_hashes` |
-| 6.d | `_load_library_latent` 4 个静默回落分支 → 硬报错（`resolve_anchor_source` 已能给出带转档指引的报错文案） | nodes.py:1461 |
-| 6.e | 手动锚越界由 `audit_keyframes`（只报）改为 `validate_anchors`（拦） | nodes.py:2812 附近 |
-| 6.f | 删除 `seg.latent_ref` / `seg.tail_src` / `seg.auto_ref` 分支、实验 `mid_anchor` / `e1_bridge_shard` / `e2_memory_anchor`（§7 剩余项） | nodes.py 多处 |
-| 6.g | 步骤 4 尾巴：`_auto_latent_save` 落盘时补 `{fps,w,h,frames,sheet,tiles}` 并调 `library.make_sheet`；`latent_tools` 的 extract / transcode 两条路径同样补 | nodes.py:2141 / latent_tools.py |
-| 6.h | `projects.py` 里 8 处 `inserts` 处理（提示词回写 / 引用改写）——新项目已不可达，但仍是死代码 | projects.py:776/803/817/1065/1098/1110/1201/1279 |
-| 6.i | 步骤 6.5 验收 6 条**必须在 G 盘那台带 GPU 的机器上实测**（本机无 ComfyUI 运行环境） | — |
-
-**步骤 5 的落地方式与规划有一处偏差（已实现，记录备查）**：规划 §5.2 说「`reroll_start`
-改为返回变更区间列表」。实际实现是**删掉 `reroll_start`、区间计算归 `anchors.change_intervals`**，
-并把区间**标进既有的重摇通道（`redo_map`）而不是 truncate**——因为重摇本来就是
-「重建某段 + 锚定邻居」，正是区间重做需要的语义，不必新造一套执行机制。
-这样「改段 5」只重建段 5，段 1-4/6-N 全部沿用存档（规划 §4.2 的孤立/连续/离散三种情形都成立）。
-`truncate` 只保留给三条显式路径：分辨率变更、序章变更、用户主动「重跑起始段」。
-
-**步骤 5 的连带修正**：`assert_match` 收窄后不再对 `experiments` 组合变化抛错——那原本会
-触发整链重做，而实验开关同样只影响此后新采样的段。
-
-## 12. 本次实测证据（2026-09-16）
-
-| 命令 | 结果 |
-|---|---|
-| `pytest tests/test_anchors.py -q` | **67 passed** |
-| `pytest tests/test_checkpoint_assert.py -q` | **11 passed**（新增） |
-| `pytest tests/test_checkpoint_truncate.py -q` | **5 passed** |
-| `pytest tests/test_anchors.py tests/test_checkpoint_assert.py tests/test_checkpoint_truncate.py -q` | **99 passed，exit 0** |
-| `pytest tests -q --ignore=…eav_feta --ignore=…rework_v2` | **280 passed, 2 failed**（改动前基线 253 passed / 2 failed；两个失败均为函数内 `import torch`，非本次引入） |
-| `py_compile` 全部 9 个改动过的 .py | 全部 OK |
-| `node --check web/h3d_anchor.js` / `web/h3_director.js` | 均通过 |
-| `pytest tests -q`（不排除） | 收集期 2 error（torch），环境限制 |
+**改完锚定相关代码跑一次**：`python -m pytest tests/test_anchor_wiring.py -q`（结构守卫，防回退）
 
 ### 步骤 3 实施记录（2026-09-16）
 

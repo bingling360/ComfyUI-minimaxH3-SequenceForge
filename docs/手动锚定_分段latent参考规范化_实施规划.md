@@ -382,12 +382,12 @@ anchor = {
 |---|---|
 | 1 回滚点与样本留底 | ✅ tag `pre-anchor-refactor` + 分支 `anchor-studio`（均 @ `c6b6b79`）；样本留底待做 |
 | 2 顺手修两个独立 bug | ✅ 2.1 已完成 + 回归测试 5/5 通过；**2.2 已决定并入步骤 4**（见下） |
-| 3 新基建 `anchors.py` | ⏸ 未开始 |
-| 4 源归一化与落盘规范 | ⏸ 未开始 |
-| 5 变更检测改造 | ⏸ 未开始 |
-| 6 主编排切换 | ⏸ 未开始 |
-| 7 清理 | ⏸ 未开始 |
-| 8 UI | ⏸ 未开始 |
+| 3 新基建 `anchors.py` | ✅ 已完成（67 用例全绿；`grid.py` 补档位数学，`test_anchors.py` 新建） |
+| 4 源归一化与落盘规范 | 🟡 **部分**：`anchors.resolve_anchor_source()` ✅ / contact sheet 生成器 ✅ / 4 个新接口 ✅ / `MAX_ENCODE_FRAMES` 收敛 ✅；**落盘元信息回填未接**（见下） |
+| 5 变更检测改造 | ✅ 已完成（`assert_match` 收窄 + `reroll_start` 删除 → 区间模型，已接进主编排） |
+| 6 主编排切换 | ⏸ **未做**（本次未动；见下「未完成项」） |
+| 7 清理 | 🟡 **部分**：插入视频全链路（nodes/projects 前端 stub/README）✅、`truncate` 死键 ✅、窗宽双实现收敛 ✅；`latent_ref`/`tail_src`/实验三件套 **未删**（与步骤 6 同生共死） |
+| 8 UI | ✅ 已交付（`web/h3d_anchor.js` 30KB + `h3_director.js` 接线；`node --check` 通过，**未经人工目视**） |
 
 ### 步骤 2 调整说明
 
@@ -401,15 +401,31 @@ anchor = {
 
 ---
 
-## 11. 环境备注（本机实测）
+## 11. 环境备注（2026-09-16 按本机实测更正）
 
-| 用途 | 解释器 | 说明 |
+> 下方为**当前工作站**实测值。原文写的 `C:/Users/xuan/...` 与
+> `D:/ComfyUI_windows_portable/python_embeded/python.exe` 属另一台机器，
+> 本机 ComfyUI 是 `.venv` 部署，那条路径**不存在**。
+
+| 用途 | 解释器 | 实测 |
 |---|---|---|
-| 跑**不依赖 torch** 的测试 | `C:/Users/xuan/.workbuddy/binaries/python/versions/3.13.12/python.exe` | 有 pytest，无 torch |
-| 跑**依赖 torch** 的测试 | `D:/ComfyUI_windows_portable/python_embeded/python.exe` | 有 torch，**无 pytest** |
+| 跑**不依赖 torch** 的测试 | `C:/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe` | pytest 9.1.1；`import torch` → ModuleNotFoundError |
+| 跑**依赖 torch** 的测试 | `.../ComfyUI/ComfyUI/.venv/Scripts/python.exe` | py 3.13.12 + **torch 2.12.1+cu130**；**无 pytest** |
 
-→ 两者都不完整：`test_rework_v2.py` 这类 `import torch` 的测试**当前环境跑不了**。
-需要时先给嵌入式 Python 装 pytest，或给 managed Python 装 torch。
+**实测结果**（仓库根目录）：
+
+- `pytest tests/test_anchors.py tests/test_checkpoint_truncate.py -q` → **72 passed**，exit 0
+- `pytest tests -q` → 收集阶段 2 error（`test_eav_feta.py` / `test_rework_v2.py` 顶层 `import torch`）
+- `pytest tests -q --ignore=tests/test_eav_feta.py --ignore=tests/test_rework_v2.py`
+  → **253 passed, 2 failed**；两个失败同在 `test_transcode_p1.py`，均为函数内 `import torch`
+
+→ 结论：**torch 依赖的测试本机跑不了**。要跑需往 `.venv` 装 pytest
+（会改动 ComfyUI 运行环境，须先征得同意）；或给 managed Python 装 torch。
+
+**Bash 工具限制**：本机 Bash 的 `PATH` 极残缺——`ls`/`find`/`head`/`tail` 全部 not found，
+但 `git` 可用（`git log/show/diff` 退出码真实）。**文件系统操作一律改用
+`python.exe -c` 内联脚本**（`os.listdir` / `os.path` / `json.load`），中文路径不受影响；
+PowerShell 工具不返回 stdout，且写中文脚本会因 GBK 解析失败，能不用就不用。
 
 ---
 
@@ -426,8 +442,9 @@ anchor = {
 | 远端 | `git@github.com:bingling360/ComfyUI-minimaxH3-SequenceForge.git`（SSH 通，HTTPS 不通） |
 | 当前分支 | `anchor-studio`（自 `c6b6b79` 切出） |
 | 回滚点 | tag `pre-anchor-refactor` @ `c6b6b79` |
-| 已完成 | 步骤 1（tag+分支）、步骤 2.1（`truncate` 修复 + 5 测试） |
-| 下一步 | 步骤 3：新建 `anchors.py` 纯函数 + `grid.py` 补函数 + `tests/test_anchors.py` |
+| 已完成 | 步骤 1（tag+分支）、2.1（`truncate` 修复 + 5 测试）、3（`anchors.py`+`grid.py`+67 测试）、5（区间重做引擎）、7 的插入视频全链路删除、8（UI） |
+| 下一步 | **步骤 6**（见 §10 未完成项 6.a–6.i）；步骤 4/7 的尾巴同表 |
+| 未做项 | 步骤 1.2 样本留底（本机 `output/h3_projects/` 为空，无旧档可归档；已决定跳过） |
 
 ## A.2 现状代码地图
 
@@ -553,6 +570,9 @@ tail_src, v2mode` → **新增 `anchors`**
 | 3 | 插入段 `fc` 上限用全局 `length`，无视 `seg_lengths` | 插入段整体删除后自然消失 |
 | 4 | `_load_library_latent` 静默回落上段尾 | 步骤 6 改硬报错 |
 | 5 | 多锚越界只报不拦 | 步骤 6 手动模式改为拦 |
+| 6 | 窗宽两处实现：`guides.clip_guide_frames`（官方语义）与 `grid.snap_window_down`（由 `video_latent_t` 推导） | 步骤 3 已加逐值等价断言（n=1..2000）；步骤 7 收敛为一份 |
+| 7 | `truncate` 的截断键列表含 `"anchors"`，但 manifest 从不写该键（全仓 grep `"anchors"` 在 nodes.py 零命中） | 死键；步骤 7 顺手删（步骤 6.4 会往**段哈希**写 anchors，不是 manifest） |
+| 8 | 尾锚执行期优先级：段级尾帧图 > 链级尾帧图 > `tail_src` > 全局 `last_frame` | ⚠️ 步骤 6 切换时**必须保留**——否则原本被尾帧图遮挡的 `tail_src` 会突然生效，旧链行为被改变 |
 
 ## A.6 验收清单（步骤 6.5，逐条实测）
 
@@ -566,15 +586,81 @@ tail_src, v2mode` → **新增 `anchors`**
 ## A.7 执行顺序速查
 
 ```
-[ ] 步骤 3  anchors.py 纯函数 + grid.py 补函数 + tests/test_anchors.py
-[ ] 步骤 4  resolve_anchor_source()（先裁后编 / fps 归一 / 硬报错）+ latent 元信息 + contact sheet
-[ ] 步骤 5  区间重做引擎：assert_match 收窄 / reroll_start 返回区间 / 双锚 / 「从这段继续」
-[ ] 步骤 6  主编排切换 + _apply_guide 重构为 anchor 列表 + 验收 6 条
-[ ] 步骤 7  按 §7 删除清单清理（19 项）
-[ ] 步骤 8  UI：先抽 h3d_anchor.js，再双轨 + A/V + token 刻度
+[x] 步骤 3  anchors.py 纯函数 + grid.py 补函数 + tests/test_anchors.py
+[~] 步骤 4  resolve_anchor_source() ✅ + 4 个新接口 ✅ + contact sheet ✅；落盘元信息回填待做（6.g）
+[x] 步骤 5  区间重做引擎：assert_match 收窄 / reroll_start→anchors.change_intervals / 区间已接进主编排
+[ ] 步骤 6  主编排切换 + _apply_guide 重构为 anchor 列表 + 验收 6 条（6.a–6.i，**未做**）
+[~] 步骤 7  插入视频全链路 ✅ / truncate 死键 ✅ / 窗宽双实现收敛 ✅；latent_ref·tail_src·实验三件套待做（6.f）
+[x] 步骤 8  UI：h3d_anchor.js（30KB）+ h3_director.js 接线 + 死 stub 清除
 ```
 
 **每个步骤做完跑一次**：`python -m pytest tests/test_anchors.py tests/test_checkpoint_truncate.py -q`
+
+### 未完成项（步骤 6 + 步骤 4/7 的尾巴）——续做从这里开始
+
+**为什么没做**：步骤 6 要给 `nodes.py`（3693 行）的主循环换血——新增 anchor → keyframe 的
+源解析层、把 `_apply_guide` 从「单 guide + 若干 kf」改成接受 anchor 列表、并把散落的
+`latent_ref`/`tail_src`/`mid_anchor`/`e1`/`e2` 五个消费点全部改读写 `seg.anchors[]`。
+它与步骤 7 的删除清单**同生共死**（删了旧字段就没有回退路径），且本机**跑不了 torch 测试、
+更没有 ComfyUI 运行环境**，无法做端到端验证。所以选择停在"仓库始终可编译、测试全绿"的
+位置，而不是留一个半接线的中间态。
+
+| # | 待做 | 位置 |
+|---|---|---|
+| 6.a | 新增 `_resolve_anchor(i, a)`：按 `src.kind` 分派（prev_tail / segment / library / video / image）返回 `(idx, video_latent, audio_latent)`；`video`/`image` 走 `resolve_anchor_source()` 的 `encode` 分支（帧窗解码 → `_center_cover` → `video_vae.encode`） | nodes.py 锚定组装处 |
+| 6.b | `_apply_guide` 重构为 `(cond, kfs, sampled_fc)`，`kfs = [(idx, v, a), …]`；同步改它的全部调用点（主循环 + 二采 + E4） | nodes.py:3527 与各调用点 |
+| 6.c | 段哈希：anchor 序列化进 `seg_hashes`（替换现有 `lr:` / `tail:` 标记），使改 anchor 触发**该段**重建（区间引擎已就绪，会自动接上） | nodes.py `seg_hashes` |
+| 6.d | `_load_library_latent` 4 个静默回落分支 → 硬报错（`resolve_anchor_source` 已能给出带转档指引的报错文案） | nodes.py:1461 |
+| 6.e | 手动锚越界由 `audit_keyframes`（只报）改为 `validate_anchors`（拦） | nodes.py:2812 附近 |
+| 6.f | 删除 `seg.latent_ref` / `seg.tail_src` / `seg.auto_ref` 分支、实验 `mid_anchor` / `e1_bridge_shard` / `e2_memory_anchor`（§7 剩余项） | nodes.py 多处 |
+| 6.g | 步骤 4 尾巴：`_auto_latent_save` 落盘时补 `{fps,w,h,frames,sheet,tiles}` 并调 `library.make_sheet`；`latent_tools` 的 extract / transcode 两条路径同样补 | nodes.py:2141 / latent_tools.py |
+| 6.h | `projects.py` 里 8 处 `inserts` 处理（提示词回写 / 引用改写）——新项目已不可达，但仍是死代码 | projects.py:776/803/817/1065/1098/1110/1201/1279 |
+| 6.i | 步骤 6.5 验收 6 条**必须在 G 盘那台带 GPU 的机器上实测**（本机无 ComfyUI 运行环境） | — |
+
+**步骤 5 的落地方式与规划有一处偏差（已实现，记录备查）**：规划 §5.2 说「`reroll_start`
+改为返回变更区间列表」。实际实现是**删掉 `reroll_start`、区间计算归 `anchors.change_intervals`**，
+并把区间**标进既有的重摇通道（`redo_map`）而不是 truncate**——因为重摇本来就是
+「重建某段 + 锚定邻居」，正是区间重做需要的语义，不必新造一套执行机制。
+这样「改段 5」只重建段 5，段 1-4/6-N 全部沿用存档（规划 §4.2 的孤立/连续/离散三种情形都成立）。
+`truncate` 只保留给三条显式路径：分辨率变更、序章变更、用户主动「重跑起始段」。
+
+**步骤 5 的连带修正**：`assert_match` 收窄后不再对 `experiments` 组合变化抛错——那原本会
+触发整链重做，而实验开关同样只影响此后新采样的段。
+
+## 12. 本次实测证据（2026-09-16）
+
+| 命令 | 结果 |
+|---|---|
+| `pytest tests/test_anchors.py -q` | **67 passed** |
+| `pytest tests/test_checkpoint_assert.py -q` | **11 passed**（新增） |
+| `pytest tests/test_checkpoint_truncate.py -q` | **5 passed** |
+| `pytest tests/test_anchors.py tests/test_checkpoint_assert.py tests/test_checkpoint_truncate.py -q` | **99 passed，exit 0** |
+| `pytest tests -q --ignore=…eav_feta --ignore=…rework_v2` | **280 passed, 2 failed**（改动前基线 253 passed / 2 failed；两个失败均为函数内 `import torch`，非本次引入） |
+| `py_compile` 全部 9 个改动过的 .py | 全部 OK |
+| `node --check web/h3d_anchor.js` / `web/h3_director.js` | 均通过 |
+| `pytest tests -q`（不排除） | 收集期 2 error（torch），环境限制 |
+
+### 步骤 3 实施记录（2026-09-16）
+
+| 新增/改动 | 内容 |
+|---|---|
+| `grid.py` | `AT_MODES` / `MIN_WINDOW_FRAMES` / `MAX_WINDOW_FRAMES=362` / `SNAP_WINDOWS`（22 档）/ `snap_window_down()` / `anchor_frame_index()` |
+| `anchors.py`（新） | `normalize_anchor()` / `normalize_anchors()` / `validate_anchors()` / `migrate_legacy_seg()` / `change_intervals()` |
+| `tests/test_anchors.py`（新） | 67 用例：档位表与可达性、吸附表、落点推导、归一化幂等、硬校验 6 类非法、迁移 15 例（含往返幂等）、变更区间 12 例 |
+
+三条设计决定（与原规划的细节有偏差，已就地解决）：
+
+1. **落点推导归 `grid.py`**（§3 与步骤 3.2 原文冲突）：`grid` 是零依赖纯数学层，
+   `anchors` 是数据结构层，各只有一个定义。
+2. **吸附只发生在迁移，归一化不吸附**：若 `normalize_anchor` 直接吸附窗宽，
+   `validate_anchors` 的档位检查在生产路径上永远不可达 —— 用户设 18 帧会被悄悄
+   改成 5 帧（`video_latent_t(18)` 只折出 2 token = 5 帧），等于把手动锚最该避免的
+   静默降级又请回来。现在归一化只补形状，档位由校验硬报错并给出最近的两个合法档位。
+3. **`snap_window_down` 由 `video_latent_t` / `latent_t_to_frames` 推导**，不另写取模：
+   17k+5 恰是 `video_latent_t` 的整数反函数，推导写法的结果与执行期实际裁剪的
+   帧数严格一致；`test_snap_window_down_agrees_with_guides_clip_guide_frames`
+   对 n=1..2000 逐值断言它与 `guides.clip_guide_frames` 等价（两份实现暂存，
+   步骤 7 可收敛为一份）。
 
 ---
 

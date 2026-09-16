@@ -749,11 +749,70 @@ def thumb_path(project, item_id) -> str:
     return os.path.join(root, ICON_NAME, h + ".jpg")
 
 
+def sheet_path_for(src_abs) -> str:
+    """latent 文件对应的 contact sheet 路径：同目录、同主名、后缀 .sheet.png。"""
+    if not src_abs:
+        return ""
+    stem, _ = os.path.splitext(src_abs)
+    return stem + ".sheet.png"
+
+
+# contact sheet 格数：落盘元信息要记这个数，前端按同一口径反查格号。
+SHEET_TILES = 12
+
+
+def make_sheet(frames, dst, tiles=SHEET_TILES, cell=160) -> str:
+    """把一段画面均匀抽 tiles 张缩略图，横向拼成一张长条 PNG（contact sheet）。
+
+    这是时间线的「接触印相样片」：胶片时代把一卷胶卷的缩略图印在同一张纸上便于选片，
+    这里同理——时间线只需加载这一张小图，按帧号算出格号 k 裁出第 k 格即可显示，
+    不必加载 VAE、不必解码 latent，故时间线能秒开（规划 §9）。
+
+    帧序严格一一对应：第 k 格 = 第 round(k × (F-1) / (tiles-1)) 帧，
+    所以「按帧号反查缩略图」是可逆的、不需要额外索引表。
+
+    frames: [F,H,W,3] float 0..1（torch 张量或 numpy 数组）。
+    成功返回落盘路径，失败返回空串（时间线降级为刻度条 + 数字）。
+    """
+    if frames is None or dst in (None, ""):
+        return ""
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        return ""
+    try:
+        arr = frames.detach().cpu().numpy() if hasattr(frames, "detach") else np.asarray(frames)
+        if arr.ndim != 4 or arr.shape[0] < 1:
+            return ""
+        total = int(arr.shape[0])
+        n = max(1, min(int(tiles), total))
+        idx = [0] if n == 1 else [round(k * (total - 1) / (n - 1)) for k in range(n)]
+        h, w = int(arr.shape[1]), int(arr.shape[2])
+        scale = min(cell / max(1, w), cell / max(1, h))
+        tw, th = max(1, int(w * scale)), max(1, int(h * scale))
+        strip = Image.new("RGB", (tw * n, th))
+        for k, i in enumerate(idx):
+            im = Image.fromarray(np.clip(arr[i][..., :3] * 255.0, 0, 255).astype("uint8"))
+            strip.paste(im.resize((tw, th)), (k * tw, 0))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".part"
+        strip.save(tmp, "PNG")
+        os.replace(tmp, dst)
+        return dst
+    except Exception:
+        return ""
+
+
 def make_thumb(src_abs, project, item_id, kind, size=256) -> str:
     """生成/复用缩略图，返回本地路径；失败返回空串（前端回落原图）。
 
     图片走 Pillow；视频/音频没有 ffmpeg 就跳过（前端用 <video preload=metadata> 预览）。
+    latent 无像素，但有落盘时同步生成的 contact sheet 就直接用它——时间线靠它秒开。
     """
+    if kind == "latent":
+        s = sheet_path_for(src_abs)
+        return s if s and os.path.isfile(s) else ""
     if kind != "image" or not src_abs or not os.path.isfile(src_abs):
         return ""
     dst = thumb_path(project, item_id)

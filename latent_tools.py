@@ -16,10 +16,14 @@ M3 三源之一（输入视频 + 完成视频现抽），需 ComfyUI 运行环�
 import os
 import time
 
-
-# 单次 VAE 编码帧数上限（H3 模型训练长度约 124–362 帧；序章同口径）。
+# 单次 VAE 编码帧数上限：唯一定义在 grid.MAX_WINDOW_FRAMES（H3 训练长度约 124–362 帧）。
 # 超限直接报错指引缩小窗口，而不是整窗单次前向把显存/内存顶爆（转码卡死根因）。
-MAX_ENCODE_FRAMES = 362
+# 双导入与本文件其余 grid 引用同口径：本模块在无 ComfyUI 环境下按文件路径单测，
+# 那时没有包上下文，相对导入会失败。
+try:
+    from .grid import MAX_WINDOW_FRAMES as MAX_ENCODE_FRAMES
+except ImportError:
+    from grid import MAX_WINDOW_FRAMES as MAX_ENCODE_FRAMES
 
 
 def _transcode_env_note(videoVAE, frames):

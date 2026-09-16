@@ -32,8 +32,6 @@ import math
 
 from . import grid
 
-MIN_CLIP_FRAMES = 5
-
 
 def resolve_frame_index(frame_idx, frame_count):
     """负索引自尾部计数（官方：frame_idx < 0 时取 frame_count + frame_idx）。"""
@@ -42,15 +40,14 @@ def resolve_frame_index(frame_idx, frame_count):
 
 
 def clip_guide_frames(n):
-    """锚定片段的合法帧数：<5 帧 -> 1 帧（单帧锚）；否则向下对齐 17k+5。"""
-    n = int(n)
-    if n < MIN_CLIP_FRAMES:
-        return 1
-    while n % 17 != 5:
-        n -= 1
-        if n < MIN_CLIP_FRAMES:
-            return 1
-    return n
+    """锚定片段的合法帧数：<5 帧 -> 1 帧（单帧锚）；否则向下对齐 17k+5。
+
+    实现委托 `grid.snap_window_down`：官方语义留在本模块（本文件头部那段复核
+    结论是逐字核对官方源码的），17k+5 的取模数学归 grid——同一套常量，
+    不两处各写一遍。等价值由 `tests/test_anchors.py`
+    `test_snap_window_down_agrees_with_guides_clip_guide_frames` 对 n=1..2000 逐值断言。
+    """
+    return grid.snap_window_down(n)
 
 
 def latent_frames_of(video_latent):

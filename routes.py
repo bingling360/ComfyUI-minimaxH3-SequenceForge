@@ -100,6 +100,10 @@ ROUTES = [
     ("POST", "/h3chain/lib_zip"),
     ("POST", "/h3chain/lib_ref"),
     ("POST", "/h3chain/lib_role"),
+    ("GET", "/h3chain/grid_spec"),
+    ("GET", "/h3chain/anchor_sources"),
+    ("GET", "/h3chain/anchor_sheet"),
+    ("POST", "/h3chain/anchor_sheet_build"),
 ]
 
 _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
@@ -1812,6 +1816,206 @@ def add_routes(routes):
         h3lib.invalidate(dir_name)
         return web.json_response({"ok": True, "roles": cur, "revision": out.get("revision")})
 
+    # ---- 手动锚定（Anchor Studio）：常量来源 / 源清单 / contact sheet ----
+    # grid / anchors 延迟导入：与本文件其余可选依赖同口径，也让 routes.py 在无包
+    # 上下文的单测里能按文件路径加载（模块级相对导入会直接 ImportError）。
+
+    def _proj_root(dir_name):
+        """项目目录（已过 safe_rel 防穿越）；不存在返回 None。"""
+        rel = h3lib.safe_rel(str(dir_name or ""))
+        if not rel:
+            return None
+        root = os.path.join(get_output_directory(), "h3_projects", *rel.split("/"))
+        return root if os.path.isdir(root) else None
+
+    def _latent_shape(abs_path):
+        """latent .pt -> (frames, tokens, w, h)；读不出来返回 None。
+
+        只有 torch 读得出形状。读不出来时调用方标 meta_ok=False，前端据此降到
+        「刻度条 + 数字」——不给一个猜的时长（规划 §8：latent 无 fps 强显秒数
+        会把时长显示错）。
+        """
+        from . import grid as h3grid
+        try:
+            import torch
+        except ImportError:
+            return None
+        try:
+            with open(abs_path, "rb") as fh:
+                pay = torch.load(fh, map_location="cpu", weights_only=True)
+            v = pay.get("video")
+            if v is None or getattr(v, "dim", lambda: 0)() != 5:
+                return None
+            t = int(v.shape[2])
+            return (h3grid.latent_t_to_frames(t), t, int(v.shape[-1]), int(v.shape[-2]))
+        except Exception:
+            return None
+
+    def _seg_sources(root, upto=None):
+        """项目里已落盘的 seg_NNN.pt -> 段源条目（按段号升序）。"""
+        out = []
+        for name in sorted(os.listdir(root)):
+            if not (name.startswith("seg_") and name.endswith(".pt")):
+                continue
+            num = name[4:-3]
+            if not num.isdigit():
+                continue
+            slot = int(num)
+            if upto is not None and slot >= upto:
+                continue
+            abs_path = os.path.join(root, name)
+            info = _latent_shape(abs_path)
+            sheet = h3lib.sheet_path_for(abs_path)
+            out.append({
+                "slot": slot, "kind": "segment", "ref": f"seg_{slot:03d}",
+                "label": f"段 {slot + 1}",
+                "frames": info[0] if info else None,
+                "tokens": info[1] if info else None,
+                "w": info[2] if info else None, "h": info[3] if info else None,
+                "fps": 24.0,          # 段 latent 恒 24fps（save_segment_mp4 默认）
+                "sheet": (os.path.relpath(sheet, root).replace("\\", "/")
+                          if os.path.isfile(sheet) else None),
+                "meta_ok": info is not None,
+            })
+        return out
+
+    async def grid_spec(request):
+        """锚定常量的唯一来源：前端据此画 token 刻度、锁窗宽档位，不硬编码数字。"""
+        from . import anchors as h3anchors
+        from . import grid as h3grid
+        return web.json_response({
+            "ok": True,
+            "frame_per_token": list(h3grid.FRAME_PER_TOKEN),
+            "frame_rescale": float(h3grid.FRAME_RESCALE),
+            "snap_windows": list(h3grid.SNAP_WINDOWS),
+            "min_window_frames": h3grid.MIN_WINDOW_FRAMES,
+            "max_window_frames": h3grid.MAX_WINDOW_FRAMES,
+            "at_modes": list(h3grid.AT_MODES),
+            "src_kinds": list(h3anchors.SRC_KINDS),
+            "branches": list(h3anchors.BRANCHES),
+        })
+
+    async def anchor_sources(request):
+        """源轨的可选源清单：上段尾 / 已完成段 / latent 库（规划 §5 ①）。"""
+        q = request.query
+        dir_name = str(q.get("dir") or "")
+        root = _proj_root(dir_name)
+        man = projects.read_project(h3lib.safe_rel(dir_name)) if dir_name else None
+        if root is None or man is None:
+            return _err("项目不存在", code="NOT_FOUND", status=404)
+        try:
+            seg_no = int(q.get("seg") or 0)      # 1-based 段号
+        except (TypeError, ValueError):
+            seg_no = 0
+        segs = _seg_sources(root)
+        srcs = []
+        # 上段尾：本段的前一个槽位（序章占 0 号，故 slot = seg_no - 2）
+        prev_slot = seg_no - 2
+        for e in segs:
+            if e["slot"] == prev_slot:
+                srcs.append({**e, "kind": "prev_tail", "ref": "",
+                             "label": f"上段尾（段 {prev_slot + 1}）"})
+                break
+        srcs.extend(e for e in segs if e["slot"] != prev_slot)
+        for rec in (man.get("latents") or []):
+            if not isinstance(rec, dict) or not rec.get("file"):
+                continue
+            rel = str(rec["file"]).replace("\\", "/")
+            parts = [p for p in rel.split("/") if p and p != "."]
+            if len(parts) != 2 or parts[0] != "latent":
+                continue
+            abs_path = os.path.join(root, "latent", parts[1])
+            if not os.path.isfile(abs_path):
+                continue
+            info = _latent_shape(abs_path)
+            sheet = h3lib.sheet_path_for(abs_path)
+            srcs.append({
+                "slot": None, "kind": "library", "ref": rel, "label": parts[1],
+                "frames": info[0] if info else rec.get("frames"),
+                "tokens": info[1] if info else None,
+                "w": info[2] if info else rec.get("w"),
+                "h": info[3] if info else rec.get("h"),
+                "fps": rec.get("fps"),
+                "sheet": (os.path.relpath(sheet, root).replace("\\", "/")
+                          if os.path.isfile(sheet) else None),
+                "meta_ok": info is not None,
+            })
+        params = man.get("params") or {}
+        return web.json_response({
+            "ok": True, "sources": srcs,
+            "seg_length": int(params.get("length") or 0),
+            "parse": man.get("parse") or {},
+        })
+
+    def _sheet_rel_ok(rel):
+        """只认 latent/<名>.sheet.png（防穿越）。"""
+        parts = [p for p in str(rel or "").replace("\\", "/").split("/") if p and p != "."]
+        if len(parts) != 2 or parts[0] != "latent" or not parts[1].endswith(".sheet.png"):
+            return None
+        name = parts[1]
+        if name.startswith(".") or ":" in name or ".." in name:
+            return None
+        return f"latent/{name}"
+
+    async def anchor_sheet(request):
+        q = request.query
+        root = _proj_root(str(q.get("dir") or ""))
+        rel = _sheet_rel_ok(q.get("file"))
+        if root is None or rel is None:
+            return _err("参数非法（file 须为 latent/<名>.sheet.png）", code="BAD_ARGS", status=400)
+        p = os.path.join(root, *rel.split("/"))
+        if not os.path.isfile(p):
+            return _err("缩略图不存在", code="NOT_FOUND", status=404)
+        return web.FileResponse(p)
+
+    async def anchor_sheet_build(request):
+        """按需补生成 contact sheet（规划 §5 第三级降级：老条目无 sheet）。
+
+        **不加载 VAE**：像素来源优先取同段已落盘的 finals/seg_NNN.mp4
+        （帧序与 latent 严格一一对应），其次取 registry 记的源素材文件。
+        两者都取不到（例如源视频已删）时明确报错让用户重跑该段，
+        而不是给一张假图——时间线的缩略图错位比没有缩略图更糟。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        root = _proj_root(str((data or {}).get("dir") or ""))
+        src_rel = str((data or {}).get("file") or "").replace("\\", "/")
+        parts = [p for p in src_rel.split("/") if p and p != "."]
+        if root is None or len(parts) != 2 or parts[0] != "latent" \
+                or not parts[1].endswith(".pt"):
+            return _err("参数非法（file 须为 latent/<名>.pt）", code="BAD_ARGS", status=400)
+        sheet_abs = h3lib.sheet_path_for(os.path.join(root, "latent", parts[1]))
+        rel = f"latent/{parts[1][:-3]}.sheet.png"
+        if os.path.isfile(sheet_abs):
+            return web.json_response({"ok": True, "sheet": rel, "cached": True})
+        man = projects.read_project(h3lib.safe_rel(dir_name)) or {}
+        entry = next((r for r in (man.get("latents") or [])
+                      if isinstance(r, dict) and str(r.get("file") or "").replace("\\", "/")
+                      == src_rel), None)
+        cands = []
+        src = str((entry or {}).get("src") or "")
+        if src.startswith("seg_") and src.endswith(".pt"):
+            cands.append(os.path.join(root, "finals",
+                                      src[:-3] + ".mp4"))          # 分段视频（帧序一一对应）
+        if src and not src.endswith(".pt"):
+            cands.append(os.path.join(root, src))
+        video = next((c for c in cands if c and os.path.isfile(c)), None)
+        if video is None:
+            return _err("该条目没有可用像素源（源素材或分段视频已不在项目里）——"
+                        "重跑该段即可顺带生成缩略图",
+                        code="NO_SOURCE", status=409)
+        try:
+            from . import media
+            frames, _wav, _sr = media.decode_av(video, None, None, None)
+        except Exception as e:
+            return _err(f"抽帧失败：{type(e).__name__}: {e}", code="DECODE_FAILED", status=500)
+        out = h3lib.make_sheet(frames, sheet_abs)
+        if not out:
+            return _err("拼图失败（缺 Pillow 或帧为空）", code="NO_SHEET", status=500)
+        return web.json_response({"ok": True, "sheet": rel, "cached": False})
+
     handlers = [
         ("GET", "/h3chain/ping", ping),
         ("GET", "/h3chain/lib_list", lib_list),
@@ -1834,6 +2038,10 @@ def add_routes(routes):
         ("POST", "/h3chain/lib_zip", lib_zip),
         ("POST", "/h3chain/lib_ref", lib_ref),
         ("POST", "/h3chain/lib_role", lib_role),
+        ("GET", "/h3chain/grid_spec", grid_spec),
+        ("GET", "/h3chain/anchor_sources", anchor_sources),
+        ("GET", "/h3chain/anchor_sheet", anchor_sheet),
+        ("POST", "/h3chain/anchor_sheet_build", anchor_sheet_build),
         ("GET", "/h3chain/busy", busy_state),
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),

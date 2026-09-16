@@ -11,6 +11,11 @@ v4（2026-09-16 修正旧注释）：**重做不需要级联。** 段 N 可用�
 所以下游段已经生成好的前提下，改某段只重建该段即可，不必连带其后的段。
 真·唯一硬约束只有分辨率（C/H/W 不同则桥拼不上）。
 
+v5（2026-09-16）：变更检测改**区间模型**（重做最小单位 = 单段，离散区间各自双锚）：
+- 区间计算迁到 `anchors.change_intervals`，本模块的 `reroll_start`（返回单一 start、
+  隐含级联语义）已删除——级联不是默认行为，留着就是第二个真相。
+- `assert_match` 收窄为**只校验 width/height**，其余参数变更只回报不报错、不触发重做。
+
 v3：存档根目录迁至 output/h3_projects/<项目名>/（游戏式一项目一文件夹），
 manifest 增加 title/created_at/updated_at/finals 键；旧 checkpoints 目录不读不写。
 
@@ -103,19 +108,6 @@ def save_keyframe(root: str, idx: int, frame) -> str:
         return ""
 
 
-def reroll_start(old_hashes: list, new_hashes: list, done: int) -> int:
-    """已完成段的提示词哈希 vs 当前提示词哈希 -> 应重做的首段下标。
-
-    返回值 >= done 表示无需重做（调用方仅在返回值 < done 时截断，返回 0 = 整链重做）；
-    首个不一致处即起点；提示词变少（done > len(new_hashes)）则截到新数量；
-    仅末尾追加新段不影响已完成前缀。
-    """
-    for i, (old, new) in enumerate(zip(old_hashes[:done], new_hashes)):
-        if old != new:
-            return i
-    return min(done, len(new_hashes))
-
-
 def truncate(root: str, manifest: dict, start: int) -> dict:
     """丢弃第 start 段起的进度：截断 manifest 各列表并立即原子落盘，删除被弃段文件。
 
@@ -144,8 +136,10 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
             if _s < start:
                 _kept.append(_x)
         out["redo_queue"] = _kept
+    # 注意：manifest 里没有 "anchors" 键——anchor 是**请求侧**字段（ds.segments[i].anchors），
+    # 只按段并进 prompt_hashes，不落盘成 manifest 列表（旧实现这里留了个永不命中的键，已删）。
     for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts",
-                "seams", "bridge_scores", "anchors", "seam_metrics"):
+                "seams", "bridge_scores", "seam_metrics"):
         if key in out:
             out[key] = list(out[key])[:start]
     up = out.get("upscale")
@@ -257,35 +251,28 @@ def load_manifest(root: str):
 
 
 def assert_match(old: dict, new: dict):
-    """严格校验存档参数；不一致直接报错（种子例外，由调用方以存档为准）。
+    """只校验**分辨率**（唯一硬约束）；其余参数变更只回报，不报错、不触发重做。
 
-    为什么单段重摇也要参数一致：重摇段与链上其余段共用同一批锚定/桥接与
-    采样配置，参数不同 = 新段与旧段画风不一致的链混搭，且存档 latent 的
-    回放与续接假设同配置。前端提交重摇时已自动套用存档参数
-    （applyChainParams），走到这里仍不一致的多为链结构（模式/首帧/参考素材
-    组合，即 chain 键）或实验性功能开关变了——需要人工决策，不能静默改。
-    旧存档缺少的新增参数键（如 smart_cut_max/drop_budget）按"沿用当前值"
-    处理不算不一致——旧段生成时该功能不存在，当前值只影响后续段。
-    唯 `experiments`（实验性功能组合指纹）例外：缺失按空串（=禁用基线）处理并
-    双向严格比对——开关组合任何变化（关->开、开->关、组合替换、参数调整）都判
-    不一致 -> 触发整链重做，杜绝不同实验复用同一缓存污染 A/B 结果。
+    为什么只有分辨率是硬约束：`PackedLayout` 按行预留，C/H/W 不同则桥拼不上，
+    链根本走不通，只能整链重做或新建链。其余参数（steps/cfg/采样器/调度器/模型
+    /fade_ratio/gate/实验开关）都只影响**此后要采样的段**——已完成段是盘上的
+    张量，与参数没有任何耦合，改参数不会让它们"画风不一致"。
+    （旧 docstring 声称"参数不同 = 链混搭画风不一致"，是伪问题，已证伪。）
+
+    佐证：模型权重根本不在 params 里——换模型连检测都没有，而它对画风影响最大。
+
+    返回：变了但不影响已有段的参数说明列表（调用方写进报告），无变化返回 []。
+    分辨率不一致直接抛 ValueError（这是硬约束）。
     """
-    exp_old = (old or {}).get("experiments", "")
-    exp_new = (new or {}).get("experiments", "")
-    diffs = [k for k in new if old.get(k, new[k]) != new[k]]
-    if exp_old != exp_new:
-        diffs.append("experiments")
-    if diffs:
-        detail = "; ".join(f"{k}: 存档={old.get(k, '')!r} 当前={new.get(k, '')!r}" for k in diffs)
-        structural = any(k in diffs for k in ("chain", "experiments"))
-        raise ValueError(
-            f"存档参数与当前不一致（{detail}）。"
-            + ("同一条链的续拍/重摇必须沿用原参数——重摇段与其余段共享锚定与采样配置，"
-               "参数不同会导致新旧段画风不一致。" if not structural else
-               "链结构（生成模式/首帧/参考素材组合）或实验性功能开关与存档不同，"
-               "重摇前请先把这些切回存档时的状态。")
-            + "数值类参数可在项目列表点「套用参数」一键还原；"
-            "要换参数开新链，请在「存档目录」里填一个新名字")
+    old, new = old or {}, new or {}
+    for key in ("width", "height"):
+        if key in new and old.get(key, new[key]) != new[key]:
+            raise ValueError(
+                f"存档分辨率与当前不一致（{key}: 存档={old.get(key)!r} 当前={new[key]!r}）。"
+                "分辨率是唯一硬约束——C/H/W 不同则 latent 桥拼不上，链无法延续。"
+                "请把分辨率改回存档值，或换个新存档目录开新链")
+    return [f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}"
+            for k in new if old.get(k, new[k]) != new[k]]
 
 
 def seg_path(root: str, idx: int) -> str:

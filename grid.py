@@ -91,3 +91,51 @@ def snap_frames_to_tokens(frames, up=True):
         return 0
     t = frames_to_latent_t(frames, up=up)
     return latent_t_to_frames(t)
+
+
+# ---- 手动锚定（Anchor Studio）：落点与窗宽档位 ----
+#
+# 窗宽只能取 17k+5（5/22/39/56…）。这不是模型层硬约束（模型只认整 token），
+# 而是官方 MiniMaxH3AddGuide 对多帧引导片段的裁剪约定，也正是 video_latent_t
+# 的整数反函数：video_latent_t(17k+5) = 5k+2 token，而 latent_t_to_frames(5k+2)
+# 恰好还原 17k+5。所以「锁档位」不会丢帧——吸附后的宽度就是引导桥实际能切出的
+# latent 帧数，不存在「UI 显示 18 帧、实际只钉 5 帧」这类错位。
+# 锁档位的意义在于宽度与 token 数一一对应，UI 才能把那段不等距的 token 刻度
+# 画出来自解释（见 docs/手动锚定_分段latent参考规范化_实施规划.md §5）。
+AT_MODES = ("head", "mid", "tail")
+MIN_WINDOW_FRAMES = 5
+# 窗宽上限 = 单次 VAE 编码帧数护栏（H3 训练长度约 124–362 帧，整窗单次前向
+# 超限会顶爆显存）。唯一定义点：latent_tools.MAX_ENCODE_FRAMES 从这里取。
+MAX_WINDOW_FRAMES = 362
+SNAP_WINDOWS = tuple(range(MIN_WINDOW_FRAMES, MAX_WINDOW_FRAMES + 1, 17))
+
+
+def snap_window_down(frames):
+    """引导窗宽向下吸附到 17k+5 档位；不足 5 帧退化为 1（单帧锚，官方同款）。
+
+    与 guides.clip_guide_frames 同结果，但由 video_latent_t / latent_t_to_frames
+    推导而非另写一遍取模——两个函数共用同一套常量，不会各自漂移。
+    """
+    n = int(frames)
+    if n < MIN_WINDOW_FRAMES:
+        return 1
+    return latent_t_to_frames(video_latent_t(n))
+
+
+def anchor_frame_index(mode, window, frame_count, frame_idx=0):
+    """anchor 落点 -> 目标段内帧位（尚未解析负值，交 guides.resolve_frame_index）。
+
+    head -> 段首 0
+    tail -> frame_count - window（与向下对齐后的终端重合，不越界）
+    mid  -> 用户指定 frame_idx（任意整数，负值自尾部计数）
+
+    返回原始帧位而非「已解析」值：负值语义只在 guides 里定义一处，
+    这里重复实现会造出第二个真相。
+    """
+    if mode == "head":
+        return 0
+    if mode == "tail":
+        return int(frame_count) - int(window)
+    if mode == "mid":
+        return int(frame_idx)
+    raise ValueError(f"未知锚点落点 {mode!r}（合法值：{'/'.join(AT_MODES)}）")

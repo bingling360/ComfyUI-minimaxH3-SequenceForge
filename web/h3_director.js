@@ -1296,7 +1296,7 @@ function defaultSegment() {
      *   intent_zh = 中文意图（支持 @素材，给人和 AI 看）
      *   script    = AI 扩写产物（官方格式剧本，可人工改）
      * 与 prompt_v2.intent_zh 是两回事：后者是具象化内部字段。 */
-    return { intent_zh: "", script: "", scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, auto_ref: null, auto_seq: null, frame_refs: null, prompt_v2: null, latent_save: null, latent_ref: null, tail_src: null, v2mode: null };
+    return { intent_zh: "", script: "", scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, auto_ref: null, auto_seq: null, frame_refs: null, prompt_v2: null, latent_save: null, latent_ref: null, tail_src: null, v2mode: null, anchors: [] };
 }
 
 function segAutoRef(seg) {
@@ -1343,6 +1343,8 @@ function restoreSegField(raw) {
         latent_save: (raw.latent_save && typeof raw.latent_save === "object") ? raw.latent_save : null,
         latent_ref: (raw.latent_ref && typeof raw.latent_ref === "object") ? raw.latent_ref : null,
         tail_src: (raw.tail_src && typeof raw.tail_src === "object") ? raw.tail_src : null,
+        /* 手动锚定（双轨时间线）：读档必须还原，否则"看着有锚、跑起来没锚"——与 frame_img 同款坑 */
+        anchors: Array.isArray(raw.anchors) ? raw.anchors : [],
         v2mode: V2_MODES.includes(raw.v2mode) ? raw.v2mode : null,
     };
 }
@@ -1425,6 +1427,8 @@ function getDs(node) {
                 latent_ref: (s?.latent_ref && typeof s.latent_ref === "object") ? s.latent_ref : null,
                 /* 段尾锚来源：{asset: 标签} | {latent: latent/x.pt} | null=无尾锚 */
                 tail_src: (s?.tail_src && typeof s.tail_src === "object") ? s.tail_src : null,
+                /* 手动锚定：透存（防 getDs 归一化洗掉已设 anchors；否则每帧渲染都把锚丢光） */
+                anchors: Array.isArray(s?.anchors) ? s.anchors : [],
                 /* v2 手动模式（null=跟随导演台） */
                 v2mode: V2_MODES.includes(s?.v2mode) ? s.v2mode : null,
             };
@@ -1610,6 +1614,7 @@ function clearPrompts(node) {
         latent_save: (s?.latent_save && typeof s.latent_save === "object") ? s.latent_save : null,
         latent_ref: (s?.latent_ref && typeof s.latent_ref === "object") ? s.latent_ref : null,
         tail_src: (s?.tail_src && typeof s.tail_src === "object") ? s.tail_src : null,
+        anchors: Array.isArray(s?.anchors) ? s.anchors : [],
         v2mode: V2_MODES.includes(s?.v2mode) ? s.v2mode : null,
     }));
     setDs(node, ds);
@@ -2346,15 +2351,9 @@ async function loadDefaultWorkflow() {
 
 /* pickAsset 已删除：旧三槽位上传入口随资产标注化下线，上传改由「素材库」承担。 */
 
-/* ---- 插入视频段前端已废弃（彻底删除 UI；后端 ds.inserts 解析/存档保留，
- *  旧项目数据不丢失；后续 latent 注入框架在分段设置里重做）。
- *  以下函数仅作兼容 stub，防止残留调用报错。 ---- */
-
-function appendInsert() { alert("插入视频已废弃：后续在分段设置里统一做 latent 注入"); }
-
-function removeInsert() { /* 已废弃，无操作 */ }
-
-function pickInsertVideo() { alert("插入视频已废弃：后续在分段设置里统一做 latent 注入"); }
+/* 插入视频段前端已彻底删除（功能合并为 src.kind="video" 的 anchor）。
+ * 旧 stub appendInsert/pickInsertVideo/removeInsert 随规划 §7 删除清单一并移除，
+ * 无调用点残留（插入视频 UI 此前已下掉），不再保留兼容壳。 */
 
 /* ---- 合并导出（勾选态纯内存，POST /h3chain/merge 流式拼接成 merged_*.mp4） ---- */
 
@@ -3675,6 +3674,9 @@ async function flushPrompts(node, dir) {
         latent_save: (s.latent_save && typeof s.latent_save === "object") ? s.latent_save : undefined,
         latent_ref: (s.latent_ref && typeof s.latent_ref === "object") ? s.latent_ref : undefined,
         tail_src: (s.tail_src && typeof s.tail_src === "object") ? s.tail_src : undefined,
+        /* 手动锚定：随 save_prompts 一起提交（ds.segments[i].anchors）；
+         * 数组才收（含空数组），对象才写——沿用现有保存调用，不新造接口 */
+        anchors: Array.isArray(s.anchors) ? s.anchors : undefined,
         /* 段级首尾帧参考图（提示词框按钮选的项目内图片） */
         frame_img: (s.frame_img && typeof s.frame_img === "object") ? {
             first: String(s.frame_img.first || "").trim().replace(/\\/g, "/"),
@@ -7144,6 +7146,12 @@ function buildCards(data) {
                 lsGrid.append(splitRow);
                 lsBox.append(lsGrid);
                 paneSet.append(lsBox);
+                // —— 手动锚定（双轨时间线，见 web/h3d_anchor.js）：anchor 存 ds.segments[i].anchors，
+                //    随 save_prompts 一起落盘；模块未加载（如旧前端）则跳过，不影响其余设置 ——
+                if (window.H3Anchor && window.H3Anchor.buildAnchorPanel) {
+                    const anchorBox = window.H3Anchor.buildAnchorPanel({ node, data, idx: it.idx, refresh: () => scheduleRefresh(60) });
+                    if (anchorBox) paneSet.append(anchorBox);
+                }
             }
             /* v2分组进Tab（主框=最终文本，v2可改+一键同步回主框） */
             if (node && it.idx !== undefined) {
@@ -7236,13 +7244,6 @@ function buildCardsSafe(data) {
         wrap.append(box);
         return wrap;
     }
-}
-
-/* insertButton 已废弃：插入视频 UI 彻底删除，后续在分段设置里重做 latent 注入。 */
-function insertButton() {
-    const s = el("span", "", "");
-    s.style.display = "none";
-    return s;
 }
 
 /* ---- 素材与参考（状态驱动：标签素材池存 JSON，缩略图直接回显；配套工作流节点做画布镜像） ---- */

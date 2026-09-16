@@ -462,14 +462,19 @@
 
   function fillTgtTrack(ctx, spec, host) {
     const { anchor, node, idx, data, refresh } = ctx;
-    host.innerHTML = ""; host.append(el("h5", "", "② 目标轨 · 钉到本段哪个位置"));
-    // 目标段总帧数：来自项目 manifest 的 params.length（每段帧数），取本段
+    host.innerHTML = "";
+    host.append(el("h5", "", "② 目标轨 · 钉到本段哪个位置"));
+    // 本段帧数：优先本段自己的时长，没有才退回全局 length
     const mf = data.mf || {};
-    const segLen = Array.isArray(mf.params && mf.params.length) ? (mf.params.length[idx] || mf.params.length[0] || 120) : 120;
+    const p = mf.params || {};
+    const lengths = Array.isArray(mf.seg_lengths) ? mf.seg_lengths : null;
+    const segLen = (lengths && Number(lengths[idx])) || Number(p.length) || 120;
     const totalFrames = Math.max(1, Number(segLen) || 120);
 
     const strip = el("div", "h3d-strip");
     strip.style.background = "linear-gradient(90deg,#2a2230,#342a38,#2a2230)";
+    strip.title = "在刻度上点或拖 = 把落点钉到该帧。位置随便放；宽度由 ① 的窗宽决定"
+      + "（非 17k+5 档位的宽度会被模型折掉，所以宽度只能点档位按钮）";
     const marks = genTokens(spec, totalFrames);
     for (let t = 0; t < marks.length; t += 1) {
       const x = (marks[t] / totalFrames) * 100;
@@ -482,53 +487,93 @@
         strip.append(lb);
       }
     }
-    // 已有锚点标记（除自己外，标出其它锚的落点，提醒多锚）
+    // 别的锚的落点（提醒多锚共存）
     const all = Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : [];
     all.forEach((o) => {
       if (o === anchor) return;
-      const rf = resolveFrame(o, totalFrames);
       const m = el("div", "h3d-marker");
-      m.style.left = (rf / totalFrames) * 100 + "%";
-      m.title = "已有锚 @" + rf;
+      m.style.left = (resolveFrame(o, totalFrames) / totalFrames) * 100 + "%";
+      m.title = "已有锚 @" + resolveFrame(o, totalFrames);
       strip.append(m);
     });
-    // 自己的落点高亮
-    const meRf = resolveFrame(anchor, totalFrames);
-    const me = el("div", "h3d-marker");
-    me.style.background = "var(--h3d-cyan)";
-    me.style.left = (meRf / totalFrames) * 100 + "%";
-    strip.append(me);
+    // 自己的落点：画成**跨度框**而不是细线——细线看不出钉了多宽，那正是
+    // 「目标轨选择特别奇怪」的根因。框宽就是 ① 选定的窗宽。
+    const box = el("div", "h3d-selbox");
+    box.style.background = "rgba(255,176,102,.20)";
+    box.style.borderColor = "var(--h3d-warn)";
+    box.style.color = "var(--h3d-warn)";
+    const place = () => {
+      const rf = resolveFrame(anchor, totalFrames);
+      box.style.left = (rf / totalFrames) * 100 + "%";
+      box.style.width = Math.max(2, Math.min(100, (anchor.window / totalFrames) * 100)) + "%";
+      box.textContent = "帧 " + rf;
+    };
+    place();
+    strip.append(box);
     host.append(strip);
 
-    // 落点按钮 head/mid/tail
+    // 落点模式：开头/结尾是快捷预设；任意位置直接在刻度上点/拖（= mid）。
+    // 「中间」按钮已去掉——能拖之后它只是冗余。
     const atBtns = el("div", "h3d-atbtns");
-    [["head", "开头"], ["mid", "中间"], ["tail", "结尾"]].forEach(([v, t]) => {
+    [["head", "开头"], ["tail", "结尾"]].forEach(([v, t]) => {
       const b = el("button", anchor.at.mode === v ? "on" : "", t);
       b.onclick = () => {
         anchor.at.mode = v;
-        if (v === "mid" && (anchor.at.frame_idx === undefined || anchor.at.frame_idx === null)) anchor.at.frame_idx = Math.floor(totalFrames / 2);
         atBtns.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
         b.classList.add("on");
-        midWrap.style.display = v === "mid" ? "flex" : "none";
+        midWrap.style.display = "none";
+        place();
         commit();
       };
       atBtns.append(b);
     });
     host.append(atBtns);
 
-    // mid 模式：frame_idx 输入框（负值自尾部计数）
+    // mid 的精确输入（负值自尾部计数）——拖不准时用键盘补
     const midWrap = el("div", "h3d-selrow");
     midWrap.style.display = anchor.at.mode === "mid" ? "flex" : "none";
-    midWrap.append(el("span", "h3d-secs-hint", "落点帧 idx（负=自尾部）"));
+    midWrap.append(el("span", "h3d-secs-hint", "落点帧（负=自尾部；也可直接拖刻度）"));
     const fi = document.createElement("input");
     fi.type = "number"; fi.className = "h3d-fpsinput";
     fi.value = anchor.at.frame_idx || 0;
     fi.onchange = () => {
       anchor.at.frame_idx = parseInt(fi.value, 10) || 0;
+      anchor.at.mode = "mid";
+      atBtns.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+      midWrap.style.display = "flex";
+      place();
       commit();
     };
     midWrap.append(fi);
     host.append(midWrap);
+
+    // 点/拖定位：指针落在刻度哪个位置就把落点钉到哪一帧。
+    // 夹到 [0, 总帧数 - 窗宽]——再往右会越界（后端会硬报错，不如这里就夹住）。
+    const setFromX = (clientX) => {
+      const rect = strip.getBoundingClientRect();
+      if (!rect.width) return;
+      const raw = ((clientX - rect.left) / rect.width) * totalFrames;
+      const f = Math.max(0, Math.min(Math.round(raw), Math.max(0, totalFrames - anchor.window)));
+      anchor.at.mode = "mid";
+      anchor.at.frame_idx = f;
+      fi.value = f;
+      midWrap.style.display = "flex";
+      atBtns.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+      place();
+    };
+    strip.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      strip.setPointerCapture(e.pointerId);
+      setFromX(e.clientX);
+      const move = (ev) => setFromX(ev.clientX);
+      const up = () => {
+        strip.removeEventListener("pointermove", move);
+        strip.removeEventListener("pointerup", up);
+        commit();
+      };
+      strip.addEventListener("pointermove", move);
+      strip.addEventListener("pointerup", up);
+    });
 
     function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
   }

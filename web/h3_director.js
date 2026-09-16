@@ -7149,7 +7149,16 @@ function buildCards(data) {
                 // —— 手动锚定（双轨时间线，见 web/h3d_anchor.js）：anchor 存 ds.segments[i].anchors，
                 //    随 save_prompts 一起落盘；模块未加载（如旧前端）则跳过，不影响其余设置 ——
                 if (window.H3Anchor && window.H3Anchor.buildAnchorPanel) {
-                    const anchorBox = window.H3Anchor.buildAnchorPanel({ node, data, idx: it.idx, refresh: () => scheduleRefresh(60) });
+                    // dir / setAnchors 是**注入给子模块的宿主访问器**：本文件的 getDirValue /
+                    // setSegmentField 都是模块级函数、并不在 window 上，子模块按全局名去找
+                    // 会当场抛错（曾因此整块「段落卡片渲染失败」）。顺带把「谁先加载」
+                    // 这条隐式契约也消掉了。
+                    const anchorBox = window.H3Anchor.buildAnchorPanel({
+                        node, data, idx: it.idx,
+                        refresh: () => scheduleRefresh(60),
+                        dir: () => getDirValue(node),
+                        setAnchors: (arr) => setSegmentField(node, it.idx, "anchors", arr),
+                    });
                     if (anchorBox) paneSet.append(anchorBox);
                 }
             }

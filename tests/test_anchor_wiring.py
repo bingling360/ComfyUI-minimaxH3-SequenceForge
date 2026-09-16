@@ -11,6 +11,7 @@
 
 import ast
 import os
+import re as _re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -126,6 +127,71 @@ def test_resolve_anchor_source_covers_three_outcomes():
     for token in ('"reuse"', '"encode"', "_REENCODE_HINT"):
         assert token in ANCHORS_SRC
     assert "分辨率不匹配" in ANCHORS_SRC
+
+
+# ---- 跨模块依赖：不许按全局名调宿主的模块级函数 ----
+
+def test_anchor_js_has_no_cross_module_global_calls():
+    """h3d_anchor.js 不得按全局名调用 h3_director.js 的模块级函数。
+
+    2026-09-16 线上故障：h3d_anchor.js 里 `typeof getDirValue !== "function"` 当场抛错，
+    整块「⚠ 段落卡片渲染失败 · getDirValue 未加载」。
+    根因：`getDirValue` / `setSegmentField` 都是 h3_director.js 的**模块级**函数，
+    并没有挂到 window 上（公开面只有 window.H3Director.upscaleLatent / H3Api /
+    H3Prompts / H3Assets），跨模块按全局名调必然失败。
+    正确做法：宿主通过 `buildAnchorPanel({ dir, setAnchors, refresh })` 注入访问器。
+    """
+    code = _js_code(_src("web/h3d_anchor.js"))
+    for name in ("getDirValue", "setSegmentField", "scheduleRefresh",
+                 "projDir", "setSegAnchors"):
+        assert name not in code, f"h3d_anchor.js 又在按全局名调 {name}（应改为宿主注入）"
+
+
+def test_director_injects_anchor_host_accessors():
+    """接线必须真的传 dir / setAnchors，否则面板一渲染就抛。"""
+    src = _src("web/h3_director.js")
+    i = src.index("window.H3Anchor.buildAnchorPanel(")
+    call = src[i:i + 800]
+    assert "dir:" in call, "buildAnchorPanel 未注入 dir"
+    assert "setAnchors:" in call, "buildAnchorPanel 未注入 setAnchors"
+
+
+def test_anchor_js_has_no_load_order_requirement():
+    """模块不得要求「必须先于/后于某文件加载」——那是设计缺陷，不是约定。"""
+    src = _src("web/h3d_anchor.js")
+    for bad in ("必须先于本模块", "后于本模块"):
+        assert bad not in src
+
+
+def test_anchor_js_exports_only_namespaced_api():
+    """只挂 window.H3Anchor，不往全局摊函数（否则又是一套隐式契约）。"""
+    src = _src("web/h3d_anchor.js")
+    assert "window.H3Anchor = {" in src
+    assert not _re.search(r"^\s*window\.\w+\s*=\s*function", src, _re.M)
+
+
+def _js_code(src):
+    """粗剥 JS 注释（块注释 + 行注释），用于「这个名字只许出现在注释里」这类静态守卫。
+
+    实现刻意简单：本仓库 web/ 下的脚本没把 `//` 写进字符串（URL 都是 /h3chain/…
+    单斜杠），所以按行剥即可。若哪天出现 `http://` 这类字面量，这里会多剥一点
+    ——只会让守卫变宽松，不会误报。
+    """
+    out, in_block = [], False
+    for ln in src.split("\n"):
+        s = ln.strip()
+        if in_block:
+            if "*/" in s:
+                in_block = False
+            continue
+        if s.startswith("/*"):
+            if "*/" not in s:
+                in_block = True
+            continue
+        if s.startswith("*"):
+            continue
+        out.append(ln.split("//")[0] if "//" in ln and "://" not in ln else ln)
+    return "\n".join(out)
 
 
 def _find_func_anywhere(tree, name):

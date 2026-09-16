@@ -9,15 +9,20 @@
 (function () {
   "use strict";
 
-  /* ---- 全局依赖（来自 h3_director.js 顶层函数，ComfyUI 同批加载，渲染时已就绪） ---- */
-  function setSegAnchors(node, idx, arr) {
-    // 写回走现有 setSegmentField（已进段哈希 / 防抖落盘），不新造保存接口
-    if (typeof setSegmentField !== "function") throw new Error("setSegmentField 未加载（h3_director.js 必须先于本模块）");
-    setSegmentField(node, idx, "anchors", arr);
+  /* ---- 宿主访问器（由 h3_director.js 在 buildAnchorPanel 调用点注入）----
+   * 为什么不直接调 getDirValue / setSegmentField：那两个是 h3_director.js 的
+   * 模块级函数，并没有挂到 window 上，按全局名去找会当场抛错，还把"谁先加载"
+   * 变成隐式契约——本模块曾因此整块渲染失败。改成注入后，本模块对加载顺序
+   * 零依赖，也不再往全局摊函数。 */
+  function dirOf(ctx) {
+    const d = ctx && ctx.dir;
+    return typeof d === "function" ? String(d() || "") : String(d || "");
   }
-  function projDir(node) {
-    if (typeof getDirValue !== "function") throw new Error("getDirValue 未加载（h3_director.js 必须先于本模块）");
-    return getDirValue(node);
+  function setAnchorsOf(ctx, arr) {
+    if (!ctx || typeof ctx.setAnchors !== "function") {
+      throw new Error("锚定面板缺少宿主写入器（h3_director.js 的 buildAnchorPanel 接线不完整）");
+    }
+    ctx.setAnchors(arr);   // 宿主内部走 setSegmentField（已进段哈希 / 防抖落盘）
   }
 
   /* ---- 后端接口（与 h3_api.js 同款前缀处理：优先 ComfyUI api.fetchApi，否则直 fetch） ---- */
@@ -177,13 +182,13 @@
     const { node, data, idx, refresh } = ctx;
     const seg = (data.ds.segments && data.ds.segments[idx]) || {};
     const anchors = Array.isArray(seg.anchors) ? seg.anchors : [];
-    const dir = projDir(node);
+    const dir = dirOf(ctx);
 
     const box = el("details", "h3d-adv h3d-anchorpanel");
     box.innerHTML = '<summary>📌 手动锚定（双轨时间线）</summary>';
 
     const grid = el("div", "h3d-anchor-grid");
-    anchors.forEach((a, i) => grid.append(renderAnchorCard({ node, data, idx, dir, refresh, anchor: a, anchors, index: i })));
+    anchors.forEach((a, i) => grid.append(renderAnchorCard({ ...ctx, anchor: a, anchors, index: i })));
     box.append(grid);
 
     const addWrap = el("div", "h3d-anchor-add");
@@ -192,8 +197,8 @@
     add.onclick = () => {
       const cur = anchors.slice();
       cur.push(newAnchor());
-      setSegAnchors(node, idx, cur);
-      (refresh || (typeof scheduleRefresh === "function" ? scheduleRefresh : () => {}))();
+      setAnchorsOf(ctx, cur);
+      (refresh || (() => {}))();
     };
     addWrap.append(add);
     box.append(addWrap);
@@ -216,7 +221,7 @@
     del.style.marginLeft = "auto";
     del.onclick = () => {
       const cur = anchors.filter((x) => x !== anchor);
-      setSegAnchors(node, idx, cur);
+      setAnchorsOf(ctx, cur);
       (refresh || (() => {}))();
     };
     head.append(del);
@@ -247,7 +252,7 @@
     return card;
 
     /* 写回：改完即时落盘 + 刷新；用现有 setSegmentField，不另造保存 */
-    function commit() { setSegAnchors(node, idx, anchors.slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, anchors.slice()); (refresh || (() => {}))(); }
   }
 
   async function fetchSources(dir, seg1based) {
@@ -275,7 +280,7 @@
     if (src && src.sheet) {
       const im = document.createElement("img");
       im.loading = "lazy";
-      im.src = "/h3chain/anchor_sheet?dir=" + encodeURIComponent(projDir(node)) + "&file=" + encodeURIComponent(src.sheet);
+      im.src = "/h3chain/anchor_sheet?dir=" + encodeURIComponent(dirOf(ctx)) + "&file=" + encodeURIComponent(src.sheet);
       im.onerror = () => im.remove();
       strip.append(im);
     }
@@ -400,11 +405,11 @@
       btn.onclick = async () => {
         btn.disabled = true; btn.textContent = "生成中…";
         try {
-          const r = await _postJson("/h3chain/anchor_sheet_build", { dir: projDir(node), file: anchor.src.ref || src?.ref || "" });
+          const r = await _postJson("/h3chain/anchor_sheet_build", { dir: dirOf(ctx), file: anchor.src.ref || src?.ref || "" });
           if (r && r.ok && r.sheet) {
             anchor.src.meta_ok = true;
             // 重新拉源清单刷新 sheet
-            const ns = await fetchSources(projDir(node), idx + 1).catch(() => null);
+            const ns = await fetchSources(dirOf(ctx), idx + 1).catch(() => null);
             commit();
             // 重建源轨（含新 sheet）
             host.innerHTML = ""; host.append(el("h5", "", "① 源轨 · 从素材选哪一段"));
@@ -421,7 +426,7 @@
       host.append(gp);
     }
 
-    function commit() { setSegAnchors(node, idx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
   }
 
   function fillTgtTrack(ctx, spec, host) {
@@ -494,7 +499,7 @@
     midWrap.append(fi);
     host.append(midWrap);
 
-    function commit() { setSegAnchors(node, idx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
   }
 
   function fillSideCol(ctx, spec, sources, host) {
@@ -613,7 +618,7 @@
     }
     host.append(checks);
 
-    function commit() { setSegAnchors(node, idx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
+    function commit() { setAnchorsOf(ctx, (Array.isArray(data.ds.segments[idx].anchors) ? data.ds.segments[idx].anchors : []).slice()); (refresh || (() => {}))(); }
     function rebuildCard() {
       // 来源/条目切换后重建整卡（spec 已缓存，直接同步填充）
       const card = host.closest(".h3d-anchor-card");

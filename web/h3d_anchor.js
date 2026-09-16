@@ -202,6 +202,10 @@
       ".h3d-track h5{margin:0 0 6px;font-size:11px;color:var(--h3d-muted);font-weight:600}",
       ".h3d-strip{position:relative;height:56px;border-radius:6px;overflow:hidden;background:linear-gradient(90deg,#222a33,#2b3540,#222a33);border:1px solid #313b46;user-select:none;touch-action:none}",
       ".h3d-strip img,.h3d-strip video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.85;pointer-events:none}",
+      // 音频源没有画面：用条纹波形占位 + 轨下一个可播放控件（能听比能看重要）
+      ".h3d-wave{position:absolute;inset:0;background:repeating-linear-gradient(90deg,#3c4b5c 0 2px,#223040 2px 5px);opacity:.55;pointer-events:none}",
+      ".h3d-strip.is-audio{background:linear-gradient(90deg,#1d2b33,#26404d,#1d2b33)}",
+      ".h3d-audio{width:100%;margin-top:6px;height:28px}",
       ".h3d-tick{position:absolute;top:0;bottom:0;width:1px;background:#5b6675;opacity:.55}",
       ".h3d-tick.major{background:#8b97a6;opacity:.9}",
       ".h3d-ticklabel{position:absolute;top:1px;font:9px ui-monospace,Consolas;color:var(--h3d-muted);transform:translateX(2px);pointer-events:none}",
@@ -264,9 +268,18 @@
     let sources = null;
     const getSources = () => sources;
     const loadSources = async (extraRef) => {
+      // 把**本段所有锚**已引用的素材 ref 一并带给后端合并元信息：只带单 ref 的话，
+      // 刷新/重开面板后已选素材不在清单里，体检误报「源不在源清单里（旧档，
+      // 或换过素材库）」，用户被迫重选一次——素材明明还在库里。
+      const refs = [];
+      const push = (r) => { if (r && refs.indexOf(r) < 0) refs.push(r); };
+      (Array.isArray(seg.anchors) ? seg.anchors : []).forEach((a) => {
+        if (a && a.src && ASSET_REF_KINDS.indexOf(a.src.kind) >= 0) push(a.src.ref);
+      });
+      push(extraRef);
       let u = "/h3chain/anchor_sources?dir=" + encodeURIComponent(dirOf(ctx))
         + "&seg=" + (idx + 1);
-      if (extraRef) u += "&ref=" + encodeURIComponent(extraRef);
+      refs.forEach((r) => { u += "&ref=" + encodeURIComponent(r); });
       const j = await _getJson(u);
       if (!j || !j.ok) throw new Error("anchor_sources 返回异常");
       sources = j.sources || [];
@@ -289,7 +302,7 @@
       grid.innerHTML = "";
       list.forEach((a, i) => grid.append(renderAnchorCard(
         { ...ctx, anchor: a, anchors: list, index: i,
-          getSources, loadSources, rebuildList: renderList })));
+          getSources, loadSources, getPrev: prevSegment, rebuildList: renderList })));
     };
     renderList();
     box.append(empty, grid);
@@ -343,7 +356,8 @@
     const onCb = document.createElement("input");
     onCb.type = "checkbox";
     onCb.checked = anchor.on !== false;
-    onCb.title = "关闭=本锚不生效（仍保留配置）";
+    onCb.title = "勾=本锚生效；不勾=本锚不注入（配置保留）。注意：段首锚关闭后会回落"
+      + "到默认自动桥（整段 ctx 宽），想连自动桥一起关请用设置页的「跳过自动引用上段」";
     onCb.onchange = () => { anchor.on = onCb.checked; commit(); };
     head.append(onCb, el("span", "", anchor.on === false ? "（已关）" : "生效中"));
     const del = el("button", "h3d-btn h3d-btn-danger", "✕ 删除");
@@ -413,7 +427,9 @@
     const w = Number(p.width), h = Number(p.height);
     return (w > 0 && h > 0) ? { w, h } : null;
   }
-  const ASSET_KINDS = ["image", "video", "library"];
+  const ASSET_KINDS = ["image", "video", "library", "audio"];
+  /* 这些 kind 的 ref 要回传后端并源清单（都是「从素材库挑出来的」寻址方式） */
+  const ASSET_REF_KINDS = ["image", "video", "library", "audio"];
 
   function fillSrcTrack(ctx, spec, sources, host) {
     const { anchor, data, idx } = ctx;
@@ -422,7 +438,10 @@
     //（实测症状：切一次来源就多一条轨道，分不清到底在看哪一段）
     host.innerHTML = "";
     host.append(el("h5", "", "① 源轨 · 从源里取哪一段"));
-    const strip = el("div", "h3d-strip");
+    // 音频源：后端把时长按 24fps 折成等效帧（与窗宽同一刻度），源轨据此画时间线；
+    // 没有画面可贴，用条纹波形占位 + 一个可播放控件（能听比能看重要）。
+    const isAudio = (src && src.kind === "audio") || anchor.src.kind === "audio";
+    const strip = el("div", "h3d-strip" + (isAudio ? " is-audio" : ""));
     // 轨长只能是**源的真实帧数**。拿 anchor.src.end_f 当轨长是错的——那是"取用窗的
     // 终点"、不是源的长度；混用会让 帧区间/帧数/刻度 三者互相矛盾（实测 帧[68,63)）。
     // 源长度未知时退到一个至少容得下当前选取的宽度，绝不产生反区间。
@@ -431,6 +450,7 @@
       : Math.max(anchor.window, (Math.max(0, Number(anchor.src.start_f) || 0)) + anchor.window);
     // 预览：latent 有 contact sheet 就贴 sheet（零 VAE）；素材库来的条目用库缩略图
     // （图片）/ 库原文件首帧（视频）。都没有才落到下面的「生成预览」按钮。
+    if (isAudio) strip.append(el("div", "h3d-wave"));
     if (src && src.sheet) {
       const im = document.createElement("img");
       im.loading = "lazy";
@@ -501,6 +521,15 @@
     });
     strip.append(sel);
     host.append(strip);
+    // 音频源在轨下挂一个播放器：波形只表示"有东西"，能听才算确认了源
+    if (isAudio && src && src.item_id) {
+      const au = document.createElement("audio");
+      au.className = "h3d-audio";
+      au.controls = true;
+      au.preload = "metadata";
+      au.src = libRawUrl(dirOf(ctx))(src.item_id);
+      host.append(au);
+    }
 
     // 窗宽档位（锁 17k+5，不连续拖宽）：常用几档外露，其余收进「更多」——22 个按钮
     // 铺两行把面板撑得很吵，而实际会用到的就前面那几个。
@@ -556,16 +585,26 @@
     winBtns.append(moreToggle);
     host.append(winBtns, moreBtns);
 
-    // A/V 三态单选
+    // A/V 三态单选（按源类型收窄可用项：音频源=仅音频；图片源=没有音频分支）
     const av = el("div", "h3d-av");
+    const srcKindAv = src ? src.kind : anchor.src.kind;
     [["both", "图像+音频"], ["video", "仅图像"], ["audio", "仅音频"]].forEach(([v, t]) => {
       const b = el("button", (anchor.branches.av || "both") === v ? "on" : "", t);
-      b.onclick = () => {
-        anchor.branches.av = v;
-        av.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
-        b.classList.add("on");
-        commit();
-      };
+      if (anchor.src.kind === "audio" && v !== "audio") {
+        b.disabled = true;
+        b.title = "音频源只能作「仅音频」锚（不占视频行）";
+      } else if (srcKindAv === "image" && v === "audio") {
+        b.disabled = true;
+        b.title = "图片源没有音轨，不能取音频分支";
+      }
+      if (!b.disabled) {
+        b.onclick = () => {
+          anchor.branches.av = v;
+          av.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+          b.classList.add("on");
+          commit();
+        };
+      }
       av.append(b);
     });
     host.append(av);
@@ -577,17 +616,23 @@
       const span = anchor.window;
       const s = Math.max(0, Number(anchor.src.start_f) || 0);
       const e = s + span;          // 派生，不读存储的 end_f（曾与 start_f/window 互相矛盾）
+      // 音频没有 fps：窗宽按 24fps 等效帧折算成秒（后端也是这么把时长折成帧的）
       let secTxt;
-      if (fps == null) {
+      if (isAudio) {
+        secTxt = (span / 24).toFixed(2) + "s";
+      } else if (fps == null) {
         secTxt = "?s";
       } else {
         secTxt = (span / fps).toFixed(2) + "s";
       }
-      info.textContent = `源：${srcLabel(anchor, src)} · ${fps == null ? "?" : fps + "fps"}`
+      const durTxt = (isAudio && src && src.duration != null) ? `总 ${src.duration}s` : "";
+      info.textContent = `源：${srcLabel(anchor, src)} · `
+        + (isAudio ? `音频${durTxt ? " · " + durTxt : ""}`
+                   : `${fps == null ? "?" : fps + "fps"}`)
         + ` · 帧[${s},${e}) · ${secTxt} · ${span}帧`
         + (src && Number.isFinite(src.frames) ? ` / 源共 ${src.frames} 帧` : " / 源长度未知");
-      // fps 未知：追加手填框（归一只能解码阶段做，这里让用户补元信息）
-      if (fps == null) {
+      // fps 未知：追加手填框（归一只能解码阶段做，这里让用户补元信息）。音频没有帧率，跳过。
+      if (fps == null && !isAudio) {
         const inp = el("input", "h3d-fpsinput");
         inp.type = "number"; inp.min = "1"; inp.step = "0.1"; inp.placeholder = "填 fps";
         inp.title = "源真实帧率未知：手填后秒数才准（仅前端显示用，后端以 latent 元信息为准）";
@@ -810,49 +855,36 @@
         "当前是旧格式的「上段尾」源：它等价于选上一段，改成任一条目即可替换。"));
     }
 
-    /* ---- 条目：段 = 下拉选段；素材 = 打开素材库挑（复用现有库面板） ---- */
+    /* ---- 条目：段 = 固定上一段（无下拉）；素材 = 打开素材库挑（复用现有库面板） ----
+     * 「段」源不再有第二层条目下拉（用户拍板：段源就说上段，条目是多余的；
+     * 不存在上段直接在下方报错，不要让用户在一个空转的下拉里找）。 */
+    let needRebuild = false;   // 渲染中发现配置需要自动修正：填完再统一重建一次
     const itemRow = el("div", "h3d-selrow");
     if (anchor.src.kind === "segment") {
-      const items = (sources || []).filter((s) => s.kind === "segment");
-      const itemSel = document.createElement("select");
-      itemSel.className = "h3d-select";
-      itemSel.style.maxWidth = "200px";
-      if (!items.length) {
-        const o = document.createElement("option");
-        o.textContent = (sources && sources.length)
-          ? "还没有已落盘的段（跑完至少一段才会出现）"
-          : "载入中…";
-        itemSel.append(o);
-        itemSel.disabled = true;
+      const prev = (typeof ctx.getPrev === "function") ? ctx.getPrev() : null;
+      itemRow.append(el("span", "h3d-secs-hint", "源"));
+      if (prev) {
+        itemRow.append(el("span", "h3d-secs-hint",
+          `上段 · ${prev.label || prev.ref}` +
+          (Number.isFinite(prev.frames) ? ` · ${prev.frames}帧` : "")));
       } else {
-        if (!anchor.src.ref) {
-          itemSel.append(new Option("（请选择）", ""));
-        }
-        for (const s of items) {
-          const o = document.createElement("option");
-          o.value = s.ref || "";
-          o.textContent = (s.label || s.ref) +
-            (Number.isFinite(s.frames) ? ` · ${s.frames}帧` : "");
-          if ((s.ref || "") === (anchor.src.ref || "")) o.selected = true;
-          itemSel.append(o);
-        }
+        itemRow.append(el("span", "h3d-secs-hint", "上段（当前不可用）"));
       }
-      itemSel.onchange = () => {
-        const s = items.find((x) => (x.ref || "") === itemSel.value) || null;
-        anchor.src.ref = itemSel.value;
-        if (s) {
-          anchor.src.src_fps = s.fps == null ? null : s.fps;
-          anchor.src.meta_ok = !!s.meta_ok;
-          // 窗宽跟着源走：源多长就用不超过它的最大档位；比最小档还短（图片=1 帧）
-          // 就取 1（单帧身份锚）。后端允许 window==1，非法档位它会硬报错。
-          anchor.window = snapDown(spec, s.frames);
+      if (prev) {
+        // 自动对准上一段：仅当**源身份变化**（ref 为空/指到别的段/已失效段）时才
+        // 落默认值（窗宽 22 起步）。只在渲染里无条件对齐会把用户手选的档位每次
+        // 都打回默认——实测症状：点 73 档后 commit 重建，窗宽又被改回 22。
+        if (anchor.src.ref !== prev.ref) {
+          anchor.src.ref = prev.ref;
+          anchor.src.src_fps = prev.fps == null ? null : prev.fps;
+          anchor.src.meta_ok = !!prev.meta_ok;
+          anchor.window = (Number.isFinite(prev.frames) && prev.frames >= 22)
+            ? 22 : snapDown(spec, prev.frames);
           anchor.src.start_f = 0;
           anchor.src.end_f = anchor.window;
+          needRebuild = true;
         }
-        commit();
-        rebuildCard();
-      };
-      itemRow.append(el("span", "h3d-secs-hint", "条目"), itemSel);
+      }
     } else {
       const cur = findSource(sources, anchor);
       const btn = el("button", "h3d-btn", anchor.src.ref ? "🔁 换素材" : "🗂 选择素材");
@@ -863,6 +895,11 @@
         el("span", "h3d-secs-hint", srcLabel(anchor, cur)));
     }
     host.append(itemRow);
+    // 音频源只能作纯音频锚：分支在渲染期统一收敛（幂等，改了才重建）
+    if (anchor.src.kind === "audio" && anchor.branches.av !== "audio") {
+      anchor.branches.av = "audio";
+      needRebuild = true;
+    }
     if (pickErr) {
       const we = el("div");
       we.append(el("span", "bad", "⚠"), el("span", "", pickErr));
@@ -885,18 +922,24 @@
       H3Lib.open({
         dir: dirOf(ctx),
         seg: ctx.idx + 1,
-        pickKinds: ["image", "video", "latent"],
+        pickKinds: ["image", "video", "latent", "audio"],
         onPick: async (item) => {
           const kind = item.kind === "latent" ? "library" : item.kind;
           try {
             const list = await ctx.loadSources(item.id);
             const hit = (list || []).find((x) => x.item_id === item.id);
-            if (!hit) throw new Error("后端没有返回这个素材的元信息");
+            if (!hit) throw new Error("后端没有返回这个素材的元信息（素材可能已被删除或改名）");
             anchor.src.kind = kind;
+            if (kind === "audio" && anchor.branches.av !== "audio") {
+              anchor.branches.av = "audio";   // 音频源只能是纯音频锚
+            }
             anchor.src.ref = hit.ref;
             anchor.src.src_fps = hit.fps == null ? null : hit.fps;
             anchor.src.meta_ok = !!hit.meta_ok;
-            anchor.window = snapDown(spec, hit.frames);
+            // 窗宽默认 22 档：源长度只决定上限（不足 22 才向下落档，图片=1 单帧锚），
+            // 不再"选个长视频窗宽就跟着跳到源长"——那不是默认值，是惊吓。
+            anchor.window = (kind === "audio") ? 22
+              : (Number.isFinite(hit.frames) && hit.frames >= 22 ? 22 : snapDown(spec, hit.frames));
             anchor.src.start_f = 0;
             anchor.src.end_f = anchor.window;
             ctx.__pickErr = hit.resolvable === false
@@ -926,9 +969,14 @@
     if (anchor.src.kind === "prev_tail") {
       c1.append(el("span", "ok", "✓"),
         el("span", "", "上段尾：取的就是上一段输出的 latent 本身，形状天然与本链一致"));
+    } else if (anchor.src.kind === "segment" && !findSource(sources, anchor)) {
+      // 「段」源固定上一段：没有上段就在这里说清楚，不再有第二层下拉可挑
+      c1.append(el("span", "bad", "✗"), el("span", "",
+        "不存在可用的「上段」（本段是第 1 段，或上一段设了「不存 latent」）："
+        + "先跑完上一段，或把来源改成「素材」"));
     } else if (!src) {
       c1.append(el("span", "warn", "⚠"), el("span", "", anchor.src.ref
-        ? `源「${anchor.src.ref}」不在源清单里（旧档，或换过素材库）：重选一次条目即可补齐帧数与分辨率`
+        ? `源「${anchor.src.ref}」已不在素材库里（被删除或改名）：重选一次素材即可补齐帧数与分辨率`
         : "还没有选源：本锚不会生效——后端以「非 prev_tail 必须给 ref」硬拦，不会静默跳过"));
     } else if (src.kind === "video" || src.kind === "image") {
       c1.append(el("span", "ok", "✓"),
@@ -990,11 +1038,30 @@
           + "把落点往左挪，或改用「结尾」"));
     }
     checks.append(c4);
-    // 5) 音频剩余时长警告（仅当取音频分支时）
+    // 5) 音频分支体检（仅当取音频分支时）。真实语义（guides.crop_audio_for_anchor，
+    //    官方 AddGuide 同式）：锚点音频只能铺「落点 → 段尾」这一段剩余时长，
+    //    max_rt = audio_t − rescale×落点帧，与窗宽档位**无关**——旧文案
+    //    「将被裁至 N token」按窗宽算 token，是把两个不相干的数搅在一起。
     if ((anchor.branches.av === "both" || anchor.branches.av === "audio")) {
       const c5 = el("div");
-      const nTok = tokensForFrames(spec, anchor.window);
-      c5.append(el("span", "warn", "⚠"), el("span", "", `音频剩余时长将被裁至 ${nTok} token`));
+      const tgtF = Math.max(1, Number(ctx.frameLen()) || 1);
+      const rf5 = resolveFrame(anchor, tgtF);
+      const rescale = Number(spec.frame_rescale) || (5 / 3);
+      const remTok = Math.max(0, Math.round(Math.max(0, tgtF - rf5) * rescale));
+      const winTok = Math.max(1, Math.round(anchor.window * rescale));
+      const noAudioSrc = anchor.src.kind === "image"
+        || (src && (src.kind === "image" || src.frames === 1));
+      if (noAudioSrc) {
+        c5.append(el("span", "bad", "✗"), el("span", "",
+          "图片源没有音轨：音频分支无从取用，执行期会硬报错（改用带音频的视频/latent，或改「仅图像」）"));
+      } else if (remTok >= winTok) {
+        c5.append(el("span", "ok", "✓"), el("span", "",
+          `音频窗 ${winTok} token 完整放得下（落点 帧${rf5} 之后剩 ${remTok} token）`));
+      } else {
+        c5.append(el("span", "warn", "⚠"), el("span", "",
+          `音频只铺到段尾：落点 帧${rf5} 之后剩 ${remTok} token < 窗宽对应 ${winTok} token，`
+          + `超出部分将被裁掉（官方 AddGuide 语义，与窗宽档位无关）`));
+      }
       checks.append(c5);
     }
     host.append(checks);
@@ -1007,6 +1074,9 @@
     // 把本地重建能力挂到 ctx：其余两个轨（以及本轨）的 commit() 靠它做一致性刷新，
     // 取代原先"每次改动都让宿主全量重刷"的做法。每次 rebuildCard 都会重设，幂等。
     ctx.__rebuildCard = () => rebuildCard();
+    // 渲染中自动修正过配置（段源对准上一段 / 音频源收敛分支）：重建一次让
+    // 源轨/目标轨拿到修正后的值。修正幂等，重建一轮即稳定，不会循环。
+    if (needRebuild) ctx.__rebuildCard();
     function rebuildCard() {
       // 来源/条目切换后重建整卡（spec 已缓存，直接同步填充）
       const card = host.closest(".h3d-anchor-card");

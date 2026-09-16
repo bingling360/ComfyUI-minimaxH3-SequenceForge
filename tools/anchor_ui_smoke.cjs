@@ -59,9 +59,9 @@ function ok(cond, label, extra) {
   await tick(120);
 
   console.log("== 1 面板渲染 ==");
-  ok(doc.querySelectorAll(".h3d-anchor-card").length === 3, "三张锚卡（段源/latent/旧上段尾）",
+  ok(doc.querySelectorAll(".h3d-anchor-card").length === 4, "四张锚卡（段源/latent/旧上段尾/音频）",
     doc.querySelectorAll(".h3d-anchor-card").length);
-  ok(doc.querySelectorAll(".h3d-anchor-three").length === 3, "每张卡一个三段容器");
+  ok(doc.querySelectorAll(".h3d-anchor-three").length === 4, "每张卡一个三段容器");
   ok(card(doc, 0).querySelectorAll(".h3d-track").length === 3, "卡里三个 track（源轨/目标轨/体检）");
   ok(card(doc, 0).querySelectorAll(".h3d-strip").length === 2, "两条时间线（源轨 + 目标轨）");
   const t0 = card(doc, 0).textContent;
@@ -71,6 +71,14 @@ function ok(cond, label, extra) {
   ok(card(doc, 2).textContent.includes("单帧锚"), "window=1 的尾锚不再被误判非法");
   ok(t0.includes("① 源轨") && t0.includes("② 目标轨") && t0.includes("③ 源选择"),
     "上下堆叠三块都在（① → ② → ③）");
+
+  // 音频源轨：没有画面，但**必须**有可看的时间线与可听的播放器
+  const cardAud = card(doc, 3);
+  ok(!!cardAud && !!cardAud.querySelector(".h3d-wave"), "音频源轨有波形占位");
+  ok(!!cardAud && !!cardAud.querySelector("audio.h3d-audio"), "音频源轨带播放器");
+  ok(!!cardAud && cardAud.textContent.includes("音频"), "音频源信息行显示音频/时长");
+  ok(!!cardAud && cardAud.textContent.includes("源共 240 帧"), "音频时长折成等效帧后画轨",
+    cardAud ? (cardAud.textContent.match(/源共 \d+ 帧/) || [""])[0] : "");
 
   console.log("\n== 2 档位收起 / 展开 ==");
   const rowA = card(doc, 0).querySelectorAll(".h3d-winbtns")[0];
@@ -126,9 +134,9 @@ function ok(cond, label, extra) {
   console.log("\n== 5 新增锚定当场重建 ==");
   btn(doc.querySelector(".h3d-anchor-add"), /新增锚定/).click();
   await tick(80);
-  ok(doc.querySelectorAll(".h3d-anchor-card").length === 4, "当场多一张卡（不用退出重进）",
+  ok(doc.querySelectorAll(".h3d-anchor-card").length === 5, "当场多一张卡（不用退出重进）",
     doc.querySelectorAll(".h3d-anchor-card").length);
-  ok(card(doc, 3).textContent.includes("段 1"), "新卡预填上一段（段 1）");
+  ok(card(doc, 4).textContent.includes("段 1"), "新卡预填上一段（段 1）");
 
   console.log("\n== 6 切来源 段 -> 素材 ==");
   const sel = card(doc, 0).querySelectorAll("select")[0];
@@ -146,9 +154,9 @@ function ok(cond, label, extra) {
   ok(c2.textContent.includes("帧窗 1 合法"), "单帧尾锚校验正确");
 
   console.log("\n== 8 删除 ==");
-  btn(card(doc, 3), /删除/).click();
+  btn(card(doc, 4), /删除/).click();
   await tick(60);
-  ok(doc.querySelectorAll(".h3d-anchor-card").length === 3, "删除当场生效",
+  ok(doc.querySelectorAll(".h3d-anchor-card").length === 4, "删除当场生效",
     doc.querySelectorAll(".h3d-anchor-card").length);
 
   console.log("\n--- errors: " + ERRORS.length + " ---");

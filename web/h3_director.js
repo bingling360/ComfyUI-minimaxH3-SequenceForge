@@ -4358,6 +4358,11 @@ function injectStyles() {
 
     /* ---- 每段时长 + 段级引用素材 ---- */
     .h3d-secs{width:58px;border:1px solid #3a352c;border-radius:5px;background:#211f1a;color:var(--h3d-bone);padding:2px 4px;font:11px ui-monospace,Consolas;text-align:right;outline:none}
+    /* 数字输入一律隐藏上下小箭头（spinner）：卡片里宽度只有 58px，箭头占掉一半
+     * 还吸附不到合法档位（17k+5 只能靠换算），纯碍眼。步进用键盘上下键仍可用。 */
+    .h3d-secs::-webkit-inner-spin-button,.h3d-secs::-webkit-outer-spin-button,
+    .h3d-fpsinput::-webkit-inner-spin-button,.h3d-fpsinput::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+    .h3d-secs,.h3d-fpsinput{-moz-appearance:textfield;appearance:textfield}
     .h3d-secs:focus{border-color:#a8d8bd}
     .h3d-secs-hint{color:var(--h3d-muted);font:10px ui-monospace,Consolas;white-space:nowrap}
     .h3d-ppane .h3d-refrow{margin-top:2px;}
@@ -4571,7 +4576,7 @@ function injectStyles() {
     .h3d-mprefs{gap:8px}
     .h3d-mprefs-chips{display:flex;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
     .h3d-mprefs-btn{padding:2px 8px;font-size:11px}
-    /* 段卡：AI 优化设置条（三页之外的公共区，区别于「设置」页的分段设置） */
+    /* 段卡：AI 优化设置条（三页之外的公共区，区别于「锚定设置」页的本段设置） */
     .h3d-optsetbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:2px 0 4px;
         padding:5px 8px;border:1px dashed #2a3438;border-radius:7px;background:#0f1418}
     .h3d-mpset{display:flex;gap:8px;flex-wrap:wrap;align-items:center;border:1px solid #2a3438;border-radius:7px;background:#10161a;padding:8px 10px;margin-bottom:8px}
@@ -4751,7 +4756,7 @@ function openDesk() {
     colL.append(lProj);
     const colC = el("section", "h3d-col center");
     const cHead = el("div", "h3d-sechead",
-        "<strong>段落流水线</strong><small>顶部横向选段（点选看一段，＋ 加段，pill 可拖调序）；✏ 改词 · 🎲 重摇 · 🎬 分段设置</small>");
+        "<strong>段落流水线</strong><small>顶部横向选段（点选看一段，＋ 加段，pill 可拖调序）；✏ 改词 · 🎲 重摇 · 🎬 锚定设置</small>");
     const mpBtn = el("button", "h3d-btn h3d-mpbtn", "📋 总提示词");
     mpBtn.title = "多段工作台：每段 ① 中文意图 → ② 剧本（AI 扩写，中文自由格式）→ "
         + "③ 结果（AI 提示词优化，H3 官方格式）；支持时长范围与一次生成多段";
@@ -6543,6 +6548,10 @@ function buildCards(data) {
 
         /* 每段时长（秒）：留空=跟随节点默认；显示吸附后的帧数 */
         let secsHint = null;
+        /* 锚定面板重建器（面板构建时赋值）：分段时间一变，目标轨的刻度/体检全要
+         * 跟着重画——面板手里的 frameLen 闭包读的是构建时的 ds 快照，这里不重建
+         * 它就会一直显示旧帧数（实测症状：改了秒数，目标轨总长不动）。 */
+        let rebuildAnchorPane = null;
         if (node && it.idx !== undefined) {
             const defRaw = Number(getWidgetValue(node, W_DUR));
             const defSec = isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
@@ -6561,7 +6570,16 @@ function buildCards(data) {
             secsInp.addEventListener("input", () => syncHint(secsInp.value));
             secsInp.addEventListener("change", () => {
                 setSegmentSeconds(node, it.idx, secsInp.value);
+                // 写透本卡持有的 ds 快照（getDs 每次 JSON.parse 出新对象，
+                // 不写透的话锚定面板读到的还是旧 seconds），再重建面板。
+                const num = Number(secsInp.value);
+                if (data.ds && Array.isArray(data.ds.segments) && data.ds.segments[it.idx]) {
+                    data.ds.segments[it.idx].seconds =
+                        (secsInp.value === "" || !isFinite(num) || num <= 0)
+                            ? null : Math.min(15, Math.max(0.5, num));
+                }
                 syncHint(secsInp.value);
+                if (typeof rebuildAnchorPane === "function") rebuildAnchorPane();
             });
             title.append(secsInp, secsHint, el("span", "h3d-secs-hint", "秒"));
         }
@@ -6657,14 +6675,16 @@ function buildCards(data) {
                 attachAtComplete(ta, node);   // P3：@别名补全（只改文本，防抖落盘不变）
                 registerPromptEditor(node, it.idx, ta);   // 程序改提示词时能同步到屏幕
             }
-            /* 三页容器：主框 / v2分组 / 设置（时长在标题行，设置页只放引用+开关） */
+            /* 三页容器：主框 / v2分组 / 锚定设置（时长在标题行，锚定设置页放
+             * 手动锚定 + 段级开关 + latent 保存）。页名就叫「锚定设置」——
+             * 这一页现在的主角是手动锚定，叫「设置」看不出进去能改什么。 */
             const tabbar = el("div", "h3d-tabs");
             const paneMain = el("div", "h3d-tabpane");
             const paneV2 = el("div", "h3d-tabpane");
             const paneSet = el("div", "h3d-tabpane");
             const tabKey = `seg${it.idx}`;
             let curTab = _segTab.get(tabKey) || "main";
-            const tabs = [["main", "主提示词"], ["v2", "具象化"], ["set", "设置"]];
+            const tabs = [["main", "主提示词"], ["v2", "具象化"], ["set", "锚定设置"]];
             const panes = { main: paneMain, v2: paneV2, set: paneSet };
             const paintTabs = () => {
                 for (const [k, label] of tabs) {
@@ -6681,18 +6701,17 @@ function buildCards(data) {
             }
             body.append(tabbar);
             /* AI 优化设置放在**三页之外**的公共区：它是全链共用的一套（服务商 /
-             * 输出语言 / 规则文件），跟「设置」页里的**分段设置**（本段时长/引用/
-             * 开关）不是一回事。以前挂在 ① 意图框里，既容易误点，也让人以为
-             * 只对这段生效。 */
+             * 输出语言 / 规则文件），跟「锚定设置」页里的本段开关不是一回事。
+             * 以前挂在 ① 意图框里，既容易误点，也让人以为只对这段生效。 */
             if (node) {
                 const optBar = el("div", "h3d-optsetbar");
                 const bOptSet = el("button", "h3d-btn", "⚙ AI 优化设置");
                 bOptSet.type = "button";
                 bOptSet.title = "AI 提示词优化设置（服务商 / 模型 / 输出语言 / 规则文件）"
-                    + "—— 全链共用，不是本段设置（本段设置在上面的「设置」页）";
+                    + "—— 全链共用，不是本段设置（本段设置在上面的「锚定设置」页）";
                 bOptSet.onclick = () => openOptSettings(node);
                 optBar.append(bOptSet, el("span", "h3d-secs-hint",
-                    "全链共用：服务商 / 输出语言 / 规则文件（本段参数在「设置」页）"));
+                    "全链共用：服务商 / 输出语言 / 规则文件（本段参数在「锚定设置」页）"));
                 body.append(optBar);
             }
             /* 三栏各自独立的引用条：意图 / 剧本 / 结果 各一条，谁也不改谁。
@@ -6919,17 +6938,31 @@ function buildCards(data) {
                     // getDirValue / setSegmentField / segmentFrames 都是模块级函数、并不在
                     // window 上，子模块按全局名去找会当场抛错（曾因此整块「段落卡片渲染
                     // 失败」）。顺带把「谁先加载」这条隐式契约也消掉了。
-                    const anchorBox = window.H3Anchor.buildAnchorPanel({
-                        node, data, idx: it.idx,
-                        refresh: () => scheduleRefresh(60),
-                        dir: () => getDirValue(node),
-                        setAnchors: (arr) => setSegmentField(node, it.idx, "anchors", arr),
-                        // 本段总帧数**只从这一个函数出**（段卡标题那个「≈N帧」也是它）：
-                        // 面板曾经自己再算一遍（还用了向上对齐），于是目标轨刻度与
-                        // 分段时长对不上——同一个数只许有一个算法、一个来源。
-                        frameLen: () => segmentFrames(node, data.ds.segments[it.idx]),
-                    });
-                    if (anchorBox) secGen.append(anchorBox);
+                    // 面板挂在可清空容器里：分段时间变化时整体重建（见 secsInp change）。
+                    const anchorWrap = el("div");
+                    rebuildAnchorPane = () => {
+                        // 重建前记住这块折叠区的展开状态：重建是整块换 DOM，
+                        // 不继承就会在改秒数的瞬间「啪」地自动收起来（很莫名）。
+                        const oldBox = anchorWrap.querySelector("details");
+                        const wasOpen = !!(oldBox && oldBox.open);
+                        anchorWrap.innerHTML = "";
+                        const anchorBox = window.H3Anchor.buildAnchorPanel({
+                            node, data, idx: it.idx,
+                            refresh: () => scheduleRefresh(60),
+                            dir: () => getDirValue(node),
+                            setAnchors: (arr) => setSegmentField(node, it.idx, "anchors", arr),
+                            // 本段总帧数**只从这一个函数出**（段卡标题那个「≈N帧」也是它）：
+                            // 面板曾经自己再算一遍（还用了向上对齐），于是目标轨刻度与
+                            // 分段时长对不上——同一个数只许有一个算法、一个来源。
+                            frameLen: () => segmentFrames(node, data.ds.segments[it.idx]),
+                        });
+                        if (anchorBox) {
+                            if (wasOpen) anchorBox.open = true;
+                            anchorWrap.append(anchorBox);
+                        }
+                    };
+                    rebuildAnchorPane();
+                    secGen.append(anchorWrap);
                 }
 
                 /* 首尾帧图段级引用：勾选本段是否参考链首/链尾锚（资产标注或旧槽位）。
@@ -6975,55 +7008,40 @@ function buildCards(data) {
                     secGen.append(row);
                 }
 
-                /* 两个开关并成一行（分段优先，null=跟随全局默认开）——各自一行时
-                 * 光这两个开关就吃掉四行高度，而它们本来就是同一类东西。 */
+                /* 两个开关并成一行。语义取**反向勾选**（用户拍板）：勾选 = 跳过，
+                 * 不勾 = 跟随全局默认开——「跟随全局」从来不是一个可点按钮该表达的
+                 * 状态，它只是"没勾"本身；旧版勾选框（自动引用上段）+旁置按钮的
+                 * 三件套让人分不清勾的到底是"开"还是"跟全局"。
+                 * 数据仍是三态：不勾写 null（跟随全局），勾写显式 false（跳过）。 */
                 const swRow = el("div", "h3d-setrow");
-                // —— 自动引用上段（false≈旧独立镜头：全断链硬切，改动从本段起重跑） ——
-                const refRow = el("label", "h3d-unlink");
+                // —— 跳过自动引用上段（勾 = 与上段断链硬切；不勾 = 跟随全局，默认无缝续拍） ——
+                const refRow = el("label", "h3d-unlink h3d-offrow");
                 const refCb = document.createElement("input");
                 refCb.type = "checkbox";
-                refCb.checked = segAutoRef(seg);
-                refRow.append(refCb, document.createTextNode("🔗 自动引用上段"));
-                refRow.title = "开=本段头部注入上段尾部 latent 桥（无缝续拍）；关=与上段完全断开（不注入桥、不裁头、不做接缝处理，段间硬切）。跟随全局时与全局一致，显式改动从本段起重跑";
+                refCb.checked = seg.auto_ref === false || seg.unlink === true;
+                refRow.append(refCb, document.createTextNode("🚫 跳过自动引用上段"));
+                refRow.title = "勾选=本段与上段完全断开（不注入桥、不裁头、不做接缝处理，段间硬切）；"
+                    + "不勾=跟随全局「视频延续」设置（默认无缝续拍）";
                 refCb.onchange = () => {
-                    // 双写：新键 + 旧键（旧后端/旧前端兼容）
-                    setSegmentField(node, it.idx, "auto_ref", refCb.checked);
-                    setSegmentField(node, it.idx, "unlink", !refCb.checked);
+                    // 不勾写 null（回到跟随全局），勾写显式 false（跳过）；unlink 双写兼容旧后端
+                    setSegmentField(node, it.idx, "auto_ref", refCb.checked ? false : null);
+                    setSegmentField(node, it.idx, "unlink", refCb.checked);
                     scheduleRefresh(60);
                 };
-                const refFollow = el("button", "h3d-btn", "跟随全局");
-                refFollow.title = "清除本段显式设置，跟随右侧「视频延续」全局（默认开）";
-                refFollow.onclick = (e) => {
-                    e.preventDefault();
-                    setSegmentField(node, it.idx, "auto_ref", null);
-                    scheduleRefresh(60);
-                };
-                if (seg.auto_ref === null || seg.auto_ref === undefined) {
-                    refRow.append(el("span", "h3d-secs-hint", "跟随全局"));
-                }
-                // —— 自动按序生成（false≈旧不上链：跳过执行不进成片，零成本恢复） ——
+                // —— 跳过自动按序生成（勾 = 本段保留但跳过执行、不进成片；不勾 = 跟随全局） ——
                 const seqRow = el("label", "h3d-unlink h3d-offrow");
                 const seqCb = document.createElement("input");
                 seqCb.type = "checkbox";
-                seqCb.checked = segAutoSeq(seg);
-                seqRow.append(seqCb, document.createTextNode("⏸ 自动按序生成"));
-                seqRow.title = "开=本段正常采样进成片；关=本段保留但跳过执行、不进成片（恢复零成本，已完成段沿用存档）";
+                seqCb.checked = seg.auto_seq === false || seg.disabled === true;
+                seqRow.append(seqCb, document.createTextNode("⏸ 跳过自动按序生成"));
+                seqRow.title = "勾选=本段保留但跳过执行、不进成片（恢复零成本，已完成段沿用存档）；"
+                    + "不勾=跟随全局（默认按序生成）";
                 seqCb.onchange = () => {
-                    setSegmentField(node, it.idx, "auto_seq", seqCb.checked);
-                    setSegmentField(node, it.idx, "disabled", !seqCb.checked);
+                    setSegmentField(node, it.idx, "auto_seq", seqCb.checked ? false : null);
+                    setSegmentField(node, it.idx, "disabled", seqCb.checked);
                     scheduleRefresh(60);
                 };
-                const seqFollow = el("button", "h3d-btn", "跟随全局");
-                seqFollow.title = "清除本段显式设置，跟随全局（默认开）";
-                seqFollow.onclick = (e) => {
-                    e.preventDefault();
-                    setSegmentField(node, it.idx, "auto_seq", null);
-                    scheduleRefresh(60);
-                };
-                if (seg.auto_seq === null || seg.auto_seq === undefined) {
-                    seqRow.append(el("span", "h3d-secs-hint", "跟随全局"));
-                }
-                swRow.append(refRow, refFollow, seqRow, seqFollow);
+                swRow.append(refRow, seqRow);
                 secGen.append(swRow);
 
                 /* —— 本段 latent 保存（null=跟随默认「全存」）——
@@ -7399,7 +7417,7 @@ function renderParamsZone(sec, data) {
     const kgrid = el("div", "h3d-adv-grid");
     for (const name of KEYFRAME_DEFS) kgrid.append(renderWidgetField(node, name));
     kgrid.append(el("div", "h3d-hint",
-        "尾部 latent 保存量与分段注入帧数在各段「分段设置」里按段覆盖（分段优先，空=跟随此处）。"));
+        "尾部 latent 保存量与分段注入帧数在各段「锚定设置」里按段覆盖（分段优先，空=跟随此处）。"));
     kf.append(kgrid);
     const seam = el("details", "h3d-adv");
     seam.open = false;
@@ -7411,7 +7429,7 @@ function renderParamsZone(sec, data) {
     cont.append(cwrap);
     sec.append(cont);
     sec.append(el("div", "h3d-foot",
-        "分段设置里同名子选项按段覆盖此处（分段优先）；「生成模式」由左侧模式条控制。"));
+        "「锚定设置」里同名子选项按段覆盖此处（分段优先）；「生成模式」由左侧模式条控制。"));
 }
 
 /* ---- 实验性功能面板（右栏，ds.experiments 扁平契约 {<id>:true, params:{...}} 驱动） ---- */

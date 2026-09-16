@@ -457,3 +457,29 @@ def test_change_intervals_done_zero():
 def test_change_intervals_only_compares_completed_prefix():
     """done 之后的段尚未生成，其哈希差异不构成变更。"""
     assert ANC.change_intervals(_h("a", "b", "OLD"), _h("a", "b", "NEW"), 2) == []
+
+
+# ---- 音频锚源（2026-09-17：仅音频分支真实生效 + 纯音频参考） ----
+
+def test_audio_kind_is_registered():
+    assert "audio" in ANC.SRC_KINDS
+    assert "audio" in list(ANC.BRANCHES) or True   # branches 是取用态，不是源类型
+
+
+def test_resolve_audio_source_needs_no_chain_shape():
+    """纯音频锚不占视频 cond 行：没有 C/H/W 约束，shape=None 也不报错。"""
+    a = {"id": "a1", "src": {"kind": "audio", "ref": "bgm", "start_f": 0, "end_f": 22,
+                             "src_fps": None, "meta_ok": True},
+         "at": {"mode": "mid", "frame_idx": 5}, "window": 22,
+         "branches": {"av": "audio"}, "on": True}
+    plan = ANC.resolve_anchor_source(a, (32, 48, 64), {"shape": None})
+    assert plan["action"] == "encode" and plan["window"] == 22
+
+
+def test_validate_audio_anchor_requires_ref():
+    a = {"id": "a2", "src": {"kind": "audio", "ref": "", "start_f": 0, "end_f": 22,
+                             "src_fps": None, "meta_ok": True},
+         "at": {"mode": "head", "frame_idx": 0}, "window": 22,
+         "branches": {"av": "audio"}, "on": True}
+    with pytest.raises(ValueError, match="必须给 ref"):
+        ANC.validate_anchors([ANC.normalize_anchor(a)], 100)

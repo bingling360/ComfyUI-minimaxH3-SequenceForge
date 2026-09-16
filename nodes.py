@@ -236,13 +236,18 @@ def _tail_keyframe(video_t, audio_t, ctx_frames, with_audio, end_tokens=None,
     则整条 keyframe 没有任何分支，返回 None 让调用方跳过。
     """
     vt = video_latent_t(ctx_frames) if full_bridge else 1
-    end = video_t.shape[2] if end_tokens is None else min(end_tokens, video_t.shape[2])
     kf = {"resolved_frame_index": 0}
     if with_video:
+        # 仅音频锚（src.kind="audio" 或分支=仅音频）没有视频 latent，走不到这里
+        end = video_t.shape[2] if end_tokens is None else min(end_tokens, video_t.shape[2])
         kf["latent"] = video_t[:, :, end - vt:end, :, :].clone()
     if with_audio and full_bridge and audio_t is not None:
         at = audio_tokens_for_frames(ctx_frames)
-        aend = min(audio_tokens_for_frames(latent_t_to_frames(end)), audio_t.shape[-1])
+        if with_video:
+            aend = min(audio_tokens_for_frames(latent_t_to_frames(end)), audio_t.shape[-1])
+        else:
+            # 无视频分支（纯音频锚）：音频从源尾部取窗，不依赖视频末端对齐
+            aend = audio_t.shape[-1]
         if 0 < at <= aend:
             kf["audio_latent"] = audio_t[..., aend - at:aend].clone()
     return kf if len(kf) > 1 else None
@@ -1474,6 +1479,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
             return (_decode_video_file(_abs, label) if _abs is not None
                     else _load_input_video(_fn, _project_root_for_assets()))
 
+        def _anchor_audio(label):
+            """素材标签 -> AUDIO dict。纯音频锚（src.kind="audio"）专用通路：
+            音频参考不走视频 latent，也就没有 C/H/W 约束。未知标签/非音频直接抛。
+            """
+            _abs, _fn = _anchor_asset(label, "audio")
+            if _abs is not None:
+                return _decode_audio_file(_abs)
+            if _fn is not None:
+                return _load_input_audio(_fn, _project_root_for_assets())
+            raise ValueError(f"锚点「{label}」找不到对应音频文件")
+
         def _resolve_anchor_latent(a):
             """anchor 源 -> (video_dev, audio_dev|None)，已确保 C/H/W 与本链一致。
 
@@ -1485,24 +1501,40 @@ class H3SeamlessChainSampler(io.ComfyNode):
             没有基准就无法判定能否拼接，此时宁可报错也不赌——赌输是模型层整链崩。
             """
             chain_ref = _chain_ref[0]
+            kind, ref = a["src"]["kind"], a["src"]["ref"]
+            # 分支取用态在此**统一生效**：不需要的视频分支不编码、不校验（省一次 VAE），
+            # 不需要的音频分支直接置 None——此前只有段首桥走 _eff_inject 尊重三态，
+            # 段中/段尾锚的「仅图像/仅音频」会被无视、两路分支全量注入。
+            want_v = a["branches"]["av"] in ("both", "video")
+            want_a = a["branches"]["av"] in ("both", "audio")
+            # 纯音频源：不占视频行，无 C/H/W 约束，也不需要链分辨率基准
+            if kind == "audio":
+                _aud = _anchor_audio(ref)
+                ea = _encode_audio_latent(audio_vae, _aud,
+                                          audio_tokens_for_frames(int(a["window"])))
+                if not want_a:
+                    raise ValueError(f"锚点 {a['id']}：音频源只支持「仅音频」取用分支")
+                return None, ea
             if chain_ref is None:
                 raise ValueError(
                     f"锚点 {a['id']} 无法解析：本链还没有任何 latent 作为分辨率基准"
                     "（首段无上段尾、也无序章）。请先跑完一段，或改选不需要形状比对的源")
-            kind, ref = a["src"]["kind"], a["src"]["ref"]
             chain_chw = (int(chain_ref.shape[0]), int(chain_ref.shape[-2]),
                          int(chain_ref.shape[-1]))
             ea = None
             hw_src = None          # 需要先裁后编时用（像素帧 + 音频）
             if kind == "prev_tail":
+                if not want_v:
+                    return None, None   # 上段 latent 存档不带音频，仅音频无源可取
                 return ref_video_t, None
             if kind == "library":
                 ev, ea = _load_library_latent(ref)
-                anchors.resolve_anchor_source(
-                    a, chain_chw,
-                    {"shape": tuple(ev.shape),
-                     "frames": latent_t_to_frames(int(ev.shape[2])),
-                     "fps": a["src"]["src_fps"], "reencodable": False})
+                if want_v:
+                    anchors.resolve_anchor_source(
+                        a, chain_chw,
+                        {"shape": tuple(ev.shape),
+                         "frames": latent_t_to_frames(int(ev.shape[2])),
+                         "fps": a["src"]["src_fps"], "reencodable": False})
             elif kind == "segment":
                 # 段源 ref 的规范形式是 `seg_NNN`（anchors.py §3 文档、routes.anchor_sources、
                 # tests/test_anchors.py 三处一致）。此前这里多要一个 ".pt" 后缀、按
@@ -1512,11 +1544,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if not _num.isdigit() or not root:
                     raise ValueError(f"段源引用非法：{ref!r}（须为 seg_NNN 形式，如 seg_003）")
                 ev, ea = (t.to("cpu") for t in checkpoint.load_segment(root, int(_num)))
-                anchors.resolve_anchor_source(
-                    a, chain_chw,
-                    {"shape": tuple(ev.shape),
-                     "frames": latent_t_to_frames(int(ev.shape[2])),
-                     "fps": 24.0, "reencodable": False})
+                if want_v:
+                    anchors.resolve_anchor_source(
+                        a, chain_chw,
+                        {"shape": tuple(ev.shape),
+                         "frames": latent_t_to_frames(int(ev.shape[2])),
+                         "fps": 24.0, "reencodable": False})
             elif kind in ("video", "image"):
                 if kind == "video":
                     _imgs, _aud = _anchor_video(ref)
@@ -1536,24 +1569,41 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if not a["src"]["meta_ok"]:
                     report.append(f"锚点 {a['id']}：源帧率未知，按 {a['window']} 帧钉住"
                                   "（时长以帧计，不折秒）")
-                hw_src = (_imgs, _aud)
+                if want_a and _aud is None:
+                    raise ValueError(f"锚点 {a['id']}：图片源没有音轨，"
+                                     "「图像+音频/仅音频」的音频分支无从取用"
+                                     "（请改用带音频的视频/latent，或改「仅图像」）")
+                if not want_v:
+                    hw_src = (None, _aud)   # 只要音频：跳过视频 VAE 编码
+                else:
+                    hw_src = (_imgs, _aud)
             else:
                 raise ValueError(f"锚点 {a['id']} 源类型非法：{kind!r}")
 
             if hw_src is not None:      # 先裁后编：帧窗 → center-cover → VAE
                 _imgs, _aud = hw_src
-                ev = video_vae.encode(_center_cover(_imgs, width, height))
+                ev = (video_vae.encode(_center_cover(_imgs, width, height))
+                      if _imgs is not None else None)
                 ea = None
                 _wav = _aud.get("waveform") if isinstance(_aud, dict) else None
                 if _wav is not None and int(_wav.shape[-1]) > 0:
-                    ea = _encode_audio_latent(audio_vae, _aud,
-                                              audio_tokens_for_frames(int(_imgs.shape[0])))
+                    # 音频按取用窗对齐（不是全曲砸进来）：音频窗 = 窗宽帧数对应的 token 数，
+                    # 与段首桥 _tail_keyframe 的 at=audio_tokens_for_frames(ctx_frames) 同一契约
+                    _at = audio_tokens_for_frames(int(a["window"]))
+                    ea = _encode_audio_latent(audio_vae, _aud, _at)
+            elif not want_v:
+                ev = None               # 仅音频：库/段 latent 的视频分支不注入
             # window 是取用契约：所有源统一裁到 window 对应的 token 数（取尾部），
             # 否则「window=1 的单帧身份锚」会退化成"整段 latent 砸在末帧上"。
             _vt = frames_to_latent_t(int(a["window"]), up=False)
-            if int(ev.shape[2]) > _vt:
+            if ev is not None and int(ev.shape[2]) > _vt:
                 ev = ev[:, :, ev.shape[2] - _vt:, :, :]
-            return ev.to(video_vae.device), (ea.to(audio_vae.device) if ea is not None else None)
+            if ea is not None and want_a:
+                _at = audio_tokens_for_frames(int(a["window"]))
+                if int(ea.shape[-1]) > _at:
+                    ea = ea[..., -_at:].clone()
+            return (ev.to(video_vae.device) if ev is not None else None,
+                    (ea.to(audio_vae.device) if ea is not None else None))
         # 链路自动推导（无手动模式）：有有效引用即走 ref conditioning；
         # 首帧可与引用共存（头锚 keyframe 叠加）。均匀链的推导值与旧版逐字一致，
         # 旧存档续跑指纹不受影响。
@@ -2673,17 +2723,25 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if not _a["on"] or _a["at"]["mode"] == "head":
                             continue
                         _av, _aa = _resolve_anchor_latent(_a)
+                        # 分支三态在段中/段尾同样生效（此前只在段首桥尊重，
+                        # 「仅图像」会把音频也钉进去、「仅音频」会连视频一起钉）
+                        _want_v = _a["branches"]["av"] in ("both", "video")
+                        _want_a = _a["branches"]["av"] in ("both", "audio")
                         _ai = grid.anchor_frame_index(_a["at"]["mode"], _a["window"], _kf_fc,
                                                       _a["at"]["frame_idx"])
                         _kf, _why = guides.prepare_anchor(
-                            _ai, _kf_fc, video_latent=_av, audio_latent=_aa,
-                            audio_t=None if _aa is None else int(_aa.shape[-1]),
+                            _ai, _kf_fc,
+                            video_latent=_av if _want_v else None,
+                            audio_latent=_aa if _want_a else None,
+                            audio_t=None if (_aa is None or not _want_a) else int(_aa.shape[-1]),
                             label=f"锚点 {_a['id']}")
                         if _kf is None:
                             raise ValueError(f"段{g + 1} {_why}")
                         _kfs.append(_kf)
                         report.append(f"段{g + 1} {_a['id']} 落位 帧{_kf['resolved_frame_index']}"
-                                      f"/{_kf_fc}")
+                                      f"/{_kf_fc}"
+                                      + ("" if "latent" not in _kf else "+V")
+                                      + ("" if "audio_latent" not in _kf else "+A"))
                     for _kf in _kfs:
                         _ok, _why = guides.validate_anchor(
                             _kf["resolved_frame_index"],

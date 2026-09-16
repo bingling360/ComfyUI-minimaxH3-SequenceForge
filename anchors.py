@@ -8,7 +8,7 @@
 anchor 结构（§3）：
 
     {"id": "a1",
-     "src": {"kind": "prev_tail|segment|library|video|image",
+     "src": {"kind": "prev_tail|segment|library|video|image|audio",
              "ref": "seg_003|latent/head.pt|素材标签",
              "start_f": 10, "end_f": 32,   # 源内像素帧窗（左闭右开），先裁后编
              "src_fps": 24.0,              # 源真实帧率；None = 未知
@@ -24,7 +24,7 @@ anchor 结构（§3）：
 from . import grid
 from . import guides
 
-SRC_KINDS = ("prev_tail", "segment", "library", "video", "image")
+SRC_KINDS = ("prev_tail", "segment", "library", "video", "image", "audio")
 BRANCHES = ("both", "video", "audio")
 
 
@@ -163,6 +163,16 @@ def resolve_anchor_source(anchor, chain_chw, source_meta):
     label = f"锚点 {anchor['id']}"
     kind, ref = anchor["src"]["kind"], anchor["src"]["ref"]
     win = int(anchor["window"])
+
+    # 纯音频锚：不占视频 cond 行（keyframe 无 latent 分支），没有 C/H/W 约束可言。
+    # 唯一要校验的是取用窗方向；帧数越界对音频无意义（音频按剩余时长裁，见 guides）。
+    if kind == "audio":
+        start_f = 0 if anchor["src"]["start_f"] is None else int(anchor["src"]["start_f"])
+        end_f = win if anchor["src"]["end_f"] is None else int(anchor["src"]["end_f"])
+        if end_f <= start_f:
+            raise ValueError(f"{label} 源帧窗非法：[{start_f},{end_f}) 左闭右开须 end_f > start_f")
+        return {"action": "encode", "window": win, "start_f": start_f, "end_f": end_f,
+                "note": ""}
 
     shape = source_meta.get("shape")
     if shape is None:

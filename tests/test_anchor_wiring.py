@@ -350,7 +350,7 @@ def test_settings_pane_is_grouped_by_effect():
     d = _src("web/h3_director.js")
     assert "影响本段生成" in d and "只影响落盘" in d
     assert "h3d-setsec-title" in d and ".h3d-setsec{" in d, "分区样式没跟上"
-    assert "secGen.append(anchorBox)" in d, "锚定面板没挂进「影响本段生成」区"
+    assert "secGen.append(anchorWrap)" in d, "锚定面板没挂进「影响本段生成」区"
     assert "secDisk.append(lsBox)" in d, "latent 保存没挂进「只影响落盘」区"
 
 
@@ -381,3 +381,66 @@ def test_video_anchor_goes_through_the_asset_registry():
     assert "def _anchor_video(" in NODES
     assert "_anchor_video(ref)" in NODES
     assert "_imgs, _aud = _load_input_video(ref" not in NODES
+
+
+# ---- 2026-09-17 修复回归：跟随全局反向化 / 音频锚源 / 刷新合并 / 分段时间同步 ----
+
+def test_follow_global_buttons_are_replaced_by_skip_checkboxes():
+    """「跟随全局」按钮 + 正向勾选的三件套反向成「跳过」勾选：勾=跳过，不勾=跟全局。"""
+    d = _src("web/h3_director.js")
+    assert "跳过自动引用上段" in d and "跳过自动按序生成" in d
+    assert 'el("button", "h3d-btn", "跟随全局")' not in d, "「跟随全局」按钮应已删除"
+    assert '"auto_ref", refCb.checked ? false : null)' in d, "不勾应写 null（跟随全局）"
+    assert '"auto_seq", seqCb.checked ? false : null)' in d
+
+
+def test_segment_seconds_change_rebuilds_anchor_pane():
+    """分段时间变化必须写透 ds 快照并重建锚定面板，否则目标轨总帧数停在旧值。"""
+    d = _src("web/h3_director.js")
+    assert "rebuildAnchorPane" in d
+    assert "rebuildAnchorPane()" in d, "seconds change 后没有重建锚定面板"
+    assert "wasOpen" in d and "anchorBox.open = true" in d, "重建后要继承展开态（否则改秒数就自动收起）"
+    assert "number spinners 应隐藏" or True
+    assert "::-webkit-inner-spin-button" in d, "数字输入的上下小箭头没隐藏"
+
+
+def test_anchor_sources_merge_existing_refs_and_support_audio():
+    """刷新后已有锚的 ref 要回传后端合并元信息（修「源不在源清单里」误报）；音频可作锚源。"""
+    a = _src("web/h3d_anchor.js")
+    assert "ASSET_REF_KINDS" in a and 'refs.forEach' in a, "loadSources 没有合并已有锚 ref"
+    assert '"image", "video", "latent", "audio"' in a, "素材库挑选没放开音频"
+    r = _src("routes.py")
+    assert 'q.getall("ref", [])' in r and '"missing": missing' in r
+    # multidict 的 getall 缺 key 直接抛 KeyError → aiohttp 里就是一个空 500
+    assert 'q.getall("ref")' not in r, "getall 必须给默认值，否则首次加载（无 ref）直接 500"
+    assert "_anchor_sources_impl" in r and "读取源清单失败" in r, "缺异常兜底外壳"
+    # 音频元信息：时长折成等效帧，前端才能画源轨时间线
+    assert 'x.type == "audio"' in r and '"duration"' in r
+    assert 'item_kind not in ("image", "video", "latent", "audio")' in r
+
+
+def test_segment_source_is_prev_only_without_item_dropdown():
+    """「段」源固定上一段：去掉条目下拉，无上段在体检区硬提示。"""
+    a = _src("web/h3d_anchor.js")
+    assert "不存在可用的「上段」" in a
+    assert 'el("span", "h3d-secs-hint", "条目")' not in a, "段源的条目下拉应已删除"
+
+
+def test_audio_source_has_its_own_timeline_in_src_track():
+    """音频源没有画面：源轨要有波形占位 + 播放器，信息行按等效帧/秒显示（不是 fps）。"""
+    a = _src("web/h3d_anchor.js")
+    assert ".h3d-wave" in a and "h3d-audio" in a
+    assert "isAudio" in a and 'secTxt = (span / 24).toFixed(2)' in a
+    assert 'fps == null && !isAudio' in a, "音频不该再弹 fps 手填框"
+
+
+def test_segment_settings_tab_is_named_anchor_settings():
+    d = _src("web/h3_director.js")
+    assert '["set", "锚定设置"]' in d
+    assert "🎬 锚定设置" in d
+    """段中/段尾锚的分支三态真实生效（此前只有段首桥尊重）；纯音频锚有独立通路。"""
+    n = _src("nodes.py")
+    assert "_anchor_audio" in n
+    assert '_want_v = _a["branches"]["av"] in ("both", "video")' in n
+    assert "video_latent=_av if _want_v else None" in n
+    assert "音频源只能作「仅音频」" in n or "音频源只支持「仅音频」" in n

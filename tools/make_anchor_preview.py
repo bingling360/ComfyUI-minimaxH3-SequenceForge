@@ -91,7 +91,7 @@ __DIRECTOR_CSS__
 const SPEC = {ok:true, frame_per_token:[1,4,4,4,4], frame_rescale:5/3,
   snap_windows:[5,22,39,56,73,90,107,124,141,158,175,192,209,226,243,260,277,294,311,328,345,362],
   min_window_frames:5, max_window_frames:362, at_modes:["head","mid","tail"],
-  src_kinds:["prev_tail","segment","library","video","image"], branches:["both","video","audio"]};
+  src_kinds:["prev_tail","segment","library","video","image","audio"], branches:["both","video","audio"]};
 
 const SOURCES = {ok:true, seg_length:124, parse:{}, sources:[
   {slot:0,kind:"prev_tail",ref:"",label:"上段尾（段 1）",frames:124,w:1280,h:720,fps:24,sheet:null,meta_ok:true},
@@ -99,6 +99,9 @@ const SOURCES = {ok:true, seg_length:124, parse:{}, sources:[
   {slot:1,kind:"segment",ref:"seg_001",label:"段 2",frames:158,w:1280,h:720,fps:24,sheet:null,meta_ok:true},
   {slot:null,kind:"library",ref:"latent/head.pt",label:"head.pt",frames:39,tokens:9,w:1280,h:720,fps:null,
    sheet:"latent/head.sheet.png",meta_ok:true},
+  // 音频源：时长 10s 按 24fps 折成 240 等效帧（与窗宽同一刻度），无宽高/帧率
+  {slot:null,kind:"audio",ref:"as_bgm0001",label:"bgm.wav",frames:240,w:null,h:null,fps:null,
+   sheet:null,meta_ok:true,duration:10.0,item_id:"global:audio/bgm.wav"},
 ]};
 
 const LIB_ITEMS = [
@@ -112,8 +115,11 @@ const LIB_ITEMS = [
    asset_id:"", size:2200000, mtime:Date.now()/1000-600, rating:0, tags:[], roles:[], refs:[]},
   {id:"finals:videos/seg_000.mp4", scope:"finals", kind:"video", name:"seg_000.mp4", file:"videos/seg_000.mp4",
    asset_id:"", size:12000000, mtime:Date.now()/1000-300, rating:0, tags:[], roles:[], refs:[]},
+  // 音频条目：放 global，避免干扰冒烟里"项目资产 scope 2 条"的断言
+  {id:"global:audio/bgm.wav", scope:"global", kind:"audio", name:"bgm.wav", file:"audio/bgm.wav",
+   asset_id:"as_bgm0001", size:3200000, mtime:Date.now()/1000-120, rating:0, tags:[], roles:[], refs:[]},
 ];
-const KIND_OF_NAME = {"角色1":"image","photo.png":"image","参考片段":"video","head.pt":"latent","seg_000.mp4":"video"};
+const KIND_OF_NAME = {"角色1":"image","photo.png":"image","参考片段":"video","head.pt":"latent","seg_000.mp4":"video","bgm.wav":"audio"};
 const ITEM_BY_ID = {};
 LIB_ITEMS.forEach(i => ITEM_BY_ID[i.id] = i);
 
@@ -132,21 +138,31 @@ function route(path){
   const p = String(path);
   if (p.includes("grid_spec")) return SPEC;
   if (p.includes("anchor_sources")) {
-    if (p.includes("ref=")) {
-      const id = decodeURIComponent((p.match(/ref=([^&]*)/)||[])[1]||"");
-      const it = ITEM_BY_ID[id];
-      if (!it) return {ok:false, code:"NOT_FOUND", message:"素材库里找不到这个素材"};
-      const kind = it.kind === "latent" ? "library" : it.kind;
-      const meta = it.kind === "latent"
-        ? {frames:39, tokens:9, w:1280, h:720, fps:null, sheet:"latent/head.sheet.png", meta_ok:true}
-        : it.kind === "video"
-          ? {frames:198, tokens:null, w:1920, h:1080, fps:30, sheet:null, meta_ok:true}
-          : {frames:1, tokens:null, w:1024, h:1024, fps:null, sheet:null, meta_ok:true};
-      const ref = it.asset_id || it.name;
-      return {ok:true, sources: SOURCES.sources.concat([Object.assign({
-        slot:null, kind:kind, ref:ref, label:it.name, item_id:id,
-        resolvable: !!it.asset_id || (it.scope==="project" && it.name==="角色1"),
-      }, meta)])};
+    // 与真后端同口径：ref= 可多个（面板把已有锚的 ref 一起带来合并元信息），
+    // 找不到的不整体报错、进 missing。
+    const qs = p.split("?")[1] || "";
+    const ids = new URLSearchParams(qs).getAll("ref").map(decodeURIComponent).filter(Boolean);
+    if (ids.length) {
+      const extra = [];
+      for (const id of ids) {
+        const it = ITEM_BY_ID[id];
+        if (!it) continue;
+        const kind = it.kind === "latent" ? "library" : it.kind;
+        const meta = it.kind === "latent"
+          ? {frames:39, tokens:9, w:1280, h:720, fps:null, sheet:"latent/head.sheet.png", meta_ok:true}
+          : it.kind === "video"
+            ? {frames:198, tokens:null, w:1920, h:1080, fps:30, sheet:null, meta_ok:true}
+            : it.kind === "audio"
+              ? {frames:null, tokens:null, w:null, h:null, fps:null, sheet:null, meta_ok:true}
+              : {frames:1, tokens:null, w:1024, h:1024, fps:null, sheet:null, meta_ok:true};
+        const ref = it.asset_id || it.name;
+        extra.push(Object.assign({
+          slot:null, kind:kind, ref:ref, label:it.name, item_id:id,
+          resolvable: !!it.asset_id || (it.scope==="project" && it.name==="角色1"),
+        }, meta));
+      }
+      return {ok:true, sources: SOURCES.sources.concat(extra),
+        missing: ids.filter(i => !ITEM_BY_ID[i])};
     }
     return SOURCES;
   }
@@ -174,6 +190,8 @@ const ds = {segments:[{seconds:6.5, anchors:[
    at:{mode:"mid", frame_idx:40}, window:39, branches:{av:"both"}, on:true},
   {id:"ax_tail", src:{kind:"prev_tail", ref:"", start_f:null, end_f:null, src_fps:null, meta_ok:true},
    at:{mode:"tail", frame_idx:0}, window:1, branches:{av:"video"}, on:true},
+  {id:"ax_aud", src:{kind:"audio", ref:"as_bgm0001", start_f:0, end_f:22, src_fps:null, meta_ok:true},
+   at:{mode:"head", frame_idx:0}, window:22, branches:{av:"audio"}, on:true},
 ]}]};
 
 function segmentFrames(sec){           // 与 h3_director.segmentFrames 同公式（就近 17k+5）

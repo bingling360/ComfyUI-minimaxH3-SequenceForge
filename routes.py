@@ -1920,6 +1920,23 @@ def add_routes(routes):
                 return None
             return {"frames": 1, "tokens": None, "w": int(w), "h": int(h),
                     "fps": None, "sheet": None, "meta_ok": True}
+        if item_kind == "audio":
+            # 音频没有帧/宽高，但有**时长**——源轨要按它画时间线（按 24fps 折算成
+            # 等效帧，与窗宽「像素帧」同一刻度；窗宽仍是唯一的取用契约）。
+            # 探测失败不报错：帧数回退 None，面板按窗宽画轨，生成不受影响。
+            dur = 0.0
+            try:
+                import av
+                with av.open(abs_path) as c:
+                    st = next((x for x in c.streams if x.type == "audio"), None)
+                    if st is not None and st.duration and st.time_base:
+                        dur = float(st.duration * st.time_base)
+            except Exception:
+                dur = 0.0
+            return {"frames": int(round(dur * 24)) if dur > 0 else None,
+                    "tokens": None, "w": None, "h": None,
+                    "fps": None, "sheet": None, "meta_ok": dur > 0,
+                    "duration": (round(dur, 2) if dur > 0 else None)}
         if item_kind == "video":
             try:
                 import av
@@ -1960,13 +1977,15 @@ def add_routes(routes):
             return "latent/" + os.path.basename(str(item.get("file") or ""))
         return str(item.get("asset_id") or "").strip() or str(item.get("name") or "").strip()
 
-    async def anchor_sources(request):
-        """源轨源清单：已完成段 + 项目 latent；给了 `ref=` 则把它对应的素材条目并进来。
+    async def _anchor_sources_impl(request):
+        """源轨源清单：已完成段 + 项目 latent；给了 `ref=`（可多个）则把对应素材条目并进来。
 
-        **不枚举素材**：图片/视频一律从素材库（web/h3_library.js 的挑选模式）选，
+        **不枚举素材**：图片/视频/音频一律从素材库（web/h3_library.js 的挑选模式）选，
         本接口只回答「你选的那个素材是多少帧 / 多大 / 多少 fps」。此前在这里扫
         ComfyUI input 目录枚举视频、从 manifest["assets"] 枚举图片，方向是错的：
         那等于另造一个素材库，与全局库/项目库两套数据必然漂移。
+        找不到的 ref 不报错（进 `missing`）：刷新合并旧锚时素材可能确已删除，
+        面板要的是「哪条失效了」，不是整个清单 404。
         """
         q = request.query
         dir_name = str(q.get("dir") or "")
@@ -2018,27 +2037,34 @@ def add_routes(routes):
                           if os.path.isfile(sheet) else None),
                 "meta_ok": info is not None,
             })
-        # ---- 面板里刚选中的那一个素材（可从全局库/项目库/成片/latent 任一处来）----
-        want_ref = str(q.get("ref") or "")
-        if want_ref:
+        # ---- 面板里（本段所有锚）已选中的素材（可从全局库/项目库/成片/latent 任一处来）----
+        # 支持**多个** ref：刷新/重开面板时前端会把存档里已有锚的 ref 一并带来合并元信息
+        # ——否则已选素材不在清单里，面板误报「源不在源清单里（旧档）」，用户被迫重选。
+        missing = []
+        # 注意：multidict 的 getall(key) **缺 key 直接抛 KeyError**（不是返回 []），
+        # 未捕获异常在 aiohttp 里就是一个空 500 —— 必须显式给默认值。
+        want_refs = [str(x) for x in q.getall("ref", []) if str(x or "").strip()] \
+            if hasattr(q, "getall") else []
+        if not want_refs:
+            want_refs = [str(q.get("ref") or "")] if str(q.get("ref") or "").strip() else []
+        for want_ref in want_refs:
             item, why = _find_lib_item(dir_name, want_ref)
             if item is None:
-                return _err(why, code="NOT_FOUND", status=404)
+                missing.append(want_ref)
+                continue
             item_kind = str(item.get("kind") or "")
-            if item_kind not in ("image", "video", "latent"):
-                return _err(f"「{item.get('name') or want_ref}」是{item_kind}素材，"
-                            "不能作锚源（锚只收图片 / 视频 / latent）",
-                            code="BAD_KIND", status=400)
+            if item_kind not in ("image", "video", "latent", "audio"):
+                missing.append(want_ref)
+                continue
             abs_p = h3lib.resolve_item_path(item, h3lib.safe_rel(dir_name))
             if not abs_p:
-                return _err(f"「{item.get('name') or want_ref}」的文件已不在原位"
-                            "（库里只剩条目）", code="NOT_FOUND", status=404)
+                missing.append(want_ref)
+                continue
             meta = _source_meta(abs_p, item_kind, root)
             if meta is None:
-                return _err(f"读不出「{item.get('name') or want_ref}」的帧数/尺寸"
-                            "（文件损坏，或缺 Pillow/av 解码依赖）",
-                            code="NO_META", status=409)
-            # 锚的源类型只有三个（library/video/image），latent 归 library
+                missing.append(want_ref)
+                continue
+            # 锚的源类型只有四个（library/video/image/audio），latent 归 library
             kind = "library" if item_kind == "latent" else item_kind
             ref = _anchor_ref_of(item)
             labels = {str(a.get("label") or "")
@@ -2056,10 +2082,29 @@ def add_routes(routes):
 
         params = man.get("params") or {}
         return web.json_response({
-            "ok": True, "sources": srcs,
+            "ok": True, "sources": srcs, "missing": missing,
             "seg_length": int(params.get("length") or 0),
             "parse": man.get("parse") or {},
         })
+
+    async def anchor_sources(request):
+        """anchor_sources 的异常兜底外壳。
+
+        未捕获异常在 aiohttp 里只回一个空 500，前端只能显示「HTTP 500 · path」，
+        用户既不知道原因、也没法自己处理（这是 2026-09-17 用户实际撞到的界面）。
+        这里统一转成**带原因的** JSON：面板能显示「读取源清单失败：XXXError: …」，
+        服务端控制台同时留全栈。
+        """
+        try:
+            return await _anchor_sources_impl(request)
+        except Exception as e:
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
+            return _err(f"读取源清单失败：{type(e).__name__}: {e}"
+                        f"（项目 {request.query.get('dir') or '?'}）",
+                        code="ANCHOR_SOURCES_FAILED", status=500)
 
     def _sheet_rel_ok(rel):
         """只认 latent/<名>.sheet.png（防穿越）。"""

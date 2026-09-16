@@ -225,3 +225,20 @@ def test_anchor_panel_owns_its_own_rendering():
     n = code.count("(refresh || (() => {}))()")
     assert n == 1, f"面板又有多余的宿主全量重刷调用（{n} 处，应只有 1 处兜底）"
     assert "ctx.__rebuildCard" in code, "本地重建能力未挂到 ctx，commit 无法自行刷新"
+
+# ---- 渲染所有权：面板必须自己刷新自己 ----
+
+def test_anchor_panel_owns_its_own_rendering():
+    """本地改动只许走本地重建，**不许**触发宿主全量重刷。
+
+    2026-09-16 症状：点「新增锚定」后轨道不出现，要退出导演台再进才有。
+    根因：commit() 每次都调宿主的 refresh()，而它**全量重刷导演台**，把本面板刚
+    渲染的 DOM 连同正在进行的异步填充一起推倒——异步结果落在已丢弃的节点上。
+    rebuildCard() 本地重建逻辑本来就是对的，只是没被用在这条路径上。
+
+    现在只保留 1 处宿主 refresh 调用：rebuildCard 找不到卡片时的兜底。
+    """
+    code = _js_code(_src("web/h3d_anchor.js"))
+    n = code.count("(refresh || (() => {}))()")
+    assert n == 1, f"面板又有多余的宿主全量重刷调用（{n} 处，应只有 1 处兜底）"
+    assert "ctx.__rebuildCard" in code, "本地重建能力未挂到 ctx，commit 无法自行刷新"

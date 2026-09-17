@@ -205,6 +205,21 @@ def _unique_label(base, taken, cap=24):
     return (f"{stem}{int(_t.time() % 100000)}")[:cap]
 
 
+def _alias_of(*cands) -> str:
+    """别名归一（规则唯一在 asset_store.alias_of —— 去扩展名 / 空白标点压成 `_` / 截 24）。
+
+    别名一律来自文件名，而文件名里的扩展名、空格、括号都进不了 `@别名` 语法
+    （后端 `_REF_AT` 在空白处断句），所以**落库那一刻**就得归一。
+    函数内延迟导入：本模块会被按顶层模块加载（见 tests/test_asset_store_p0.py 的
+    `_load_top`，它只替换 `from . import checkpoint` 那一行）。
+    """
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    return asset_store.alias_of(*cands)
+
+
 def _unique_filename(directory, want, sep="_"):
     """directory 里找一个不冲突文件名（同名加 _2），**保证能停**。"""
     d, w = str(directory or ""), str(want or "")
@@ -873,7 +888,7 @@ def move_media(name, src_file, dest_lib, save_name=None, base_revision=None,
     _rewrite_media_refs(manifest, os.path.basename(src_hit), dest_rel)
     _rewrite_media_refs(manifest, src_rel, dest_rel)
     if register_asset and dest_lib == "assets":
-        lbl = str(label or "").strip()[:24] or os.path.splitext(cand)[0][:24]
+        lbl = _alias_of(label, os.path.splitext(cand)[0])
         kk = str(kind or "video").strip()
         if kk not in ("image", "video", "audio"):
             kk = "video"
@@ -1035,7 +1050,7 @@ def import_asset(name, src_file, label="", kind="image", roles=None, base_revisi
     dest_rel = f"assets/{cand}"
     taken = {a["label"] for a in (manifest.get("assets") or [])
              if isinstance(a, dict) and a.get("label")}
-    lbl = str(label or "").strip()[:24] or os.path.splitext(cand)[0][:24]
+    lbl = _alias_of(label, os.path.splitext(cand)[0])
     lbl = _unique_label(lbl, taken)
     ent = {"label": lbl, "kind": kk, "file": dest_rel}
     if isinstance(roles, list):

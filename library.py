@@ -78,6 +78,19 @@ def safe_rel(rel) -> str:
 ASSET_LABEL_MAX = 24
 
 
+def _alias_of(*cands) -> str:
+    """别名归一（规则唯一在 asset_store.alias_of —— 去扩展名 / 空白标点压成 `_` / 截 24）。
+
+    本模块可能被按顶层模块加载（tests/test_library.py 就是 `import library`），
+    所以沿用本模块既有的「函数内延迟导入」惯例，不做模块级相对导入。
+    """
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    return asset_store.alias_of(*cands)
+
+
 def unique_label(base, taken, cap=ASSET_LABEL_MAX):
     """在 taken 之外找一个不冲突的标签，**保证能停**。
 
@@ -475,6 +488,33 @@ _REF_AT = re.compile(
     r"(?<![0-9A-Za-z_])@([^\s@\[\]{}<>()（）,，.。;；:：!！?？\"'`|/\\]{1,24})")
 
 
+def _find_refs(text, labels=None):
+    """提示词里引用的素材标签：`@标签` + 旧写法 `[[标签]]`。
+
+    与 nodes._find_refs **逐字同算法**的本地副本（本模块不能 import nodes —— 那个
+    要 torch），也与前端 `h3_director.refTokens` 同口径：**池标签优先最长前缀匹配**。
+    `@引用` 没有天然终止符，`@图片让这张图动起来` 不打空格时纯正则会把「让」吃进
+    标签（正好顶 24 字上限）→ 反查"素材被哪几段引用"时会静默漏。
+    """
+    s = str(text or "")
+    out = [m.group(1) for m in _REF_BRACKET.finditer(s)]
+    labs = sorted({str(l) for l in (labels or ()) if l}, key=len, reverse=True)
+    i = 0
+    while i < len(s):
+        m = _REF_AT.match(s, i) if s[i] == "@" else None
+        if m is None:
+            i += 1
+            continue
+        hit = next((l for l in labs if s.startswith(l, i + 1)), None)
+        if hit is not None:              # 池内最长优先：标签到哪儿为止由池说了算
+            out.append(hit)
+            i += len(hit) + 1
+        else:
+            out.append(m.group(1))
+            i = m.end()
+    return out
+
+
 def compute_refs(manifest, items) -> dict:
     """按项目 manifest 算每个素材被哪几段引用 -> {标识: [段号]}。
 
@@ -536,7 +576,9 @@ def compute_refs(manifest, items) -> dict:
         if ts:
             touch(ts, i + 1)
         txt = str(prompts[i] if i < len(prompts) else "")
-        for lbl in (_REF_BRACKET.findall(txt) + _REF_AT.findall(txt)):
+        # 传池（alias_to_item 的键 = 显示名 + asset_id）：标签边界按池内最长匹配定，
+        # 否则 `@图片让这张图动起来` 会抽出「…让」这种带尾巴的假标签，反查静默漏。
+        for lbl in _find_refs(txt, alias_to_item):
             touch(lbl, i + 1)
 
     for e in items:
@@ -946,8 +988,7 @@ def mirror_to_project(project, item, label=None) -> dict:
     rel = f"assets/{cand}"
     assets = [dict(a) if isinstance(a, dict) else a for a in (manifest.get("assets") or [])]
     taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
-    lbl = (str(label or item.get("name") or os.path.splitext(cand)[0])).strip()[:24]
-    lbl = lbl or os.path.splitext(cand)[0][:24]
+    lbl = _alias_of(label, item.get("name"), os.path.splitext(cand)[0])
     lbl = unique_label(lbl, taken)
     assets.append({"label": lbl, "kind": kind, "file": rel})
     out = _pj.save_assets(name, assets, None)
@@ -987,7 +1028,7 @@ def store_to_project(project, src_abs, name=None, kind="image", label=None) -> d
     rel = f"assets/{cand}"
     assets = [dict(a) if isinstance(a, dict) else a for a in (manifest.get("assets") or [])]
     taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
-    lbl = (str(label or "").strip() or os.path.splitext(cand)[0])[:24] or "素材"
+    lbl = _alias_of(label, os.path.splitext(cand)[0])
     lbl = unique_label(lbl, taken)
     assets.append({"label": lbl, "kind": kk, "file": rel})
     out = _pj.save_assets(proj, assets, None)

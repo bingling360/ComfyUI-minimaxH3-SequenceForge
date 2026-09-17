@@ -748,6 +748,7 @@
     const v = await askText({
       title: `重命名「${it.name}」`,
       hint: "这个名字就是提示词里 @别名 用的名字（<=24 字）。\n"
+        + "空格与标点会自动换成下划线（后端 @引用 按空白断句，留着会引用不到）。\n"
         + "改名后段落里已勾选的引用会跟着换成新名字。",
       value: it.name,
       maxLength: 24,
@@ -756,12 +757,16 @@
     });
     if (v === null) return;
     const name = String(v).trim();
-    if (!name || name === it.name) return;
+    if (!name) return;
     const A = api();
     const r = await A.libAlias(S.dir, it.id, name);
     if (!r.body?.ok) { fail(A.errText(r, "重命名失败")); return; }
-    it.name = name;
-    after(`已重命名为「${name}」：提示词里写 @${name} 即可引用`);
+    /* 以后端归一后的名字为准（用户输入的原文可能带空格/扩展名）；它才是
+     * `@引用` 真正要写的那个串。 */
+    const fixed = String(r.body.alias || "").trim() || name;
+    it.name = fixed;
+    after(fixed === name ? `已重命名为「${fixed}」：提示词里写 @${fixed} 即可引用`
+      : `已重命名为「${fixed}」（原名里的空格/标点已按 @引用 规则改写）：提示词里写 @${fixed} 即可引用`);
     fetchPage(false);
   }
 
@@ -1004,10 +1009,11 @@
             const H3Assets = window.H3Assets;
             if (!H3Assets?.uploadDirect) throw new Error("上传接口不可用");
             const kind = H3Assets.guessKind(f);
-            const alias = f.name.replace(/\.[^.]+$/, "").slice(0, 24);
+            /* 别名不在这里拼：`@别名` 的规范化规则只有一份（后端 asset_store.clean_alias），
+             * 前端再拼一份必然漂移 —— 旧代码只去扩展名、把空格与括号留在了别名里。 */
             const opt = onlyGlobal
-              ? { kind, alias, dest: "global" }
-              : { kind, alias, dest, link_dir: S.dir, mirror: "1" };
+              ? { kind, dest: "global" }
+              : { kind, dest, link_dir: S.dir, mirror: "1" };
             const res = await H3Assets.uploadDirect(f, opt);
             if (!res?.ok) throw new Error("上传返回异常");
             if (res.store_error) fail(`${f.name}：${res.store_error}`);

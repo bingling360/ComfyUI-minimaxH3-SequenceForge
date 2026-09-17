@@ -21,6 +21,7 @@
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -30,6 +31,14 @@ KINDS = ("image", "video", "audio")
 KIND_CN = {"image": "图片", "video": "视频", "audio": "音频"}
 REF_CAPS = {"image": 9, "video": 3, "audio": 3}
 ALIAS_MAX = 24
+# 别名里一律不允许的字符（空白与标点）：`@别名` 的解析按它们断句，留着就是死引用。
+_ALIAS_BAD = re.compile(r"[^\w\-]+")
+# 只剥这些真媒体扩展名；`v1.0` / `2.5` 之类不在名单里的尾巴保持原样（再被 `_ALIAS_BAD` 压成 `_`）。
+_MEDIA_EXT = (
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "avif",
+    "mp4", "mov", "webm", "mkv", "avi", "wmv", "flv", "m4v",
+    "wav", "mp3", "ogg", "flac", "m4a", "aac", "opus",
+)
 _TOKEN_FMT = {"image": "<Picture {}>", "video": "<Video {}>", "audio": "<Audio {}>"}
 
 
@@ -47,7 +56,36 @@ def normalize_kind(kind) -> str:
 
 
 def clean_alias(alias) -> str:
-    return str(alias or "").strip()[:ALIAS_MAX]
+    """别名归一：**唯一权威**（前后端同一规则，前端 web/h3_director.js::cleanLabel）。
+
+    别名是 `@别名` 引用语法的载体，而引用解析按空白/标点断句（后端 `_REF_AT`
+    在空格处就停、连 `.` `()` 都不认）。所以别名里不能有空白、括号、点号、
+    逗号等任何标点 —— 否则"提示词里看着有引用，编译时说找不到标签"。
+
+    规则：取文件名 -> 剥媒体扩展名（白名单，`v1.0` 这类不动扩展名语义） ->
+    非法字符压成 `_` -> 折叠连续 `_-` -> 截 ALIAS_MAX。保留中英文数字、下划线、
+    连字符、汉字与假名（`\\w` 的 unicode 语义）。
+    """
+    s = str(alias or "").strip().replace("\\", "/").split("/")[-1]
+    stem, ext = os.path.splitext(s)
+    if ext.lstrip(".").lower() in _MEDIA_EXT:
+        s = stem
+    s = _ALIAS_BAD.sub("_", s)
+    s = re.sub(r"[_\-]{2,}", "_", s).strip("_-")
+    return s[:ALIAS_MAX].strip("_-")
+
+
+def alias_of(*cands) -> str:
+    """用候选串（用户给的 label / 库内显示名 / 文件名 stem）挑一个别名并归一。
+
+    别名一律来自文件名，而文件名里的扩展名、空格、括号都进不了 `@别名` 语法
+    （见 clean_alias），所以**落库那一刻**就得归一，而不是留给显示层去圆。
+    """
+    for c in cands:
+        a = clean_alias(c)
+        if a:
+            return a
+    return "素材"
 
 
 def asset_id_for_content(sha_hex: str) -> str:

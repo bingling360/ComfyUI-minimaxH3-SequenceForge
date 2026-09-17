@@ -340,10 +340,25 @@ function matchCanvasCombo(w, h) {
 
 /* ---------- 素材标签工具 ---------- */
 
+/* 别名归一（前端侧）。**权威规则在后端 asset_store.clean_alias，两边必须同规则**：
+ * 后端 `nodes._REF_AT` 在空白处就断句、连 `.` `()` 都不认，而别名一律来自文件名
+ * （空格/括号是常态）—— 别名里留着这些字符，就是"提示词里看着有引用、编译时说
+ * 找不到标签"。前端 `refTokens` 靠池内最长匹配能穿过去，所以问题只在后端暴露，
+ * 更容易被当成偶发。
+ *
+ * 规则：剥媒体扩展名（白名单，`v1.0` 不动）→ 非法字符压成 `_` → 折叠连续 `_-`
+ * → 截 24（与后端 ALIAS_MAX 对齐；旧 12 会在 widget 读写循环里截断长别名，
+ * 导致服务端别名与段引用对不上）。 */
+const _ALIAS_EXT_RE = /\.(png|jpg|jpeg|gif|webp|bmp|tiff|tif|heic|avif|mp4|mov|webm|mkv|avi|wmv|flv|m4v|wav|mp3|ogg|flac|m4a|aac|opus)$/i;
 function cleanLabel(text) {
-    /* P3 修正：上限与后端 _ASSET_LABEL_MAX=24 对齐（旧 12 会在 widget 读写循环里
-     * 截断长别名，导致服务端链接别名与段引用对不上） */
-    return String(text ?? "").trim().replace(/[[\]]/g, "").slice(0, 24);
+    const base = String(text ?? "").trim().replace(/\\/g, "/").split("/").pop() || "";
+    const stem = base.replace(_ALIAS_EXT_RE, "");
+    return (stem || base)
+        .replace(/[^\p{L}\p{N}_-]+/gu, "_")
+        .replace(/[_-]{2,}/g, "_")
+        .replace(/^[_-]+|[_-]+$/g, "")
+        .slice(0, 24)
+        .replace(/[_-]+$/, "");
 }
 
 /** 纯展示用：把标签里夹带的「(.png|.jpg|.mp4|.wav|.webp…)」格式后缀去掉。

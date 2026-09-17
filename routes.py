@@ -1384,10 +1384,17 @@ def add_routes(routes):
             data = await request.json()
         except Exception:
             return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import asset_store
+        except ImportError:
+            import asset_store
         dir_name = str(data.get("dir") or "")
-        alias = str(data.get("alias") or "").strip()[:24]
+        # 别名 = `@别名` 引用语法的载体，唯一权威规则在 asset_store.clean_alias
+        # （去扩展名 / 空白与标点压成 `_` / 截 24）——这里不再各写一份截断。
+        alias = asset_store.clean_alias(data.get("alias"))
         if not alias:
-            return _err("别名不能为空", code="BAD_ARGS", status=400)
+            return _err("别名不能为空（只有空格或标点？改成中英文、数字或下划线）",
+                        code="BAD_ARGS", status=400)
         it = _find_item(dir_name, str(data.get("id") or ""))
         if it is None:
             return _err("素材不存在", code="NOT_FOUND", status=404)
@@ -1463,10 +1470,6 @@ def add_routes(routes):
             root = h3lib._library_root()
             if not root:
                 return _err("全局库不可用", code="NO_LIBRARY", status=400)
-            try:
-                from . import asset_store
-            except ImportError:
-                import asset_store
             lib = asset_store.load_library(root)
             hit = False
             for a in lib.get("assets") or []:

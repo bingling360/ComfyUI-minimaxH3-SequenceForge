@@ -64,6 +64,13 @@
 | D8 | 目标尺寸 / 百万像素模式（上游 `3d.py:455-578`） | 面板直接给像素尺寸更符合视频工作流；本地沿用「latent 偶数 = 像素 32 对齐」口径 |
 | D9 | `force_unload` / `soft_empty_cache` / rocm 检测 / `safe_open` 零拷贝（上游 `3d.py:108-129`、L356-372、L599-608），阶段 6 并入 | 与上游的口径差：我们的 `force_unload` 是缓存逐出 + `soft_empty_cache`（上游只 `to('cpu')` 留缓存）——多段链后段更易 OOM 的主因是 CPU 侧权重副本，逐出才真释放；rocm 仍映射 cuda 设备对象，本地无法验证，代码注明 |
 | D10 | 3D 装权从 `strict=True` 放宽为 `strict=False` + attn 白名单 | 与 2D 同口径（attn 推理强制关闭会缺键）；非 attn 缺键仍报错 |
+| D11 | **补回上游的「前向不建图」设置**（2026-09-17）。上游 `3d.py:440` 是 `model.to(device).eval().requires_grad_(False)`，`3d.py:584` 用 `with torch.inference_mode():` 包住归一化→前向→反归一化；本地移植时**两处都丢了**（D1–D10 台账此前漏记这条）。现已补回：`upscale_net.py` 加载时加 `.requires_grad_(False)`；`upscale.py` 的 `upscale_video` 用 `torch.no_grad()` 包住整段 | **这不是刻意差异，是移植遗漏。** 后果：每次放大前向都建 autograd 图并保存全部中间激活，而该图会被扣押到「精化采样结束」才释放（`up_v` 经 `latent["samples"]` 交给采样器，直到 `del cond, latent` 才回收），与 UNET + 精化激活正面相撞。**本地刻意与上游不同的点**：用 `no_grad` 而非 `inference_mode`——后者产生 inference tensor，出了块再做原地操作会报 `Inplace update to inference tensor outside InferenceMode`，而 `up_v` 要交给采样器，风险不可控；`no_grad` 同样阻止建图且无此限制 |
+
+> **D11 的教训（同步上游时别只看 §4 台账）**：台账是人工维护的，会漏。`inference_mode` /
+> `requires_grad_(False)` 这种"只影响记账、不影响输出数值"的设置最容易被漏记——因为它们
+> 不影响成片观感，跑起来"看着正常"。**每次同步上游时，除了比对台账，还要 diff 上游的
+> `load_model` 与 `forward` 全文**，特别留意 `no_grad` / `inference_mode` / `requires_grad_` /
+> `.eval()` / `.detach()` 这类"不改变数值只改变内存行为"的调用。
 
 ## 5. 同步 SOP
 

@@ -1240,7 +1240,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 一采 UNET + net + 高清 latent 同时驻留 = 全链峰值）。
             # 二采通道（upscale.render_latent）发现它在 CPU 会自行腾挪并搬回 GPU，
             # 首段因此与后续段走同一条路径——否则首段是全链唯一不腾挪的一段。
-            # 代价：每段一次 net 回搬（约 200-300MB，PCIe 毫秒级），后续段本来就有。
+            # 代价：每段一次 net 回搬（实测权重 345,280,216 参数 / 全 F16 / **659MB**
+            # = 6GB 卡的 11%；旧注释写"约 200-300MB"已过时，别照那个数估），
+            # PCIe 毫秒级，后续段本来就有。
             if up_net is not None:
                 up_net.cpu()
 
@@ -2393,9 +2395,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                  "（精化步数/σ不影响峰值显存）"
                                  "（本段会自动补渲染，基础链不重做）" if oom else ""))
                 # 释放二采残留（放大 latent / 解码帧 / 推理缓存）给后续基础采样腾空间；
-                # 放大网络可能已在 CPU（render_latent 内 net.cpu()），下段二采自愈装回 GPU
+                # 放大网络可能已在 CPU（render_latent 内 net.cpu()），下段二采自愈装回 GPU。
+                # 注意 soft_empty_cache() 只归还缓存块、**不卸载权重**：A≠B 时精化用的
+                # B 会滞留在场，紧接着下段一采要载 A → 两个 UNET 同时在册（ComfyUI
+                # load_models_gpu 会兜底，不会出错，但多一次换页 + 显存碎片）。
+                # 故 A≠B 时补一次 unload_all_models()；A==B 时 B 就是 A，滞留正是想要的，
+                # 卸了反而白付一次回载。顺序同其它腾挪点：unload → gc → empty_cache。
                 try:
                     import comfy.model_management
+                    if _up_swap:
+                        comfy.model_management.unload_all_models()
                     comfy.model_management.soft_empty_cache()
                     gc.collect()
                     torch.cuda.empty_cache()

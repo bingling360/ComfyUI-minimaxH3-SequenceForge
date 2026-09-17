@@ -868,10 +868,28 @@ def _diff_model(model):
     return model
 
 
-def _vram_gb():
-    """当前空闲显存（GB，comfy 语义；失败回退 torch，再失败返回 0）。"""
+def _vram_gb(unet_model=None):
+    """当前空闲显存（GB；失败回退 torch，再失败返回 0）。
+
+    口径（关键）：DynamicVRAM（comfy-aimdo）默认启用时，`mm.get_free_memory()`
+    = `mem_free_cuda + mem_free_torch`，**不含** aimdo 可换出的权重页——该机制故意
+    把显存当权重缓存填满，于是这个值严重低估「真实可动用显存」（常趋近 0）。
+    `ModelPatcher.get_free_memory(device)`（model_patcher.py:417，基类上）在其上
+    加了 `comfy_aimdo.model_vbar.vbars_analyze()`，才是官方自己解码路径用的口径
+    （对照 `comfy/sd.py:1242`）。
+
+    给了 `unet_model`（ModelPatcher）且它带 `get_free_memory` 时优先走该口径；
+    拿不到就退回 `mm.get_free_memory()`（非 DynamicVRAM 环境两者等价）。
+    """
     try:
         import comfy.model_management as mm
+        if unet_model is not None:
+            fn = getattr(unet_model, "get_free_memory", None)
+            if callable(fn):
+                try:
+                    return fn(mm.get_torch_device()) / (1024 ** 3)
+                except Exception:
+                    pass
         return mm.get_free_memory() / (1024 ** 3)
     except Exception:
         try:
@@ -1063,13 +1081,20 @@ _SAFE_MARGIN_GB = 1.0      # 显存账目安全余量（避免贴着上沿静默
 def _dynamic_vram_active():
     """comfy-aimdo DynamicVRAM 是否在管权重。该机制把显存当权重缓存故意填满、
     按需换页（空闲显存小是常态而非异常），权重占用是弹性的——显存账目对它
-    只作参考不作硬约束。"""
+    只作参考不作硬约束。
+
+    读**真开关** `comfy.memory_management.aimdo_enabled`（`main.py:301` 在
+    aimdo 可用时置 True）。
+
+    历史坑（别改回去）：旧实现查 `"aimdo" in sys.modules` / `find_spec("aimdo")`。
+    那来自首次提交 `6eee9d3`，写的时候 aimdo 还不是默认启用，探测合理；但
+    `comfy/model_management.py` 顶层就 `import comfy_aimdo.*`，而 render_latent
+    必然 import 它 → 探测信号与真实开关彻底脱钩，**恒为 True**，预检的硬停
+    分支因此永久失效。探测"包装是否装了"≠"开关是否开着"。
+    """
     try:
-        import sys
-        if any("aimdo" in k for k in sys.modules):
-            return True
-        import importlib.util
-        return importlib.util.find_spec("aimdo") is not None
+        import comfy.memory_management as cmm
+        return bool(getattr(cmm, "aimdo_enabled", False))
     except Exception:
         return False
 
@@ -1168,7 +1193,9 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     # 全卸、只回载 UNET——可用 = 当前空闲 + 其他模型权重（确定性腾挪）。
     # DynamicVRAM 下权重本身可按需换页（弹性），账面紧张只 ⚠ 不硬停，
     # 真 OOM 由运行时降级链（自动卸载重试/LOW_VRAM 分块）兜底。
-    free = _vram_gb()
+    # 空闲显存走 patcher 口径（含 aimdo 可换出权重）——`模型` 就是二采 UNET 的
+    # ModelPatcher，与下面 _reclaimable_gb / _unet_size_gb 同源，口径一致
+    free = _vram_gb(模型)
     reclaim = _reclaimable_gb(模型)
     free_eff = free + reclaim
     dyn = _dynamic_vram_active()
@@ -1687,7 +1714,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                            "峰值显存由画布×帧数决定——请降低放大倍率或缩短该段帧数"
                            "（精化步数/起始σ只影响耗时、不影响峰值），或增大显存。"
                            "当前精化 {2} 步 @ σ≈{3:g}{4}。本段尚未落盘二采产物。".format(
-                               cfg["scale"], _vram_gb(), ks_steps, ks_denoise,
+                               cfg["scale"], _vram_gb(模型), ks_steps, ks_denoise,
                                round_desc))
                     if report is not None:
                         report.append(msg)

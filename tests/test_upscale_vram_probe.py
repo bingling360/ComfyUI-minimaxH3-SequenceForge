@@ -1,7 +1,8 @@
-"""二采显存埋点与预检口径单测（upscale 的 _vram_probe / _vram_report / _vram_gb）。
+"""二采显存埋点与预检口径单测（upscale 的 _vram_probe / _vram_report / _vram_gb /
+_dynamic_vram_active），以及 P0-1/P0-2「前向不建图」的源码级回归守卫。
 
 背景：本机 `nvidia-smi` 不可用（NVML 错误），显存实测只能靠 torch 计数器；
-而这几个函数此前**零测试覆盖**（全仓只有 test_upscale_model_tag.py 碰 upscale，
+而这些路径此前**零测试覆盖**（全仓只有 test_upscale_model_tag.py 碰 upscale，
 且只测纯函数 model_tag）。改动前先把行为钉住。
 
 无 ComfyUI 依赖：`_vram_report` 是纯函数；`_vram_probe` / `_vram_gb` 在无 CUDA /
@@ -11,9 +12,13 @@
     python -m pytest tests/test_upscale_vram_probe.py -q
 """
 
+import contextlib
+import importlib
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 import types
 
 import pytest
@@ -79,6 +84,69 @@ def _load_upscale():
 
 
 upscale = _load_upscale()
+
+
+@contextlib.contextmanager
+def _fake_comfy(**modules):
+    """在临时目录里造一个**真实可导入**的 `comfy` 包，临时挂到 sys.path 最前。
+
+    为什么不直接往 `sys.modules` 塞 ModuleType：`import comfy.x as y` 在 CPython
+    里走 C 层导入，光有 sys.modules 条目不够——父包没有真实 `__path__` / `__spec__`
+    时仍抛 `ModuleNotFoundError`（三种造法都实测失败），必须让导入器真能按路径
+    找到文件。
+
+    `modules` 是 {子模块名: 源码}，例如
+    `_fake_comfy(model_management="def get_free_memory(): ...")` 会生成
+    `comfy/model_management.py`。
+
+    ⚠ 注意 upscale 里两个名字是**不同**的真实模块，别搞混：
+    - 空闲显存口径 → `comfy.model_management`（`_vram_gb`）
+    - DynamicVRAM 真开关 → `comfy.memory_management`（`_dynamic_vram_active`）
+
+    退出时移除 sys.path 条目、清掉本次产生的 `comfy*` 缓存并还原原有条目、
+    删临时目录——绝不污染同会话。
+    """
+    tmp = tempfile.mkdtemp(prefix="h3sf_fake_comfy_")
+    pkg = os.path.join(tmp, "comfy")
+    os.makedirs(pkg)
+    with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write("")
+    for mod_name, source in modules.items():
+        with open(os.path.join(pkg, f"{mod_name}.py"), "w", encoding="utf-8") as f:
+            f.write(source)
+    saved = {k: sys.modules[k] for k in list(sys.modules)
+             if k == "comfy" or k.startswith("comfy.")}
+    for k in saved:
+        del sys.modules[k]
+    sys.path.insert(0, tmp)
+    try:
+        yield {n: importlib.import_module(f"comfy.{n}") for n in modules}
+    finally:
+        try:
+            sys.path.remove(tmp)
+        except ValueError:
+            pass
+        for k in [k for k in list(sys.modules)
+                  if k == "comfy" or k.startswith("comfy.")]:
+            del sys.modules[k]
+        sys.modules.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# 空闲显存替身：mm 口径给 2GB，用来验证「没走这条」或「回退到这条」
+_MODEL_MM_2GB = (
+    "def get_torch_device():\n"
+    "    return 'cuda:0'\n"
+    "\n"
+    "\n"
+    "def get_free_memory(device=None):\n"
+    "    return 2.0 * (1024 ** 3)\n"
+)
+
+
+def _mm_aimdo_flag(value):
+    """生成 `comfy/memory_management.py` 源码：只放 DynamicVRAM 真开关。"""
+    return f"aimdo_enabled = {bool(value)}\n"
 
 
 # ---- _vram_report：汇总行 ----
@@ -149,6 +217,95 @@ def test_vram_gb_returns_float():
     assert v >= 0.0
 
 
+def test_vram_gb_prefers_patcher_caliber():
+    """给了 ModelPatcher 时优先用 `patcher.get_free_memory(device)` 口径。
+
+    DynamicVRAM 下 `mm.get_free_memory()` 不含 aimdo 可换出的权重页（严重低估、
+    常趋近 0），只有 patcher 口径才是「真实可动用」——官方解码路径
+    （comfy/sd.py:1242）用的就是它。这里把 mm 口径故意设成 0，用来证明没走它。
+    """
+    calls = {}
+
+    class _FakePatcher(object):
+        def get_free_memory(self, dev):
+            calls["dev"] = dev
+            return 3.5 * (1024 ** 3)
+
+    src = ("def get_torch_device():\n    return 'cuda:0'\n"
+           "\n\n"
+           "def get_free_memory(device=None):\n    return 0.0\n")
+    with _fake_comfy(model_management=src):
+        got = upscale._vram_gb(_FakePatcher())
+    assert got == pytest.approx(3.5)
+    assert calls.get("dev") == "cuda:0"
+
+
+def test_vram_gb_falls_back_when_patcher_lacks_method():
+    """patcher 没有 get_free_memory（老版本 / 非 ModelPatcher）时静默回退到 mm。"""
+    class _Bare(object):
+        pass
+
+    with _fake_comfy(model_management=_MODEL_MM_2GB):
+        got = upscale._vram_gb(_Bare())
+    assert got == pytest.approx(2.0)
+
+
+def test_vram_gb_patcher_raises_is_swallowed():
+    """patcher 口径内部抛异常时退回 mm 口径，绝不把异常抛给预检。"""
+    class _FakePatcher(object):
+        def get_free_memory(self, dev):
+            raise RuntimeError("vbar 不可用")
+
+    with _fake_comfy(model_management=_MODEL_MM_2GB):
+        got = upscale._vram_gb(_FakePatcher())
+    assert got == pytest.approx(2.0)
+
+
+def test_vram_gb_without_arg_uses_mm_caliber():
+    """不传参时保持原口径（mm.get_free_memory）——老调用点行为不变。"""
+    with _fake_comfy(model_management=_MODEL_MM_2GB):
+        got = upscale._vram_gb()
+    assert got == pytest.approx(2.0)
+
+
+# ---- P0-3：DynamicVRAM 真开关 ----
+
+def test_dynamic_vram_active_reads_real_switch():
+    """必须读 `comfy.memory_management.aimdo_enabled`（真开关），开关两边都要跟。"""
+    with _fake_comfy(memory_management=_mm_aimdo_flag(True)):
+        assert upscale._dynamic_vram_active() is True
+    with _fake_comfy(memory_management=_mm_aimdo_flag(False)):
+        assert upscale._dynamic_vram_active() is False
+
+
+def test_dynamic_vram_active_ignores_module_presence():
+    """P0-3 回归守卫：`comfy_aimdo` 出现在 sys.modules 里 **不等于** 开关开着。
+
+    旧实现查 `"aimdo" in sys.modules` / `find_spec("aimdo")`——而
+    `comfy/model_management.py` 顶层就 import comfy_aimdo，于是它恒为 True、
+    预检硬停分支永久失效。这里模拟「包已导入但开关是关的」，必须返回 False。
+    """
+    fake_aimdo = types.ModuleType("comfy_aimdo")
+    prev = sys.modules.get("comfy_aimdo")
+    sys.modules["comfy_aimdo"] = fake_aimdo
+    try:
+        with _fake_comfy(memory_management=_mm_aimdo_flag(False)):
+            assert "comfy_aimdo" in sys.modules, "前提：包在场"
+            assert upscale._dynamic_vram_active() is False, \
+                "包在场但开关关闭时必须返回 False"
+    finally:
+        if prev is None:
+            sys.modules.pop("comfy_aimdo", None)
+        else:
+            sys.modules["comfy_aimdo"] = prev
+
+
+def test_dynamic_vram_active_missing_attribute_is_false():
+    """老版本 comfy 没有该字段时保守返回 False（走非 DynamicVRAM 分支）。"""
+    with _fake_comfy(memory_management="# 模拟老版本：没有 aimdo_enabled 字段\n"):
+        assert upscale._dynamic_vram_active() is False
+
+
 # ---- P0-1 / P0-2：前向不建图的回归守卫（源码级，与 test_rework_v2 同风格） ----
 
 def _read(name):
@@ -166,10 +323,9 @@ def test_upscale_video_forward_is_wrapped_in_no_grad():
     src = _read("upscale.py")
     body = src.split("def upscale_video(", 1)[1].split("\ndef ", 1)[0]
     assert "with torch.no_grad():" in body, "放大前向必须包 no_grad"
-    # 反归一化也必须在块内，否则 y 又被挂回计算图
-    assert "return y.to(torch.float32) * std32 + mean32" in body
     assert body.index("with torch.no_grad():") < body.index(
-        "return y.to(torch.float32) * std32 + mean32")
+        "return y.to(torch.float32) * std32 + mean32"), \
+        "反归一化也必须在 no_grad 块内，否则 y 又被挂回计算图"
 
 
 def test_upscale_video_uses_no_grad_not_inference_mode():
@@ -177,7 +333,8 @@ def test_upscale_video_uses_no_grad_not_inference_mode():
     原地操作会报错，而 up_v 要交给采样器（风险不可控）。"""
     src = _read("upscale.py")
     body = src.split("def upscale_video(", 1)[1].split("\ndef ", 1)[0]
-    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
+    code = "\n".join(ln for ln in body.splitlines()
+                     if not ln.strip().startswith("#"))
     assert "inference_mode" not in code, "不要用 inference_mode（注释除外）"
 
 

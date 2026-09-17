@@ -871,6 +871,49 @@ def _vram_gb():
             return 0.0
 
 
+def _vram_probe():
+    """显存探针快照 `(当前分配 GB, 峰值分配 GB)`；无 CUDA / 异常 -> `(None, None)`。
+
+    本机 `nvidia-smi` 不可用（`Failed to initialize NVML`），显存实测只能靠
+    torch 计数器——这是阶段 0 埋点的唯一数据源。
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None, None
+        return (torch.cuda.memory_allocated() / (1024 ** 3),
+                torch.cuda.max_memory_allocated() / (1024 ** 3))
+    except Exception:
+        return None, None
+
+
+def _vram_probe_reset():
+    """重置 CUDA 峰值统计（埋点用；无 CUDA / 异常静默跳过）。"""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _vram_report(seg_no, v):
+    """显存峰值埋点汇总行（阶段 0 诊断；无数据返回 ""，调用方据此跳过打印）。
+
+    「放大前 / 卸载后」报**当时占用**（看腾挪是否真回收），其余报**该阶段峰值**。
+    """
+    if not v or v.get("up") is None:
+        return ""
+
+    def _f(key, which="peak"):
+        t = v.get(key)
+        return "n/a" if t is None or t[1 if which == "peak" else 0] is None \
+            else f"{t[1 if which == 'peak' else 0]:.2f}"
+
+    return (f"[H3二采] 段{seg_no} 显存峰值：放大前{_f('base', 'alloc')}GB · "
+            f"放大后{_f('up')}GB · cond后{_f('cond')}GB · "
+            f"卸载后{_f('unload', 'alloc')}GB · 精化后{_f('refine')}GB · "
+            f"解码后{_f('decode')}GB")
+
+
 _UNET_SIZE_CACHE = {}
 
 
@@ -1322,6 +1365,14 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         if _timing is not None:
             _timing[key] = _timing.get(key, 0.0) + (time.perf_counter() - t0)
 
+    def _vmark(key):
+        # 显存埋点（阶段 0 诊断）：记录 (当时占用, 阶段峰值) 后重置峰值统计；
+        # _vram=None 时零开销，不影响生产路径
+        if _vram is None:
+            return
+        _vram[key] = _vram_probe()
+        _vram_probe_reset()
+
     if net is not None:
         dev = next(net.parameters()).device
         if dev.type == 'cpu':
@@ -1383,6 +1434,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）；
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
+    _vram_probe_reset()
+    _vmark("base")          # 埋点①放大前
     _t = time.perf_counter()
     up_v = upscale_video(video_t, net, eff_scale, cfg["arch"],
                          hw=(h2, w2), chunk=cfg.get("chunk", True))
@@ -1392,6 +1445,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     mix = float(cfg.get("mix") or 0.0)
     up_v_base = up_v.detach().to("cpu", torch.float32) if mix > 0.0 else None
     _tmark("up", _t)
+    _vmark("up")            # 埋点②放大后（autograd 建图带来的额外激活在此可见）
     _up_done = "神经放大完成" if net is not None else "跳过神经放大（纯精化，原分辨率）"
     print(f"[H3二采] 段{seg_no}：{_up_done} → 高清条件构建"
           "（挂了参考素材时需按高清画幅重编码，分钟级属正常，此间 GPU 应有占用）…",
@@ -1727,6 +1781,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         restore_rows()
         restore_video_rows()
     _tmark("refine", _t)
+    _vmark("refine")        # 埋点⑤精化重采样后（与放大后对比即可量化 autograd 图的影响）
     print(f"[H3二采] 段{seg_no}：精化重采样完成（{(_timing or {}).get('refine', 0.0):.0f}s）"
           "→ 高清解码…", flush=True)
     del cond, latent
@@ -1785,12 +1840,16 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
         print(f"[H3二采] 段{g + 1}：开始渲染（{upscale_net.kind_of(net)} → {_tw}×{_th} 像素，"
               f"放大网络 @ {_ndev}{_heal_note}）", flush=True)
     _timing = {}
+    _vram = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
-        采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1)
-    # 解码高清 latent -> 高清帧（官方 VAE.decode 自带 OOM→tiled 降级，无需干预）
+        采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1, _vram=_vram)
+    # 解码高清 latent -> 高清帧。注意：H3 视频 VAE 声明 handles_tiling=True
+    # （comfy/sd.py:1020），**它本来就内部分块解码**（256px 空间 tile + 17 帧时序块），
+    # 不存在「OOM 才降级到 tiled」这个动作——这里无需也不该做显存干预。
+    _vram_probe_reset()
     _t = time.perf_counter()
     frames = video_vae.decode(up_v)
     del up_v
@@ -1799,6 +1858,11 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
         frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
     frames = frames[skip_f:skip_f + vis_len]
     _timing["decode"] = time.perf_counter() - _t
+    _vram["decode"] = _vram_probe()
+    _vram_probe_reset()
+    _vram_line = _vram_report(g + 1, _vram)
+    if _vram_line:
+        print(_vram_line, flush=True)
     # 像素域锐化（抗糊 N4）：解码后、编码前——连 VAE 解码的软化一起补偿；
     # CPU 分块零显存，amount=0 原对象直通
     _t = time.perf_counter()

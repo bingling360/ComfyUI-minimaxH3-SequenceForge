@@ -2380,7 +2380,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     首帧图片 if (kind == "prompt" and idx == 0 and seg_first_on[0]) else None,
                     guide_kf, tail_kf, head_kf, cur_seed,
                     skip_f, vis_len,
-                    wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag)
+                    wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag,
+                    _up_swap=_up_swap)
                 return True, False
             except upscale.UpscaleAbortError:
                 raise   # 预检/二采显存致命：报告已 append，终止整链，不降级

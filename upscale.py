@@ -1832,12 +1832,18 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    seg_prompts, seg_label_orders, pool_tensors, refs,
                    first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
                    skip_f, vis_len,
-                   wav, sample_rate, bh, report, 采样器, 调度器, model_tag=None):
+                   wav, sample_rate, bh, report, 采样器, 调度器, model_tag=None,
+                   _up_swap=False):
     """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪）。
 
     model_tag：二采模型结构签名（model_tag()），仅用于报告标注与写进
     manifest.upscale.segs[g].model 留痕——不进 params_hash，换模型不会
     触发既有高清分段重做（要重做请设「重跑起始段」）。
+
+    _up_swap：本次二采用的 `模型` 是否与一采模型是**两份不同权重**
+    （`upscale.models_distinct` 判定，nodes.py 传入）。为真时解码前会先卸掉
+    精化 UNET（P1-2）：那时它反正要被换出去给下段一采让位，卸载是零额外代价；
+    A==B 时会多一次回载，所以不卸。
 
     主循环逐段调用（采样定稿/回放载入之后、基础段落盘之前）：分段视频与
     缩略图沿用基础段同名（单份产物——seg_NNN.mp4 即高清结果），另存尾帧锚
@@ -1883,6 +1889,25 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
         采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1, _vram=_vram)
+    # P1-2：解码前卸掉精化 UNET（仅在 A≠B 时——见 _up_swap 说明）。
+    # 为什么值得做（三条都可核实）：
+    #   ① 官方 decode 会先 load_models_gpu([vae_patcher], memory_required=…)，
+    #      UNET 驻留时这一步要腾挪/换页（comfy/sd.py:1241）；
+    #   ② batch_number = get_free_memory / memory_used（sd.py:1242）——可用小则退化；
+    #   ③ 0.36 新增的 tile 批次优化（vae.py:590）也用同一个低估口径，可用小则
+    #      batch 恒为 1，「每批多块 tile 提速 ~7%」拿不到。
+    # 注意 H3 视频 VAE 声明 handles_tiling=True，本来就内部分块解码，
+    # 所以收益是「解码更快」，不是「避免降级到 tiled」。
+    # 用 unload_model_and_clones 而非 unload_all_models：前者按 clone_base_uuid
+    # 只卸同源模型，解码要用的 VAE 会保留（不用立刻重载）。
+    # 顺序同项目其它腾挪点：unload → gc → empty_cache（反序收不回）。
+    if _up_swap:
+        try:
+            comfy.model_management.unload_model_and_clones(模型)
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
     # 解码高清 latent -> 高清帧。注意：H3 视频 VAE 声明 handles_tiling=True
     # （comfy/sd.py:1020），**它本来就内部分块解码**（256px 空间 tile + 17 帧时序块），
     # 不存在「OOM 才降级到 tiled」这个动作——这里无需也不该做显存干预。

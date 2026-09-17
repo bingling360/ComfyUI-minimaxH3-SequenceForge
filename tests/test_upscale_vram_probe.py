@@ -343,3 +343,36 @@ def test_upscale_net_load_sets_requires_grad_false():
     src = _read("upscale_net.py")
     assert ".eval().requires_grad_(False)" in src, \
         "放大网络权重必须关梯度（否则前向必建图）"
+
+
+# ---- P1-2：解码前卸 UNET（仅 A≠B） ----
+
+def test_render_segment_signature_accepts_up_swap():
+    """render_segment 必须有 _up_swap 开关，且默认 False（保持旧行为可回滚）。"""
+    src = _read("upscale.py")
+    sig = src.split("def render_segment(", 1)[1].split("):", 1)[0]
+    assert "_up_swap=False" in sig
+
+
+def test_render_segment_unloads_unet_before_decode():
+    """P1-2：卸载必须发生在 decode 之前，受 _up_swap 保护，且用精准卸载。
+
+    用 unload_model_and_clones 而非 unload_all_models：前者按 clone_base_uuid
+    只卸同源模型，解码要用的 VAE 会保留（不用立刻重载）。
+    """
+    src = _read("upscale.py")
+    body = src.split("def render_segment(", 1)[1]
+    i_unload = body.index("unload_model_and_clones(模型)")
+    i_decode = body.index("video_vae.decode(up_v)")
+    assert i_unload < i_decode, "卸载必须在解码之前"
+    assert "if _up_swap:" in body[:i_unload], "必须受 _up_swap 条件保护"
+    seg = body[i_unload:i_decode]
+    assert seg.index("gc.collect()") < seg.index("torch.cuda.empty_cache()"), \
+        "顺序必须是 unload → gc → empty_cache（反序收不回）"
+
+
+def test_nodes_passes_up_swap_to_render_segment():
+    """nodes.py 主循环必须把 _up_swap 传下去，否则开关恒为 False（等于没生效）。"""
+    src = _read("nodes.py")
+    assert "_up_swap=_up_swap)" in src, \
+        "nodes.py 必须把 _up_swap 传给 render_segment"

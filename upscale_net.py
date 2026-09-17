@@ -815,7 +815,9 @@ def load_model(name, device, precision, arch="auto"):
                 model = model.to(device)
             if cur_dtype != want_dtype:
                 model = model.to(want_dtype)
-            model = model.eval()
+            # requires_grad_(False) 一起恢复：缓存对象正常已是 False（加载时设过），
+            # 这里重设是防御——万一缓存被外部改过，前向仍不会建图
+            model = model.eval().requires_grad_(False)
         except (StopIteration, AttributeError):
             pass
         return model
@@ -877,7 +879,11 @@ def load_model(name, device, precision, arch="auto"):
         print(f"[H3二采] 放大权重多余键（可能来自合并文件）: {unexpected[:5]}…")
     dtype = {"fp32": torch.float32, "fp16": torch.float16,
              "bf16": torch.bfloat16}.get(precision, torch.float32)
-    model = model.to(device).eval()
+    # requires_grad_(False) 与上游对齐（upstream 3d.py:440
+    # `model = model.to(device).eval().requires_grad_(False)`）——本插件只做推理，
+    # 权重带梯度标记会让每次前向都建 autograd 图并扣押整套激活（见 UPSTREAM.md D11）。
+    # 注意：必须在这里、`.to(dtype)` 之前设，避免任何一次前向先于它发生。
+    model = model.to(device).eval().requires_grad_(False)
     if dtype != torch.float32:
         model = model.to(dtype)
     MODEL_CACHE[cache_key_probe] = model

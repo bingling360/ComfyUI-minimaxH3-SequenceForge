@@ -147,3 +147,42 @@ def test_vram_gb_returns_float():
     v = upscale._vram_gb()
     assert isinstance(v, float)
     assert v >= 0.0
+
+
+# ---- P0-1 / P0-2：前向不建图的回归守卫（源码级，与 test_rework_v2 同风格） ----
+
+def _read(name):
+    with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_upscale_video_forward_is_wrapped_in_no_grad():
+    """P0-1：放大前向必须包在 no_grad 里。
+
+    不包 = 每次前向都建 autograd 图、保存全部中间激活，而该图会被扣押到
+    「精化采样结束」才释放（up_v 一路交给采样器），与 UNET + 精化激活正面相撞。
+    上游 3d.py:584 本来有 inference_mode，是移植时丢的。
+    """
+    src = _read("upscale.py")
+    body = src.split("def upscale_video(", 1)[1].split("\ndef ", 1)[0]
+    assert "with torch.no_grad():" in body, "放大前向必须包 no_grad"
+    # 反归一化也必须在块内，否则 y 又被挂回计算图
+    assert "return y.to(torch.float32) * std32 + mean32" in body
+    assert body.index("with torch.no_grad():") < body.index(
+        "return y.to(torch.float32) * std32 + mean32")
+
+
+def test_upscale_video_uses_no_grad_not_inference_mode():
+    """用 no_grad 而非 inference_mode：后者产生的 inference tensor 出了块再做
+    原地操作会报错，而 up_v 要交给采样器（风险不可控）。"""
+    src = _read("upscale.py")
+    body = src.split("def upscale_video(", 1)[1].split("\ndef ", 1)[0]
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
+    assert "inference_mode" not in code, "不要用 inference_mode（注释除外）"
+
+
+def test_upscale_net_load_sets_requires_grad_false():
+    """P0-2：加载放大网络时必须 requires_grad_(False)，与上游 3d.py:440 对齐。"""
+    src = _read("upscale_net.py")
+    assert ".eval().requires_grad_(False)" in src, \
+        "放大网络权重必须关梯度（否则前向必建图）"

@@ -695,17 +695,27 @@ def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True):
     # 输入对齐网络设备：魔改 DynamicVRAM 运行时采样输出 latent 可能滞留 CPU，
     # 网络 @ cuda 时直接前向 = addmm 设备不匹配（mat1 on cpu）崩溃
     net_dev = next(net.parameters()).device
-    x = video_t.detach().to(net_dev, torch.float32)
     nd = next(net.parameters()).dtype
-    mean, std = _norm_tensors(x.device, nd)
-    xn = (x.to(nd) - mean) / std
-    if ak == "3D":
-        y = net(xn, scale=float(scale), target_size=(x.shape[2], h2, w2),
-                enable_chunking=chunk)
-    else:
-        y = net(xn, scale=float(scale), target_hw=(h2, w2))
-    mean32, std32 = _norm_tensors(x.device, torch.float32)
-    return y.to(torch.float32) * std32 + mean32
+    # ★ 必须包 no_grad（上游 3d.py:584 用 inference_mode，移植时丢了——见 UPSTREAM.md D11）。
+    # 不包 = 每次放大前向都建 autograd 图并保存全部中间激活，而该图会被扣押到
+    # 「精化采样结束」才释放（up_v 一路交给采样器、其间不 detach），与 UNET +
+    # 精化激活正面相撞。放大网络全 F16 659MB，但 512 通道 × 高清 latent 的
+    # 每 ResBlock 两张满尺寸特征图才是大头。
+    # 用 no_grad 而非 inference_mode：后者产生 "inference tensor"，出了块再做
+    # 原地操作会报 `Inplace update to inference tensor outside InferenceMode`，
+    # 而 up_v 要交给采样器，风险不可控；no_grad 同样阻止建图且无此限制。
+    with torch.no_grad():
+        x = video_t.detach().to(net_dev, torch.float32)
+        mean, std = _norm_tensors(x.device, nd)
+        xn = (x.to(nd) - mean) / std
+        if ak == "3D":
+            y = net(xn, scale=float(scale), target_size=(x.shape[2], h2, w2),
+                    enable_chunking=chunk)
+        else:
+            y = net(xn, scale=float(scale), target_hw=(h2, w2))
+        # 反归一化也在块内：否则这一步又会把 y 挂回计算图
+        mean32, std32 = _norm_tensors(x.device, torch.float32)
+        return y.to(torch.float32) * std32 + mean32
 
 
 def _norm_tensors(device, dtype):

@@ -57,7 +57,9 @@ def _load_upscale():
     pkg = types.ModuleType(pkg_name)
     pkg.__path__ = [ROOT]
     sys.modules[pkg_name] = pkg
-    for name in ("checkpoint", "grid"):
+    # perf 必须一起预载：upscale 顶层 `from . import perf`（RSS 埋点），
+    # 而 perf 零依赖可独立加载
+    for name in ("checkpoint", "grid", "perf"):
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.{name}", os.path.join(ROOT, f"{name}.py"))
         mod = importlib.util.module_from_spec(spec)
@@ -177,6 +179,28 @@ def test_vram_report_full_contains_six_stages():
     assert "卸载后0.12GB" in line
     assert "放大后2.25GB" in line
     assert "解码后5.75GB" in line
+
+
+def test_rss_report_full_contains_six_stages():
+    """RSS 行与显存行同构：六个节点齐备、两位小数、缺项 n/a。"""
+    r = {"base": 1.2, "up": 3.4, "cond": 3.6,
+         "unload": 3.6, "refine": 4.1, "decode": 4.8}
+    line = upscale._rss_report(7, r)
+    assert line.startswith("[H3二采] 段7 内存RSS：")
+    for label in ("放大前", "放大后", "cond后", "卸载后", "精化后", "解码后"):
+        assert label in line
+    assert "放大前1.20" in line and "解码后4.80" in line
+
+
+def test_rss_report_empty_returns_blank():
+    """无数据 / 未采到「放大后」时不打印（与显存行同规则：调用方据此跳过）。"""
+    assert upscale._rss_report(1, None) == ""
+    assert upscale._rss_report(1, {}) == ""
+    assert upscale._rss_report(1, {"base": 1.0}) == ""
+
+
+def test_rss_report_missing_stage_is_na():
+    assert "精化后n/a" in upscale._rss_report(1, {"up": 2.0})
 
 
 def test_vram_report_missing_stage_is_na():
@@ -376,3 +400,45 @@ def test_nodes_passes_up_swap_to_render_segment():
     src = _read("nodes.py")
     assert "_up_swap=_up_swap)" in src, \
         "nodes.py 必须把 _up_swap 传给 render_segment"
+
+
+# ---- 阶段 0：埋点容器必须真的接得上 ----
+
+def test_render_latent_accepts_vram_and_rss_containers():
+    """回归守卫：render_latent 必须有 `_vram` / `_rss` 形参。
+
+    2026-09-17 实测到的真 bug：render_segment 一直在传 `_vram=_vram`，而
+    render_latent 的签名里**漏了这两个形参** —— 每次二采都会在调用处
+    TypeError。埋点此前从没在真机跑通过，所以一直没暴露。
+    """
+    src = _read("upscale.py")
+    sig = src.split("def render_latent(", 1)[1].split("):", 1)[0]
+    assert "_vram=None" in sig, "render_latent 必须接收 _vram 容器"
+    assert "_rss=None" in sig, "render_latent 必须接收 _rss 容器"
+
+
+def test_render_segment_hands_both_containers_to_render_latent():
+    """两个容器都建了、也都得传进去（建了不传 = 埋点永远是空 dict）。"""
+    src = _read("upscale.py")
+    body = src.split("def render_segment(", 1)[1]
+    assert "_vram = {}" in body and "_rss = {}" in body
+    assert "_vram=_vram" in body and "_rss=_rss" in body
+
+
+def test_six_vram_marks_are_all_collected():
+    """六个显存埋点必须全部采到（此前只有 4/6，cond / unload 缺失）。"""
+    src = _read("upscale.py")
+    body = src.split("def render_latent(", 1)[1]
+    for key in ("base", "up", "cond", "unload", "refine"):
+        assert f'_vmark("{key}")' in body, f"缺显存埋点 {key}"
+    # decode 在 render_segment 里采（render_latent 返回后才解码）
+    assert '_vram["decode"] = _vram_probe()' in src
+
+
+def test_rss_marks_mirror_vram_marks():
+    """RSS 与显存同批采样：每个 _vmark 旁边都该有 _rmark（decode 在段级）。"""
+    src = _read("upscale.py")
+    body = src.split("def render_latent(", 1)[1]
+    for key in ("base", "up", "cond", "unload", "refine"):
+        assert f'_rmark("{key}")' in body, f"缺 RSS 埋点 {key}"
+    assert '_rss["decode"] = _rss_probe()' in src

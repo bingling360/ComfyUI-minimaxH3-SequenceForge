@@ -35,6 +35,7 @@ import torch
 
 from . import checkpoint
 from . import grid
+from . import perf
 
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
@@ -923,6 +924,19 @@ def _vram_probe_reset():
         pass
 
 
+def _rss_probe():
+    """进程常驻内存 RSS（GB）；量不到 -> None。
+
+    显存账上完全看不见内存侧的累积（放大网络 CPU 副本 / cond 缓存 / 解码帧 /
+    ComfyUI 节点输出缓存…），而「多段越跑越卡」的成因多半在这边。与显存同批采样，
+    两条曲线一起看才分得清是显存真不够，还是内存被吃光导致换页（§5.5）。
+    """
+    try:
+        return perf.rss_gb()
+    except Exception:
+        return None
+
+
 def _vram_report(seg_no, v):
     """显存峰值埋点汇总行（阶段 0 诊断；无数据返回 ""，调用方据此跳过打印）。
 
@@ -940,6 +954,25 @@ def _vram_report(seg_no, v):
             f"放大后{_f('up')}GB · cond后{_f('cond')}GB · "
             f"卸载后{_f('unload', 'alloc')}GB · 精化后{_f('refine')}GB · "
             f"解码后{_f('decode')}GB")
+
+
+def _rss_report(seg_no, r):
+    """RSS 曲线行（阶段 0 诊断；无数据返回 ""，调用方据此跳过打印）。
+
+    与显存行分开成两行而不是拼进去：显存行已经六个数字，再塞 RSS 会看不清。
+    看点是**跨段同一位置的数字有没有往上爬**（段1 解码后 vs 段9 解码后），
+    绝对值不重要——起步就有 ComfyUI 自身的常驻。
+    """
+    if not r or r.get("up") is None:
+        return ""
+
+    def _f(key):
+        v = r.get(key)
+        return "n/a" if v is None else f"{v:.2f}"
+
+    return (f"[H3二采] 段{seg_no} 内存RSS：放大前{_f('base')} · 放大后{_f('up')} · "
+            f"cond后{_f('cond')} · 卸载后{_f('unload')} · 精化后{_f('refine')} · "
+            f"解码后{_f('decode')} GB")
 
 
 _UNET_SIZE_CACHE = {}
@@ -1373,8 +1406,14 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent,
                   cur_seed,
-                  采样器, 调度器, report=None, _timing=None, seg_no=None):
+                  采样器, 调度器, report=None, _timing=None, seg_no=None,
+                  _vram=None, _rss=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
+
+    _vram / _rss：阶段 0 诊断埋点的**出参容器**（dict，由 render_segment 建好后
+    传进来，函数内只往里写）。默认 None = 零开销不采样。
+    ⚠ 这两个形参之前漏了，而 render_segment 一直在传 `_vram=_vram` ——
+    每次二采都会在调用处 TypeError（埋点从未在真机跑通过，故一直没暴露）。
 
     kind: "prompt"（提示词段，cond 带本段提示词/参考素材/首帧）
           / "insert"|"prologue"（外部素材段，空提示词轻精修）。
@@ -1409,6 +1448,13 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             return
         _vram[key] = _vram_probe()
         _vram_probe_reset()
+
+    def _rmark(key):
+        # RSS 埋点（阶段 0 诊断）：与 _vmark 同批位置采内存侧。
+        # _rss=None 时零开销；单独开关是因为它跟显存没有必然联动
+        if _rss is None:
+            return
+        _rss[key] = _rss_probe()
 
     if net is not None:
         dev = next(net.parameters()).device
@@ -1473,6 +1519,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
     _vram_probe_reset()
     _vmark("base")          # 埋点①放大前
+    _rmark("base")
     _t = time.perf_counter()
     up_v = upscale_video(video_t, net, eff_scale, cfg["arch"],
                          hw=(h2, w2), chunk=cfg.get("chunk", True))
@@ -1483,6 +1530,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_v_base = up_v.detach().to("cpu", torch.float32) if mix > 0.0 else None
     _tmark("up", _t)
     _vmark("up")            # 埋点②放大后（autograd 建图带来的额外激活在此可见）
+    _rmark("up")
     _up_done = "神经放大完成" if net is not None else "跳过神经放大（纯精化，原分辨率）"
     print(f"[H3二采] 段{seg_no}：{_up_done} → 高清条件构建"
           "（挂了参考素材时需按高清画幅重编码，分钟级属正常，此间 GPU 应有占用）…",
@@ -1550,6 +1598,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     if net is not None:
         net.cpu()
     _tmark("cond", _t)
+    _vmark("cond")      # 埋点③高清条件后（TE/VAE 重编码的峰值在此可见）
+    _rmark("cond")
     # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
     if _timing is not None:
         _timing["te_hit"] = getattr(clip, "last_encode_hit", None)
@@ -1569,6 +1619,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     comfy.model_management.unload_all_models()
     gc.collect()
     torch.cuda.empty_cache()
+    _vmark("unload")    # 埋点④卸载后（报当时占用——腾挪到底回收了多少，就看它）
+    _rmark("unload")
     # 面包屑：本行之后应立刻出现「Requested to load MiniMaxH3」+ 精化进度条；
     # 长时间没有 = 主模型回载（DynamicVRAM 分页加载）或上面的卸载调用本身卡死
     print(f"[H3二采] 段{seg_no}：显存已腾挪，精化重采样回载主模型…", flush=True)
@@ -1819,6 +1871,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         restore_video_rows()
     _tmark("refine", _t)
     _vmark("refine")        # 埋点⑤精化重采样后（与放大后对比即可量化 autograd 图的影响）
+    _rmark("refine")
     print(f"[H3二采] 段{seg_no}：精化重采样完成（{(_timing or {}).get('refine', 0.0):.0f}s）"
           "→ 高清解码…", flush=True)
     del cond, latent
@@ -1884,11 +1937,13 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
               f"放大网络 @ {_ndev}{_heal_note}）", flush=True)
     _timing = {}
     _vram = {}
+    _rss = {}
     up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
         模型, clip, video_vae, audio_vae, negative, cfg, net,
         video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
         pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
-        采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1, _vram=_vram)
+        采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1,
+        _vram=_vram, _rss=_rss)
     # P1-2：解码前卸掉精化 UNET（仅在 A≠B 时——见 _up_swap 说明）。
     # 为什么值得做（三条都可核实）：
     #   ① 官方 decode 会先 load_models_gpu([vae_patcher], memory_required=…)，
@@ -1922,9 +1977,13 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _timing["decode"] = time.perf_counter() - _t
     _vram["decode"] = _vram_probe()
     _vram_probe_reset()
+    _rss["decode"] = _rss_probe()
     _vram_line = _vram_report(g + 1, _vram)
     if _vram_line:
         print(_vram_line, flush=True)
+    _rss_line = _rss_report(g + 1, _rss)
+    if _rss_line:
+        print(_rss_line, flush=True)
     # 像素域锐化（抗糊 N4）：解码后、编码前——连 VAE 解码的软化一起补偿；
     # CPU 分块零显存，amount=0 原对象直通
     _t = time.perf_counter()

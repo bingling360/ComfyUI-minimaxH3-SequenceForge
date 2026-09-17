@@ -49,6 +49,7 @@ from . import transition
 from . import bridge
 from . import guides
 from . import grid
+from . import perf
 from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
                    audio_tokens_for_frames, align_frame_count_down)
 
@@ -1674,6 +1675,24 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 同 base 的克隆（只差 LoRA）不卸——卸了等于把二采自己搬走，纯浪费。
         _up_swap = upscale.models_distinct(模型, _up_model)
         _up_swap_logged = [False]
+        # 阶段 0 只读探测：同 base 只差 LoRA 时到底有没有真的回载权重（§5.3）。
+        # 只打一次，避免每段刷屏。
+        _reload_logged = [False]
+        _perf_logged = [False]
+        # 阶段 0：硬件判据一行流（只在本次运行打一次）。
+        # 放这儿而不是插件导入时：UNET / TE 的真实体量**只有拿到模型才算得出**，
+        # 而 R_v / R_m 全靠它俩。量不到就显示 "?"，不编数字。
+        if not _perf_logged[0]:
+            _perf_logged[0] = True
+            try:
+                _hw = perf.probe_hardware(unet_bytes=perf.weight_bytes(模型),
+                                          te_bytes=perf.weight_bytes(clip))
+                print(perf.report_line(_hw), flush=True)
+                _gd = perf.offload_guard(_hw)
+                if not _gd["ok"]:
+                    print(f"[H3性能] 落盘守卫：{_gd['message']}", flush=True)
+            except Exception:
+                pass
         if up_cfg:
             _up_src = "独立「二采模型」槽" if 二采模型 is not None else "沿用一采「模型」"
             report.append(f"二采模型：{_up_src}" + (f"（{_up_tag}）" if _up_tag else "")
@@ -2375,15 +2394,30 @@ class H3SeamlessChainSampler(io.ComfyNode):
             try:
                 # 返回 (高清尾帧 CPU tensor, 最新存档状态)：尾帧暂无消费方
                 # （跨段连续性仍走基础 latent 桥），只回填存档状态进 manifest
-                _, proj_upscale = upscale.render_segment(
-                    _up_model, clip, video_vae, audio_vae, negative, up_cfg, up_net,
-                    root, g, video_t, audio_t, kind, idx,
-                    seg_prompts, seg_label_orders, pool_tensors, refs,
-                    首帧图片 if (kind == "prompt" and idx == 0 and seg_first_on[0]) else None,
-                    guide_kf, tail_kf, head_kf, cur_seed,
-                    skip_f, vis_len,
-                    wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag,
-                    _up_swap=_up_swap)
+                # 外层再套一层「权重回载计数」：验证同 base 只差 LoRA 是否真的零换页
+                with perf.watch_model_loads() as _loads:
+                    _, proj_upscale = upscale.render_segment(
+                        _up_model, clip, video_vae, audio_vae, negative, up_cfg, up_net,
+                        root, g, video_t, audio_t, kind, idx,
+                        seg_prompts, seg_label_orders, pool_tensors, refs,
+                        首帧图片 if (kind == "prompt" and idx == 0 and seg_first_on[0]) else None,
+                        guide_kf, tail_kf, head_kf, cur_seed,
+                        skip_f, vis_len,
+                        wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag,
+                        _up_swap=_up_swap)
+                if not _reload_logged[0]:
+                    _reload_logged[0] = True
+                    n = len(_loads)
+                    if n == 0:
+                        _verdict = ("未触发权重回载 → 确认零换页，"
+                                    "「两遍式」没有省头（不必做）")
+                    else:
+                        _verdict = (f"触发 {n} 次权重回载 → 同 base 换 LoRA 确实在重传，"
+                                    f"「两遍式」重新有价值（2N → 1）")
+                    print(f"[H3性能] 段{g + 1} 二采入口换页探测（A≠B={_up_swap}）：{_verdict}",
+                          flush=True)
+                    for _m in _loads[:4]:
+                        print(f"[H3性能]   ↳ {_m}", flush=True)
                 return True, False
             except upscale.UpscaleAbortError:
                 raise   # 预检/二采显存致命：报告已 append，终止整链，不降级

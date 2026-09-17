@@ -425,20 +425,40 @@ def test_render_segment_hands_both_containers_to_render_latent():
     assert "_vram=_vram" in body and "_rss=_rss" in body
 
 
-def test_six_vram_marks_are_all_collected():
-    """六个显存埋点必须全部采到（此前只有 4/6，cond / unload 缺失）。"""
+def test_six_marks_are_all_collected():
+    """六段埋点必须齐全（此前只有 4/6，cond / unload 缺失）。
+
+    显存与 RSS 由同一个 `_mark()` 一次采齐：分开采会漏（两个函数得各调一次），
+    而且**逐点落盘**也只能发生在一个地方。
+    """
     src = _read("upscale.py")
     body = src.split("def render_latent(", 1)[1]
     for key in ("base", "up", "cond", "unload", "refine"):
-        assert f'_vmark("{key}")' in body, f"缺显存埋点 {key}"
+        assert f'_mark("{key}"' in body, f"缺埋点 {key}"
     # decode 在 render_segment 里采（render_latent 返回后才解码）
     assert '_vram["decode"] = _vram_probe()' in src
-
-
-def test_rss_marks_mirror_vram_marks():
-    """RSS 与显存同批采样：每个 _vmark 旁边都该有 _rmark（decode 在段级）。"""
-    src = _read("upscale.py")
-    body = src.split("def render_latent(", 1)[1]
-    for key in ("base", "up", "cond", "unload", "refine"):
-        assert f'_rmark("{key}")' in body, f"缺 RSS 埋点 {key}"
     assert '_rss["decode"] = _rss_probe()' in src
+
+
+def test_marks_emit_to_durable_log():
+    """崩溃安全守卫：每个埋点必须 **逐点落盘**，不能只堆到段末统一打印。
+
+    云端 OOM 的下场是 SIGKILL —— 没有 except / finally，段末汇总一定丢；
+    而最需要看数据的恰恰是崩掉的那一段。
+    """
+    src = _read("upscale.py")
+    body = src.split("def _mark(key, label):", 1)[1].split("\n    def ", 1)[0]
+    assert "perf.emit(" in body, "_mark 必须逐点 emit（落盘）"
+    assert 'print(' in body and "flush=True" in body, "并立即 flush 打印"
+
+
+def test_render_segment_dumps_partial_marks_on_crash():
+    """中断时要把**已采到的**埋点吐出来，不能等段末（那时已经没机会了）。"""
+    src = _read("upscale.py")
+    body = src.split("def render_segment(", 1)[1]
+    i_try = body.index("def _dump_partial(")
+    # _dump_partial 定义在 render_segment 内，且必须挂在 render_latent 的异常路径上
+    assert "except BaseException:" in body[i_try:], "render_latent 必须有异常兜底"
+    i_except = body.index("except BaseException:", i_try)
+    assert "_dump_partial(" in body[i_except:i_except + 200]
+    assert "raise" in body[i_except:i_except + 200], "兜底后必须原样上抛（不改变语义）"

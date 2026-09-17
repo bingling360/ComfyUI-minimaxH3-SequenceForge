@@ -26,9 +26,11 @@
 """
 
 import contextlib
+import json
 import logging
 import math
 import os
+import time
 
 GB = float(1024 ** 3)
 
@@ -744,6 +746,214 @@ def watch_model_loads(mark=_MODEL_LOAD_MARK):
         root.removeHandler(handler)
         if root.level != prev_level:
             root.setLevel(prev_level)
+
+
+# ============================ 探测日志（崩溃安全） ============================
+#
+# 为什么必须有它：云端显存不足的下场是 **OOM killer 发 SIGKILL** —— 没有 except、
+# 没有 finally、没有 atexit，堆在内存里等着段末统一打印的汇总行**一定丢失**。
+# 而最需要看数据的恰恰就是崩掉的那一段。
+# 故：每采一个点就 append 一行 JSON 并 flush（SIGKILL 不丢已写入 OS 的数据），
+# 事后用 tools/perf_report.py 回读。stdout 只管「跟着日志走」，落盘只管「不丢」。
+#
+# 顺序（从最不丢到最丢）：JSONL 落盘 > 逐点 print > 段末汇总行。
+# 三条都做，任一条活下来都够用。
+
+LOG_ENV = "H3_PERF_LOG"          # 环境变量覆盖路径；设 "0" 关闭
+LOG_NAME = "h3_perf_probe.jsonl"
+LOG_MAX_BYTES = 4 * 1024 * 1024  # 超过先滚一份 .1，避免无限增长
+LOG_KEEP_LINES = 20000           # 回读上限（只取尾部，防止老机器读爆内存）
+
+_run_id = None
+
+
+def run_id():
+    """本次进程唯一标识（回读时按它区分「哪一次运行」）。"""
+    global _run_id
+    if _run_id is None:
+        _run_id = "%s-%d" % (time.strftime("%Y%m%d-%H%M%S"), os.getpid())
+    return _run_id
+
+
+def log_path():
+    """JSONL 落盘路径。默认 <插件>/logs/h3_perf_probe.jsonl。"""
+    override = os.environ.get(LOG_ENV)
+    if override:
+        return override
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "logs", LOG_NAME)
+
+
+def emit(event, path=None):
+    """追加一条 JSON 事件并**立即 flush**。
+
+    任何情况都不抛（探测不能成为故障源）：路径不可写 / JSON 序列化失败一律静默。
+    返回 True/False 只为便于自测，调用方无需检查。
+    """
+    try:
+        p = path or log_path()
+        if p == "0":
+            return False
+        d = os.path.dirname(p)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        try:   # 体积护栏：先滚一份 .1
+            if os.path.getsize(p) > LOG_MAX_BYTES:
+                os.replace(p, p + ".1")
+        except OSError:
+            pass
+        rec = {"t": round(time.time(), 3),
+               "ts": time.strftime("%H:%M:%S"),
+               "run": run_id()}
+        rec.update(event)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            # flush 已经把数据交给 OS —— **抗 SIGKILL（OOM kill）靠它就够了**。
+            # fsync 只多防「机器断电 / 内核崩」，但云端网络盘上可能明显拖慢
+            # （每个埋点一次，卡在渲染关键路径上不值得）→ 默认不做，按需开。
+            if os.environ.get("H3_PERF_FSYNC") == "1":
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+        return True
+    except Exception:
+        return False
+
+
+def read_events(path=None, run=None, limit=LOG_KEEP_LINES):
+    """回读事件列表。run 为空时自动取**最后一次**运行。
+
+    坏行（写到一半被 kill 的那种）直接跳过——宁可少一条，也不能让报告读不出来。
+    """
+    p = path or log_path()
+    try:
+        with open(p, encoding="utf-8") as f:
+            raw = f.readlines()[-limit:]
+    except OSError:
+        return []
+    events = []
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            continue
+    if run is None and events:
+        run = events[-1].get("run")
+    return [e for e in events if e.get("run") == run] if run else events
+
+
+def list_runs(path=None, limit=LOG_KEEP_LINES):
+    """文件里出现过的所有运行标识（按时间顺序）。"""
+    p = path or log_path()
+    try:
+        with open(p, encoding="utf-8") as f:
+            raw = f.readlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in raw:
+        try:
+            r = json.loads(line).get("run")
+        except Exception:
+            continue
+        if r and r not in out:
+            out.append(r)
+    return out
+
+
+# 六段的固定顺序（与 _vram_report 一致）
+STAGES = ("base", "up", "cond", "unload", "refine", "decode")
+STAGE_LABELS = ("放大前", "放大后", "cond后", "卸载后", "精化后", "解码后")
+# 这两段报「当时占用」，其余报「阶段峰值」
+ALLOC_STAGES = ("base", "unload")
+
+# 耗时四阶段（与 upscale.render_segment 的 _timing 键一致）
+TIMING_KEYS = ("up", "cond", "refine", "decode")
+TIMING_LABELS = ("放大", "条件", "精化", "解码")
+
+
+def summarize(events):
+    """把事件列表渲染成跨段对照报告（文本）。崩溃后回读全靠它。
+
+    看点是**同一列往下有没有往上爬**：段1 解码后 vs 段9 解码后，
+    爬就是累积（内存泄漏 / 缓存只增），平就是稳定。
+    """
+    if not events:
+        return ["（无探测数据）"]
+
+    out = []
+    over = [e for e in events if e.get("kind") == "overview"]
+    if over:
+        o = over[-1]
+        out.append("硬件概览：" + o.get("line", ""))
+        if o.get("guard"):
+            out.append("落盘守卫：" + o["guard"])
+        out.append("")
+
+    segs = {}
+    for e in events:
+        if e.get("kind") != "mark":
+            continue
+        segs.setdefault(e.get("seg"), {})[e.get("stage")] = e
+
+    for title, key, pick in (("显存峰值（GB）", "vram", _pick_vram),
+                             ("内存 RSS（GB）", "rss", _pick_rss)):
+        rows = []
+        for seg in sorted(s for s in segs if s is not None):
+            rows.append([str(seg)] + [pick(segs[seg].get(st)) for st in STAGES])
+        if not rows:
+            continue
+        out.append(title)
+        out.append("  段   " + "  ".join(f"{l:>7}" for l in STAGE_LABELS))
+        for r in rows:
+            out.append("  " + r[0].rjust(3) + "   " + "  ".join(f"{c:>7}" for c in r[1:]))
+        out.append("")
+
+    # 耗时表：「多段变卡」归根结底是时间现象，字节曲线看不出来
+    tims = {e.get("seg"): e for e in events if e.get("kind") == "timing"}
+    if tims:
+        out.append("各段耗时（秒）")
+        out.append("  段   " + "  ".join(f"{l:>7}" for l in TIMING_LABELS)
+                   + f"{'合计':>9}")
+        for seg in sorted(s for s in tims if s is not None):
+            e = tims[seg]
+            vals = [e.get(k) for k in TIMING_KEYS]
+            cells = [f"{v:7.1f}" if isinstance(v, (int, float)) else f"{'n/a':>7}"
+                     for v in vals]
+            tot = sum(v for v in vals if isinstance(v, (int, float)))
+            out.append("  " + str(seg).rjust(3) + "   " + "  ".join(cells)
+                       + f"{tot:9.1f}")
+        out.append("")
+
+    for e in events:
+        if e.get("kind") == "swap_probe":
+            out.append(f"二采换页探测：段{e.get('seg')} A≠B={e.get('up_swap')} "
+                       f"回载 {e.get('loads')} 次"
+                       + ("（零换页 → 两遍式无省头）" if not e.get("loads")
+                          else "（确实重传 → 两遍式有价值）"))
+        elif e.get("kind") == "fail":
+            out.append(f"⚠ 段{e.get('seg')} 中断（{e.get('where', '?')}）——"
+                       "其后无数据，说明进程在此终止")
+    return out
+
+
+def _pick_vram(e):
+    if not e:
+        return "n/a"
+    v = e.get("vram_peak") if e.get("stage") not in ALLOC_STAGES else e.get("vram_alloc")
+    return "n/a" if v is None else f"{v:.2f}"
+
+
+def _pick_rss(e):
+    if not e:
+        return "n/a"
+    v = e.get("rss")
+    return "n/a" if v is None else f"{v:.2f}"
 
 
 def probe_hardware(unet_bytes=None, te_bytes=None, disk_path=None):

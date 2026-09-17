@@ -574,11 +574,33 @@ _REF_AT = re.compile(
     r"(?<![0-9A-Za-z_])@([^\s@\[\]{}<>()（）,，.。;；:：!！?？\"'`|/\\]{1,24})")
 
 
-def _find_refs(text):
-    """提示词里引用的素材标签：新写法 `@标签` + 旧写法 `[[标签]]`（老存档还能跑）。"""
+def _find_refs(text, labels=None):
+    """提示词里引用的素材标签：新写法 `@标签` + 旧写法 `[[标签]]`（老存档还能跑）。
+
+    **池标签（labels）优先做最长前缀匹配**，与前端 `h3_director.refTokens`、
+    `library.compute_refs` 同口径。理由：`@引用` 没有天然终止符 —— 中文句子里
+    `@图片让这张图动起来` 不打空格，纯正则会把后文一起吃进标签
+    （`微信图片_20260730155838_638` 后面跟个「让」就变成 24 字的假标签，还正好
+    顶到字符上限）→ 校验时误报"未知素材标签"。池里没有的才退回正则，
+    `@2x`、邮箱之类普通文本照旧不被误伤。
+    """
     s = str(text or "")
-    return ([m.group(1) for m in _REF_BRACKET.finditer(s)]
-            + [m.group(1) for m in _REF_AT.finditer(s)])
+    out = [m.group(1) for m in _REF_BRACKET.finditer(s)]
+    labs = sorted({str(l) for l in (labels or ()) if l}, key=len, reverse=True)
+    i = 0
+    while i < len(s):
+        m = _REF_AT.match(s, i) if s[i] == "@" else None
+        if m is None:
+            i += 1
+            continue
+        hit = next((l for l in labs if s.startswith(l, i + 1)), None)
+        if hit is not None:              # 池内最长优先：标签到哪儿为止由池说了算
+            out.append(hit)
+            i += len(hit) + 1
+        else:
+            out.append(m.group(1))
+            i = m.end()
+    return out
 
 
 def _resolve_canvas(ar, mp):
@@ -1115,7 +1137,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             _keys.append(_kk)
                     seg_custom_refs += 1
                     # 提示词里 @标签 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
-                    for lbl in _find_refs(full):
+                    # （传池：标签边界由池内最长匹配决定，`@图片让这张图动起来` 不会吞掉「让」）
+                    for lbl in _find_refs(full, pool_labels):
                         lbl = lbl.strip()
                         if lbl and lbl not in _keys:
                             _keys.append(lbl)
@@ -1123,7 +1146,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 缺省 = 只用提示词文本 @标签 里出现的素材（按出现顺序）；
                     # 没出现 = 本段无引用（纯文本段）。资产库总量不限，只卡单段上
                     # 限——库再大也不会逼每段显式勾选。
-                    for lbl in _find_refs(full):
+                    for lbl in _find_refs(full, pool_labels):
                         lbl = lbl.strip()
                         if lbl and lbl not in _keys:
                             _keys.append(lbl)
@@ -1687,10 +1710,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
             try:
                 _hw = perf.probe_hardware(unet_bytes=perf.weight_bytes(模型),
                                           te_bytes=perf.weight_bytes(clip))
-                print(perf.report_line(_hw), flush=True)
+                _line = perf.report_line(_hw)
+                print(_line, flush=True)
                 _gd = perf.offload_guard(_hw)
-                if not _gd["ok"]:
-                    print(f"[H3性能] 落盘守卫：{_gd['message']}", flush=True)
+                _guard_msg = _gd["message"] if not _gd["ok"] else ""
+                if _guard_msg:
+                    print(f"[H3性能] 落盘守卫：{_guard_msg}", flush=True)
+                # 落盘：被 OOM kill 时 stdout 可能一起没了，JSONL 是唯一留存
+                perf.emit({"kind": "overview", "line": _line,
+                           "guard": _guard_msg, "hw": _hw})
             except Exception:
                 pass
         if up_cfg:
@@ -2418,6 +2446,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           flush=True)
                     for _m in _loads[:4]:
                         print(f"[H3性能]   ↳ {_m}", flush=True)
+                    perf.emit({"kind": "swap_probe", "seg": g + 1,
+                               "up_swap": bool(_up_swap), "loads": n,
+                               "verdict": _verdict})
                 return True, False
             except upscale.UpscaleAbortError:
                 raise   # 预检/二采显存致命：报告已 append，终止整链，不降级

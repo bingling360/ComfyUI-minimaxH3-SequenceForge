@@ -14,6 +14,7 @@ perf.py 的设计前提就是**零 ComfyUI 依赖**（与 grid.py 同级，必�
     python -m pytest tests/test_perf.py -q
 """
 
+import json
 import logging
 import os
 import sys
@@ -434,3 +435,146 @@ def test_watch_model_loads_yields_empty_when_no_load():
     with perf.watch_model_loads() as hits:
         pass
     assert hits == []
+
+
+# ---- 探测日志（崩溃安全）----
+
+@pytest.fixture
+def logfile(tmp_path):
+    """每个用例一份独立 JSONL，绝不碰真实的 logs/。"""
+    return str(tmp_path / "probe.jsonl")
+
+
+def _sim_run(logfile, crash_at=None):
+    """模拟一次运行：概览 + 两段完整 + 可选第三段中途崩。"""
+    perf.emit({"kind": "overview", "line": "[H3性能] 显存 32.0GB · R_v 0.83",
+               "guard": ""}, path=logfile)
+    perf.emit({"kind": "swap_probe", "seg": 1, "up_swap": False, "loads": 0},
+              path=logfile)
+    stages = [("base", 1.5, 3.2), ("up", 2.2, 4.6), ("cond", 3.5, 4.8),
+              ("unload", 0.12, 4.8), ("refine", 4.0, 5.3), ("decode", 5.7, 6.0)]
+    for seg in (1, 2, 3):
+        done = stages if crash_at != seg else stages[:4]
+        for st, vp, rs in done:
+            perf.emit({"kind": "mark", "seg": seg, "stage": st, "label": st,
+                       "vram_alloc": 0.12 if st == "unload" else vp,
+                       "vram_peak": vp, "rss": rs}, path=logfile)
+        if crash_at == seg:
+            perf.emit({"kind": "fail", "seg": seg, "where": "二采渲染中断"},
+                      path=logfile)
+            break
+
+
+def test_emit_appends_flushed_json_lines(logfile):
+    """每 emit 一行就是一条完整 JSON —— 写完即在盘上（SIGKILL 不会丢已写数据）。"""
+    assert perf.emit({"kind": "test", "a": 1}, path=logfile) is True
+    with open(logfile, encoding="utf-8") as f:
+        lines = f.read().strip().split("\n")
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["a"] == 1
+    assert "t" in rec and "run" in rec      # 自动补时间戳与 run id
+
+
+def test_emit_never_raises(tmp_path, logfile):
+    """探测绝不能成为故障源：路径非法 / 不可序列化都静默返回 False。
+
+    ⚠ 不可达路径要挑**立刻失败**的那种。别用 `Z:/...`（不存在的盘符）：
+    实测 Windows 上 `os.path.isdir("Z:/no/such/dir")` 要 **15 秒**才返回，
+    会把整个测试套件拖挂。这里用「父路径是个普通文件」→ NotADirectoryError，秒失败。
+    """
+    assert perf.emit({"bad": object()}, path=logfile) is False
+    blocker = tmp_path / "iam_a_file"
+    blocker.write_text("x", encoding="utf-8")
+    assert perf.emit({"ok": 1}, path=str(blocker / "x.jsonl")) is False
+
+
+def test_emit_disabled_by_env_zero(logfile):
+    """H3_PERF_LOG=0 关闭落盘（生产环境可彻底关掉）。"""
+    old = os.environ.get(perf.LOG_ENV)
+    os.environ[perf.LOG_ENV] = "0"
+    try:
+        assert perf.emit({"kind": "x"}) is False
+    finally:
+        if old is None:
+            os.environ.pop(perf.LOG_ENV, None)
+        else:
+            os.environ[perf.LOG_ENV] = old
+
+
+def test_read_events_defaults_to_last_run(logfile):
+    """回读默认取最后一次运行 —— 崩溃后最想看的就是「刚才那次」。"""
+    _sim_run(logfile)
+    events = perf.read_events(path=logfile)
+    assert events and len({e["run"] for e in events}) == 1
+    assert any(e.get("kind") == "overview" for e in events)
+
+
+def test_summarize_shows_partial_data_after_crash(logfile):
+    """★ 崩溃安全的核心：崩之前采到的点在报告里一个不少，缺的显示 n/a。"""
+    _sim_run(logfile, crash_at=3)
+    text = "\n".join(perf.summarize(perf.read_events(path=logfile)))
+    assert "段   3" in text or "  3 " in text
+    # 段3 崩在 cond 之后 → 精化后/解码后无数据，但前四列在
+    row3 = [l for l in text.split("\n") if l.strip().startswith("3 ") and "n/a" in l]
+    assert row3, "崩溃段必须出现在报告里（带 n/a），不能整段消失"
+    assert "中断" in text, "必须标出在哪一段中断"
+
+
+def test_summarize_exposes_rss_climb_across_segments(logfile):
+    """跨段同一列的对比——「多段变卡」的判据就看这条曲线爬不爬。"""
+    _sim_run(logfile)
+    events = perf.read_events(path=logfile)
+    for e in events:
+        if e.get("kind") == "mark" and e.get("seg") == 3 and e.get("stage") == "base":
+            e["rss"] = 9.9        # 人为抬高末段，模拟累积
+    text = "\n".join(perf.summarize(events))
+    assert "9.90" in text
+
+
+def test_summarize_empty_is_graceful():
+    assert perf.summarize([]) == ["（无探测数据）"]
+
+
+def test_summarize_includes_timing_table(logfile):
+    """耗时表：「多段变卡」归根结底是**时间**现象，字节曲线看不出来。"""
+    perf.emit({"kind": "timing", "seg": 1, "up": 12.3, "cond": 44.1,
+               "refine": 61.5, "decode": 9.2}, path=logfile)
+    text = "\n".join(perf.summarize(perf.read_events(path=logfile)))
+    assert "各段耗时" in text
+    for label in ("放大", "条件", "精化", "解码"):
+        assert label in text
+    assert "127.1" in text, "应给出合计（12.3+44.1+61.5+9.2）"
+
+
+def test_summarize_timing_missing_stage_is_na(logfile):
+    """某阶段没跑到（崩了）→ n/a，且合计只算有数的。"""
+    perf.emit({"kind": "timing", "seg": 1, "up": 10.0, "cond": None,
+               "refine": None, "decode": None}, path=logfile)
+    text = "\n".join(perf.summarize(perf.read_events(path=logfile)))
+    assert "n/a" in text
+
+
+def test_read_events_skips_torn_lines(logfile):
+    """被 kill 时可能写出半行 —— 回读必须跳过坏行而不是整个读不出来。"""
+    with open(logfile, "w", encoding="utf-8") as f:
+        f.write('{"kind":"mark","run":"r1","seg":1,"stage":"base"}\n')
+        f.write('{"kind":"mark","run":"r1","seg":1,"stage":"up", "trunc')
+    events = perf.read_events(path=logfile)
+    assert len(events) == 1 and events[0]["stage"] == "base"
+
+
+def test_read_events_missing_file_is_empty(tmp_path):
+    missing = str(tmp_path / "nope.jsonl")     # 同目录存在，只是文件没有 → 秒失败
+    assert perf.read_events(path=missing) == []
+    assert perf.list_runs(path=missing) == []
+
+
+def test_list_runs_returns_distinct_runs_in_order(logfile):
+    _sim_run(logfile)
+    runs = perf.list_runs(path=logfile)
+    assert runs and all(isinstance(r, str) for r in runs)
+
+
+def test_run_id_stable_within_process():
+    assert perf.run_id() == perf.run_id()

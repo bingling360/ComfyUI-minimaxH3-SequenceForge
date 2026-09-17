@@ -1441,20 +1441,33 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         if _timing is not None:
             _timing[key] = _timing.get(key, 0.0) + (time.perf_counter() - t0)
 
-    def _vmark(key):
-        # 显存埋点（阶段 0 诊断）：记录 (当时占用, 阶段峰值) 后重置峰值统计；
-        # _vram=None 时零开销，不影响生产路径
-        if _vram is None:
-            return
-        _vram[key] = _vram_probe()
-        _vram_probe_reset()
+    def _mark(key, label):
+        """一次采齐显存 + RSS：**立即打印并落盘**，不等段末汇总。
 
-    def _rmark(key):
-        # RSS 埋点（阶段 0 诊断）：与 _vmark 同批位置采内存侧。
-        # _rss=None 时零开销；单独开关是因为它跟显存没有必然联动
-        if _rss is None:
+        为什么必须逐点输出而不是段末统一打：云端显存不足的下场是
+        **OOM killer 发 SIGKILL** —— 没有 except、没有 finally 的机会，
+        段末那行汇总一定丢失；而最需要看数据的恰恰就是崩掉的那一段。
+        三条保险（从最不丢到最丢）：JSONL 落盘 > 逐点 print > 段末汇总。
+        _vram/_rss 都为 None 时零开销，不影响生产路径。
+        """
+        if _vram is None and _rss is None:
             return
-        _rss[key] = _rss_probe()
+        if _vram is not None:
+            _vram[key] = _vram_probe()
+            _vram_probe_reset()
+        if _rss is not None:
+            _rss[key] = _rss_probe()
+        _v = (_vram or {}).get(key)
+        _r = (_rss or {}).get(key)
+        _alloc = None if _v is None else _v[0]
+        _peak = None if _v is None else _v[1]
+        # 「放大前 / 卸载后」看当时占用（腾挪回收了多少），其余看阶段峰值
+        _shown = _alloc if key in perf.ALLOC_STAGES else _peak
+        _vb = "n/a" if _shown is None else f"{_shown:.2f}"
+        _rb = "n/a" if _r is None else f"{_r:.2f}"
+        print(f"[H3二采] 段{seg_no} · {label} 显存{_vb}GB · RSS{_rb}GB", flush=True)
+        perf.emit({"kind": "mark", "seg": seg_no, "stage": key, "label": label,
+                   "vram_alloc": _alloc, "vram_peak": _peak, "rss": _r})
 
     if net is not None:
         dev = next(net.parameters()).device
@@ -1518,8 +1531,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 放大网络放大视频 latent 到 scale×（常驻 GPU，放大完卸回 CPU 腾给高清重采样）；
     # hf_up = 纯放大（无精化）的高频能量基线——细节增益度量的「前」
     _vram_probe_reset()
-    _vmark("base")          # 埋点①放大前
-    _rmark("base")
+    _mark("base", "放大前")     # 埋点①放大前
     _t = time.perf_counter()
     up_v = upscale_video(video_t, net, eff_scale, cfg["arch"],
                          hw=(h2, w2), chunk=cfg.get("chunk", True))
@@ -1529,8 +1541,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     mix = float(cfg.get("mix") or 0.0)
     up_v_base = up_v.detach().to("cpu", torch.float32) if mix > 0.0 else None
     _tmark("up", _t)
-    _vmark("up")            # 埋点②放大后（autograd 建图带来的额外激活在此可见）
-    _rmark("up")
+    _mark("up", "放大后")      # 埋点②放大后（autograd 建图带来的额外激活在此可见）
     _up_done = "神经放大完成" if net is not None else "跳过神经放大（纯精化，原分辨率）"
     print(f"[H3二采] 段{seg_no}：{_up_done} → 高清条件构建"
           "（挂了参考素材时需按高清画幅重编码，分钟级属正常，此间 GPU 应有占用）…",
@@ -1598,8 +1609,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     if net is not None:
         net.cpu()
     _tmark("cond", _t)
-    _vmark("cond")      # 埋点③高清条件后（TE/VAE 重编码的峰值在此可见）
-    _rmark("cond")
+    _mark("cond", "cond后")    # 埋点③高清条件后（TE/VAE 重编码的峰值在此可见）
     # CachedClipProxy 在位时标注本段高清条件构建的 TE 是否命中缓存
     if _timing is not None:
         _timing["te_hit"] = getattr(clip, "last_encode_hit", None)
@@ -1619,8 +1629,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     comfy.model_management.unload_all_models()
     gc.collect()
     torch.cuda.empty_cache()
-    _vmark("unload")    # 埋点④卸载后（报当时占用——腾挪到底回收了多少，就看它）
-    _rmark("unload")
+    _mark("unload", "卸载后")   # 埋点④卸载后（报当时占用——腾挪到底回收了多少，就看它）
     # 面包屑：本行之后应立刻出现「Requested to load MiniMaxH3」+ 精化进度条；
     # 长时间没有 = 主模型回载（DynamicVRAM 分页加载）或上面的卸载调用本身卡死
     print(f"[H3二采] 段{seg_no}：显存已腾挪，精化重采样回载主模型…", flush=True)
@@ -1870,8 +1879,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         restore_rows()
         restore_video_rows()
     _tmark("refine", _t)
-    _vmark("refine")        # 埋点⑤精化重采样后（与放大后对比即可量化 autograd 图的影响）
-    _rmark("refine")
+    _mark("refine", "精化后")   # 埋点⑤精化重采样后（与放大后对比即可量化 autograd 图的影响）
     print(f"[H3二采] 段{seg_no}：精化重采样完成（{(_timing or {}).get('refine', 0.0):.0f}s）"
           "→ 高清解码…", flush=True)
     del cond, latent
@@ -1938,12 +1946,24 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _timing = {}
     _vram = {}
     _rss = {}
-    up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
-        模型, clip, video_vae, audio_vae, negative, cfg, net,
-        video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
-        pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
-        采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1,
-        _vram=_vram, _rss=_rss)
+
+    def _dump_partial(where):
+        """中断时把**已采到的**埋点吐出来（段末汇总没机会跑时的唯一线索）。"""
+        for line in (_vram_report(g + 1, _vram), _rss_report(g + 1, _rss)):
+            if line:
+                print(line + f"（{where}前已采到）", flush=True)
+        perf.emit({"kind": "fail", "seg": g + 1, "where": where})
+
+    try:
+        up_v, tw, th, up_seed, bridged, hf_gain, retried = render_latent(
+            模型, clip, video_vae, audio_vae, negative, cfg, net,
+            video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
+            pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
+            采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1,
+            _vram=_vram, _rss=_rss)
+    except BaseException:
+        _dump_partial("二采渲染中断")
+        raise
     # P1-2：解码前卸掉精化 UNET（仅在 A≠B 时——见 _up_swap 说明）。
     # 为什么值得做（三条都可核实）：
     #   ① 官方 decode 会先 load_models_gpu([vae_patcher], memory_required=…)，
@@ -1978,6 +1998,18 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _vram["decode"] = _vram_probe()
     _vram_probe_reset()
     _rss["decode"] = _rss_probe()
+    _alloc, _peak = _vram["decode"] or (None, None)
+    _vb = "n/a" if _peak is None else f"{_peak:.2f}"
+    _rb = "n/a" if _rss["decode"] is None else f"{_rss['decode']:.2f}"
+    print(f"[H3二采] 段{g + 1} · 解码后 显存{_vb}GB · RSS{_rb}GB", flush=True)
+    perf.emit({"kind": "mark", "seg": g + 1, "stage": "decode", "label": "解码后",
+               "vram_alloc": _alloc, "vram_peak": _peak, "rss": _rss["decode"]})
+    # 耗时账：「多段变卡」归根结底是**时间**现象，只记字节看不出来。
+    # 每段四个阶段，跨段对比即可定位到底是哪一阶段在爬。
+    perf.emit({"kind": "timing", "seg": g + 1,
+               **{k: round(float(_timing.get(k) or 0.0), 2)
+                  for k in ("up", "cond", "refine", "decode")}})
+    # 段末汇总（六段一行，便于对比；逐点行已经先打过了，这里只是 recap）
     _vram_line = _vram_report(g + 1, _vram)
     if _vram_line:
         print(_vram_line, flush=True)

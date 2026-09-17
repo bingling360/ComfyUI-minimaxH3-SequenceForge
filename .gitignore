@@ -25,3 +25,6 @@ Thumbs.db
 
 # 生成物：由 tools/make_anchor_preview.py 从 web/ 现读现拼，不入库（必然漂移）
 tools/anchor_preview.html
+
+# 性能探测日志（运行时生成，回读用 tools/perf_report.py）
+logs/

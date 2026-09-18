@@ -147,5 +147,35 @@ def test_w_ref_length_still_fires_when_too_short():
     assert "W_REF_LENGTH" in _codes(v)
 
 
+# ------------------------------------------------------ W_LENGTH 时长缩放
+
+def test_w_length_scales_with_duration():
+    """10s 段的内容量约为 5s 的两倍，阈值必须跟着 duration 走。
+
+    回归：阈值写死 20-260（5s 口径），一个 442 中文字的 10s 段被误报"过长"。
+    这是只有真跑 10s 场景才会暴露的问题 —— 上一轮修中文折算时只测了 5s。
+    """
+    desc = "[Shot 1] " + "画面持续推进" * 74          # 约 444 中文字
+    v5 = validate.validate_envelope(_env(desc, duration=5))
+    v10 = validate.validate_envelope(_env(desc, duration=10))
+    assert "W_LENGTH" in _codes(v5), "5s 段这个量确实该报过长"
+    assert "W_LENGTH" not in _codes(v10), "10s 段同量不该报（阈值没缩放）"
+
+
+def test_w_length_message_shows_actual_duration():
+    """文案要给出当前时长的建议区间，不能写死 5s。"""
+    v = validate.validate_envelope(_env("[Shot 1] " + "画面持续推进" * 200, duration=10))
+    msg = next(w["message"] for w in v["warnings"] if w["code"] == "W_LENGTH")
+    assert "10s" in msg
+    assert "120-240 词" in msg, f"未按 2 倍缩放：{msg}"
+
+
+def test_w_length_short_still_fires_at_any_duration():
+    """缩放不能把下限也放掉：任何时长下过短都该报。"""
+    for d in (5, 10, 15):
+        v = validate.validate_envelope(_env("[Shot 1] 短。", duration=d))
+        assert "W_LENGTH" in _codes(v), f"{d}s 过短未报"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

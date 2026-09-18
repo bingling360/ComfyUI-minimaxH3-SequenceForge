@@ -215,16 +215,21 @@ def validate_envelope(obj):
         if n_sent > 3:
             warn("W_MUSIC_LONG", f"配乐 {n_sent} 句，官方建议 1-3 句")
 
-    # 长度：5s 配 60-120 词，过长多为企划书直翻。
-    # 只数英文词会对全中文描述永久误报：官方同档位是「中文约 100-200 字」，
-    # 与 60-120 英文词等价，故按 1 中文字 ≈ 0.6 英文词折算后合并计数。
+    # 长度：密度按**时长缩放**（官方 5s 配 60-120 词 / 中文约 100-200 字，
+    # 约每 3 秒一个切点）。只数英文词会对全中文描述永久误报，故按
+    # 1 中文字 ≈ 0.6 英文词折算后合并计数。
+    # 阈值与文案都必须跟着 duration 走：写死 5s 口径会把 10s 段误报成"过长"。
     words_en = len(re.findall(r"[A-Za-z']+", desc))
     cjk = len(re.findall(r"[\u4e00-\u9fff]", desc))
     words = words_en + int(cjk * 0.6)
-    if words and (words < 20 or words > 260):
+    sec = duration if isinstance(duration, (int, float)) and duration > 0 else 5.0
+    scale = sec / 5.0
+    if words and not (20 * scale <= words <= 260 * scale):
         detail = f"英文 {words_en} 词" + (f" + 中文 {cjk} 字" if cjk else "")
-        warn("W_LENGTH", f"description 约 {words} 词（{detail}），建议 5s 配 60-120 词"
-                         f"（中文约 100-200 字，过短太空、过长必 rush）")
+        warn("W_LENGTH", f"description 约 {words} 词（{detail}），建议 {sec:g}s 配 "
+                         f"{int(60 * scale)}-{int(120 * scale)} 词"
+                         f"（中文约 {int(100 * scale)}-{int(200 * scale)} 字，"
+                         "过短太空、过长必 rush）")
 
     # ---- 镜头时间戳 ----
     shots = list(SHOT_RE.finditer(desc))

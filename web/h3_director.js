@@ -423,6 +423,17 @@ function createPromptEditor(opts) {
      * （早期版本只传 kind，够挑图标但不够拼缩略图地址。） */
     const infoOf = () => (typeof o.assets === "function" ? o.assets() : (o.assets || {})) || {};
     const dirOf = () => (typeof o.dir === "function" ? o.dir() : (o.dir || "")) || "";
+    /* token 映射：{"<Picture 1>": "素材别名"}。外部 agent / 官方格式的文本里写的是
+     * `<Picture N>`，这里把它也渲染成缩略图（序列化时**原样还原** `<Picture N>`），
+     * 让用户直接看见"Picture 几"到底对应哪张图 —— 素材顺序挂错时一眼就能发现。
+     * 与 @别名 并存互不干扰：@别名 是导演台引用语法（可增删、带 ✕），
+     * `<Picture N>` 是官方格式的一部分（只读展示，要改就编辑正文）。 */
+    const tokenMapOf = () => (typeof o.tokenMap === "function" ? o.tokenMap() : (o.tokenMap || {})) || {};
+    /* 是否启用官方标签可视化：**只在显式传入 tokenMap 的编辑器里开启**。
+     * ①②框不传 → 不识别 `<Picture N>`，避免误伤正文里恰好出现的尖括号文本；
+     * ③结果框传了 → 即使一张素材都没挂（映射为空）也照渲染，标红警示悬空引用。 */
+    const tokenOn = () => typeof o.tokenMap === "function"
+        || (!!o.tokenMap && typeof o.tokenMap === "object");
 
     /* —— 序列化：DOM → 纯文本（绿框还原成 @别名；块级换行补 \n） —— */
     function ser(node) {
@@ -430,6 +441,8 @@ function createPromptEditor(opts) {
         for (const n of node.childNodes) {
             if (n.nodeType === 3) { out += n.nodeValue || ""; continue; }
             if (n.nodeType !== 1) continue;
+            /* token 优先：<Picture N> 框要还原成官方标签原文，别被当成 @别名 输出 */
+            if (n.dataset && n.dataset.token) { out += n.dataset.token; continue; }
             if (n.dataset && n.dataset.label) { out += "@" + n.dataset.label; continue; }
             if (n.tagName === "BR") { out += "\n"; continue; }
             const block = /^(DIV|P|LI|TR|SECTION)$/.test(n.tagName);
@@ -481,6 +494,39 @@ function createPromptEditor(opts) {
         return sp;
     }
 
+    /** 官方格式标签 `<Picture N>` / `<Video N>` / `<Audio N>` 的可视化。
+     *
+     * 与 makeTag（@别名）的区别：**不带 ✕**。它是外部/官方文本的一部分，不是导演台的
+     * 引用语法 —— 要删就编辑正文，不走引用计数逻辑。
+     * dataset.token 用于序列化还原；dataset.label 让缩略图/换标识逻辑复用；
+     * class 带 h3d-rtok，使 normalizeLoose / removeOneTag 的 `.h3d-rtag` 计数能精确
+     * 排除它（否则 token 会被误当成 @别名 的框，漏判"还有裸别名没成框"）。
+     * 挂不到素材时标 h3d-rtok-missing —— 这正是"悬空引用"的可视化。 */
+    function makeTokenTag(token, label) {
+        const sp = document.createElement("span");
+        sp.className = "h3d-rtag h3d-rtok";
+        sp.contentEditable = "false";
+        sp.dataset.token = String(token);
+        sp.dataset.label = String(label || "");
+        const info = infoOf()[label] || {};
+        const ainfo = {
+            kind: String(info.kind || "image"),
+            file: String(info.file || ""),
+            asset_id: String(info.asset_id || ""),
+        };
+        sp.dataset.thumbSig = thumbSig(ainfo);
+        if (label) {
+            sp.append(buildAssetThumb(dirOf(), ainfo));
+            sp.title = `${token}：官方格式引用，指向素材「${label}」（按素材调度顺序编号）`;
+        } else {
+            sp.classList.add("h3d-rtok-missing");
+            sp.title = `${token}：没有挂到任何素材 —— 生成时不会有图。`
+                + "请到「引用素材」按顺序挂上对应素材，或删掉这个标签。";
+        }
+        sp.append(document.createTextNode(token));
+        return sp;
+    }
+
     /** 正文分词：把 `@别名` 切成引用 token（**最长优先**，与后端 compile_refs /
      *  refsFromText 同口径）。渲染、计数、删除全走这一条路 —— 早期用正则
      *  `@短标签(?![0-9A-Za-z_])` 去删，负向后顾只挡 ASCII 字母，于是删「阿依」
@@ -488,10 +534,25 @@ function createPromptEditor(opts) {
     function refTokens(text) {
         const s = String(text == null ? "" : text);
         const labs = [...labelsOf()].sort((a, b) => b.length - a.length);
+        const map = tokenMapOf();
         const out = [];
         let buf = "";
         let i = 0;
         while (i < s.length) {
+            /* 官方标签 <Picture N>/<Video N>/<Audio N>：切成 token 形态，序列化时
+             * 原样还原（不会像 @别名 那样被改写）。
+             * 按**语法形态**识别而非查映射表 —— 否则挂不到素材的标签根本不被渲染，
+             * "手贴了文本却没挂图"就完全没有提示。映射表只用来查它指向哪张素材，
+             * 查不到即 label 为空，渲染层标红警示。 */
+            if (tokenOn() && s[i] === "<") {
+                const mt = /^<(?:Picture|Video|Audio)\s+\d+>/.exec(s.slice(i));
+                if (mt) {
+                    if (buf) { out.push({ text: buf }); buf = ""; }
+                    out.push({ token: mt[0], label: String(map[mt[0]] || "") });
+                    i += mt[0].length;
+                    continue;
+                }
+            }
             if (s[i] === "@" && !/[0-9A-Za-z_]/.test(s[i - 1] || "")) {
                 const hit = labs.find((l) => s.startsWith(l, i + 1));
                 if (hit) {
@@ -508,10 +569,16 @@ function createPromptEditor(opts) {
         return out;
     }
 
+    /* token 重建：三类 token 各自的文本形态。序列化统一走这里 ——
+     * 凡是从 token 数组拼回文本的地方都必须用它，否则 `<Picture N>`
+     * 会被写成 `@别名`（形态被悄悄改写）。 */
+    const emitTok = (tk) => (tk.token ? tk.token : (tk.label ? `@${tk.label}` : tk.text));
+
     function render(text) {
         box.replaceChildren();
         for (const tk of refTokens(text)) {
-            if (tk.label) box.append(makeTag(tk.label));
+            if (tk.token) box.append(makeTokenTag(tk.token, tk.label));
+            else if (tk.label) box.append(makeTag(tk.label));
             else box.append(document.createTextNode(tk.text));
         }
     }
@@ -547,7 +614,17 @@ function createPromptEditor(opts) {
                     }
                     acc += len;
                 } else if (n.nodeType === 1) {
-                    if (n.dataset && n.dataset.label) {
+                    if (n.dataset && n.dataset.token) {
+                        /* token 按标签原文计长（`<Picture 1>` = 11 字符） */
+                        const len = n.dataset.token.length;
+                        if (acc + len >= want) {
+                            const r = document.createRange();
+                            r.setStartAfter(n);
+                            r.collapse(true);
+                            return r;
+                        }
+                        acc += len;
+                    } else if (n.dataset && n.dataset.label) {
                         const len = n.dataset.label.length + 1;
                         if (acc + len >= want) {
                             const r = document.createRange();
@@ -626,8 +703,9 @@ function createPromptEditor(opts) {
         let hit = 0;
         let next = "";
         for (const tk of refTokens(cur)) {
-            if (tk.label && tk.label === want) { hit += 1; continue; }
-            next += tk.label ? `@${tk.label}` : tk.text;
+            /* 只删 @别名；token（<Picture N>）是官方文本的一部分，不归引用计数管 */
+            if (tk.label && !tk.token && tk.label === want) { hit += 1; continue; }
+            next += emitTok(tk);
         }
         if (!hit) return false;
         next = tidy(next);
@@ -651,7 +729,8 @@ function createPromptEditor(opts) {
         if (!want) return false;
         let nth = 0;
         if (tagEl) {
-            for (const n of box.querySelectorAll(".h3d-rtag")) {
+            /* :not(.h3d-rtok)：token 框不算 @别名 的第 n 个，否则序号会错位 */
+            for (const n of box.querySelectorAll(".h3d-rtag:not(.h3d-rtok)")) {
                 if (n === tagEl) break;
                 if ((n.dataset.label || "") === want) nth += 1;
             }
@@ -661,13 +740,13 @@ function createPromptEditor(opts) {
         let hit = false;
         let next = "";
         for (const tk of refTokens(ser(box))) {
-            if (tk.label && tk.label === want) {
+            if (tk.label && !tk.token && tk.label === want) {
                 if (seen === nth) { seen += 1; hit = true; continue; }
                 seen += 1;
-                next += `@${tk.label}`;
+                next += emitTok(tk);
                 continue;
             }
-            next += tk.label ? `@${tk.label}` : tk.text;
+            next += emitTok(tk);
         }
         if (!hit) return false;
         next = tidy(next);
@@ -680,7 +759,8 @@ function createPromptEditor(opts) {
 
     function tagCount(label) {
         const want = String(label || "");
-        return refTokens(ser(box)).filter((tk) => tk.label === want).length;
+        /* 只数 @别名：token 不算"引用次数"（它是官方文本，不是导演台引用语法） */
+        return refTokens(ser(box)).filter((tk) => tk.label && !tk.token && tk.label === want).length;
     }
 
     /* —— textarea 兼容面 —— */
@@ -791,7 +871,9 @@ function createPromptEditor(opts) {
         if (composing) return false;
         const text = api.value;
         const domCount = {};
-        box.querySelectorAll(".h3d-rtag").forEach((n) => {
+        /* 只数 @别名 的框：token（<Picture N>）也带 dataset.label，混进来会让
+         * domCount 虚高 → 漏判"还有裸别名没成框"（手打的 @别名 迟迟不变绿框）。 */
+        box.querySelectorAll(".h3d-rtag:not(.h3d-rtok)").forEach((n) => {
             const l = n.dataset.label || "";
             domCount[l] = (domCount[l] || 0) + 1;
         });
@@ -4327,6 +4409,8 @@ function injectStyles() {
     .h3d-rta:empty:before{content:attr(data-ph);color:#7d8695;pointer-events:none}
     .h3d-rta-off{color:#636e7b;cursor:not-allowed;background:#22272e}
     .h3d-rtag{display:inline-flex;align-items:center;gap:4px;margin:0 2px;padding:0 3px 0 4px;border:1px solid #2f6e57;border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;vertical-align:baseline;user-select:all}
+    .h3d-rtok{border-color:#2f5a8e;background:#111f2e;color:#8fc4f0;padding:0 4px;cursor:default}
+    .h3d-rtok.h3d-rtok-missing{border-color:#8e2f2f;background:#2e1414;color:#f09595}
     /* 绿框里的标识：缩略图（图/视首帧）或音符图标。pointer-events:none 防误拖。
      * outline 描一圈内缘（不占布局、不改变尺寸）—— 缩略图压在深色底上时边缘不发虚。 */
     .h3d-rtag>.h3d-thumb{width:15px;height:15px;border-radius:5px;object-fit:cover;background:#0d0c0a;flex:none;pointer-events:none;outline:1px solid #2f6e5799;outline-offset:-1px}
@@ -6691,6 +6775,20 @@ function buildCards(data) {
                         }
                     }
                     return m;
+                },
+                /* 官方标签 → 素材别名：{"<Picture 1>": "回廊场景", ...}。
+                 * 外部 agent 写的官方格式文本里是 `<Picture N>`，靠它渲染成缩略图，
+                 * 让用户直接看见"Picture 几"是哪张图（顺序挂错一眼可见）；
+                 * 挂不到素材的标红警示。序列化时原样还原，不改写正文。
+                 * 与 v2RefsFromSchedule 同口径 —— 那正是后端 _kind_tokens 的编号规则。 */
+                tokenMap: () => {
+                    const out = {};
+                    let dsNow = data.ds;
+                    if (node) { try { dsNow = getDs(node); } catch (e) { /* 回落快照 */ } }
+                    for (const r of v2RefsFromSchedule(dsNow, it.idx)) {
+                        out[r.label] = String(r.src || "");
+                    }
+                    return out;
                 },
                 /* 项目目录：拼项目内 assets/… 的预览地址用（读活的控件值）。 */
                 dir: () => getDirValue(node),

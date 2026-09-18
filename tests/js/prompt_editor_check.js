@@ -284,6 +284,70 @@ eq(mk6 && mk6.textContent, M.KIND_ICON.audio, "音频类别图标=音符");
 eq(tag6.dataset.label, "素材", "redrawIcons 不得动 dataset.label（序列化口径不变）");
 eq(ta6.value, "@素材 出现", "redrawIcons 不得动正文文本");
 
+/* ⑮ 官方标签 <Picture N> 的可视化（外部 agent 贴进来的官方格式文本）。
+ * 要点：渲染成缩略图、序列化**原样还原**（绝不能改写成 @别名）、
+ * 不参与 @别名 的计数与删除、挂不到素材时标红警示。 */
+const TOKENS = { "<Picture 1>": "阿依", "<Picture 2>": "阿依的家" };
+const tokAssets = () => ({
+    阿依: { kind: "image", file: "assets/a.png", asset_id: "" },
+    阿依的家: { kind: "video", file: "assets/b.mp4", asset_id: "" },
+});
+const ta7 = M.createPromptEditor({
+    value: "subject_definitions:\n<Picture 1>：角色参考\n<Picture 2>：场景参考",
+    labels: () => ds.ref_assets.map((a) => a.label),
+    assets: tokAssets,
+    dir: () => "",
+    tokenMap: () => TOKENS,
+});
+window.document.body.append(ta7.el);
+const tokEls = ta7.el.querySelectorAll(".h3d-rtok");
+eq(tokEls.length, 2, "两个 <Picture N> 应各渲染成一个 token 框");
+eq([...tokEls].map((n) => n.dataset.token), ["<Picture 1>", "<Picture 2>"],
+    "dataset.token 记录标签原文");
+eq(ta7.value, "subject_definitions:\n<Picture 1>：角色参考\n<Picture 2>：场景参考",
+    "序列化必须原样还原 <Picture N>（不得改写成 @别名）");
+ok(!ta7.value.includes("@阿依"), "正文里不应出现 @别名");
+eq(ta7.tagCount("阿依"), 0, "token 不计入 @别名 引用次数");
+ta7.removeTag("阿依");
+ok(ta7.value.includes("<Picture 1>"), "removeTag（清引用）不得删掉 token 文本");
+eq(ta7.value, "subject_definitions:\n<Picture 1>：角色参考\n<Picture 2>：场景参考",
+    "removeTag 对纯 token 文本应是空操作");
+
+/* 混用：@别名 与 <Picture N> 并存，各自形态不变 */
+const ta8 = M.createPromptEditor({
+    value: "@阿依 与 <Picture 2> 并存",
+    labels: () => ds.ref_assets.map((a) => a.label),
+    assets: tokAssets,
+    dir: () => "",
+    tokenMap: () => TOKENS,
+});
+eq(ta8.value, "@阿依 与 <Picture 2> 并存", "混用时两种形态都要原样保留");
+eq(ta8.tagCount("阿依"), 1, "混用时 @别名 仍正常计数");
+eq(ta8.el.querySelectorAll(".h3d-rtag:not(.h3d-rtok)").length, 1, "@别名 绿框 1 个");
+eq(ta8.el.querySelectorAll(".h3d-rtok").length, 1, "token 框 1 个（两者互不干扰）");
+
+/* 悬空 token：映射里没有 → 标红警示（"挂不到素材"的可视化） */
+const ta9 = M.createPromptEditor({
+    value: "<Picture 9>：没挂到素材",
+    labels: () => [],
+    assets: () => ({}),
+    dir: () => "",
+    tokenMap: () => TOKENS,
+});
+window.document.body.append(ta9.el);
+eq(ta9.el.querySelectorAll(".h3d-rtok-missing").length, 1, "悬空 token 应标 h3d-rtok-missing");
+eq(ta9.value, "<Picture 9>：没挂到素材", "悬空 token 也要原样保留");
+
+/* 不传 tokenMap 时行为不变（老调用点不受影响） */
+const ta10 = M.createPromptEditor({
+    value: "@阿依 与 <Picture 2>",
+    labels: () => ds.ref_assets.map((a) => a.label),
+    assets: tokAssets,
+    dir: () => "",
+});
+eq(ta10.el.querySelectorAll(".h3d-rtok").length, 0, "未传 tokenMap：不渲染 token 框");
+eq(ta10.value, "@阿依 与 <Picture 2>", "未传 tokenMap：正文原样");
+
 if (fails.length) {
     console.error("FAIL:\n - " + fails.join("\n - "));
     process.exit(1);

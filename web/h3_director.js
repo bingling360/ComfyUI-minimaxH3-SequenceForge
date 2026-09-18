@@ -2969,14 +2969,18 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
         if (ui.name) ui.name.textContent = settings.mode === "local"
             ? `本地: ${String(settings.local_model || "").split(/[\\/]/).pop() || "未选"}`
             : (settings.model || "").split("/").pop() || "API";
-        /* 悬空引用告警：正文写了 <Picture N>/<Subject N>，但本段一张图都没送进模型。
-         * 可能是模型照抄了剧本里的标签，也可能是手写的 —— 不说破的话要等出片
-         * 才发现人物/场景全变了。 */
-        const usedTags = (String(finalText).match(/<(?:Picture|Subject|Video|Audio)\s+\d+>/g) || []).length;
-        if (usedTags > 0 && (!mm.media || mm.media.length === 0)) {
-            setLed("warn", `已回填，但正文里有 ${usedTags} 处 <Picture/Subject/...> 引用，`
-                + "而本段没有挂任何素材 —— 这些标签是悬空的，生成时不会有图。"
-                + "请到「引用素材」挂上素材，或删掉这些标签。");
+        /* 悬空引用告警：<Picture N> 的编号超过实际送进模型的图片数。
+         * 编号是**按挂载顺序**分配的 —— collectSegMedia 先把首/尾帧排在最前，
+         * 再接 seg.refs，所以"挂了几张"和"产出里写了几号"可能对不上：
+         * 挂了 2 张却写 <Picture 3>、或事后调过挂载顺序，引用都会指向不存在的图。
+         * 只查 Picture：collectSegMedia 只传 kind==="image"，Video/Audio 不在其中。 */
+        const picIdx = [...String(finalText).matchAll(/<Picture\s+(\d+)>/g)].map((m) => Number(m[1]));
+        const maxPic = picIdx.length ? Math.max(...picIdx) : 0;
+        const nMedia = (mm.media || []).length;
+        if (maxPic > nMedia) {
+            setLed("warn", `已回填，但正文引用了 <Picture ${maxPic}>，而本段只有 ${nMedia} 张图`
+                + "送进模型 —— 超出的编号是悬空的，生成时不会有图。"
+                + "请到「引用素材」补挂对应图片，或删掉这些引用。");
         } else {
             setLed("done", "优化已回填主框＋具象化（对齐指令已按首尾帧锚补回）");
         }

@@ -930,11 +930,18 @@ function buildRefBar(RB) {
                     rec.minus.classList.toggle("off", n <= 0);
                 }
                 const nAsset = new Set(refs).size;
+                /* RB.note：调用方补一句说明（如"其中 2 个来自素材调度"）。
+                 * 只读展示，不影响 chips 点亮逻辑。 */
+                let noteTxt = "";
+                try {
+                    noteTxt = String(typeof RB.note === "function" ? RB.note() : (RB.note || "")).trim();
+                } catch (e) { noteTxt = ""; }
+                const tail = noteTxt ? ` · ${noteTxt}` : "";
                 counter.textContent = nAsset
                     ? (RB.gate
-                        ? `已引用 ${nAsset} 个素材（共 ${refs.length} 次 · 图${cnt.image}/${KIND_CAPS.image}·视${cnt.video}/${KIND_CAPS.video}·音${cnt.audio}/${KIND_CAPS.audio}）`
-                        : `已标注 ${nAsset} 个素材（共 ${refs.length} 次 · 仅标注，不进模型）`)
-                    : (RB.gate ? "本段未引用素材" : "本段未标注素材");
+                        ? `已引用 ${nAsset} 个素材（共 ${refs.length} 次 · 图${cnt.image}/${KIND_CAPS.image}·视${cnt.video}/${KIND_CAPS.video}·音${cnt.audio}/${KIND_CAPS.audio}）${tail}`
+                        : `已标注 ${nAsset} 个素材（共 ${refs.length} 次 · 仅标注，不进模型）${tail}`)
+                    : ((RB.gate ? "本段未引用素材" : "本段未标注素材") + tail);
             };
             /* 用 mousedown 而不是 click：① 卡片重绘可能夹在 mousedown/click
              * 之间把节点换掉 → click 永远不来（"点了没反应"）；
@@ -982,6 +989,18 @@ function buildRefBar(RB) {
                     scheduleRefresh(240);
                 }));
                 const clearAll = () => {
+                    /* 只来自素材调度、正文里没有 @ 的引用：✕ 在正文里清不到任何东西。
+                     * 不明确说一句就会变成"点了没反应"（历史上这类抱怨的来源）。 */
+                    let inherited = [];
+                    try {
+                        inherited = (typeof RB.inherited === "function"
+                            ? RB.inherited() : (RB.inherited || []));
+                    } catch (e) { inherited = []; }
+                    if (inherited.includes(a.label)) {
+                        setLed("warn", `「${a.label}」来自素材调度，生成时真的会送图；`
+                            + "要取消请到素材调度里移除");
+                        return;
+                    }
                     if (ed) {
                         ed.removeTag(a.label);              // 正文里所有该绿框一次清掉
                         RB.commit(ed);
@@ -2950,7 +2969,17 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
         if (ui.name) ui.name.textContent = settings.mode === "local"
             ? `本地: ${String(settings.local_model || "").split(/[\\/]/).pop() || "未选"}`
             : (settings.model || "").split("/").pop() || "API";
-        setLed("done", "优化已回填主框＋具象化（对齐指令已按首尾帧锚补回）");
+        /* 悬空引用告警：正文写了 <Picture N>/<Subject N>，但本段一张图都没送进模型。
+         * 可能是模型照抄了剧本里的标签，也可能是手写的 —— 不说破的话要等出片
+         * 才发现人物/场景全变了。 */
+        const usedTags = (String(finalText).match(/<(?:Picture|Subject|Video|Audio)\s+\d+>/g) || []).length;
+        if (usedTags > 0 && (!mm.media || mm.media.length === 0)) {
+            setLed("warn", `已回填，但正文里有 ${usedTags} 处 <Picture/Subject/...> 引用，`
+                + "而本段没有挂任何素材 —— 这些标签是悬空的，生成时不会有图。"
+                + "请到「引用素材」挂上素材，或删掉这些标签。");
+        } else {
+            setLed("done", "优化已回填主框＋具象化（对齐指令已按首尾帧锚补回）");
+        }
         scheduleRefresh(200);
     } catch (e) {
         alert(`提示词优化失败：${e.message || e}`);
@@ -6785,6 +6814,18 @@ function buildCards(data) {
                 }
                 return m;
             };
+            /* 素材调度挂上的引用（seg.refs）—— 与「正文里有没有 @」是两回事：
+             * AI 扩写回填只写剧本正文、不会写 @，但 seg.refs 生成时真的会送图。
+             * 引用条必须把它算进去，否则显示空白会被误读成"图没挂上"。 */
+            const liveRefs = () => {
+                if (node) {
+                    try {
+                        const s = (getDs(node).segments || [])[it.idx];
+                        if (s && Array.isArray(s.refs)) return s.refs.slice();
+                    } catch (e) { /* 回落快照 */ }
+                }
+                return Array.isArray(segNow.refs) ? segNow.refs.slice() : [];
+            };
             /* 可折叠编辑区：三段统一外观，点标题栏收起/展开。
              * 抽成顶层 h3dPane —— 总提示词工作台的段卡用同一套外观。 */
             const mkPane = h3dPane;
@@ -6867,12 +6908,31 @@ function buildCards(data) {
                 scriptTa.disabled = true;
             }
             pScript.body.append(scriptTa.el || scriptTa);
-            /* ② 的引用条：纯标注（写完只落在 script 正文里，不进模型、不写 seg.refs） */
+            /* ② 的引用条：正文里的 @ 是纯标注（写完只落在 script 正文里，不进模型、
+             * 不写 seg.refs）；但**素材调度挂的 seg.refs 生成时真的会送图**。
+             * AI 扩写回填只写剧本正文、不会写 @，所以这里要把 seg.refs 一并点亮
+             * 并注明来源 —— 否则引用条一片空白，会被误读成"图没挂上"。 */
+            const scriptRefsInText = () => refsFromText(
+                String((canEdit ? scriptTa.value : segNow.script) || ""), poolNow());
             const refScript = mkRefBar({
                 title: "引用素材 · 剧本",
                 editor: canEdit ? scriptTa : null,
-                readRefs: () => refsFromText(String((canEdit ? scriptTa.value : segNow.script) || ""),
-                    poolNow()),
+                readRefs: () => {
+                    const out = scriptRefsInText().slice();
+                    for (const l of liveRefs()) {
+                        if (l && !out.includes(l)) out.push(l);
+                    }
+                    return out;
+                },
+                note: () => {
+                    const inText = scriptRefsInText();
+                    const n = liveRefs().filter((l) => l && !inText.includes(l)).length;
+                    return n ? `其中 ${n} 个来自素材调度（生成时真的送图）` : "";
+                },
+                inherited: () => {
+                    const inText = scriptRefsInText();
+                    return liveRefs().filter((l) => l && !inText.includes(l));
+                },
                 commit: (ed) => {
                     setSegmentField(node, it.idx, "script", ed.value);
                     scheduleRefresh(200);

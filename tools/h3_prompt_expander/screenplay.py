@@ -103,13 +103,37 @@ def _as_list(v, limit=8):
 
 # ---------------------------------------------------------------- outline
 
+def _split_style_note(note):
+    """把「随图说明」从风格/案例参考里拆出来。
+
+    前端 collectSegMedia 把随图说明（`<Picture 1> = 参考素材「xx」`）塞进 style_note
+    一起下发，但那句是**事实信息**——哪张图是谁；而 style_note 的既有口径是
+    「风格/案例参考（只吸收机制）」。混在一起会让模型把"图1是谁"也当成
+    可吸收可不吸收的参考。这里拆开：随图说明单独成节，并强调照图写。
+    """
+    note = str(note or "").strip()
+    if not note:
+        return "", ""
+    # 到句号为止：贪婪到行尾会把同行的风格/案例参考一起吞进来
+    m = re.search(r"随图说明：([^。\n]*)。?", note)
+    if not m:
+        return "", note
+    visual = m.group(1).strip()
+    # 切片而非索引：「随图说明：」落在串尾时 m.end() == len(note)，索引会越界
+    rest = re.sub(r"[；;。\s]+", " ", (note[:m.start()] + " " + note[m.end():])).strip(" ；;。")
+    return visual, rest
+
+
 def compose_outline_messages(raw_zh, count, sec_range, style="balanced", style_note=""):
     _screenplay_sys, outline_sys = load_screenplay_prompts()
     lo, hi = sec_range
     cfg_s = style_cfg(style)
     extra = [cfg_s["note"]]
-    if str(style_note or "").strip():
-        extra.append(f"用户指定的风格/案例参考（吸收其机制，不许照抄人物）：{style_note.strip()}")
+    visual, rest = _split_style_note(style_note)
+    if visual:
+        extra.append(f"随图（你实际看到的图片，规划时照图来）：{visual}")
+    if rest:
+        extra.append(f"用户指定的风格/案例参考（吸收其机制，不许照抄人物）：{rest}")
     user = ("用户全片中文意图：" + str(raw_zh).strip()
             + f"\n需要切成 {count} 段"
             + f"\n每段时长范围：{lo:g}–{hi:g} 秒（你在范围内自行定秒数）"
@@ -183,8 +207,11 @@ def compose_script_messages(logline_zh, sec_range, ctx=None, style="balanced", s
     parts.append(f"本段时长范围：{lo:g}–{hi:g} 秒（你在这个范围内自行定秒数，"
                  "并在正文开头写「时长：N 秒」）")
     extra = [cfg_s["note"]]
-    if str(style_note or "").strip():
-        extra.append(f"风格/案例参考（只吸收机制）：{style_note.strip()}")
+    visual, rest = _split_style_note(style_note)
+    if visual:
+        extra.append(f"随图（这是你实际看到的图片，务必照图写，不要当成可取舍的参考）：{visual}")
+    if rest:
+        extra.append(f"风格/案例参考（只吸收机制）：{rest}")
     parts.append("\n".join(extra))
     return {"system": screenplay_sys, "user": "\n\n".join(parts)}
 

@@ -1550,9 +1550,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
             ea = None
             hw_src = None          # 需要先裁后编时用（像素帧 + 音频）
             if kind == "prev_tail":
-                if not want_v:
-                    return None, None   # 上段 latent 存档不带音频，仅音频无源可取
-                return ref_video_t, None
+                # prev_tail 是**「上段尚未生成」的哨兵**（anchors.SRC_KINDS 默认源），
+                # 不是可解析的张量 —— anchors._REENCODE_HINT 给它的指引就是
+                # 「上段尚未生成；先跑完上段，或改用别的源」。
+                # 本函数开头也写明「手动锚不静默降级……绝不回落上段尾」：
+                # 段首桥的 prev_tail 由 eff_guide 承担（_anchor_head 已先行排除该 kind），
+                # 能走到这里的 mid/tail 锚带 prev_tail 属配置矛盾 —— 点名报错，
+                # 而不是返回一个不存在的上段尾（原代码引用了从未定义的 ref_video_t）。
+                raise ValueError(f"锚点 {a['id']}：源类型「上段尾」没有可用的上段"
+                                 "（上段尚未生成或被禁用/跳过）——先跑完上段，或改用别的源")
             if kind == "library":
                 ev, ea = _load_library_latent(ref)
                 if want_v:
@@ -2477,6 +2483,23 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     pass
                 return False, True
 
+        # ---- 主循环状态容器 ----
+        # ⚠ 这一整块在 cc93c7d「手动锚定步骤 6 主编排切换」重构中被整体删除过，
+        # 导致 `total` / `prompt_list` / `thumbs` / `pbar` 等十余个名字全部 NameError ——
+        # 任何带存档的运行都必然崩在下面第一行 save_state（`total` 未定义），
+        # 且修完一个还会撞上下一个。已加 tests/test_no_undefined_names.py 守住。
+        # total 口径 = 执行序列 + 序章槽，与「存档续跑」报告行、_off_slots 三处一致。
+        pbar = comfy.utils.ProgressBar(len(exec_items))
+        total = len(exec_items) + off
+        prompt_list = (["「序章（上传视频）」"] if off else []) + [
+            seg_prompts[it[1]] for it in exec_items]
+        thumbs, videos, seams, bridge_scores = [], [], [], []
+        all_frames = []
+        seg_frames = []
+        seg_wavs = []
+        trims = []
+        seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
+
         if use_ckpt:  # 运行起点状态（面板据此定位当前链）
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll, "report": "",
@@ -3091,6 +3114,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 thumbs.append("")
                 videos.append("")
 
+            # 本段 latent 注入开关（旧字段 latent_ref.on）：旧档才带，现由
+            # migrate_legacy_seg 迁走、新状态里已无此概念 —— 故取空字典，
+            # 等价于原实现「越界/无记录时的 {}」分支（不改写 note）。
+            _lr_cur = {}
             if guide is not None:
                 note = (f"guide=上段尾{_eff_fr}帧" if full_bridge else "guide=单帧桥(旧协议降级)") \
                     + ("+音频" if "audio_latent" in guide else "")
@@ -3098,7 +3125,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 note = "guide=无（首段）"
             if seg_unlink[i]:
                 note = "guide=无（关闭自动引用上段·断链）"
-            elif _lr_cur.get("on") is False:
+            elif _lr_cur.get("on") is False:   # _lr_cur 见上方「本段 latent 注入开关」
                 note = "guide=无（本段关闭 latent 注入）"
             if _redo_mode is not None:
                 note = f"重摇（{_redo_mode}）：首锚{'上段尾帧桥' if eff_guide is not None else '无'}" \

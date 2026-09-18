@@ -2142,7 +2142,10 @@ def add_routes(routes):
             data = await request.json()
         except Exception:
             data = {}
-        root = _proj_root(str((data or {}).get("dir") or ""))
+        # dir_name 必须先取出来：下面 read_project(safe_rel(dir_name)) 要用它，
+        # 而此前这里只解了 root、没定义 dir_name —— 该路由必然 NameError 500。
+        dir_name = str((data or {}).get("dir") or "")
+        root = _proj_root(dir_name)
         src_rel = str((data or {}).get("file") or "").replace("\\", "/")
         parts = [p for p in src_rel.split("/") if p and p != "."]
         if root is None or len(parts) != 2 or parts[0] != "latent" \

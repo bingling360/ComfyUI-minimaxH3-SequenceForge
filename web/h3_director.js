@@ -2913,7 +2913,8 @@ async function collectSegMedia(node, ds, idx) {
     for (const key of ((Array.isArray(seg.refs) ? seg.refs : []).slice(0, 8))) {
         const hit = pool.find((a) => a && (a.label === key || a.asset_id === key));
         if (!hit || hit.kind !== "image") continue;
-        picks.push({ file: hit.file, asset_id: hit.asset_id || "", role: `参考素材「${hit.label}」` });
+        picks.push({ file: hit.file, asset_id: hit.asset_id || "", label: hit.label,
+            role: `参考素材「${hit.label}」` });
     }
     const media = [];
     const notes = [];
@@ -2922,11 +2923,19 @@ async function collectSegMedia(node, ds, idx) {
         const dataUrl = await optImageToDataUrl(
             assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
         if (!dataUrl) continue;
-        const tag = `<Picture ${media.length + 1}>`;
-        media.push({ kind: "image", label: tag, images: [dataUrl] });
-        notes.push(`${tag} = ${asset.role}`);
+        const nm = String(asset.label || "");
+        /* label 用**素材名**，不再用 <Picture N>：让 LLM 写 @素材名，由后端
+         * _apply_label_tokens 按 seg.refs 顺序压实成 <Picture k>。好处是
+         * 顺序无关（名字唯一）、回填时 applyPromptEdit→syncRefsFromText 自动挂图、
+         * 外部 agent 只看素材名就能独立写完直接贴。
+         * 首尾帧没有素材名 → label 留空（后端 `if m.get("label")` 会过滤掉）。 */
+        media.push({ kind: "image", label: nm, images: [dataUrl] });
+        if (nm) notes.push(`@${nm}`);
     }
-    return { media, note: notes.length ? `随图说明：${notes.join("；")}。` : "" };
+    return { media, note: notes.length
+        ? `随图说明：可用素材 ${notes.join("、")}`
+          + "（正文里直接写 @名字 引用，不要写 <Picture N>）。"
+        : "" };
 }
 
 async function optFetchRuleFiles() {

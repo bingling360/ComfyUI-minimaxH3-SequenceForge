@@ -243,18 +243,27 @@ def build_system_prompt(task: str, duration: float, labels: list,
     t = str(task or "T2VA").upper()
     dur = max(0.5, min(30.0, float(duration or 5.0)))
     lang = "中文" if str(output_language or "中文") in ("中文", "chinese", "zh") else "English"
-    lbl = ", ".join(labels) if labels else "无"
+    # 传**素材名**而不是 <Picture N>：LLM 写 @素材名，由后端 _apply_label_tokens
+    # 按 seg.refs 顺序压实成 <Picture k>。这样顺序无关、回填时前端
+    # applyPromptEdit→syncRefsFromText 会自动挂图，外部 agent 也只需知道素材名。
+    # 与 web/h3_director.js 的 collectSegMedia 配套（它把素材名放进 media.label）。
+    lbl = (("可用素材：" + "、".join("@" + str(x) for x in labels)
+            + "（正文里直接写 @名字 引用，不要写 <Picture N>）") if labels
+           else "本段无参考素材")
     if t in ("REF2VA", "HYBRID"):
         return (
             "你是 MiniMax H3 全参考提示词改写器。输出语言：%s。"
             "恰好输出六节，每节标题独占一行、冒号后换行写内容，节间空一行："
             "subject_definitions, summary, retention_analysis, detailed_description, "
             "overall_soundscape, non_diegetic_music。"
-            "标签纪律：复用可见内容用 <Subject N>，首尾帧等具体帧锚用 <Picture N>，"
+            # 参考素材走 @素材名（见 lbl），这里不再提 <Picture N> —— 否则与
+            # 末尾「不要写 <Picture N>」自相矛盾。首尾帧对齐指令由前端自动生成，
+            # 本就不需要模型写。
+            "标签纪律：复用可见内容用 <Subject N>，参考素材直接用 @素材名（名单见末尾），"
             "整片编辑/续写用 <Video N>，音频用 <Audio N>；summary 首行用 [task type] 前缀；"
             "retention 每行形如 <label>: marker - 解释；对白用 <d>[语言] 原文</d>，说话人用 (S1)/(S2)；"
             "镜头用 [Shot 1] 开头（无时间戳），后续 [Shot N] At MM:SS.mmm；"
-            "只改写用户给的内容，不虚构新事件。目标时长 %.1fs，可用标签：%s。"
+            "只改写用户给的内容，不虚构新事件。目标时长 %.1fs，%s。"
             % (lang, dur, lbl)
         )
     if t == "FL2VA":
@@ -271,7 +280,7 @@ def build_system_prompt(task: str, duration: float, labels: list,
         "用 [Shot 1] 开头，有真实切镜才加后续 [Shot N] At MM:SS.mmm；"
         "运镜写自然语句（含类型/幅度/速度）；对白用 <d>[语言] 原文</d>，说话人 (S1)/(S2)；"
         "环境氛围进 overall_soundscape，角色听不到的配乐进 non_diegetic_music（无则 N/A）。"
-        "目标时长 %.1fs，可用标签：%s。只改写用户给的内容。"
+        "目标时长 %.1fs，%s。只改写用户给的内容。"
         % (t, lang, dur, lbl)
     )
 

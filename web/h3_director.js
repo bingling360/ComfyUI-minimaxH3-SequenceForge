@@ -380,11 +380,12 @@ function chipLabelText(s) {
 /** 超长素材名的显示形态：保留首尾、中间省略。
  *
  * 素材名常常是长文件名，而两个素材可能只差尾部几位
- * （`…_14_02_12` / `…_14_02_03`）。纯前缀截断会让它们在界面上长得
+ * （`…_14_02_12.png` / `…_14_02_03.png`）。纯前缀截断会让它们在界面上长得
  * 一模一样 —— 尾巴才是区分点，必须留着，否则用户根本看不出引用了哪个。
- * 短名字行为不变（仍走 chipLabelText 的剥媒体后缀语义）。 */
+ * **含格式后缀**（如 `.png`）：素材引用要"完整"，@回廊场景.png 才是自描述完整；
+ * 短名字行为不变（`foo.png` 直接显示 `foo.png`，不省略）。 */
 function shortLabel(s, head = 13, tail = 10) {
-    const t = chipLabelText(s);
+    const t = String(s == null ? "" : s).trim();
     if (t.length <= head + tail + 1) return t;
     return t.slice(0, head) + "…" + t.slice(-tail);
 }

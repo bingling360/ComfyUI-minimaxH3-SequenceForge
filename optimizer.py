@@ -75,6 +75,7 @@ RULE_REF = {"中文": "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
 # 本地模型句柄进程内缓存：同一模型只加载一次（加载一次几十秒，反复加载会拖死节点）
 _GGUF_CACHE: dict = {}
 _TF_CACHE: dict = {}
+MAX_LLM_IMAGES = 9  # 与 H3 单段图片上限一致；超出时显式报错，不静默丢图
 
 
 def prompt_dir() -> str:
@@ -115,9 +116,40 @@ def pick_rule_text(settings: dict | None, files: dict | None, task: str | None =
     return files.get(table[lang]) or files.get(RULE_REF[lang])
 
 
+def _stored_config() -> dict:
+    try:
+        try:
+            from . import llm_config
+        except ImportError:
+            import llm_config
+        return llm_config.load()
+    except Exception:
+        return {}
+
+
+def save_user_config(raw: dict | None) -> dict:
+    try:
+        try:
+            from . import llm_config
+        except ImportError:
+            import llm_config
+        return llm_config.save(raw, keep_secrets=True)
+    except Exception as exc:
+        raise RuntimeError(f"用户级 LLM 配置保存失败：{exc}") from exc
+
+
 def normalize_config(raw: dict | None) -> dict:
     cur = DEFAULT_CONFIG
-    raw = raw if isinstance(raw, dict) else {}
+    incoming = raw if isinstance(raw, dict) else {}
+    stored = _stored_config()
+    # 前端新请求只带非敏感配置或空 api_key 时，自动合并用户级配置；
+    # 显式非空值仍可在当前请求覆盖用户默认值。
+    raw = dict(stored)
+    raw.update(incoming)
+    if not str(incoming.get("api_key") or "").strip() and stored.get("api_key"):
+        raw["api_key"] = stored["api_key"]
+    if not isinstance(incoming.get("api_keys"), dict) and isinstance(stored.get("api_keys"), dict):
+        raw["api_keys"] = stored["api_keys"]
     provider = str(raw.get("provider") or cur["provider"]).lower()
     preset = PROVIDERS.get(provider)
     api_keys = raw.get("api_keys") if isinstance(raw.get("api_keys"), dict) else {}
@@ -152,10 +184,23 @@ def normalize_config(raw: dict | None) -> dict:
     }
 
 
+def _safe_model_ref(value) -> str:
+    value = str(value or "").strip().replace("\\", "/")
+    if not value or value.startswith("/") or ":" in value or ".." in value.split("/"):
+        return ""
+    return value
+
+
 def public_config(cfg: dict) -> dict:
     out = dict(cfg)
     out["api_key"] = ""
-    out["has_api_key"] = bool(cfg.get("api_key"))
+    out["api_keys"] = {}
+    out["has_api_key"] = bool(cfg.get("api_key") or any(cfg.get("api_keys", {}).values()))
+    # 本地模型路径也不应随项目/设置响应向前端暴露绝对路径；前端只使用扫描出的相对名。
+    out["local_model_ref"] = _safe_model_ref(cfg.get("local_model"))
+    out["local_mmproj_ref"] = _safe_model_ref(cfg.get("local_mmproj"))
+    out["local_model"] = ""
+    out["local_mmproj"] = ""
     try:
         out["models"] = scan_visual_models()
     except Exception:
@@ -324,16 +369,9 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
     if not cfg.get("api_url") or not cfg.get("model"):
         raise ValueError("API 地址或模型为空")
     proto = str(cfg.get("protocol") or "openai").lower()
-    # 图片只取前 8 张（与测试分支一致，防包过大）
-    images: list = []
-    for item in media or []:
-        if not isinstance(item, dict):
-            continue
-        for u in (item.get("images") or [])[:8]:
-            if isinstance(u, str) and u.startswith("data:image"):
-                images.append(u)
-        if len(images) >= 8:
-            break
+    images = _media_images(media)
+    if len(images) > MAX_LLM_IMAGES:
+        raise ValueError(f"本次选择了 {len(images)} 张图片，超过视觉模型上限 {MAX_LLM_IMAGES} 张；请减少本段素材")
     if proto == "gemini":
         parts: list = [{"text": system + "\n\n" + user_prompt}]
         for u in images:
@@ -400,17 +438,15 @@ def _temp(v, default: float = 0.2) -> float:
 
 
 def _media_images(media: list) -> list:
-    """取前 8 张图片 dataURL（与云通道同口径）。"""
+    """收集全部图片 dataURL；上限由调用方显式检查，不静默丢素材。"""
     out: list = []
     for item in media or []:
         if not isinstance(item, dict):
             continue
-        for u in (item.get("images") or [])[:8]:
+        for u in item.get("images") or []:
             if isinstance(u, str) and u.startswith("data:image"):
                 out.append(u)
-        if len(out) >= 8:
-            break
-    return out[:8]
+    return out
 
 
 def _b64_to_pil(data_url: str):
@@ -432,6 +468,8 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
     if not sel:
         raise ValueError("请先在优化设置里选择本地视觉模型")
     images = _media_images(media) if cfg.get("read_media") else []
+    if len(images) > MAX_LLM_IMAGES:
+        raise ValueError(f"本次选择了 {len(images)} 张图片，超过视觉模型上限 {MAX_LLM_IMAGES} 张；请减少本段素材")
     root = (_llm_roots() or [""])[0]
 
     # ---- GGUF 路径（llama-cpp-python + mmproj 视觉投影）----
@@ -540,6 +578,183 @@ def generate_json(config_in: dict | None, system: str, user_prompt: str,
             except ValueError:
                 pass
     raise RuntimeError(f"LLM 未返回合法 JSON：{text[:300]}")
+
+
+def _generation_system_prompt(segments: list[dict], output_language: str) -> str:
+    """统一提示词生成入口的系统约束：一次请求直接产出 H3 JSON。"""
+    modes = {str(s.get("task") or "T2VA").upper() for s in segments}
+    mode = next(iter(modes)) if len(modes) == 1 else "T2VA"
+    duration = max([float(s.get("seconds") or 5.0) for s in segments] or [5.0])
+    labels = []
+    for seg in segments:
+        for asset in seg.get("selected_assets") or []:
+            if isinstance(asset, dict):
+                name = str(asset.get("file_name") or asset.get("label") or "").strip()
+            else:
+                name = str(asset or "").strip()
+            if name and name not in labels:
+                labels.append(name)
+    base = build_system_prompt(mode, duration, labels, output_language,
+                               {"generation_mode": "one_shot_json"})
+    return base + "\\n\\n" + (
+        "你现在不是剧本扩写器，也不要输出解释、Markdown 或自由格式剧本。"
+        "请一次完成：把每段 intent 直接改写成可执行的 MiniMax H3 官方提示词。"
+        "参考素材在编辑层必须使用 @完整文件名（包含扩展名），禁止输出 <Picture N>、"
+        "<Video N>、<Audio N>；这些 token 会由后端在发送 H3 前按正文首次出现顺序生成。"
+        "返回严格 JSON，顶层只有 schema_version 和 segments。segments 必须按输入顺序返回，"
+        "每项必须包含 segment_id、mode、fields、text。text 是 fields 按官方字段顺序拼接的纯文本；"
+        "不要在 JSON 之外输出任何文字。schema_version 固定为 h3.prompt.generate.v1。"
+    )
+
+
+def _generation_user_prompt(segments: list[dict], output_language: str) -> str:
+    """给 LLM 的文本上下文不携带 data URL；图片由 generate_text 的 media 参数传递。"""
+    rows = []
+    for index, seg in enumerate(segments):
+        assets = []
+        for asset in seg.get("selected_assets") or []:
+            if isinstance(asset, dict):
+                name = str(asset.get("file_name") or asset.get("label") or "").strip()
+                kind = str(asset.get("kind") or "image").strip()
+                desc = str(asset.get("description") or asset.get("role") or "").strip()
+                if name:
+                    assets.append({"file_name": name, "kind": kind, "description": desc})
+            elif str(asset).strip():
+                assets.append({"file_name": str(asset).strip(), "kind": "image"})
+        rows.append({
+            "index": index,
+            "segment_id": str(seg.get("segment_id") or f"seg-{index + 1}"),
+            "intent": str(seg.get("intent") or "").strip(),
+            "duration_seconds": float(seg.get("seconds") or 5.0),
+            "task": str(seg.get("task") or "T2VA").upper(),
+            "selected_assets": assets,
+            "current_result": str(seg.get("current_result") or "").strip(),
+        })
+    return (
+        f"输出语言：{output_language}。以下是本次要生成的分段 JSON 输入：\\n"
+        + json.dumps({"segments": rows}, ensure_ascii=False, indent=2)
+        + "\\n请逐段直接生成最终 H3 字段，不要生成 script 字段。"
+    )
+
+
+def _normalize_generation_segments(raw: dict, requested: list[dict]) -> list[dict]:
+    """把模型结果归一为请求段顺序，并拒绝模型擅自新增/调换 segment_id。"""
+    if not isinstance(raw, dict):
+        raise RuntimeError("LLM JSON 顶层不是对象")
+    returned = raw.get("segments")
+    if not isinstance(returned, list):
+        # 单段兼容：允许旧模型直接返回 {text/fields}，但不对多段猜测。
+        if len(requested) == 1 and (raw.get("text") or raw.get("fields")):
+            returned = [raw]
+        else:
+            raise RuntimeError("LLM JSON 缺少 segments 数组")
+    if len(returned) != len(requested):
+        raise RuntimeError(f"LLM 返回 {len(returned)} 段，期望 {len(requested)} 段")
+    out = []
+    for index, (item, wanted) in enumerate(zip(returned, requested)):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"LLM 返回的第 {index + 1} 段不是对象")
+        wanted_id = str(wanted.get("segment_id") or f"seg-{index + 1}")
+        got_id = str(item.get("segment_id") or wanted_id)
+        if got_id != wanted_id:
+            raise RuntimeError(f"LLM 修改了第 {index + 1} 段的 segment_id：{got_id}")
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+        text = str(item.get("text") or "").strip()
+        if not text and fields:
+            try:
+                import prompts as _prompts
+                text = _prompts.serialize_fields({str(k): str(v or "") for k, v in fields.items()})
+            except Exception as exc:
+                raise RuntimeError(f"无法拼接第 {index + 1} 段 fields：{exc}") from exc
+        if not text:
+            raise RuntimeError(f"LLM 返回的第 {index + 1} 段结果为空")
+        out.append({
+            "segment_id": wanted_id,
+            "mode": str(item.get("mode") or wanted.get("task") or "T2VA").upper(),
+            "fields": fields,
+            "text": text,
+            "seconds": float(wanted.get("seconds") or 5.0),
+            "selected_assets": list(wanted.get("selected_assets") or []),
+        })
+    return out
+
+
+def generate_prompt_once(config_in: dict | None, payload: dict | None) -> dict:
+    """一次 LLM 请求：意图/资产 -> 多段完整 H3 结果 JSON。
+
+    这是新前端唯一应使用的生成业务入口。它只调用 ``generate_json``，不导入
+    nodes.py、不调用 ComfyUI API、不创建或修改画布节点。
+    """
+    cfg = normalize_config(config_in)
+    payload = payload if isinstance(payload, dict) else {}
+    requested = payload.get("segments")
+    if not isinstance(requested, list) or not requested:
+        requested = [{
+            "segment_id": str(payload.get("segment_id") or "seg-1"),
+            "intent": str(payload.get("intent") or payload.get("total_intent") or "").strip(),
+            "seconds": payload.get("seconds") or payload.get("duration") or 5.0,
+            "task": payload.get("task") or "T2VA",
+            "selected_assets": payload.get("selected_assets") or payload.get("assets") or [],
+            "current_result": payload.get("current_result") or "",
+        }]
+    if len(requested) > 24:
+        raise ValueError("一次最多生成 24 段提示词")
+    normalized = []
+    media = []
+    shared_media = payload.get("media") if isinstance(payload.get("media"), list) else []
+    for index, raw in enumerate(requested):
+        raw = raw if isinstance(raw, dict) else {}
+        try:
+            seconds = float(raw.get("seconds") or raw.get("duration") or 5.0)
+        except (TypeError, ValueError):
+            seconds = 5.0
+        assets = raw.get("selected_assets")
+        if not isinstance(assets, list):
+            assets = raw.get("assets") if isinstance(raw.get("assets"), list) else []
+        seg = {
+            "segment_id": str(raw.get("segment_id") or f"seg-{index + 1}"),
+            "intent": str(raw.get("intent") or "").strip(),
+            "seconds": seconds,
+            "task": str(raw.get("task") or payload.get("task") or "T2VA").upper(),
+            "selected_assets": assets,
+            "current_result": str(raw.get("current_result") or "").strip(),
+        }
+        if not seg["intent"] and not seg["current_result"]:
+            raise ValueError(f"第 {index + 1} 段意图为空")
+        normalized.append(seg)
+        seg_media = raw.get("media") if isinstance(raw.get("media"), list) else shared_media
+        for item in seg_media:
+            if isinstance(item, dict) and item not in media:
+                media.append(item)
+    system = _generation_system_prompt(normalized, cfg.get("output_language") or "中文")
+    user_prompt = _generation_user_prompt(normalized, cfg.get("output_language") or "中文")
+    raw = generate_json(cfg, system, user_prompt, media,
+                        int(cfg.get("max_tokens") or 4096), _temp(payload.get("temperature")))
+    results = _normalize_generation_segments(raw, normalized)
+    all_ok = True
+    for item in results:
+        try:
+            import prompts as _prompts
+            verdict = _prompts.compile_prompt_document(
+                item["text"], assets=item["selected_assets"], seconds=item["seconds"],
+                mode=item["mode"], segment_id=item["segment_id"],
+            )
+        except Exception as exc:
+            verdict = {"ok": False, "errors": [{"code": "H3_RESULT_VALIDATE_FAILED",
+                                                   "message": str(exc)}], "warnings": []}
+        item["ok"] = bool(verdict.get("ok"))
+        item["errors"] = verdict.get("errors") or []
+        item["warnings"] = verdict.get("warnings") or []
+        item["editor_text"] = item["text"]
+        item["compiled_preview"] = verdict.get("prompt_text") or ""
+        all_ok = all_ok and item["ok"]
+    return {
+        "ok": all_ok,
+        "schema_version": "h3.prompt.generate.v1",
+        "segments": results,
+        "meta": {"count": len(results), "failed": sum(1 for x in results if not x["ok"]),
+                 "mode": cfg.get("mode"), "model": cfg.get("model") or ""},
+    }
 
 
 def optimize_once(config_in: dict | None, payload: dict | None) -> str:

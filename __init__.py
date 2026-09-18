@@ -36,7 +36,7 @@ try:
                       "/h3chain/upscale_models, /h3chain/experiments, /h3chain/prompt-rules, "
                       "/h3chain/optimizer-config, "
                       "POST /h3chain/create_project, /h3chain/save_prompts, /h3chain/compile, "
-                      "/h3chain/optimize, /h3chain/expand, /h3chain/expand_validate, "
+                      "/h3chain/optimize, /h3chain/prompt_generate, /h3chain/expand, /h3chain/expand_validate, "
                        "/h3chain/assets, /h3chain/asset_check, /h3chain/compile_refs, "
                        "/h3chain/transcode_submit|jobs|job|cancel, /h3chain/library_upload, "
                        "GET /h3chain/library_file|asset_links, POST /h3chain/asset_link|unlink|mirror, "

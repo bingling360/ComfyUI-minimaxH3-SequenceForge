@@ -358,6 +358,12 @@ def scan_scope(scope, project=None) -> list:
                 continue
             f = str(a["file"]).replace("\\", "/")
             abs_p = os.path.join(root, *f.split("/"))
+            # 只读自愈：文件不在就**不列**（不写 manifest，读路径绝不落盘）。
+            # 历史包袱：老版本删除只 os.remove 文件、不摘登记 -> 库里攒下一批
+            # "文件没了条目还在"的幽灵，永远显示、点删除也没用（删的是不存在的文件）。
+            # 这里挡掉，用户不用手工清库；新删除路径已由 asset_store.remove_asset 摘干净。
+            if not os.path.isfile(abs_p):
+                continue
             e = _entry("global", str(a.get("kind") or "image"),
                        a.get("orig_name") or os.path.basename(f), f, abs_p,
                        asset_id=str(a.get("asset_id") or ""))

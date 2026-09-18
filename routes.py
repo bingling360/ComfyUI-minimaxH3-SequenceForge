@@ -47,7 +47,9 @@ ROUTES = [
     ("GET", "/h3chain/experiments"),
     ("GET", "/h3chain/prompt-rules"),
     ("GET", "/h3chain/optimizer-config"),
+    ("POST", "/h3chain/optimizer-config"),
     ("POST", "/h3chain/optimize"),
+    ("POST", "/h3chain/prompt_generate"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
     ("POST", "/h3chain/compile"),
@@ -144,7 +146,10 @@ def add_routes(routes):
         manifest = projects.read_project(request.query.get("dir") or "")
         if manifest is None:
             return _err("项目不存在", code="NOT_FOUND", status=404)
-        return web.json_response({"ok": True, "manifest": manifest})
+        # 新 UI 读取统一文档；manifest 原字段原样保留给旧工作流和旧前端。
+        document = projects.prompt_document_from_manifest(manifest)
+        return web.json_response({"ok": True, "manifest": manifest,
+                                  "prompt_document": document})
 
     async def create_project(request):
         try:
@@ -223,6 +228,15 @@ def add_routes(routes):
         if not target.startswith(root + os.sep) or not os.path.isfile(target):
             return _err("文件不存在", code="NOT_FOUND", status=404)
         os.remove(target)
+        # 文件没了，manifest 里的历史记录也要少一条：右栏「成片 / 合并片段」是照
+        # manifest["finals"] / ["merges"] 渲染的，不摘就永远挂着一张放不出来的卡
+        # （与素材库删除同一根因）。videos 是链状态，不在"历史"范围，故意不动。
+        rel = "/".join(parts[2:])
+        try:
+            projects.forget_media(parts[1], rel)
+        except (ValueError, OSError):
+            pass
+        h3lib.invalidate(parts[1])
         return web.json_response({"ok": True})
 
     async def merge(request):
@@ -1014,6 +1028,26 @@ def add_routes(routes):
             cfg = {"ok": False}
         return web.json_response({"ok": True, **cfg})
 
+    async def optimizer_config_save(request):
+        """保存用户级 LLM 配置；Key 不进入导演台状态或项目 manifest。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="H3_BAD_JSON", status=400)
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+        try:
+            saved = await asyncio.get_event_loop().run_in_executor(
+                None, _opt.save_user_config, data.get("config") if isinstance(data, dict) else data)
+            public = _opt.public_config(_opt.normalize_config(saved))
+        except ValueError as e:
+            return _err(str(e), code="H3_CONFIG_INVALID", status=400)
+        except Exception as e:
+            return _err(f"配置保存失败：{e}", code="H3_CONFIG_SAVE_FAILED", status=500)
+        return web.json_response({"ok": True, **public})
+
     async def optimize(request):
         """提示词优化（长耗时，放线程池）：自研后端，云/本地双通道。"""
         try:
@@ -1034,6 +1068,32 @@ def add_routes(routes):
         except Exception as e:
             return _err(f"优化失败：{e}", code="OPTIMIZE_FAILED", status=500)
         return web.json_response({"ok": True, "prompt": text})
+
+    async def prompt_generate(request):
+        """统一提示词生成：意图 + 本段资产 -> H3 JSON 结果。
+
+        该 handler 只进入 optimizer 的 LLM 通道，不导入 nodes.py，不加载默认工作流，
+        也不调用 queuePrompt。旧 expand/optimize 接口保留给历史项目和外部脚本。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="H3_BAD_JSON", status=400)
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _opt.generate_prompt_once, data.get("config"), data)
+        except ValueError as e:
+            return _err(str(e), code="H3_SCHEMA_INVALID", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="H3_LLM_PROVIDER_ERROR", status=502)
+        except Exception as e:
+            return _err(f"提示词生成失败：{e}", code="H3_PROMPT_GENERATE_FAILED", status=500)
+        status = 200 if result.get("ok") else 422
+        return web.json_response(result, status=status)
 
     def _load_expander():
         """加载 tools/h3_prompt_expander/service.py（非包目录，走 sys.path 注入）。"""
@@ -1154,10 +1214,27 @@ def add_routes(routes):
         mode = data.get("mode")
         mode = mode if isinstance(mode, str) and mode else None
         try:
-            compiled = _prompts.compile_segment(prompt, seconds=seconds,
-                                                has_start=has_start, has_end=has_end,
-                                                mode=mode)
-            verdict = _prompts.validate_compiled(compiled)
+            # 新编辑层传纯 H3 字段文本 + assets：统一走 Prompt Compiler，
+            # @完整文件名只在这里转换为官方 token。旧结构化 prompt 继续走旧适配器。
+            if isinstance(prompt, str) or data.get("result_text") is not None:
+                editor_text = data.get("result_text") if data.get("result_text") is not None else prompt
+                compiled = _prompts.compile_prompt_document(
+                    editor_text,
+                    assets=data.get("assets") or data.get("selected_assets") or [],
+                    seconds=seconds,
+                    mode=mode,
+                    has_start=has_start,
+                    has_end=has_end,
+                    segment_id=data.get("segment_id"),
+                )
+                verdict = {"ok": bool(compiled.get("ok")),
+                           "errors": compiled.get("errors") or [],
+                           "warnings": compiled.get("warnings") or []}
+            else:
+                compiled = _prompts.compile_segment(prompt, seconds=seconds,
+                                                    has_start=has_start, has_end=has_end,
+                                                    mode=mode)
+                verdict = _prompts.validate_compiled(compiled)
         except Exception as e:
             return _err(f"编译失败：{e}", code="COMPILE_FAILED", status=400)
         status = 200 if verdict["ok"] else 422
@@ -1571,7 +1648,18 @@ def add_routes(routes):
         return web.json_response({"ok": True})
 
     async def lib_delete(request):
-        """删除物理文件；项目清单里的引用由前端确认后各自清理。"""
+        """删除物理文件 **+ 同步清单**（三条清理，缺一条就出"删不掉的幽灵条目"）。
+
+        以前只删文件、不动任何清单，于是同一个根因长出两个症状：
+          - **全局库**：`scan_scope("global")` 以全局库 manifest 为唯一源 —— 文件删了
+            条目还在，瓦片永远留在库里，用户看到的就是「全局库根本删除不了」
+            （点确定后弹窗关了，什么都没变）；
+          - **项目资产**：瓦片扫的是真目录会消失（所以看起来"能删"），但导演台
+            「资产引用」栏以 `manifest["assets"]` 为唯一真相 —— 那一栏永远少不掉，
+            留着一条点不亮的幽灵素材。
+        现在：global 摘全局库登记、project 摘项目 assets/asset_links、linked 只解链，
+        三者都顺带清掉 seg.refs 与正文里的 @别名；另附"还有别的项目在引用"提醒。
+        """
         try:
             data = await request.json()
         except Exception:
@@ -1582,6 +1670,10 @@ def add_routes(routes):
             ([str(data["id"])] if data.get("id") else [])
         paths = []
         unlinked = []
+        notes = []
+        drop_labels, drop_ids, drop_files = set(), set(), set()
+        latent_files = []
+        global_drops = []          # [(asset_id, file)]
         for i in ids:
             it = _find_item(dir_name, i)
             if it is None:
@@ -1590,7 +1682,7 @@ def add_routes(routes):
                 # 链接条目（asset_links）：只解链 —— 文件是全局库那份，绝不能删
                 try:
                     if projects.unlink_asset(dir_name, asset_id=it.get("asset_id"),
-                                         alias=it.get("name")) is not None:
+                                             alias=it.get("name")) is not None:
                         unlinked.append(it["name"])
                 except ValueError as e:
                     unlinked.append(f"{it['name']}（{e}）")
@@ -1598,10 +1690,91 @@ def add_routes(routes):
             p = h3lib.resolve_item_path(it, dir_name)
             if p:
                 paths.append(p)
+            scope = str(it.get("scope") or "")
+            if scope == "global":
+                global_drops.append((it.get("asset_id"), it.get("file")))
+            elif scope == "project":
+                if it.get("name"):
+                    drop_labels.add(str(it["name"]))
+                if it.get("file"):
+                    drop_files.add(str(it["file"]))
+                if it.get("asset_id"):
+                    drop_ids.add(str(it["asset_id"]))
+            elif scope == "latent":
+                latent_files.append(str(it.get("file") or ""))
+        # ① 全局库登记（manifest 是 scan_scope("global") 的唯一源）
+        removed_global = []
+        if global_drops:
+            try:
+                from . import asset_store
+            except ImportError:
+                import asset_store
+            lib_root = h3lib._library_root()
+            if not lib_root:
+                notes.append("全局库不可用：文件已删，但库内登记没能清掉（刷新后会重新出现）")
+            else:
+                for aid, f in global_drops:
+                    got = asset_store.remove_asset(lib_root, asset_id=aid, file=f)
+                    if got.get("removed"):
+                        removed_global.append(got["removed"])
+        # ①b 本项目也链着它吗？那就顺手解开 —— 用户正站在这个项目里删它，
+        #     留一条指向已删文件的链接只会让项目编译报"文件缺失"。
+        #     （别的项目不动，只在下面出提醒：不替用户改别的项目的存档。）
+        if removed_global and dir_name:
+            cur_ids = set()
+            try:
+                cur_mf = projects.read_project(dir_name) or {}
+                for x in (cur_mf.get("asset_links") or []):
+                    if isinstance(x, dict) and x.get("asset_id"):
+                        cur_ids.add(str(x["asset_id"]))
+            except Exception:
+                cur_ids = set()
+            for e in removed_global:
+                aid = str(e.get("asset_id") or "")
+                if not aid or aid not in cur_ids:
+                    continue
+                try:
+                    projects.unlink_asset(dir_name, asset_id=aid)
+                    unlinked.append(str(e.get("orig_name") or aid))
+                    notes.append(f"本项目里指向它的链接已一并解开"
+                                 f"（{e.get('orig_name') or aid}）")
+                except (ValueError, OSError) as ex:
+                    notes.append(f"本项目解链失败：{ex}")
+        # ② 项目清单（导演台「资产引用」栏的唯一真相）
+        if drop_labels or drop_ids or drop_files:
+            try:
+                projects.remove_assets(dir_name, labels=drop_labels, asset_ids=drop_ids,
+                                       files=drop_files)
+            except (ValueError, OSError) as e:
+                notes.append(f"项目清单清理失败：{e}")
+        if latent_files:
+            try:
+                projects.remove_latents(dir_name, latent_files)
+            except (ValueError, OSError) as e:
+                notes.append(f"latent 清单清理失败：{e}")
         res = h3lib.delete_items(paths)
-        h3lib.invalidate(dir_name)
+        # 全局库缓存键是 "global|"（不含项目名），invalidate(dir_name) 清不到它
+        if global_drops:
+            h3lib.invalidate()
+        else:
+            h3lib.invalidate(dir_name)
+        # ③ 删掉的全局资产还有别的项目在链吗？断了要说出来，别让人过两天才发现
+        if removed_global:
+            aids = [str(e.get("asset_id") or "") for e in removed_global]
+            try:
+                hit = projects.projects_linking(aids, exclude=dir_name)
+            except Exception:
+                hit = {}
+            for e in removed_global:
+                users = hit.get(str(e.get("asset_id") or "")) or []
+                if users:
+                    notes.append(
+                        f"⚠「{e.get('orig_name') or e.get('file')}」仍被 {len(users)} 个项目引用"
+                        f"（{'、'.join(sorted(users))}）：那边的引用已失效，"
+                        f"请重开项目重新挑素材")
         return web.json_response({"ok": True, **res, "unlinked": unlinked,
-                                  "requested": len(ids)})
+                                  "detached": len(removed_global) + len(drop_labels),
+                                  "notes": notes, "requested": len(ids)})
 
     async def lib_archive(request):
         """把非全局库的条目存一份进全局库（成片产物自动备份，跨项目复用）。
@@ -2216,7 +2389,9 @@ def add_routes(routes):
         ("GET", "/h3chain/experiments", experiment_defs),
         ("GET", "/h3chain/prompt-rules", prompt_rules),
         ("GET", "/h3chain/optimizer-config", optimizer_config),
+        ("POST", "/h3chain/optimizer-config", optimizer_config_save),
         ("POST", "/h3chain/optimize", optimize),
+        ("POST", "/h3chain/prompt_generate", prompt_generate),
         ("POST", "/h3chain/expand", expand),
         ("POST", "/h3chain/expand_multi", expand_multi),
         ("POST", "/h3chain/optimize_multi", optimize_multi),

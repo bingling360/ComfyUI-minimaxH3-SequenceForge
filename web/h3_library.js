@@ -869,21 +869,45 @@
     say(`已打包 ${r.body.count} 个文件（${fmtSize(r.body.bytes)}）`);
   }
 
+  /** 删除：物理文件 + **清单同步**（后端一次做完），前端负责把"删的到底是什么"说清楚。
+   *
+   * 三种条目后果不同，混成一句话必然让人误判：
+   *   项目内文件 → 删文件 + 从本项目「资产引用」栏与提示词 @引用里一并清掉；
+   *   全局库文件 → 从全局库彻底移除（别的项目链接它的引用会失效）；
+   *   「链接」条目 → 只解链，全局库那份文件保留。
+   */
   async function actDelete(ids) {
-    const linkedN = S.items.filter((x) => ids.includes(x.id) && x.linked).length;
-    const tip = linkedN
-      ? `选中里含 ${linkedN} 个「链接」条目：只会解除项目链接（全局库那份文件保留）。\n`
-        + "其余条目会删除物理文件，不可撤销。确认继续？"
-      : `确认删除这 ${ids.length} 个文件的物理文件？（不可撤销）`;
+    const rows = S.items.filter((x) => ids.includes(x.id));
+    const linkedN = rows.filter((x) => x.linked).length;
+    const globalN = rows.filter((x) => x.scope === "global").length;
+    const projN = rows.length - linkedN - globalN;
+    const lines = [];
+    if (projN > 0) {
+      lines.push(`${projN} 个项目内文件：删物理文件，并从本项目「资产引用」栏`
+        + "和提示词里的 @引用一并清掉");
+    }
+    if (globalN > 0) {
+      lines.push(`${globalN} 个全局库文件：从全局库彻底移除（不可撤销）；`
+        + "本项目里指向它的链接会一并解开，已被其它项目链接的那些引用会失效");
+    }
+    if (linkedN > 0) {
+      lines.push(`${linkedN} 个「链接」条目：只解除项目链接（全局库那份文件保留）`);
+    }
+    const tip = (lines.length
+      ? `确认删除选中的 ${rows.length} 个条目？\n\n`
+        + lines.map((s) => "· " + s).join("\n") + "\n\n不可撤销。"
+      : `确认删除这 ${ids.length} 个文件的物理文件？（不可撤销）`);
     if (!window.confirm(tip)) return;
     const A = api();
     const r = await A.libDelete(S.dir, ids);
     if (!r.body?.ok) { fail(A.errText(r, "删除失败")); return; }
     S.sel.clear();
     const un = (r.body.unlinked || []).length;
+    const notes = r.body.notes || [];
     say(`已删除 ${(r.body.deleted || []).length} 个`
-        + (un ? `，解除链接 ${un} 个（全局库文件保留）` : "")
-        + ((r.body.skipped || []).length ? `，跳过 ${r.body.skipped.length} 个` : ""));
+        + (un ? `，解除项目链接 ${un} 个` : "")
+        + ((r.body.skipped || []).length ? `，跳过 ${r.body.skipped.length} 个` : "")
+        + (notes.length ? `\n${notes.join("\n")}` : ""));
     notify();          // 项目里没了：导演台的引用栏/提示词补全要同步
     fetchPage(false);
   }

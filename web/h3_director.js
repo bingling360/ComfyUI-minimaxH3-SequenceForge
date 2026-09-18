@@ -101,6 +101,23 @@ const REF_TPL_DEFAULT = 0;
  * 钩子，把卡片内的活状态推进到最新，重活（整卡重建）仍等焦点离开。 */
 let _cardPainters = [];
 function registerCardPainter(fn) { if (typeof fn === "function") _cardPainters.push(fn); }
+
+/* 打开中的浮层里的「活」渲染器（总提示词框等）：每次 refresh 一并推进。
+ * 为什么必须有：素材库弹窗（.h3l-overlay）与总提示词框（.h3d-overlay）**可以同时开着**，
+ * 在素材库里删/改名/上传后，总提示词框的「参考素材（AI 可见）」chips 却停在旧池上
+ * —— 那一栏没少、点上去还报错。段卡的引用条有 _cardPainters，浮层这边此前没有对应物。
+ * 注册者自己负责摘除（DOM 断开即 unregister），不留悬挂引用。 */
+let _livePainters = [];
+function registerLivePainter(fn) { if (typeof fn === "function") _livePainters.push(fn); }
+function unregisterLivePainter(fn) {
+    const i = _livePainters.indexOf(fn);
+    if (i >= 0) _livePainters.splice(i, 1);
+}
+function runLivePainters() {
+    for (const fn of [..._livePainters]) {
+        try { fn(); } catch (e) { /* 单个浮层失败不影响别的 */ }
+    }
+}
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧起手（可选尾帧图片=FL2VA 首尾帧），fl2va UNET"],
@@ -397,6 +414,20 @@ function uniqueLabelFrom(taken, base) {
     return `${base}${n}`;
 }
 
+/* 现行编辑引用使用完整原文件名；label 只作为旧项目/旧后端 alias 保留。
+ * 显示层可以 shortLabel，但 dataset、@文本和 API payload 永远走这个完整值。 */
+function assetFileName(asset) {
+    if (!asset || typeof asset !== "object") return "";
+    const raw = asset.file_name || asset.filename || asset.orig_name || asset.original_name;
+    if (raw) return String(raw).trim().replace(/\\/g, "/").split("/").pop();
+    const file = String(asset.file || "").trim().replace(/\\/g, "/");
+    const base = file.split("/").pop() || "";
+    return base || String(asset.label || "").trim();
+}
+function assetRefName(asset) {
+    return assetFileName(asset) || String(asset?.label || "").trim();
+}
+
 /** 在 textarea 光标处插入文本（未聚焦则追加到末尾），返回新值 */
 function insertAtCursor(ta, text) {
     if (!ta) return "";
@@ -485,9 +516,12 @@ function createPromptEditor(opts) {
         };
         sp.dataset.thumbSig = thumbSig(ainfo);
         sp.append(buildAssetThumb(dirOf(), ainfo));
-        /* 显示剥掉夹带的格式后缀（chipLabelText）：dataset.label 保持原值，
-         * 序列化/匹配仍按原别名走，只是不把 ".png" 摆到用户眼前。 */
-        sp.append(document.createTextNode(shortLabel(label)));
+        /* 显示首尾省略，title/dataset 保留完整文件名；不要把显示值当引用 key。 */
+        const text = document.createElement("span");
+        text.className = "h3d-rtag-text";
+        text.textContent = shortLabel(label);
+        text.title = String(label);
+        sp.append(text);
         /* ✕ 用 span 而不是 <button>：contenteditable 内的交互元素在 Chromium 下
          * 行为不一致（button 的 click 有时被选区逻辑吃掉 → "点了没反应"）。
          * 直接吃 mousedown：不依赖 click 配对，也不会因为重绘换节点而丢事件。 */
@@ -993,15 +1027,17 @@ function buildRefBar(RB) {
                     || !c.querySelector(":scope > .h3d-thumb, :scope > .h3d-kindmark, :scope > .h3d-chipbtn-text")) {
                     buildChipBody(c, a);
                 }
-                const lbl = shortLabel(a.label) || a.label || "素材";
+                const fullName = assetRefName(a);
+                const lbl = shortLabel(fullName) || fullName || a.label || "素材";
+                c.title = `${KIND_NAME[a.kind] || ""}「${fullName || lbl}」${roles}`;
                 const txt = c.querySelector(":scope > .h3d-chipbtn-text")
                     || c.appendChild(Object.assign(document.createElement("span"),
                         { className: "h3d-chipbtn-text" }));
                 txt.textContent = `${n > 0 ? "✓ " : "＋ "}${lbl}${roles}${n > 1 ? ` ×${n}` : ""}`;
                 const armedName = (REF_TEMPLATES[refTpl] || [])[0] || "裸引用（不加描述）";
-                c.title = `${KIND_NAME[a.kind] || ""}「${lbl}」${roles}：`
+                c.title = `${KIND_NAME[a.kind] || ""}「${fullName || lbl}」${roles}：`
                     + (n > 0
-                        ? `本段已引用 ${n} 次${token ? `（正文里每个 @${a.label} 都会编译成 ${token}）` : ""}`
+                        ? `本段已引用 ${n} 次${token ? `（正文里每个 @${fullName || a.label} 都会编译成 ${token}）` : ""}`
                         : "本段未引用")
                     + "\n点一次 = 在提示词框里插一个绿框（图标+别名，点两次=引用两次）；"
                     + "右侧 ✕（或右键本 chip）= 取消本段对它的全部引用。"
@@ -1012,7 +1048,8 @@ function buildRefBar(RB) {
             let chipKeys = null;      // 已建 chips 的别名序列（与 livePool 对齐；池变了才重建 DOM）
             const syncChips = (live) => {
                 const arr = live || livePool();
-                const joined = arr.map((x) => String(x.label || "")).join("\u0001");
+                const joined = arr.map((x) => `${assetRefName(x)}\u0002${String(x.label || "")}`)
+                    .join("\u0001");
                 if (joined === chipKeys) return;       // 池没变：chips DOM 原样留用
                 chipKeys = joined;
                 for (const rec of chips.splice(0)) { rec.c.remove(); rec.minus.remove(); }
@@ -1076,7 +1113,7 @@ function buildRefBar(RB) {
                 const roles = Array.isArray(a.roles) && a.roles.length ? `【${a.roles.join("·")}】` : "";
                 const c = el("button", "h3d-chipbtn");
                 c.type = "button";
-                c.dataset.ref = String(a.label || "");
+                c.dataset.ref = assetRefName(a) || String(a.label || "");
                 /* 一次建好"图标 + 文本"骨架：paintChip 只更新文本，不再重建 DOM，
                  * 这样 chip 不会因为 paint 闪烁，鼠标悬停/焦点也保得住。 */
                 buildChipBody(c, a);
@@ -1091,12 +1128,13 @@ function buildRefBar(RB) {
                         const tplDef = REF_TEMPLATES[refTpl];
                         if (tplDef) {
                             /* 锚定方式：按句式写入（@别名 落成绿框，前后文一起进正文） */
-                            const phrase = tplDef[1](a.label);
+                            const refName = assetRefName(a) || a.label;
+                            const phrase = tplDef[1](refName);
                             const m = /^(.*?)@([^\s]+)([\s\S]*)$/.exec(phrase);
-                            if (m) ed.insertTag(a.label, m[1], m[3]);
+                            if (m) ed.insertTag(refName, m[1], m[3]);
                             else ed.insertText(phrase);
                         } else {
-                            ed.insertTag(a.label);
+                            ed.insertTag(assetRefName(a) || a.label);
                         }
                         RB.commit(ed);
                                                 }
@@ -1166,17 +1204,51 @@ function buildRefBar(RB) {
  *  与后端 compile_refs / _find_refs 同口径（`@标签`，负向后顾防 a@b.com）。 */
 function refsFromText(text, pool) {
     const s = String(text || "");
-    const labs = (pool || []).map((a) => String(a.label || "")).filter(Boolean)
-        .sort((a, b) => b.length - a.length);
+    const entries = [];
+    for (const asset of (pool || [])) {
+        const legacy = String(asset?.label || "").trim();
+        const full = assetRefName(asset);
+        const keys = [full, legacy].filter(Boolean);
+        for (const key of keys) {
+            if (!entries.some((x) => x.key === key && x.asset === asset)) {
+                entries.push({ key, asset });
+            }
+        }
+    }
+    entries.sort((a, b) => b.key.length - a.key.length);
     const out = [];
+    const found = [];
     let i = 0;
     while (i < s.length) {
-        if (s[i] === "@" && !/[0-9A-Za-z_]/.test(s[i - 1] || "")) {
-            const hit = labs.find((l) => s.startsWith(l, i + 1));
-            if (hit) { out.push(hit); i += hit.length + 1; continue; }
+        if (s[i] !== "@" || /[0-9A-Za-z_]/.test(s[i - 1] || "")) { i += 1; continue; }
+        if (s[i + 1] === '"' || s[i + 1] === "'") {
+            const q = s[i + 1];
+            const end = s.indexOf(q, i + 2);
+            if (end > i + 2) {
+                const key = s.slice(i + 2, end);
+                const hit = entries.find((x) => x.key === key);
+                if (hit) { found.push({ pos: i, value: String(hit.asset.label || hit.key) }); }
+                i = end + 1;
+                continue;
+            }
+        }
+        const hit = entries.find((x) => s.slice(i + 1, i + 1 + x.key.length) === x.key);
+        if (hit) {
+            found.push({ pos: i, value: String(hit.asset.label || hit.key) });
+            i += hit.key.length + 1;
+            continue;
         }
         i += 1;
     }
+    /* 兼容 [[旧标签]]，仍按正文出现顺序并入 refs。 */
+    const bracket = /\[\[([^\[\]]+)\]\]/g;
+    let m;
+    while ((m = bracket.exec(s))) {
+        const hit = entries.find((x) => x.key === m[1]);
+        if (hit) found.push({ pos: m.index, value: String(hit.asset.label || hit.key) });
+    }
+    found.sort((a, b) => a.pos - b.pos);
+    for (const item of found) out.push(item.value);
     return out;
 }
 
@@ -1451,6 +1523,18 @@ function defaultUpscale() {
              include: [] };
 }
 
+function segmentIdFor(raw, index, fallbackText = "") {
+    const existing = String(raw?.segment_id || raw?.id || "").trim();
+    if (existing) return existing;
+    const text = `${index}|${String(raw?.intent_zh || raw?.intent || fallbackText || "")}`;
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        h ^= text.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return `seg-${(h >>> 0).toString(16).padStart(8, "0")}`;
+}
+
 function defaultSegment() {
     // 双按钮（null=跟随全局默认开）：auto_ref=false≈旧unlink，auto_seq=false≈旧disabled；
     // latent_ref（null=跟随全局尾部N帧注入），latent_save（null=默认全存）。
@@ -1458,7 +1542,7 @@ function defaultSegment() {
      *   intent_zh = 中文意图（支持 @素材，给人和 AI 看）
      *   script    = AI 扩写产物（官方格式剧本，可人工改）
      * 与 prompt_v2.intent_zh 是两回事：后者是具象化内部字段。 */
-    return { intent_zh: "", script: "", scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, auto_ref: null, auto_seq: null, frame_refs: null, prompt_v2: null, latent_save: null, latent_ref: null, tail_src: null, v2mode: null, anchors: [] };
+    return { segment_id: "", intent_zh: "", script: "", scene_prompt: "", character_prompt: "", soundscape: "", music: "", seconds: null, refs: [], unlink: false, disabled: false, auto_ref: null, auto_seq: null, frame_refs: null, prompt_v2: null, latent_save: null, latent_ref: null, tail_src: null, v2mode: null, anchors: [] };
 }
 
 function segAutoRef(seg) {
@@ -1481,6 +1565,7 @@ function restoreSegField(raw) {
     if (!raw || typeof raw !== "object") return base;
     const sec = Number(raw.seconds);
     return {
+        segment_id: String(raw.segment_id || raw.id || "").trim(),
         scene_prompt: typeof raw.scene_prompt === "string" ? raw.scene_prompt : "",
         character_prompt: typeof raw.character_prompt === "string" ? raw.character_prompt : "",
         soundscape: typeof raw.soundscape === "string" ? raw.soundscape : "",
@@ -1526,7 +1611,8 @@ function getDs(node) {
         let refAssets = Array.isArray(raw.ref_assets)
             ? raw.ref_assets.filter((a) => a && typeof a === "object" && (a.file || a.asset_id))
                 .map((a) => ({
-                    file: String(a.file),
+                    file: String(a.file || ""),
+                    file_name: assetFileName(a),
                     kind: KIND_LIST.includes(a.kind) ? a.kind : "image",
                     label: cleanLabel(a.label) || "",
                     /* P3：全局库稳定 ID（空=旧本地条目；保存 manifest.assets 时剥离，住 asset_links） */
@@ -1538,7 +1624,7 @@ function getDs(node) {
             : null;
         if (!refAssets) {
             const legacy = Array.isArray(raw.ref_images) ? raw.ref_images.filter(String).map(String) : [];
-            refAssets = legacy.map((file) => ({ file, kind: "image", label: "" }));
+            refAssets = legacy.map((file) => ({ file, file_name: assetFileName({ file }), kind: "image", label: "" }));
         }
         const kindCount = { image: 0, video: 0, audio: 0 };
         refAssets.forEach((a) => {
@@ -1556,9 +1642,10 @@ function getDs(node) {
         const validLabels = new Set(refAssets.map((a) => a.label));
         /* P3：段引用同时接受 asset_id（后端 compile_refs 同口径；写回时保持原样） */
         const validIds = new Set(refAssets.map((a) => a.asset_id).filter(Boolean));
-        segments = segments.map((s) => {
+        segments = segments.map((s, si) => {
             const sec = Number(s?.seconds);
             return {
+                segment_id: segmentIdFor(s, si, s?.intent_zh || ""),
                 scene_prompt: typeof s?.scene_prompt === "string" ? s.scene_prompt : "",
                 character_prompt: typeof s?.character_prompt === "string" ? s.character_prompt : "",
                 soundscape: typeof s?.soundscape === "string" ? s.soundscape : "",
@@ -1688,8 +1775,9 @@ function getDs(node) {
     }
 }
 
-function setDs(node, ds) {
+function setDs(node, ds, options) {
     if (!node) return false;
+    options = options && typeof options === "object" ? options : {};
     const w = (node.widgets || []).find((x) => x.name === W_DS);
     if (!w) return false;
     /* ref_images 兼容字段 = ref_assets 图片类文件序列（旧版前端/后端仍可读） */
@@ -1707,7 +1795,9 @@ function setDs(node, ds) {
     }
     node.setDirtyCanvas(true, true);
     node.graph?.change?.();
-    syncMirrors(node, ds);   // 状态写入统一同步画布镜像（提示词/首帧/素材，幂等）
+    if (options.syncMirrors !== false) {
+        syncMirrors(node, ds);   // 旧兼容路径默认同步；LLM 生成路径显式关闭
+    }
     return true;
 }
 
@@ -1725,13 +1815,13 @@ function getPrompts(node) {
     return getDs(node).prompts;
 }
 
-function setPromptText(node, idx, text) {
+function setPromptText(node, idx, text, options) {
     const ds = getDs(node);
     if (idx < 0 || idx >= ds.prompts.length) return false;
     ds.prompts[idx] = text;
-    /* 正文是唯一真相：本段引用集合跟着正文里的 @别名 走（手删绿框/手打 @别名都同步） */
+    /* 正文是唯一真相：本段引用集合跟着正文里的 @素材名走（手删绿框/手打 @素材名都同步） */
     syncRefsFromText(ds, idx, text);
-    setDs(node, ds);
+    setDs(node, ds, options);
     schedulePromptFlush();   // 编辑即落盘（防抖）：提示词的持久源=项目文件夹
     return true;
 }
@@ -1795,6 +1885,19 @@ function setSegmentField(node, idx, field, text) {
     if (idx < 0 || idx >= (ds.segments || []).length) return false;
     ds.segments[idx][field] = text;
     setDs(node, ds);
+    return true;
+}
+
+function setSegmentIntent(node, idx, text) {
+    const ds = getDs(node);
+    if (idx < 0 || idx >= (ds.segments || []).length) return false;
+    const seg = ds.segments[idx];
+    seg.intent_zh = String(text || "");
+    /* 意图框里的资产选择和正文引用共用同一份完整文件名解析；refs 只保留
+     * 旧执行链需要的 alias/id 兼容投影，编辑文本本身仍是 @完整文件名。 */
+    seg.refs = refsFromText(seg.intent_zh, ds.ref_assets || []);
+    setDs(node, ds, { syncMirrors: false });
+    schedulePromptFlush();
     return true;
 }
 
@@ -2877,6 +2980,7 @@ const _optBefore = new Map();
 const _optAfter = new Map();
 const _optShown = new Map();
 let _optBusy = null;
+let _optRuntimeSettings = null;  // Key/本地模型只在当前会话与用户级服务端配置中存在
 const _optRulesCache = { loaded: false, files: {} };
 
 function optDefaultSettings() {
@@ -2893,12 +2997,21 @@ function optDefaultSettings() {
 function optGetSettings(node) {
     const ds = getDs(node);
     const saved = ds && ds.optimizer && typeof ds.optimizer === "object" ? ds.optimizer : null;
-    return Object.assign(optDefaultSettings(), saved || {});
+    return Object.assign(optDefaultSettings(), saved || {}, _optRuntimeSettings || {});
 }
 
 function optSaveSettings(node, settings) {
+    const next = Object.assign({}, settings || {});
+    _optRuntimeSettings = next;
     const ds = getDs(node);
-    ds.optimizer = Object.assign({}, settings);
+    /* Key/本地路径不再随导演台状态序列化；服务端用户级配置负责持久化。 */
+    const safe = Object.assign({}, next);
+    delete safe.api_key;
+    delete safe.api_keys;
+    delete safe.local_model;
+    delete safe.local_mmproj;
+    safe.has_api_key = !!(next.api_key || next.has_api_key);
+    ds.optimizer = safe;
     setDs(node, ds);
 }
 
@@ -2956,8 +3069,8 @@ async function collectSegMedia(node, ds, idx) {
         const dataUrl = await optImageToDataUrl(
             assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
         if (!dataUrl) continue;
-        const nm = String(asset.label || "");
-        /* label 用**素材名**，不再用 <Picture N>：让 LLM 写 @素材名，由后端
+        const nm = assetRefName(asset);
+        /* label 用**完整文件名**，不再用 <Picture N>：让 LLM 写 @完整文件名，由后端
          * _apply_label_tokens 按 seg.refs 顺序压实成 <Picture k>。好处是
          * 顺序无关（名字唯一）、回填时 applyPromptEdit→syncRefsFromText 自动挂图、
          * 外部 agent 只看素材名就能独立写完直接贴。
@@ -2967,8 +3080,65 @@ async function collectSegMedia(node, ds, idx) {
     }
     return { media, note: notes.length
         ? `随图说明：可用素材 ${notes.join("、")}`
-          + "（正文里直接写 @名字 引用，不要写 <Picture N>）。"
+          + "（正文里直接写 @完整文件名 引用，不要写 <Picture N>）。"
         : "" };
+}
+
+function selectedAssetsForSegment(ds, idx) {
+    const pool = Array.isArray(ds?.ref_assets) ? ds.ref_assets : [];
+    const refs = Array.isArray(ds?.segments?.[idx]?.refs) ? ds.segments[idx].refs : [];
+    const out = [], seen = new Set();
+    for (const ref of refs) {
+        const key = String((ref && typeof ref === "object")
+            ? (ref.asset_id || ref.asset || ref.id || ref.label || "") : (ref || "")).trim();
+        if (!key) continue;
+        const hit = pool.find((a) => a && (String(a.label || "") === key
+            || String(a.asset_id || "") === key
+            || assetRefName(a) === key));
+        if (!hit) continue;
+        const id = String(hit.asset_id || assetRefName(hit) || hit.label || "");
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push({
+            asset_id: String(hit.asset_id || ""),
+            file_name: assetRefName(hit),
+            label: String(hit.label || ""),
+            kind: String(hit.kind || "image"),
+            file: String(hit.file || ""),
+        });
+    }
+    return out;
+}
+
+async function generatePromptForSegments(node, segments, sharedMedia) {
+    if (!window.H3Api?.promptGenerate) throw new Error("h3_api.js 未更新（缺 promptGenerate）");
+    const settings = optGetSettings(node);
+    if (settings.mode === "local" && !settings.local_model) {
+        openOptSettings(node);
+        throw new Error("请先在提示词生成设置中选择本地视觉模型");
+    }
+    if (settings.mode !== "local" && !settings.api_key && !settings.has_api_key) {
+        openOptSettings(node);
+        throw new Error("请先在提示词生成设置中填写 API Key");
+    }
+    const payload = {
+        config: settings,
+        segments: (segments || []).map((seg, i) => ({
+            segment_id: String(seg.segment_id || `seg-${i + 1}`),
+            intent: String(seg.intent || "").trim(),
+            seconds: Number(seg.seconds) || 5,
+            task: String(seg.task || "T2VA"),
+            selected_assets: Array.isArray(seg.selected_assets) ? seg.selected_assets : [],
+            current_result: String(seg.current_result || "").trim(),
+            media: Array.isArray(seg.media) ? seg.media : undefined,
+        })),
+        media: Array.isArray(sharedMedia) ? sharedMedia : [],
+    };
+    const res = await window.H3Api.promptGenerate(payload);
+    if (res.status >= 400 || res.body?.ok === false) {
+        throw new Error(window.H3Api.errText(res, "提示词生成失败"));
+    }
+    return res.body || {};
 }
 
 async function optFetchRuleFiles() {
@@ -3148,8 +3318,8 @@ const OPT_PROVIDERS = {
     custom: { label: "自定义", url: "", model: "", protocol: "openai" },
 };
 
-/* 提示词优化设置面板（结构对齐参考项目，请求仍走自研 /h3chain 后端）。
- * Key 随导演台状态保存，分享前请清空。 */
+/* 提示词生成设置面板（云 API / 本地视觉模型双通道）。
+ * Key 与本地模型引用保存到服务端用户级配置，不进入导演台状态或项目分享文件。 */
 async function openOptSettings(node, onSaved) {
     let current;
     try { current = optGetSettings(node); }
@@ -3158,7 +3328,19 @@ async function openOptSettings(node, onSaved) {
         if (window.H3Api?.getOptimizerConfig) {
             const r = await window.H3Api.getOptimizerConfig();
             if (r.body?.ok) {
-                current = Object.assign({}, current);
+                current = Object.assign({}, current, {
+                    provider: r.body.provider || current.provider,
+                    api_url: r.body.api_url || current.api_url,
+                    model: r.body.model || current.model,
+                    protocol: r.body.protocol || current.protocol,
+                    output_language: r.body.output_language || current.output_language,
+                    rule_file: r.body.rule_file || current.rule_file,
+                    mode: r.body.mode || current.mode,
+                    has_api_key: !!r.body.has_api_key,
+                    local_model: r.body.local_model_ref || current.local_model || "",
+                    local_mmproj: r.body.local_mmproj_ref || current.local_mmproj || "",
+                });
+                _optRuntimeSettings = Object.assign({}, _optRuntimeSettings || {}, current);
                 if (Array.isArray(r.body.models)) current._models = r.body.models;
                 if (Array.isArray(r.body.mmproj_models)) current._mmproj = r.body.mmproj_models;
             }
@@ -3170,7 +3352,8 @@ async function openOptSettings(node, onSaved) {
     overlay.append(dialog);
     dialog.append(el("div", "h3d-opt-title", "提示词优化 · 功能设置"));
     dialog.append(el("div", "h3d-opt-sub",
-        "自研后端（云 API / 本地模型双通道）+ prompt/*.txt 规则注入。Key 随导演台状态保存，分享前请清空。"));
+        "统一提示词生成后端（云 API / 本地视觉模型双通道）+ prompt/*.txt 规则注入。"
+        + "Key 和本地模型引用保存在本机用户配置，不会随项目分享。"));
     /* 未选本地模型时的引导提示：选择模型后自动消失 */
     const guide = el("div", "h3d-opt-guide",
         "尚未选择本地视觉模型：请在下方「本地模型」里选择一个（GGUF 还需选视觉投影 mmproj），"
@@ -3200,7 +3383,7 @@ async function openOptSettings(node, onSaved) {
     if (current.model && !providerModels[current.provider || "runninghub"]) providerModels[current.provider || "runninghub"] = current.model;
 
     const key = el("input", ""); key.type = "password"; key.value = apiKeys[provider.value] || "";
-    key.placeholder = "sk-…";
+    key.placeholder = current.has_api_key ? "已配置（留空保持）" : "sk-…";
     const url = el("input", ""); url.type = "text";
     const model = el("input", ""); model.type = "text";
     model.placeholder = "如 openai/gpt-5.6-sol";
@@ -3332,7 +3515,7 @@ async function openOptSettings(node, onSaved) {
     const close = () => overlay.remove();
     cancel.onclick = close;
     overlay.addEventListener("pointerdown", (ev) => { if (ev.target === overlay) close(); });
-    save.onclick = () => {
+    save.onclick = async () => {
         const outLang = language.querySelector("input:checked")?.value || "中文";
         const preset = OPT_PROVIDERS[provider.value];
         apiKeys[provider.value] = key.value;
@@ -3351,9 +3534,25 @@ async function openOptSettings(node, onSaved) {
             max_tokens: mt, auto_optimize: autoOptimize.checked,
         };
         if (body.mode === "local" && !body.local_model) { alert("请先选择一个本地视觉模型"); return; }
-        if (body.mode === "api" && (!body.api_key || !body.model)) { alert("请填写 API Key 与模型名"); return; }
-        optSaveSettings(node, body);
-        close();
+        if (body.mode === "api" && (!body.api_key && !current.has_api_key || !body.model)) {
+            alert("请填写 API Key；已有配置时可留空保持"); return;
+        }
+        save.disabled = true;
+        try {
+            if (window.H3Api?.saveOptimizerConfig) {
+                const remote = await window.H3Api.saveOptimizerConfig(body);
+                if (remote.status >= 400 || !remote.body?.ok) {
+                    throw new Error(window.H3Api.errText(remote, "用户级配置保存失败"));
+                }
+                body.has_api_key = !!remote.body.has_api_key;
+            }
+            optSaveSettings(node, body);
+            close();
+        } catch (e) {
+            alert(e?.message || e);
+        } finally {
+            save.disabled = false;
+        }
         if (onSaved) onSaved(body);
         scheduleRefresh(120);
     };
@@ -4450,7 +4649,8 @@ function injectStyles() {
     .h3d-rta{display:block;min-height:84px;max-height:40vh;overflow:auto;white-space:pre-wrap;word-break:break-word;cursor:text}
     .h3d-rta:empty:before{content:attr(data-ph);color:#7d8695;pointer-events:none}
     .h3d-rta-off{color:#636e7b;cursor:not-allowed;background:#22272e}
-    .h3d-rtag{display:inline-flex;align-items:center;gap:4px;margin:0 2px;padding:0 3px 0 4px;border:1px solid #2f6e57;border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;vertical-align:baseline;user-select:all}
+    .h3d-rtag{display:inline-flex;align-items:center;gap:4px;max-width:min(42vw,360px);min-width:0;margin:0 2px;padding:0 3px 0 4px;border:1px solid #2f6e57;border-radius:11px;background:#12291f;color:#7fe0b0;font-size:11.5px;line-height:1.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:baseline;user-select:all}
+    .h3d-rtag > .h3d-rtag-text{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .h3d-rtok{border-color:#2f5a8e;background:#111f2e;color:#8fc4f0;padding:0 4px;cursor:default}
     .h3d-rtok.h3d-rtok-missing{border-color:#8e2f2f;background:#2e1414;color:#f09595}
     /* 绿框里的标识：缩略图（图/视首帧）或音符图标。pointer-events:none 防误拖。
@@ -4932,9 +5132,8 @@ function openDesk() {
     const cHead = el("div", "h3d-sechead",
         "<strong>段落流水线</strong><small>顶部横向选段（点选看一段，＋ 加段，pill 可拖调序）；✏ 改词 · 🎲 重摇 · 🎬 锚定设置</small>");
     const mpBtn = el("button", "h3d-btn h3d-mpbtn", "📋 总提示词");
-    mpBtn.title = "多段工作台：每段 ① 中文意图 → ② 剧本（AI 扩写，中文自由格式）→ "
-        + "③ 结果（AI 提示词优化，H3 官方格式）；支持时长范围与一次生成多段";
-    mpBtn.onclick = openMasterPromptModal;
+    mpBtn.title = "多段工作台：总意图 → 一次生成各段 H3 结果；每段资产在段卡中独立选择";
+    mpBtn.onclick = openPromptWorkspaceV2;
     cHead.append(mpBtn);
     colC.append(cHead);
     const colR = el("aside", "h3d-col right");
@@ -6783,8 +6982,8 @@ function buildCards(data) {
         {
             const pool = (data.ds.ref_assets || []);
             const poolHint = pool.length
-                ? `用 @${pool[0].label} 这样的标签引用素材（引用会显示成绿框，点 ✕ 取消）`
-                : "上传参考图后可用 @标签 引用";
+                ? `用 @${assetRefName(pool[0])} 这样的完整文件名引用素材（引用会显示成绿框，点 ✕ 取消）`
+                : "上传参考图后可用 @完整文件名 引用";
             /* 卡片轻量重绘（引用条建好后赋值；在此之前是空实现 = 无害）。
              * 引用 chips / 计数 / 绿框三处状态由它统一推进，任何"改了引用"的入口
              * 都立刻调它，不等 240ms 刷新（刷新在焦点守卫下会被丢掉）。 */
@@ -6799,21 +6998,25 @@ function buildCards(data) {
                 labels: () => {
                     let arr = data.ds.ref_assets;
                     if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
-                    return (arr || []).map((a) => a.label);
+                    return [...new Set((arr || []).flatMap((a) => [assetRefName(a), a.label])
+                        .map(String).filter(Boolean))];
                 },
-                /* 别名 -> 素材信息 {kind,file,asset_id}（绿框据此挑缩略图/图标）。
+                /* 完整文件名和旧 alias 都指向同一素材（绿框据此挑缩略图/图标）。
                  * 同样读活的节点状态——上传/换类别后旧绿框的标识能立刻对得上。 */
                 assets: () => {
                     let arr = data.ds.ref_assets;
                     if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
                     const m = {};
                     for (const a of (arr || [])) {
-                        if (a && a.label) {
-                            m[a.label] = {
-                                kind: a.kind || "image",
-                                file: String(a.file || ""),
-                                asset_id: String(a.asset_id || ""),
-                            };
+                        if (!a) continue;
+                        const info = {
+                            kind: a.kind || "image",
+                            file: String(a.file || ""),
+                            asset_id: String(a.asset_id || ""),
+                            file_name: assetRefName(a),
+                        };
+                        for (const key of [assetRefName(a), a.label]) {
+                            if (key) m[String(key)] = info;
                         }
                     }
                     return m;
@@ -6902,9 +7105,7 @@ function buildCards(data) {
                     "全链共用：服务商 / 输出语言 / 规则文件（本段参数在「锚定设置」页）"));
                 body.append(optBar);
             }
-            /* 三栏各自独立的引用条：意图 / 剧本 / 结果 各一条，谁也不改谁。
-             * 只有「③ 结果」那条进模型（ds.prompts + seg.refs，走官方 9/3/3）；
-             * ①② 只是标注，写完只落在自己的正文里。 */
+            /* 两个用户区：意图/资产选择 + H3 结果。旧剧本数据只读迁移，不渲染为第三框。 */
             const refBars = [];
             /* 活素材池（**数组**）：三栏引用条按它算引用；注意别和下面的别名表 liveAssets 撞名 */
             const poolNow = () => {
@@ -6936,25 +7137,26 @@ function buildCards(data) {
                 for (const b of refBars) { try { b.paint(); } catch (e) { /* 单条失败不影响其它 */ } }
             };
             registerCardPainter(repaintCard);
-            /* 主框三段式：① 中文意图 → ② 剧本（扩写产物） → ③ 结果（进模型）。
-             * 只有 ③ 进模型（ds.prompts[idx]），①②都只是给人/AI 看的中间稿。 */
+            /* 新主框：① 意图与本段资产 → ② H3 结果（唯一进模型）。
+             * script 字段只在旧项目兼容数据中保留，不再渲染用户可见的剧本框。 */
             const segNow = (data.ds.segments || [])[it.idx] || {};
             const canEdit = !!node && it.idx !== undefined;
             /* 别名表读**活的**节点状态（与结果框同口径），@补全与绿框才跟得上素材变动 */
             const liveLabels = () => {
                 let arr = data.ds.ref_assets;
                 if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
-                return (arr || []).map((a) => a.label);
+                return [...new Set((arr || []).flatMap((a) => [assetRefName(a), a.label])
+                    .map(String).filter(Boolean))];
             };
             const liveAssets = () => {
                 let arr = data.ds.ref_assets;
                 if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
                 const m = {};
                 for (const a of (arr || [])) {
-                    if (a && a.label) {
-                        m[a.label] = { kind: a.kind || "image", file: String(a.file || ""),
-                            asset_id: String(a.asset_id || "") };
-                    }
+                    if (!a) continue;
+                    const info = { kind: a.kind || "image", file: String(a.file || ""),
+                        file_name: assetRefName(a), asset_id: String(a.asset_id || "") };
+                    for (const key of [assetRefName(a), a.label]) if (key) m[String(key)] = info;
                 }
                 return m;
             };
@@ -6975,7 +7177,7 @@ function buildCards(data) {
             const mkPane = h3dPane;
 
             /* ---- ① 中文意图：最需要 @素材的一段（指定这段参考谁）---- */
-            const pIntent = mkPane("① 中文意图（不进模型 · 可用 @素材）", true);
+            const pIntent = mkPane("① 意图与本段资产", true);
             const intentTa = createPromptEditor({
                 value: String(segNow.intent_zh || ""),
                 labels: liveLabels,
@@ -6983,7 +7185,7 @@ function buildCards(data) {
                 dir: () => getDirValue(node),
                 /* 意图不参与 conditioning，绿框 ✕ 只改文本、不动 seg.refs */
                 onRemove: () => {
-                    if (canEdit) setSegmentField(node, it.idx, "intent_zh", intentTa.value);
+                    if (canEdit) setSegmentIntent(node, it.idx, intentTa.value);
                     scheduleRefresh(200);
                 },
             });
@@ -6991,9 +7193,9 @@ function buildCards(data) {
                 + "例：夜晚便利店门口，@角色1 撑伞等车，霓虹倒映在积水里，缓慢推近。";
             if (canEdit) {
                 intentTa.addEventListener("input",
-                    () => setSegmentField(node, it.idx, "intent_zh", intentTa.value));
+                    () => setSegmentIntent(node, it.idx, intentTa.value));
                 intentTa.addEventListener("blur", () => {
-                    setSegmentField(node, it.idx, "intent_zh", intentTa.value);
+                    setSegmentIntent(node, it.idx, intentTa.value);
                     scheduleRefresh(200);
                 });
                 attachAtComplete(intentTa, node);
@@ -7001,100 +7203,79 @@ function buildCards(data) {
                 intentTa.disabled = true;
             }
             pIntent.body.append(intentTa.el || intentTa);
-            /* ① 的引用条：纯标注（写完只落在 intent_zh 正文里，不进模型、不写 seg.refs） */
+            /* ① 的引用条现在是本段资产选择器：点素材会把完整 @文件名插入意图，
+             * 同时写入 seg.refs 作为本段送给 LLM/H3 的资产集合；不再有独立剧本框。 */
             const refIntent = mkRefBar({
-                title: "引用素材 · 意图",
+                title: "本段资产（点击选择）",
                 editor: canEdit ? intentTa : null,
-                readRefs: () => refsFromText(String((canEdit ? intentTa.value : segNow.intent_zh) || ""),
-                    poolNow()),
+                readRefs: () => refsFromText(
+                    String((canEdit ? intentTa.value : segNow.intent_zh) || ""), poolNow()),
                 commit: (ed) => {
-                    setSegmentField(node, it.idx, "intent_zh", ed.value);
+                    const ds2 = getDs(node);
+                    const seg2 = (ds2.segments || [])[it.idx];
+                    if (seg2) {
+                        seg2.intent_zh = ed.value;
+                        seg2.refs = refsFromText(ed.value, ds2.ref_assets || []);
+                        setDs(node, ds2);
+                    }
+                    schedulePromptFlush();
                     scheduleRefresh(200);
                 },
-                gate: false, showFrames: false, tplKey: "i" + it.idx,
+                gate: true, showFrames: false, tplKey: "i" + it.idx,
             });
             if (refIntent) pIntent.body.append(refIntent);
             const intentBar = el("div", "h3d-actions");
-            const bExpand = el("button", "h3d-btn h3d-btn-cyan", "✨ AI扩写 → 剧本");
-            bExpand.title = "把一句中文意图扩写成一大段能填满时长的中文剧本（自由格式，"
-                + "不套官方字段），生成后可就地改再回填「② 剧本」；"
-                + "时长是范围，模型在范围内自定秒数。格式由 ② 的「提示词优化」负责";
+            const bExpand = el("button", "h3d-btn h3d-btn-cyan", "✨ 生成 H3 提示词");
+            bExpand.title = "把本段意图和已选资产一次生成完整 H3 提示词，直接写入结果框。"
+                + "不再显示剧本中间框；已有结果会先要求确认覆盖。";
             bExpand.disabled = !canEdit;
-            bExpand.onclick = () => openExpandModal(node, it.idx,
-                (segNow.prompt_v2 && typeof segNow.prompt_v2 === "object") ? segNow.prompt_v2 : null);
+            bExpand.onclick = async () => {
+                if (!canEdit) return;
+                const dsBefore = getDs(node);
+                const current = String((dsBefore.prompts || [])[it.idx] || "").trim();
+                if (current && !confirm("本段结果已有内容，重新生成会覆盖当前结果。继续吗？")) return;
+                bExpand.disabled = true;
+                const oldText = bExpand.textContent;
+                bExpand.textContent = "生成中…";
+                try {
+                    const liveDs = getDs(node);
+                    const seg = (liveDs.segments || [])[it.idx] || {};
+                    const selected = selectedAssetsForSegment(liveDs, it.idx);
+                    const mm = await collectSegMedia(node, liveDs, it.idx);
+                    const res = await generatePromptForSegments(node, [{
+                        segment_id: `seg-${it.idx + 1}`,
+                        intent: String(seg.intent_zh || "").trim(),
+                        seconds: Number(seg.seconds) || Number(getWidgetValue(node, W_DUR)) || 5,
+                        task: defaultV2Mode(liveDs, it.idx),
+                        selected_assets: selected,
+                        current_result: current,
+                        media: mm.media,
+                    }], mm.media);
+                    const item = (res.segments || [])[0];
+                    if (!item || !item.editor_text) throw new Error("模型没有返回本段结果");
+                    setPromptText(node, it.idx, item.editor_text, { syncMirrors: false });
+                    setLed(item.ok ? "done" : "warn", item.ok
+                        ? `第 ${it.idx + 1} 段 H3 提示词已生成`
+                        : `第 ${it.idx + 1} 段已生成，但存在格式/素材诊断`);
+                    if (item.errors?.length) alert(item.errors.map((x) => x.message || x.code).join("\\n"));
+                    scheduleRefresh(120);
+                } catch (e) {
+                    setLed("error", `提示词生成失败：${e?.message || e}`);
+                } finally {
+                    bExpand.disabled = false;
+                    bExpand.textContent = oldText;
+                }
+            };
             intentBar.append(bExpand);
             pIntent.body.append(intentBar);
             paneMain.append(pIntent.g);
 
-            /* ---- ② 剧本：AI 扩写产物，可手工改后再优化 ---- */
-            const pScript = mkPane("② 剧本（扩写产物 · 可手工改）", true);
-            const scriptTa = createPromptEditor({
-                value: String(segNow.script || ""),
-                labels: liveLabels,
-                assets: liveAssets,
-                dir: () => getDirValue(node),
-                onRemove: () => {
-                    if (canEdit) setSegmentField(node, it.idx, "script", scriptTa.value);
-                    scheduleRefresh(200);
-                },
-            });
-            scriptTa.placeholder = "点上方「✨ AI扩写」生成，或直接粘贴官方格式剧本"
-                + "（integrated_multimodal_description: …）";
-            if (canEdit) {
-                scriptTa.addEventListener("input",
-                    () => setSegmentField(node, it.idx, "script", scriptTa.value));
-                scriptTa.addEventListener("blur", () => {
-                    setSegmentField(node, it.idx, "script", scriptTa.value);
-                    scheduleRefresh(200);
-                });
-                attachAtComplete(scriptTa, node);
-            } else {
-                scriptTa.disabled = true;
-            }
-            pScript.body.append(scriptTa.el || scriptTa);
-            /* ② 的引用条：正文里的 @ 是纯标注（写完只落在 script 正文里，不进模型、
-             * 不写 seg.refs）；但**素材调度挂的 seg.refs 生成时真的会送图**。
-             * AI 扩写回填只写剧本正文、不会写 @，所以这里要把 seg.refs 一并点亮
-             * 并注明来源 —— 否则引用条一片空白，会被误读成"图没挂上"。 */
-            const scriptRefsInText = () => refsFromText(
-                String((canEdit ? scriptTa.value : segNow.script) || ""), poolNow());
-            const refScript = mkRefBar({
-                title: "引用素材 · 剧本",
-                editor: canEdit ? scriptTa : null,
-                readRefs: () => {
-                    const out = scriptRefsInText().slice();
-                    for (const l of liveRefs()) {
-                        if (l && !out.includes(l)) out.push(l);
-                    }
-                    return out;
-                },
-                note: () => {
-                    const inText = scriptRefsInText();
-                    const n = liveRefs().filter((l) => l && !inText.includes(l)).length;
-                    return n ? `其中 ${n} 个来自素材调度（生成时真的送图）` : "";
-                },
-                inherited: () => {
-                    const inText = scriptRefsInText();
-                    return liveRefs().filter((l) => l && !inText.includes(l));
-                },
-                commit: (ed) => {
-                    setSegmentField(node, it.idx, "script", ed.value);
-                    scheduleRefresh(200);
-                },
-                gate: false, showFrames: false, tplKey: "s" + it.idx,
-            });
-            if (refScript) pScript.body.append(refScript);
-            const scriptBar = el("div", "h3d-actions");
-            const bOptRun = el("button", "h3d-btn h3d-btn-cyan", "✨ 提示词优化 → 结果");
-            bOptRun.title = "把剧本优化成最终结果写进「③ 结果」；剧本本身保留，可反复重优化";
-            bOptRun.disabled = !canEdit;
-            bOptRun.onclick = () => runOptForSegment(node, it.idx, ta, { btn: bOptRun }, scriptTa);
-            scriptBar.append(bOptRun);
-            pScript.body.append(scriptBar);
-            paneMain.append(pScript.g);
+            /* 旧版曾在这里渲染「② 剧本」和独立优化按钮。新架构保留 script 字段
+             * 只用于旧项目迁移，但不再创建 DOM；意图 -> LLM -> 结果由上面的一个按钮完成。
+             * 这样不会出现用户必须在两个小框之间搬运文本的假中间层。 */
 
-            /* ---- ③ 结果：最终进模型文本 ---- */
-            const pResult = mkPane("③ 结果（最终进模型）", true);
+            /* ---- ② 结果：唯一可编辑的 H3 提示词文本 ---- */
+            const pResult = mkPane("② 结果（H3 提示词）", true);
             pResult.body.append(ta.el || ta);
             /* ③ 的引用条：唯一进模型的那条（gate=true → 走官方 9/3/3、写 seg.refs） */
             const refResult = mkRefBar({
@@ -7107,12 +7288,17 @@ function buildCards(data) {
                 gate: true, showFrames: false, tplKey: it.idx,
             });
             if (refResult) pResult.body.append(refResult);
-            /* 结果工具条：原稿切换 / 双向同步具象化（优化入口在 ② 剧本区） */
-            const optbar = el("div", "h3d-actions");
-            optbar.dataset.optbar = String(it.idx);
-            pResult.body.append(optbar);
+            /* 结果工具条只有一个动作：重新生成/整理当前结果；不再有原稿/优化稿
+             * 双框，也不再回填隐藏的 prompt_v2。 */
+            const resultBar = el("div", "h3d-actions");
+            const bRegenerate = el("button", "h3d-btn h3d-btn-cyan", "↻ 重新生成 / 整理");
+            bRegenerate.type = "button";
+            bRegenerate.title = "使用本段意图、已选资产和当前结果重新请求 LLM；应用前确认覆盖。";
+            bRegenerate.disabled = !canEdit;
+            bRegenerate.onclick = () => bExpand.onclick();
+            resultBar.append(bRegenerate);
+            pResult.body.append(resultBar);
             paneMain.append(pResult.g);
-            try { paintOptbar(optbar, node, data, it.idx, ta); } catch (e) {}
 
             /* 源码覆盖已彻底移除（有结果框就够了）。旧存档若残留 override_text，
              * 它会取代一切编译结果——必须让用户看见并能一键清掉，否则是个暗坑。 */
@@ -8587,7 +8773,208 @@ function openNewProjectModal() {
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
 }
 
-/* ---- 总提示词工作台：三框（① 意图 → ② 剧本 → ③ 结果） ----
+/* ---- 总提示词工作台 V2：双框（总意图 → 总结果） ----
+ * 新入口不再渲染剧本框，也不把 AI 扩写拆成两个用户动作。总意图按【段N】
+ * 自动拆分，已有段沿用本段资产；新段先无资产。一次请求直接返回每段 H3 结果，
+ * 成功后按段号写回段卡并拼接总结果。旧三框函数保留在文件后方，仅供旧粘贴格式
+ * 和迁移测试使用，不由新的入口调用。 */
+function _workspaceIntentItems(text) {
+    const split = mpSplitBox(text);
+    return (split.items || []).map((value, index) => ({
+        index,
+        intent: String(value || "").trim(),
+    })).filter((item) => item.intent);
+}
+
+function _workspaceResultText(ds) {
+    const prompts = Array.isArray(ds?.prompts) ? ds.prompts : [];
+    return prompts.map((value, index) => `【段${index + 1}】\\n${String(value || "").trim()}`)
+        .join("\\n\\n").replace(/(?:【段\\d+】\\s*)+$/, "");
+}
+
+function _workspaceEnsureSegmentState(ds, count) {
+    const out = ds && typeof ds === "object" ? ds : defaultDs();
+    if (!Array.isArray(out.prompts)) out.prompts = [];
+    if (!Array.isArray(out.segments)) out.segments = [];
+    while (out.prompts.length < count) out.prompts.push("");
+    while (out.segments.length < count) out.segments.push(defaultSegment());
+    return out;
+}
+
+async function openPromptWorkspaceV2() {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
+    if (document.querySelector(".h3d-overlay")) return;
+
+    const overlay = el("div", "h3d-overlay h3d-overlay-full");
+    const dialog = el("div", "h3d-dialog h3d-dialog-full");
+    dialog.innerHTML = `
+        <h3>📋 总提示词 · 意图到 H3 结果</h3>
+        <p class="h3d-lead">只保留两个框：<b>总意图</b>和<b>总结果</b>。总意图支持
+        【段1】【段2】分段；点击「一键生成」后，模型会直接生成每段完整 H3 提示词。
+        每段素材在段卡中单独选择；已有段沿用当前资产，新段默认不带素材。结果框里的
+        引用保留 <code>@完整文件名</code>，真正发送 H3 时才转换成官方 Picture/Video/Audio 编号。</p>`;
+
+    const top = el("div", "h3d-mpset");
+    const settings = el("button", "h3d-btn", "⚙ 生成设置");
+    settings.type = "button";
+    settings.onclick = () => openOptSettings(node);
+    const status = el("span", "h3d-mpmode", "");
+    top.append(settings, status);
+
+    const stack = el("div", "h3d-mpstack");
+    const mk = (cls, title, hint, placeholder) => {
+        const wrap = el("div", `h3d-mpboxwrap ${cls}`);
+        const head = el("div", "h3d-mplabel");
+        head.append(el("b", "", title), el("small", "", hint));
+        const ta = document.createElement("textarea");
+        ta.className = "h3d-mpbox";
+        ta.spellcheck = false;
+        ta.placeholder = placeholder || "";
+        wrap.append(head, ta);
+        stack.append(wrap);
+        return { wrap, ta };
+    };
+    const boxI = mk("h3d-mpboxwrap-1", "① 总意图",
+        "一句话或用【段N】分段；模型直接从这里生成最终提示词",
+        "【段1】\\n雨夜市场里，白袍少女回头示意我跟上。\\n\\n【段2】\\n她穿过人群消失在霓虹里。");
+    const boxR = mk("h3d-mpboxwrap-3", "② 总结果",
+        "所有段 H3 字段结果拼接；可编辑，保存时按段头回写段卡",
+        "【段1】\\nintegrated_multimodal_description: ...\\n\\nnon_diegetic_music: N/A");
+
+    const info = el("div", "h3d-mpinfo", "");
+    const err = el("div", "h3d-err", "");
+    const row = el("div", "h3d-dialog-row");
+    const load = el("button", "h3d-btn", "从当前链载入");
+    const clear = el("button", "h3d-btn", "清空");
+    const cancel = el("button", "h3d-btn", "取消");
+    const apply = el("button", "h3d-btn", "应用结果");
+    const generate = el("button", "h3d-btn h3d-btn-cta", "✨ 一键生成 H3 提示词");
+    row.append(load, clear, cancel, apply, generate);
+    dialog.append(top, stack, info, err, row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+    document.body.append(overlay);
+
+    const loadCurrent = () => {
+        const ds = getDs(node);
+        const intents = (ds.segments || []).map((seg, index) => {
+            const value = String(seg?.intent_zh || "").trim();
+            return value ? `【段${index + 1}】\\n${value}` : "";
+        }).filter(Boolean);
+        boxI.ta.value = intents.join("\\n\\n");
+        boxR.ta.value = _workspaceResultText(ds);
+        status.textContent = `当前 ${ds.prompts?.length || 0} 段`;
+        updateInfo();
+    };
+    const updateInfo = () => {
+        const intents = _workspaceIntentItems(boxI.ta.value);
+        const results = mpSplitBox(boxR.ta.value).items || [];
+        info.textContent = `识别 ${intents.length} 段意图 · 结果 ${results.filter((x) => String(x).trim()).length} 段`;
+    };
+    loadCurrent();
+    boxI.ta.addEventListener("input", updateInfo);
+    boxR.ta.addEventListener("input", updateInfo);
+
+    load.onclick = loadCurrent;
+    clear.onclick = () => {
+        if ((boxI.ta.value || boxR.ta.value).trim()
+            && !confirm("清空总意图和总结果？当前段卡不会立即被清除。")) return;
+        boxI.ta.value = "";
+        boxR.ta.value = "";
+        updateInfo();
+    };
+    cancel.onclick = () => overlay.remove();
+
+    apply.onclick = () => {
+        const items = mpSplitBox(boxR.ta.value).items || [];
+        if (!items.some((x) => String(x || "").trim())) {
+            err.textContent = "总结果为空，不能应用";
+            return;
+        }
+        const ds = _workspaceEnsureSegmentState(getDs(node), items.length);
+        for (let i = 0; i < items.length; i++) {
+            const value = String(items[i] || "").trim();
+            if (value) ds.prompts[i] = value;
+        }
+        setDs(node, ds, { syncMirrors: false });
+        schedulePromptFlush();
+        setLed("done", `总结果已应用到 ${items.length} 段`);
+        loadCurrent();
+        scheduleRefresh(80);
+    };
+
+    generate.onclick = async () => {
+        const intents = _workspaceIntentItems(boxI.ta.value);
+        if (!intents.length) {
+            err.textContent = "先写总意图；多段请用【段N】分隔";
+            return;
+        }
+        const before = getDs(node);
+        const hasExisting = intents.some((item) => String(before.prompts?.[item.index] || "").trim());
+        if (hasExisting && !confirm("已有段结果会被新结果覆盖，是否继续？")) return;
+        generate.disabled = true;
+        const oldText = generate.textContent;
+        generate.textContent = "生成中…";
+        err.textContent = "";
+        status.textContent = "正在请求模型（不会加载工作流或创建节点）…";
+        try {
+            const payload = [];
+            const allMedia = [];
+            for (const item of intents) {
+                const seg = (before.segments || [])[item.index] || {};
+                const selected = selectedAssetsForSegment(before, item.index);
+                const mm = (before.segments || [])[item.index]
+                    ? await collectSegMedia(node, before, item.index) : { media: [], note: "" };
+                for (const media of mm.media || []) {
+                    if (!allMedia.some((x) => x.label === media.label && x.kind === media.kind)) {
+                        allMedia.push(media);
+                    }
+                }
+                payload.push({
+                    segment_id: String(seg.segment_id || `seg-${item.index + 1}`),
+                    intent: item.intent,
+                    seconds: Number(seg.seconds) || Number(getWidgetValue(node, W_DUR)) || 5,
+                    task: defaultV2Mode(before, item.index),
+                    selected_assets: selected,
+                    current_result: String(before.prompts?.[item.index] || "").trim(),
+                    media: mm.media,
+                });
+            }
+            const result = await generatePromptForSegments(node, payload, allMedia);
+            const output = result.segments || [];
+            if (output.length !== payload.length) throw new Error("模型返回段数与总意图不一致");
+            const ds = _workspaceEnsureSegmentState(getDs(node), intents.length);
+            for (let i = 0; i < intents.length; i++) {
+                const item = output[i];
+                if (!item || !item.editor_text || !item.ok) {
+                    const first = item?.errors?.[0];
+                    throw new Error(first?.message || `第 ${i + 1} 段结果未通过校验`);
+                }
+                ds.segments[i].intent_zh = intents[i].intent;
+                ds.segments[i].refs = refsFromText(intents[i].intent, ds.ref_assets || []);
+                ds.prompts[i] = item.editor_text;
+            }
+            setDs(node, ds, { syncMirrors: false });
+            schedulePromptFlush();
+            boxR.ta.value = _workspaceResultText(ds);
+            status.textContent = `已生成 ${output.length} 段 H3 结果`;
+            info.textContent = "总结果已同步到段卡；新段默认无资产，可在段卡选择后单独重新生成";
+            setLed("done", `总意图已生成 ${output.length} 段 H3 提示词`);
+            scheduleRefresh(120);
+        } catch (e) {
+            err.textContent = `生成失败：${e?.message || e}`;
+            setLed("error", err.textContent);
+        } finally {
+            generate.disabled = false;
+            generate.textContent = oldText;
+        }
+    };
+    boxI.ta.focus();
+}
+
+/* ---- 旧版总提示词工作台：三框（① 意图 → ② 剧本 → ③ 结果） ----
  * 历史形态：一个巨大的文本框里用「意图：/剧本：/提示词：」行内标签混写，改一层要
  * 在长正文里翻找，且**没有参考素材入口**（AI 扩写/优化拿不到任何图）。现在三分框：
  *   ① 意图（最小，一段话）→ ② 剧本（中等，中文自由格式）→ ③ 结果（最大，H3 官方格式）
@@ -8727,9 +9114,9 @@ async function collectMasterMedia(node, assets) {
         const dataUrl = await optImageToDataUrl(
             assetPreviewUrl(getDirValue(node), a.file, a.asset_id));
         if (!dataUrl) continue;
-        const tag = `<Picture ${media.length + 1}>`;
-        media.push({ kind: "image", label: tag, images: [dataUrl] });
-        notes.push(`${tag} = 参考素材「${a.label || a.file || "未命名"}」`);
+        const fileName = assetRefName(a);
+        media.push({ kind: "image", label: fileName, file_name: fileName, images: [dataUrl] });
+        notes.push(`@${fileName} = 参考素材「${fileName || a.label || a.file || "未命名"}」`);
     }
     return { media, note: notes.length ? `随图说明：${notes.join("；")}。` : "" };
 }
@@ -8792,7 +9179,8 @@ function openMasterPromptModal() {
     const bRefAll = el("button", "h3d-btn h3d-mprefs-btn", "全选");
     const bRefNone = el("button", "h3d-btn h3d-mprefs-btn", "清空");
     const bRefReload = el("button", "h3d-btn h3d-mprefs-btn", "⟳");
-    bRefReload.title = "重新读取素材池（刚上传/改名/删了素材时点一下）";
+    bRefReload.title = "立即重读素材池（正常情况下素材库增删改后会自动跟上；"
+        + "点它用于手动催一次）";
     refRow.append(bRefAll, bRefNone, bRefReload);
 
     /* 两个 AI 动作的实现挂在下面（挂在各自作用的框头上，这里先建句柄） */
@@ -8862,6 +9250,11 @@ function openMasterPromptModal() {
         let pool = [];
         try { pool = getDs(node).ref_assets || []; } catch (e) { pool = []; }
         imgPool = pool.filter((a) => a && String(a.kind || "image") === "image");
+        /* 池里已经没有的素材要从勾选集合里剔掉：否则删完素材，
+         * 计数还写着「已选 3/2」，而且 compose 时还惦记着一条不存在的图。 */
+        for (const k of [...selKey]) {
+            if (!imgPool.some((a) => assetKey(a) === k)) selKey.delete(k);
+        }
         chipBox.innerHTML = "";
         if (!imgPool.length) {
             chipBox.append(el("span", "h3d-secs-hint",
@@ -8888,6 +9281,12 @@ function openMasterPromptModal() {
     bRefNone.onclick = () => { selKey.clear(); renderRefs(); };
     bRefReload.onclick = () => renderRefs();
     renderRefs();
+    /* 素材库删/改名/上传后 chips 自动跟上（DOM 断开即自摘，不必在各处 close 里挂钩子） */
+    const paintLive = () => {
+        if (!chipBox.isConnected) { unregisterLivePainter(paintLive); return; }
+        renderRefs();
+    };
+    registerLivePainter(paintLive);
 
     const pickedAssets = () => imgPool.filter((a) => selKey.has(assetKey(a)));
 
@@ -9419,6 +9818,7 @@ async function refresh() {
         const data = await collectData();
         renderMini(data);
         if (desk) updateDesk(data);
+        runLivePainters();            // 打开中的浮层（总提示词框的参考素材 chips 等）
     } catch (e) {
         console.warn("[h3-director] refresh failed:", e);
         renderMiniFallback(e);   // 出错也保住入口按钮，不留空白标签

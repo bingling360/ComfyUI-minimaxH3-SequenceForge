@@ -15,6 +15,11 @@
 
 import re
 
+try:
+    from .resolved_media import resolve_media_plan
+except ImportError:  # 允许 pytest/ComfyUI 以顶层模块加载
+    from resolved_media import resolve_media_plan
+
 CAMERA_MOVES = ("Zoom In", "Zoom Out", "Push In", "Pull Out", "Pan Left", "Pan Right",
                 "Truck Left", "Truck Right", "Tilt Up", "Tilt Down", "Pedestal Up",
                 "Pedestal Down", "Arc Shot", "Tracking Shot", "Static Shot",
@@ -539,3 +544,81 @@ def validate_compiled(compiled):
     for w in compiled.get("warnings") or []:
         warnings.append(w)
     return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+
+def compile_prompt_document(result_text, *, assets=None, seconds=5.0, mode=None,
+                            has_start=False, has_end=False, segment_id=None,
+                            allow_official_tokens=False):
+    """统一编译编辑层结果文本，并在最后一步解析素材引用。
+
+    编辑层保存的是完整 ``@文件名``；本函数返回的 ``prompt_text`` 才是给 H3
+    conditioning 的官方文本。它把字段解析、官方格式校验和素材编号放在一个
+    返回值里，供编译预览、新提示词 API 和 nodes.py 执行期共同调用。
+
+    这不是另一个 LLM：输入已经是用户/模型生成的结果文本，函数不发请求、不
+    创建节点、不提交队列。错误会阻断调用方，但原始 ``editor_text`` 始终保留，
+    便于前端在结果框继续修改后重试。
+    """
+    editor_text = str(result_text or "").strip()
+    warnings, errors = [], []
+    if not editor_text:
+        return {"ok": False, "editor_text": "", "prompt_text": "", "fields": {},
+                "mode": mode if mode in VALID_MODES else "T2VA",
+                "media_plan": resolve_media_plan("", assets, segment_id=segment_id),
+                "errors": [{"code": "H3_EMPTY_RESULT", "message": "结果提示词为空"}],
+                "warnings": []}
+
+    if not allow_official_tokens and _LABEL_RE.search(editor_text):
+        errors.append({"code": "H3_DIRECT_TOKEN_FORBIDDEN",
+                       "message": "编辑层结果应使用 @完整文件名，不能直接写 <Picture N>/<Video N>/<Audio N>",
+                       "segment_id": segment_id})
+
+    parsed, order, preamble = parse_override(editor_text)
+    if preamble:
+        # 新架构不再显示额外剧本/修复框：自然语言仍可作为一个最小 base 描述，
+        # 但保留 warning，让用户知道结果不是完整字段文本。
+        if not parsed:
+            parsed = {"integrated_multimodal_description": "[Shot 1] " + editor_text,
+                      "non_diegetic_music": "N/A"}
+            order = ["integrated_multimodal_description", "non_diegetic_music"]
+            warnings.append({"code": "W_RESULT_WRAPPED", "message": "自然语言已包装为 H3 基础字段"})
+        else:
+            errors.append({"code": "H3_RESULT_PREAMBLE", "message": "结果字段前存在无法归属的文本"})
+
+    auto_mode = "Ref2VA" if any(k in parsed for k in REF_FIELDS[:3]) else "T2VA"
+    selected_mode = mode if mode in VALID_MODES else auto_mode
+    media_plan = resolve_media_plan(editor_text, assets, segment_id=segment_id)
+    warnings.extend(media_plan.get("warnings") or [])
+    errors.extend(media_plan.get("errors") or [])
+    official_text = media_plan.get("prompt_text") or editor_text
+    parsed_tokens, token_order, token_preamble = parse_override(official_text)
+    if token_preamble and parsed_tokens:
+        errors.append({"code": "H3_COMPILED_PREAMBLE", "message": "编译后的结果字段前存在额外文本"})
+    fields = parsed_tokens or parsed
+    if not fields:
+        fields = {"integrated_multimodal_description": "[Shot 1] " + official_text,
+                  "non_diegetic_music": "N/A"}
+        token_order = list(fields)
+    if "non_diegetic_music" not in fields or not str(fields.get("non_diegetic_music") or "").strip():
+        fields["non_diegetic_music"] = "N/A"
+        if "non_diegetic_music" not in token_order:
+            token_order.append("non_diegetic_music")
+    canonical_text = serialize_fields(fields, token_order)
+
+    compiled = {"mode": selected_mode, "duration": float(seconds or 5.0),
+                "fields": fields, "prompt_text": canonical_text,
+                "warnings": warnings, "diagnostics": {}, "override": True}
+    verdict = validate_compiled(compiled)
+    errors.extend(verdict.get("errors") or [])
+    warnings.extend(verdict.get("warnings") or [])
+    return {
+        "ok": not errors,
+        "editor_text": editor_text,
+        "prompt_text": canonical_text,
+        "fields": fields,
+        "mode": selected_mode,
+        "media_plan": media_plan,
+        "errors": errors,
+        "warnings": warnings,
+        "diagnostics": compiled.get("diagnostics") or {},
+    }

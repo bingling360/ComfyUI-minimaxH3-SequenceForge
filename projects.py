@@ -141,6 +141,38 @@ def read_project(name: str):
     return _ensure_revision(manifest)
 
 
+def prompt_document_from_manifest(manifest: dict) -> dict:
+    """从现有 manifest 生成 h3.director.v3 文档，不修改或落盘 manifest。
+
+    旧项目首次打开也能立刻得到新 UI 使用的统一文档；只有用户保存新文档时，
+    调用方才决定是否把它作为 manifest 的显式字段保存。"""
+    try:
+        try:
+            from . import prompt_document as _doc
+        except ImportError:
+            import prompt_document as _doc
+        mf = manifest if isinstance(manifest, dict) else {}
+        assets = list(mf.get("assets") or [])
+        # 资产链接只有 alias/id 时仍透传，prompt_document 会保留可确认的 ID；
+        # 全局库文件名由导演台活池在执行期补齐。
+        assets.extend(list(mf.get("asset_links") or []))
+        raw_segments = mf.get("segments") if isinstance(mf.get("segments"), list) else mf.get("seg_fields")
+        return _doc.normalize_document(
+            mf,
+            prompts=mf.get("prompts") or [],
+            segments=raw_segments or [],
+            assets=assets,
+        )
+    except Exception as exc:
+        return {
+            "schema_version": "h3.director.v3",
+            "total_intent": "",
+            "segments": [],
+            "execution_settings": {"review_mode": "off"},
+            "compat": {"migration": {"warnings": [{"code": "E_DOCUMENT_MIGRATION", "message": str(exc)}]}},
+        }
+
+
 _ASSET_KINDS = ("image", "video", "audio")
 _ASSET_LABEL_MAX = 24
 
@@ -162,7 +194,10 @@ def _clean_asset(raw) -> dict | None:
         return None
     if not os.path.splitext(parts[-1])[1]:
         return None
-    ent = {"label": label, "kind": kind, "file": "/".join(parts)}
+    rel_file = "/".join(parts)
+    # label 是旧 24 字 alias；file_name 才是现行编辑层完整引用 key。
+    # 旧 manifest 没有 file_name 时用真实 basename 补回，不改变旧 label/refs。
+    ent = {"label": label, "file_name": parts[-1], "kind": kind, "file": rel_file}
     # 资产标注 roles 白名单透存（首帧图/尾帧图；单张冲突校验在执行期做）
     rl = raw.get("roles")
     if isinstance(rl, list):
@@ -278,7 +313,10 @@ def _clean_asset_link(raw) -> dict | None:
     kind = str(raw.get("kind") or "image").strip()
     if kind not in _ASSET_KINDS:
         kind = "image"
+    file_name = str(raw.get("file_name") or raw.get("orig_name") or "").strip()
     ent = {"asset_id": aid, "alias": alias, "kind": kind}
+    if file_name:
+        ent["file_name"] = file_name.replace("\\", "/").split("/")[-1]
     # P3：标注透存（首帧图/尾帧图，与 _clean_asset 同口径；执行期 roles 仍以 ds 池为准）
     rl = raw.get("roles")
     if isinstance(rl, list):
@@ -286,6 +324,43 @@ def _clean_asset_link(raw) -> dict | None:
         if kept:
             ent["roles"] = kept[:2]
     return ent
+
+
+def _purge_alias_refs(manifest: dict, aliases) -> bool:
+    """从 segments[i].refs 与 prompts[i] 正文里清掉这些别名（含 `@别名`）-> 是否有改动。
+
+    **解链（unlink_asset）与删素材（remove_assets）共用这一份**：两处各写一份必然
+    漂移，历史 bug 就是解链清了正文、删素材没清 —— "删了项目库里的东西，提示词框的
+    引用还在"（seg.refs 漏删 → 引用条残留 → 渲染的 @xxx 找不到素材而红框，文本却还在）。
+    """
+    targets = {str(t).strip() for t in (aliases or ()) if str(t).strip()}
+    if not targets:
+        return False
+    changed = False
+    for seg in (manifest.get("segments") or []):
+        if not isinstance(seg, dict):
+            continue
+        cur = seg.get("refs") or []
+        new = [r for r in cur if r not in targets]
+        if new != cur:
+            seg["refs"] = new
+            changed = True
+    prompts = manifest.get("prompts") or []
+    for i in range(len(prompts)):
+        if not isinstance(prompts[i], str):
+            continue
+        txt = prompts[i]
+        for t in targets:
+            # 单词边界：`@[名]` 后面不能跟 label 字符（_A-Za-z0-9），
+            # 防止误删 @回廊 → @回廊场景2 这种更长名字的前缀。
+            txt = re.sub(rf"@{re.escape(t)}(?![A-Za-z0-9_])", "", txt)
+        txt = re.sub(r"[ \t]+", " ", txt)        # 多余空格压一个
+        txt = re.sub(r"\n{3,}", "\n\n", txt)     # 多余空行压一行
+        if txt != prompts[i]:
+            prompts[i] = txt
+            changed = True
+    manifest["prompts"] = prompts
+    return changed
 
 
 def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision=None,
@@ -396,29 +471,9 @@ def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
         manifest["asset_links"] = [x for x in manifest["asset_links"] if x is not None]
     # 同步清理 seg.refs 和正文里的 @xxx —— 此前只解链不解引用，导致"删了项目库
     # 里的东西提示词框的引用还在"（也是 seg.refs 漏删 → 引用条残留 → 渲染的 @xxx
-    # 找不到素材而红框，但文本还在那里）。
+    # 找不到素材而红框，但文本还在那里）。删素材（remove_assets）走同一份实现。
     if target_aliases:
-        for seg in (manifest.get("segments") or []):
-            if not isinstance(seg, dict):
-                continue
-            cur = seg.get("refs") or []
-            new = [r for r in cur if r not in target_aliases]
-            if new != cur:
-                seg["refs"] = new
-        prompts = manifest.get("prompts") or []
-        for i in range(len(prompts)):
-            if not isinstance(prompts[i], str):
-                continue
-            txt = prompts[i]
-            for t in target_aliases:
-                # 单词边界：`@[名](后面不能跟 label 字符 _A-Za-z0-9`)，
-                # 防止误删 @回廊 → @回廊场景2 这种更长名字的前缀。
-                txt = re.sub(rf"@{re.escape(t)}(?![A-Za-z0-9_])", "", txt)
-            txt = re.sub(r"[ \t]+", " ", txt)        # 多余空格压一个
-            txt = re.sub(r"\n{3,}", "\n\n", txt)     # 多余空行压一行
-            if txt != prompts[i]:
-                prompts[i] = txt
-        manifest["prompts"] = prompts
+        _purge_alias_refs(manifest, target_aliases)
     # 仅当真的有改动才升 revision 并落盘
     if target_aliases or len(kept) != len(links):
         manifest["updated_at"] = time.time()
@@ -426,6 +481,206 @@ def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
         manifest["manifest_schema"] = MANIFEST_SCHEMA
         checkpoint.save_manifest(root, manifest)
     return manifest
+
+
+def remove_assets(name: str, labels=(), asset_ids=(), files=(), base_revision=None):
+    """删素材后清清单：manifest["assets"] 按 label/file 摘、asset_links 按 alias/asset_id 摘，
+    并同步清掉 segments[].refs 与正文里的 `@别名`。幂等（条目不存在也算成功）。
+
+    为什么必须清（两条独立的症状，同一个根因）：
+    - `manifest["assets"]` 是导演台「资产引用」栏（可引用素材池）的**唯一真相**
+      —— 前端 poolFromManifest 按它整体重建，**不看磁盘**。所以项目资产的瓦片删掉了
+      （`scan_scope("project")` 扫的是真目录），引用栏却永远少不掉那一栏：
+      一条文件已不在、点了也点不亮的幽灵素材。
+    - `segments[].refs` / 正文里的 `@别名` 不清就是死引用，编译期点名"找不到资产"。
+
+    labels 与 files 都收：files 是刚被删掉的真路径（最可靠），命中条目后连它的
+    label 一起进清理目标 —— 只按 label 匹配会漏掉"清单里 label 与索引显示名不一致"
+    的条目（assets/ 下有未登记的文件时就是这样）。
+    与 unlink_asset 的分工：那个只解"链接"（文件在全局库那份，绝不能删）；
+    这个连项目内文件条目（manifest["assets"]）一起摘。
+    目录或 manifest 不存在返回 None；base_revision 不一致抛 ValueError(REVISION_CONFLICT)。
+    """
+    name = safe_name(name)
+    if not name:
+        return None
+    labels = {str(x).strip() for x in (labels or ()) if str(x).strip()}
+    aids = {str(x).strip() for x in (asset_ids or ()) if str(x).strip()}
+    files = {str(x).strip().replace("\\", "/") for x in (files or ()) if str(x).strip()}
+    if not labels and not aids and not files:
+        return None
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+
+    assets = [x for x in (manifest.get("assets") or []) if isinstance(x, dict)]
+
+    def _rel(x):
+        return str(x.get("file") or "").replace("\\", "/")
+
+    # 先按 file 反查 label：删的是文件，清单里的 label 才是引用语法用的那个串
+    for x in assets:
+        if _rel(x) and _rel(x) in files and x.get("label"):
+            labels.add(str(x["label"]))
+    # 要清的别名 = 显式 label ∪ 命中链接的 alias ∪ asset_id 本身
+    # （label 与 alias 同一命名空间；asset_id 也可能被当成引用 key 写进 seg.refs）
+    targets = set(labels)
+    for x in (manifest.get("asset_links") or []):
+        if not isinstance(x, dict):
+            continue
+        if (str(x.get("asset_id") or "") in aids) or (str(x.get("alias") or "") in labels):
+            if x.get("alias"):
+                targets.add(str(x["alias"]))
+    targets |= aids
+
+    changed = False
+    kept_assets = [x for x in assets
+                   if str(x.get("label") or "") not in labels and _rel(x) not in files]
+    if len(kept_assets) != len(assets):
+        manifest["assets"] = kept_assets
+        changed = True
+    links = [x for x in (manifest.get("asset_links") or []) if isinstance(x, dict)]
+    kept_links = [x for x in links
+                  if not ((str(x.get("asset_id") or "") in aids)
+                          or (str(x.get("alias") or "") in labels))]
+    if len(kept_links) != len(links):
+        manifest["asset_links"] = kept_links
+        changed = True
+    if _purge_alias_refs(manifest, targets):
+        changed = True
+    if changed:
+        manifest["updated_at"] = time.time()
+        manifest["revision"] = int(manifest.get("revision") or 1) + 1
+        manifest["manifest_schema"] = MANIFEST_SCHEMA
+        checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def remove_latents(name: str, files, base_revision=None):
+    """删 latent 后清 manifest["latents"] 登记（幂等，只动清单不删文件）。
+
+    二采/锚源下拉会 `os.path.isfile` 自过滤，所以幽灵条目不至于"选不出来"，
+    但素材库入口的计数（latent N）会虚高 —— 顺手清掉，口径与磁盘一致。
+    登记里的 file 恒为 `latent/<名>`（见 slice_latent），而索引扫的是 latents/ 与
+    latent/ 两个目录，所以按**相对路径或文件名**任一命中都摘。
+    """
+    name = safe_name(name)
+    if not name:
+        return None
+    want = {str(f).strip().replace("\\", "/") for f in (files or ())
+            if str(f).strip()}
+    if not want:
+        return None
+    want_base = {w.split("/")[-1] for w in want}
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    _ensure_revision(manifest)
+    cur = [x for x in (manifest.get("latents") or []) if isinstance(x, dict)]
+    kept = [x for x in cur
+            if str(x.get("file") or "").replace("\\", "/") not in want
+            and str(x.get("file") or "").replace("\\", "/").split("/")[-1] not in want_base]
+    if len(kept) == len(cur):
+        return manifest
+    manifest["latents"] = kept
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def forget_media(name: str, rel: str, base_revision=None):
+    """删掉项目内某个媒体文件后，把它从 manifest 的**历史列表**里摘掉（幂等）。
+
+    `manifest["finals"]`（成片文件名）与 `manifest["merges"]`（[{file,...}]）都只是
+    历史记录，文件没了就该少一条 —— 否则右栏「成片」永远挂着一张放不出来的卡
+    （video src 404），再点删除也没用（删的已经是不存在的文件）。与素材库删除同一根因。
+
+    **故意不动 `manifest["videos"]`**：那是分段链的完成状态（第 i 段做完没有），
+    摘掉等于告诉链"这段没做"→ 语义完全不同，要单独决策，不在"清理历史"的范围里。
+    """
+    name = safe_name(name)
+    r = str(rel or "").strip().replace("\\", "/")
+    if not name or not r:
+        return None
+    base = r.split("/")[-1]
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    _ensure_revision(manifest)
+
+    def _hit(x):
+        s = str(x or "").replace("\\", "/")
+        return s == r or s.split("/")[-1] == base
+
+    changed = False
+    finals = [x for x in (manifest.get("finals") or []) if isinstance(x, str)]
+    kept_f = [x for x in finals if not _hit(x)]
+    if len(kept_f) != len(finals):
+        manifest["finals"] = kept_f
+        changed = True
+    merges = [x for x in (manifest.get("merges") or []) if isinstance(x, dict)]
+    kept_m = [x for x in merges if not _hit(x.get("file"))]
+    if len(kept_m) != len(merges):
+        manifest["merges"] = kept_m
+        changed = True
+    if not changed:
+        return manifest
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
+
+def projects_linking(asset_ids, exclude=None) -> dict:
+    """哪些项目链接了这些全局资产 -> {asset_id: [项目名...]}（不含 exclude）。
+
+    删全局库素材前用来回答"会波及谁"：全局库是内容寻址的单份文件，多项目靠
+    asset_links 引它 —— 删掉文件，那些项目的引用就断了。不是禁止删（用户的地盘
+    用户做主），但必须说出来，别让人过两天才发现某个项目打不开。
+    """
+    want = {str(a).strip() for a in (asset_ids or ()) if str(a).strip()}
+    if not want:
+        return {}
+    skip = str(exclude or "")
+    out = {}
+    root = checkpoint.projects_root()
+    if not os.path.isdir(root):
+        return out
+    for nm in os.listdir(root):
+        if nm == skip or not safe_name(nm):
+            continue
+        pdir = os.path.join(root, nm)
+        if not os.path.isdir(pdir):
+            continue
+        try:
+            with open(os.path.join(pdir, "manifest.json"), "r", encoding="utf-8") as f:
+                mf = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(mf, dict):
+            continue
+        for x in (mf.get("asset_links") or []):
+            if not isinstance(x, dict):
+                continue
+            aid = str(x.get("asset_id") or "")
+            if aid in want:
+                out.setdefault(aid, []).append(nm)
+    return out
 
 
 # intent_zh 是段级中文意图：主框上半区输入，不进模型，只给人和 AI 扩写看。

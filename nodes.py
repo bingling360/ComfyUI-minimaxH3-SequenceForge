@@ -984,6 +984,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _ASSET_ROLES = ("首帧图", "尾帧图")
         pool_files = []   # [(kind, label, file, roles)]
         pool_ids = []     # P3：与 pool_files 同下标的 asset_id（""=无，ds 活池自带）
+        pool_names = []   # 现行编辑引用用的完整文件名（含扩展名，不截断）
         _kind_n = {"image": 0, "video": 0, "audio": 0}
         if isinstance(ds.get("ref_assets"), list) and ds["ref_assets"]:
             for item in ds["ref_assets"]:
@@ -999,11 +1000,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     label = f"{_KIND_NAME[_k]}{_kind_n[_k]}"
                 _roles = [str(r).strip() for r in (item.get("roles") or [])
                           if str(r).strip() in _ASSET_ROLES] if isinstance(item.get("roles"), list) else []
-                pool_files.append((_k, label[:24], str(item["file"]), _roles))
+                _file = str(item["file"]).strip().replace("\\", "/")
+                _file_name = str(item.get("file_name") or _file.rsplit("/", 1)[-1] or label).strip()
+                pool_files.append((_k, label[:24], _file, _roles))
                 pool_ids.append(str(item.get("asset_id") or "").strip())
+                pool_names.append(_file_name)
         elif ds.get("ref_images") and isinstance(ds["ref_images"], list):
             pool_files = [("image", f"图片{i + 1}", str(fn), []) for i, fn in enumerate(ds["ref_images"]) if fn]
             pool_ids = [""] * len(pool_files)
+            pool_names = [str(fn).replace("\\", "/").rsplit("/", 1)[-1] for _, _, fn, _ in pool_files]
         _seen = set()
         for _i, (_k, _lbl, _fn, _rl) in enumerate(pool_files):
             _base, _n = _lbl, 2
@@ -1015,6 +1020,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         pool_labels = [lbl for _, lbl, _, _ in pool_files]
         pool_kind = {lbl: k for k, lbl, _, _ in pool_files}
         pool_file_of = {lbl: fn for _, lbl, fn, _ in pool_files}
+        pool_file_name_of = {lbl: (pool_names[i] if i < len(pool_names) else fn.rsplit("/", 1)[-1])
+                             for i, (_, lbl, fn, _) in enumerate(pool_files)}
         pool_roles_of = {lbl: list(rl) for _, lbl, _, rl in pool_files}
         # P3：活池 asset_id 随去重后的 label 对齐（去重只改名不换序，下标对齐天然保持）
         pool_id_of = {lbl: aid for lbl, aid in zip(pool_labels, pool_ids) if aid}
@@ -1042,6 +1049,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 import asset_store as _AS
             except ImportError:
                 _AS = None
+        try:
+            from . import resolved_media as _RM
+        except ImportError:
+            try:
+                import resolved_media as _RM
+            except ImportError:
+                _RM = None
         _asset_reg_cache = {}
 
         def _asset_registry():
@@ -1108,6 +1122,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
         chain_tail_label = next((lbl for lbl in pool_labels if "尾帧图" in pool_roles_of.get(lbl, [])), None)
 
         segments = ds.get("segments") if isinstance(ds.get("segments"), list) else []
+        # 新编辑层的统一资产视图：完整 file_name 只用于 @引用解析，旧 label/id
+        # 仍保留在 order 中供现有张量加载和官方 H3 conditioning 使用。
+        _media_assets = []
+        for _mi, (_mk, _ml, _mf, _mr) in enumerate(pool_files):
+            _media_assets.append({
+                "asset_id": pool_id_of.get(_ml) or f"legacy:{_ml}",
+                "file_name": pool_file_name_of.get(_ml) or _ml,
+                "alias": _ml,
+                "label": _ml,
+                "kind": _mk,
+                "file": _mf,
+                "roles": _mr,
+            })
 
         # 分段处理中心：官方三字段组装（场景/角色/环境音/配乐）；[[标签]] -> <Picture>/<Video>/<Audio>；
         # 缺 tag 的引用只补最小映射行（_reference_tags_minimal，不写散文）。
@@ -1126,6 +1153,27 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seg_dialogues += dlg
             if scene or char or soundscape or music:
                 seg_composed += 1
+            # 新结果文本走唯一 ResolvedMediaPlan：正文首次出现决定编号，未知 @素材
+            # 直接阻断；只有这里把 @完整文件名转换成官方 token。
+            if _RM is not None and pool_files and ("@" in full or "[[" in full):
+                _plan = _RM.resolve_media_plan(
+                    full, _media_assets, selected_assets=_media_assets, segment_id=f"seg-{i + 1}")
+                if not _plan.get("ok"):
+                    _err0 = (_plan.get("errors") or [{}])[0]
+                    _name = _err0.get("asset_name") or ""
+                    _code = _err0.get("code") or "H3_UNKNOWN_ASSET_REF"
+                    if _code == "H3_MEDIA_LIMIT":
+                        raise ValueError(_err0.get("message") or f"段{i + 1} 素材引用超限")
+                    raise ValueError(
+                        f"段{i + 1} 引用了未知/歧义素材「{_name}」："
+                        "请使用本段资产列表中的完整文件名")
+                full = _plan.get("prompt_text") or full
+                seg_label_orders[i] = [
+                    (b["kind"], b.get("alias") or b.get("asset_id"))
+                    for b in (_plan.get("blocks") or [])
+                ]
+                composed_prompts.append(full)
+                continue
             if pool_files:
                 _reg, _ = _asset_registry()
                 refs_sel = seg.get("refs")

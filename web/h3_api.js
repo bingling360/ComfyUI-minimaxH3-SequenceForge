@@ -91,7 +91,10 @@
     vaeFiles: () => _call("/h3chain/vae_files"),
     getPromptRules: () => _call("/h3chain/prompt-rules"),
     getOptimizerConfig: () => _call("/h3chain/optimizer-config"),
+    saveOptimizerConfig: (config) => _json("POST", "/h3chain/optimizer-config", { config }),
     optimize: (payload) => _json("POST", "/h3chain/optimize", payload),
+    /* 现行入口：意图 + 按段资产 -> 一次返回完整 H3 JSON；不加载工作流、不创建画布节点 */
+    promptGenerate: (payload) => _json("POST", "/h3chain/prompt_generate", payload),
     expand: (payload) => _json("POST", "/h3chain/expand", payload),
     expandValidate: (payload) => _json("POST", "/h3chain/expand_validate", payload),
     /* 剧本扩写（内容发散器）：总意图 + 时长范围 + 段数 -> N 段中文剧本 */

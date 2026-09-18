@@ -24,7 +24,12 @@
     const parts = file.split("/").filter((p) => p && p !== ".");
     if (!parts.length || parts.length > 2) return null;
     if (!/\.[A-Za-z0-9]+$/.test(parts[parts.length - 1])) return null;
-    return { label, kind, file: parts.join("/") };
+    return {
+      label,
+      file_name: String(raw.file_name || parts[parts.length - 1] || label),
+      kind,
+      file: parts.join("/")
+    };
   }
 
   function dedupe(assets) {

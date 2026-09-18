@@ -43,7 +43,10 @@ def normalize_pack(raw) -> tuple:
         if kind not in _KINDS:
             warns.append({"code": "W_PACK_KIND", "message": f"未知类别已按图片处理：{kind!r}"})
             kind = "image"
-        label = str(entry.get("label") or "").strip()[:_LABEL_MAX]
+        # 不截断 label —— 同 h3_assets.js 的注释：截到 24 字符会导致绿框不显示后缀、
+        # 相似素材名字相同、前缀匹配把所有 @引用 解析成同一 label。显示截断交给
+        # 前端 shortLabel 处理，数据本身要完整。
+        label = str(entry.get("label") or "").strip()
         file = str(entry.get("file") or "").strip().replace("\\", "/")
         if not label or not file:
             continue

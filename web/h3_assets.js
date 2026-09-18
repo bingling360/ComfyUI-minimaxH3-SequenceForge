@@ -9,7 +9,16 @@
   function cleanAsset(raw) {
     if (!raw || typeof raw !== "object") return null;
     const kind = ["image", "video", "audio"].includes(raw.kind) ? raw.kind : "image";
-    const label = String(raw.label || "").trim().slice(0, 24);
+    /* label 不截断：历史上截到 24 字符会把
+     *   "ChatGPT_Image_2026年9月18日_14_02_12.png"
+     * 变成
+     *   "ChatGPT_Image_2026年9月18日"
+     * 后果：
+     *   ① 绿框/引用条 chip 不显示后缀
+     *   ② 两个只差尾部的相似素材名字完全相同，无法区分
+     *   ③ 前缀匹配把所有 @引用 解析成同一个 label → 引用条只点亮 1 个
+     * 显示截断交给 shortLabel 处理（超长才首尾省略）；数据本身要完整。 */
+    const label = String(raw.label || "").trim();
     const file = String(raw.file || "").trim().replace(/\\/g, "/");
     if (!label || !file) return null;
     const parts = file.split("/").filter((p) => p && p !== ".");

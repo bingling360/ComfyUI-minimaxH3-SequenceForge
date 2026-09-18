@@ -1528,7 +1528,7 @@ def add_routes(routes):
         if not aid:
             return _err("这个全局条目没有 asset_id（旧数据）：请用「调入项目（复制文件）」",
                         code="NO_ASSET_ID", status=400)
-        lbl = str(data.get("label") or "").strip()[:24] or str(it.get("name") or "")[:24]
+        lbl = str(data.get("label") or "").strip() or str(it.get("name") or "")
         try:
             mf = projects.link_asset(dir_name, aid, lbl, it.get("kind") or "image",
                                      data.get("base_revision"))

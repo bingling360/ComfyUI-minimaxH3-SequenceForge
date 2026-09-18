@@ -98,9 +98,15 @@ def projects(checkpoint):
 
 
 @pytest.fixture(scope="session")
-def routes(projects):
+def library():
+    return _load_top("library", os.path.join(ROOT, "library.py"))
+
+
+@pytest.fixture(scope="session")
+def routes(projects, library):
     return _load_top("routes", os.path.join(ROOT, "routes.py"),
                      [("from . import projects", "import projects"),
+                      ("from . import library as h3lib", "import library as h3lib"),
                       ("from . import asset_hub", "import asset_hub"),
                       ("from . import prompts as _prompts", "import prompts as _prompts")])
 
@@ -232,8 +238,14 @@ def test_nodes_wiring():
     assert "该段图片没选" not in src and "素材库共" not in src
     assert "总量不限、按段按需" in src
     assert "超过官方单段上限" in src
-    # 段 latent_ref.src 外源桥必须透传进 seg_latent_ref（否则 _inject_guide 外源分支不可达）
-    assert '_ent["src"] = {"file": "/".join(_src_parts)}' in src
+    # 段锚「外源桥」必须透传：旧写法（_ent["src"] = {"file": ...} 从 latent_ref.src 桥进
+    # seg_latent_ref）已随「手动锚定」重构删掉，现在由 anchors 建条目带 src.kind/ref、
+    # nodes._inject_guide 认 src 非 prev_tail 时改取外源 —— 钉住这条新链路，
+    # 否则「设了源却不生效、静默回落上段尾」那类最坏 bug 会悄悄回潮。
+    anc = open(os.path.join(ROOT, "anchors.py"), encoding="utf-8").read()
+    assert '"kind": "prev_tail"' in anc and '"kind": "library"' in anc
+    assert '_a["src"]["kind"] != "prev_tail"' in src
+    assert "_resolve_anchor_latent" in src
 
 
 # ---- M2.5 ----
@@ -379,10 +391,14 @@ def test_v2_section_wired():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     assert "function renderV2Section(sec, data)" in d
     assert "renderV2Section(sec, data);" in d
+    # 端点接线：符号可能落在 director / api / latent 任一个文件里。
+    # 别再按「名字里含 latent 就去 h3_latent.js 找」猜 —— latent_slice 一直在 h3_api.js，
+    # 旧启发式把 latent_slice 派给 h3_latent.js，于是这条断言长期假红。
+    _web_all = "".join(
+        open(os.path.join(ROOT, "web", f), encoding="utf-8").read()
+        for f in sorted(os.listdir(os.path.join(ROOT, "web"))) if f.endswith(".js"))
     for ep in ["compilePreview", "saveAssets", "assetCheck", "latent_slice", "trim"]:
-        assert ep in d or ep.replace("_", "/") in d or ep in open(
-            os.path.join(ROOT, "web", "h3_latent.js" if "latent" in ep or ep == "trim" else "h3_api.js"),
-            encoding="utf-8").read()
+        assert ep in d or ep.replace("_", "/") in d or ep in _web_all, ep
 
 
 def test_transcode_jobs_normalized():
@@ -423,8 +439,8 @@ def test_v2_group_form_wired():
     assert "JSON.stringify(s.prompt_v2)" in d
     assert "function renderPromptV2Panel(body, node, data, segIdx)" in d or \
         "function renderPromptV2Panel(" in d
-    assert "renderPromptV2Panel(paneV2, node, data, it.idx)" in d or \
-        "renderPromptV2Panel(body, node, data, it.idx)" in d
+    # B05 起具象化面板搬进「⇄ 结构化提示词」弹窗，渲染器复用、宿主容器改成弹窗 body
+    assert "renderPromptV2Panel(bodyBox, node, data, idx)" in d
     assert "function setPromptV2Field(node, idx, mutate" in d
     assert "function debouncePromptV2Write" in d
     assert "function getSegPromptV2" in d
@@ -443,11 +459,15 @@ def test_v2_group_form_wired():
     # 具象化精简：画面合并为 visual 单框；每镜低频项收进「更多」
     for sym in ["pv0.visual", '"visual"', "更多 · 换镜时间"]:
         assert sym in d, sym
-    # 主框三段式：①中文意图 → ②剧本 → ③结果（只有 ③ 进模型）
-    for sym in ["① 中文意图（不进模型 · 可用 @素材）", "② 剧本（扩写产物 · 可手工改）",
-                "③ 结果（最终进模型）", "同步到具象化", "← 从具象化同步",
-                "✨ 提示词优化 → 结果"]:
+    # 主框单框化（B04）：原「①中文意图 → ②剧本 → ③结果」三框已合并成一个框，
+    # 「只有 ③ 进模型」的分层随之取消 —— 框内正文就是最终进模型的文本。
+    for sym in ["提示词（最终进模型 · 可用 @素材）", "✨ AI 扩写 + 优化",
+                "✨ 提示词优化", "⇄ 结构化提示词"]:
         assert sym in d, sym
+    for gone in ["① 中文意图（不进模型 · 可用 @素材）", "② 剧本（扩写产物 · 可手工改）",
+                 "③ 结果（最终进模型）", "同步到具象化", "← 从具象化同步",
+                 "✨ 提示词优化 → 结果"]:
+        assert gone not in d, "三框时代的文案不该回潮：" + gone
     assert "gMore.append(gMoreBody)" in d, "镜头「更多」内容没挂进 details"
     # 复位后开合状态要记下来（否则加对白/重建会被 details 默认收起打断）
     assert "const _v2Open = new Map();" in d, "缺 details 开合记忆"
@@ -465,8 +485,10 @@ def test_v2_group_form_wired():
     assert "需要首帧图＋尾帧图" not in d, "旧的强制文案应移除"
     # 素材调度 ⇄ 官方引用双向同步（否则前后端模式判定打架）
     assert "function v2RefsFromSchedule(" in d
-    assert "function syncV2RefsFromSchedule(" in d
-    assert "syncV2RefsFromSchedule(node, idx);" in d
+    # 但「结果框」没了以后，正文就是唯一真相：正文里的 @别名 序列 → seg.refs
+    # （旧的 syncV2RefsFromSchedule 早已不存在，别再拿它钉）
+    assert "function syncRefsFromText(ds, idx, text)" in d
+    assert "syncRefsFromText(ds, idx, text);" in d
     assert "const want = v2RefsFromSchedule(data.ds, segIdx);" in d
     for t in ["<Picture ", "<Video ", "<Audio "]:
         assert t in d, t

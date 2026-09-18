@@ -3777,7 +3777,7 @@ async function openOptSettings(node, onSaved) {
     document.body.append(overlay);
 }
 
-/* 主框工具条：优化/设置/原稿切换/从具象化同步（双写入口） */
+/* 主框工具条：原稿/优化稿切换 + 「⇄ 结构化提示词」弹窗入口（结构化 ⇄ 文本 双写） */
 function paintOptbar(optbar, node, data, idx, ta) {
     try {
         optbar.replaceChildren();

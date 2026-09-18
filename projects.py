@@ -9,6 +9,7 @@ merge_project 按序合并若干段/成片/外部视频 -> merged_*.mp4（只追
 
 import json
 import os
+import re
 import shutil
 import time
 
@@ -345,17 +346,20 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
 
 
 def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
-    """解链：按 asset_id 或 alias 移除 manifest["asset_links"] 条目，revision+1。
+    """解链 + 清理引用：按 asset_id 或 alias 移除 manifest["asset_links"] 条目，
+    同步从 segments[i].refs 和 prompts[i] 文本中移除该 alias 的所有 @引用。
 
     幂等：条目不存在同样成功（返回现 manifest）。目录或 manifest 不存在返回
-    None；base_revision 不一致抛 ValueError(REVISION_CONFLICT)。只动链接，
+    None；base_revision 不一致抛 ValueError(REVISION_CONFLICT)。只动链接与引用，
     不删全局库文件与旧 assets。
     """
     name = safe_name(name)
     if not name:
         return None
     aid = str(asset_id or "").strip()
-    als = str(alias or "").strip()[:_ASSET_LABEL_MAX]
+    # 不截断 alias —— 历史 bug：[:_ASSET_LABEL_MAX] 让"ChatGPT_Image_2026年9月18日_14_02_12"
+    # 变成"ChatGPT_Image_2026年9月18日"，与素材库不一致，正文清理会漏删。
+    als = str(alias or "").strip()
     if not aid and not als:
         return None
     root = os.path.join(checkpoint.projects_root(), name)
@@ -371,6 +375,18 @@ def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
         if int(manifest.get("revision") or 1) != br:
             raise ValueError(
                 f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    # 收集被解链条目的 alias（用于清理 seg.refs 和正文）。
+    # 必须用完整 alias（包括历史 24 字符截断版），否则旧的 alias 清不掉。
+    target_aliases = set()
+    for x in (manifest.get("asset_links") or []):
+        if not isinstance(x, dict):
+            continue
+        if (aid and str(x.get("asset_id") or "") == aid) or \
+           (als and str(x.get("alias") or "") == als):
+            if x.get("alias"):
+                target_aliases.add(str(x["alias"]))
+            if aid:
+                target_aliases.add(aid)
     links = [x for x in (manifest.get("asset_links") or []) if isinstance(x, dict)]
     kept = [x for x in links
             if not ((aid and str(x.get("asset_id") or "") == aid)
@@ -378,6 +394,33 @@ def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
     if len(kept) != len(links):
         manifest["asset_links"] = [_clean_asset_link(x) or x for x in kept]
         manifest["asset_links"] = [x for x in manifest["asset_links"] if x is not None]
+    # 同步清理 seg.refs 和正文里的 @xxx —— 此前只解链不解引用，导致"删了项目库
+    # 里的东西提示词框的引用还在"（也是 seg.refs 漏删 → 引用条残留 → 渲染的 @xxx
+    # 找不到素材而红框，但文本还在那里）。
+    if target_aliases:
+        for seg in (manifest.get("segments") or []):
+            if not isinstance(seg, dict):
+                continue
+            cur = seg.get("refs") or []
+            new = [r for r in cur if r not in target_aliases]
+            if new != cur:
+                seg["refs"] = new
+        prompts = manifest.get("prompts") or []
+        for i in range(len(prompts)):
+            if not isinstance(prompts[i], str):
+                continue
+            txt = prompts[i]
+            for t in target_aliases:
+                # 单词边界：`@[名](后面不能跟 label 字符 _A-Za-z0-9`)，
+                # 防止误删 @回廊 → @回廊场景2 这种更长名字的前缀。
+                txt = re.sub(rf"@{re.escape(t)}(?![A-Za-z0-9_])", "", txt)
+            txt = re.sub(r"[ \t]+", " ", txt)        # 多余空格压一个
+            txt = re.sub(r"\n{3,}", "\n\n", txt)     # 多余空行压一行
+            if txt != prompts[i]:
+                prompts[i] = txt
+        manifest["prompts"] = prompts
+    # 仅当真的有改动才升 revision 并落盘
+    if target_aliases or len(kept) != len(links):
         manifest["updated_at"] = time.time()
         manifest["revision"] = int(manifest.get("revision") or 1) + 1
         manifest["manifest_schema"] = MANIFEST_SCHEMA

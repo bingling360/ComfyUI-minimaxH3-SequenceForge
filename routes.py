@@ -1589,7 +1589,8 @@ def add_routes(routes):
             if it.get("linked"):
                 # 链接条目（asset_links）：只解链 —— 文件是全局库那份，绝不能删
                 try:
-                    if projects.unlink_asset(dir_name, asset_id=it.get("asset_id")) is not None:
+                    if projects.unlink_asset(dir_name, asset_id=it.get("asset_id"),
+                                         alias=it.get("name")) is not None:
                         unlinked.append(it["name"])
                 except ValueError as e:
                     unlinked.append(f"{it['name']}（{e}）")

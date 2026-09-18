@@ -203,8 +203,30 @@ def register_content(root: str, src_path: str, kind, tags=None, desc="",
     dest = os.path.join(root, sub, stored)
     manifest = load_library(root)
     for e in manifest["assets"]:
-        if isinstance(e, dict) and e.get("asset_id") == aid:
-            return e  # 秒传
+        if not (isinstance(e, dict) and e.get("asset_id") == aid):
+            continue
+        old_abs = os.path.join(root, *str(e.get("file") or "").replace("\\", "/").split("/")) \
+            if e.get("file") else ""
+        if old_abs and os.path.isfile(old_abs):
+            return e          # 秒传：同内容 + 文件确实在
+        if not old_abs:
+            manifest["assets"].remove(e)      # 无 file 的坏条目：摘掉，往下重建一条
+            break
+        # 幽灵修复：登记在、文件没了（老版本删除只 os.remove 不摘登记；新版 scan_scope
+        # 按 isfile 过滤，条目看不见）。若在这里"秒传"返回，用户重新上传同一份文件会
+        # 拿回一条永远看不见的幽灵 —— 就是"传了没反应"。复用原路径补齐文件并刷新登记，
+        # 而不是新开一条同 asset_id 的条目（两条同 id 会让注册表首胜口径变得不可预测）。
+        os.makedirs(os.path.dirname(old_abs), exist_ok=True)
+        tmp = old_abs + ".part"
+        with open(src_path, "rb") as fi, open(tmp, "wb") as fo:
+            fo.write(fi.read())
+        os.replace(tmp, old_abs)
+        now = time.time()
+        e["bytes"] = os.path.getsize(old_abs)
+        e["orig_name"] = raw_base
+        e["updated_at"] = now
+        save_library(root, manifest)
+        return e
     os.makedirs(os.path.join(root, sub), exist_ok=True)
     if not os.path.isfile(dest):
         tmp = dest + ".part"
@@ -219,6 +241,39 @@ def register_content(root: str, src_path: str, kind, tags=None, desc="",
     manifest["assets"].append(entry)
     save_library(root, manifest)
     return entry
+
+
+def remove_asset(root: str, asset_id=None, file=None) -> dict:
+    """从全局库 manifest 摘掉一条登记（幂等）-> {removed, remaining}。
+
+    **只改 manifest，不碰磁盘**：物理文件由调用方按需删。顺序反过来（先删文件、
+    再摘登记）中间失败就会留下"文件没了但条目还在"的幽灵，而 `scan_scope("global")`
+    恰恰以 manifest 为唯一源 —— 幽灵条目会永远显示在全局库里，点删除也删不掉
+    （删的是已经不在的文件，条目照旧）—— 这就是"全局库根本删除不了"的真身。
+    所以宁可能留一个孤儿文件，也不留幽灵条目。
+
+    匹配口径：asset_id 优先，其次 file（相对路径，与 manifest 里存的一致）。
+    """
+    aid = str(asset_id or "").strip()
+    rel = str(file or "").strip().replace("\\", "/")
+    if not root or (not aid and not rel):
+        return {"removed": None, "remaining": 0}
+    manifest = load_library(root)
+    kept, removed = [], None
+    for e in manifest.get("assets") or []:
+        if not isinstance(e, dict):
+            continue
+        if removed is None and (
+                (aid and str(e.get("asset_id") or "") == aid)
+                or (rel and str(e.get("file") or "").replace("\\", "/") == rel)):
+            removed = e
+            continue
+        kept.append(e)
+    if removed is None:
+        return {"removed": None, "remaining": len(kept)}
+    manifest["assets"] = kept
+    save_library(root, manifest)
+    return {"removed": removed, "remaining": len(kept)}
 
 
 # ---- 注册表（全局 + 项目链接 + 旧资产三源汇合） ----

@@ -101,6 +101,23 @@ const REF_TPL_DEFAULT = 0;
  * 钩子，把卡片内的活状态推进到最新，重活（整卡重建）仍等焦点离开。 */
 let _cardPainters = [];
 function registerCardPainter(fn) { if (typeof fn === "function") _cardPainters.push(fn); }
+
+/* 打开中的浮层里的「活」渲染器（总提示词框等）：每次 refresh 一并推进。
+ * 为什么必须有：素材库弹窗（.h3l-overlay）与总提示词框（.h3d-overlay）**可以同时开着**，
+ * 在素材库里删/改名/上传后，总提示词框的「参考素材（AI 可见）」chips 却停在旧池上
+ * —— 那一栏没少、点上去还报错。段卡的引用条有 _cardPainters，浮层这边此前没有对应物。
+ * 注册者自己负责摘除（DOM 断开即 unregister），不留悬挂引用。 */
+let _livePainters = [];
+function registerLivePainter(fn) { if (typeof fn === "function") _livePainters.push(fn); }
+function unregisterLivePainter(fn) {
+    const i = _livePainters.indexOf(fn);
+    if (i >= 0) _livePainters.splice(i, 1);
+}
+function runLivePainters() {
+    for (const fn of [..._livePainters]) {
+        try { fn(); } catch (e) { /* 单个浮层失败不影响别的 */ }
+    }
+}
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧起手（可选尾帧图片=FL2VA 首尾帧），fl2va UNET"],
@@ -8792,7 +8809,8 @@ function openMasterPromptModal() {
     const bRefAll = el("button", "h3d-btn h3d-mprefs-btn", "全选");
     const bRefNone = el("button", "h3d-btn h3d-mprefs-btn", "清空");
     const bRefReload = el("button", "h3d-btn h3d-mprefs-btn", "⟳");
-    bRefReload.title = "重新读取素材池（刚上传/改名/删了素材时点一下）";
+    bRefReload.title = "立即重读素材池（正常情况下素材库增删改后会自动跟上；"
+        + "点它用于手动催一次）";
     refRow.append(bRefAll, bRefNone, bRefReload);
 
     /* 两个 AI 动作的实现挂在下面（挂在各自作用的框头上，这里先建句柄） */
@@ -8862,6 +8880,11 @@ function openMasterPromptModal() {
         let pool = [];
         try { pool = getDs(node).ref_assets || []; } catch (e) { pool = []; }
         imgPool = pool.filter((a) => a && String(a.kind || "image") === "image");
+        /* 池里已经没有的素材要从勾选集合里剔掉：否则删完素材，
+         * 计数还写着「已选 3/2」，而且 compose 时还惦记着一条不存在的图。 */
+        for (const k of [...selKey]) {
+            if (!imgPool.some((a) => assetKey(a) === k)) selKey.delete(k);
+        }
         chipBox.innerHTML = "";
         if (!imgPool.length) {
             chipBox.append(el("span", "h3d-secs-hint",
@@ -8888,6 +8911,12 @@ function openMasterPromptModal() {
     bRefNone.onclick = () => { selKey.clear(); renderRefs(); };
     bRefReload.onclick = () => renderRefs();
     renderRefs();
+    /* 素材库删/改名/上传后 chips 自动跟上（DOM 断开即自摘，不必在各处 close 里挂钩子） */
+    const paintLive = () => {
+        if (!chipBox.isConnected) { unregisterLivePainter(paintLive); return; }
+        renderRefs();
+    };
+    registerLivePainter(paintLive);
 
     const pickedAssets = () => imgPool.filter((a) => selKey.has(assetKey(a)));
 
@@ -9419,6 +9448,7 @@ async function refresh() {
         const data = await collectData();
         renderMini(data);
         if (desk) updateDesk(data);
+        runLivePainters();            // 打开中的浮层（总提示词框的参考素材 chips 等）
     } catch (e) {
         console.warn("[h3-director] refresh failed:", e);
         renderMiniFallback(e);   // 出错也保住入口按钮，不留空白标签

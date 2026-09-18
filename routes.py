@@ -223,6 +223,15 @@ def add_routes(routes):
         if not target.startswith(root + os.sep) or not os.path.isfile(target):
             return _err("文件不存在", code="NOT_FOUND", status=404)
         os.remove(target)
+        # 文件没了，manifest 里的历史记录也要少一条：右栏「成片 / 合并片段」是照
+        # manifest["finals"] / ["merges"] 渲染的，不摘就永远挂着一张放不出来的卡
+        # （与素材库删除同一根因）。videos 是链状态，不在"历史"范围，故意不动。
+        rel = "/".join(parts[2:])
+        try:
+            projects.forget_media(parts[1], rel)
+        except (ValueError, OSError):
+            pass
+        h3lib.invalidate(parts[1])
         return web.json_response({"ok": True})
 
     async def merge(request):
@@ -1571,7 +1580,18 @@ def add_routes(routes):
         return web.json_response({"ok": True})
 
     async def lib_delete(request):
-        """删除物理文件；项目清单里的引用由前端确认后各自清理。"""
+        """删除物理文件 **+ 同步清单**（三条清理，缺一条就出"删不掉的幽灵条目"）。
+
+        以前只删文件、不动任何清单，于是同一个根因长出两个症状：
+          - **全局库**：`scan_scope("global")` 以全局库 manifest 为唯一源 —— 文件删了
+            条目还在，瓦片永远留在库里，用户看到的就是「全局库根本删除不了」
+            （点确定后弹窗关了，什么都没变）；
+          - **项目资产**：瓦片扫的是真目录会消失（所以看起来"能删"），但导演台
+            「资产引用」栏以 `manifest["assets"]` 为唯一真相 —— 那一栏永远少不掉，
+            留着一条点不亮的幽灵素材。
+        现在：global 摘全局库登记、project 摘项目 assets/asset_links、linked 只解链，
+        三者都顺带清掉 seg.refs 与正文里的 @别名；另附"还有别的项目在引用"提醒。
+        """
         try:
             data = await request.json()
         except Exception:
@@ -1582,6 +1602,10 @@ def add_routes(routes):
             ([str(data["id"])] if data.get("id") else [])
         paths = []
         unlinked = []
+        notes = []
+        drop_labels, drop_ids, drop_files = set(), set(), set()
+        latent_files = []
+        global_drops = []          # [(asset_id, file)]
         for i in ids:
             it = _find_item(dir_name, i)
             if it is None:
@@ -1590,7 +1614,7 @@ def add_routes(routes):
                 # 链接条目（asset_links）：只解链 —— 文件是全局库那份，绝不能删
                 try:
                     if projects.unlink_asset(dir_name, asset_id=it.get("asset_id"),
-                                         alias=it.get("name")) is not None:
+                                             alias=it.get("name")) is not None:
                         unlinked.append(it["name"])
                 except ValueError as e:
                     unlinked.append(f"{it['name']}（{e}）")
@@ -1598,10 +1622,91 @@ def add_routes(routes):
             p = h3lib.resolve_item_path(it, dir_name)
             if p:
                 paths.append(p)
+            scope = str(it.get("scope") or "")
+            if scope == "global":
+                global_drops.append((it.get("asset_id"), it.get("file")))
+            elif scope == "project":
+                if it.get("name"):
+                    drop_labels.add(str(it["name"]))
+                if it.get("file"):
+                    drop_files.add(str(it["file"]))
+                if it.get("asset_id"):
+                    drop_ids.add(str(it["asset_id"]))
+            elif scope == "latent":
+                latent_files.append(str(it.get("file") or ""))
+        # ① 全局库登记（manifest 是 scan_scope("global") 的唯一源）
+        removed_global = []
+        if global_drops:
+            try:
+                from . import asset_store
+            except ImportError:
+                import asset_store
+            lib_root = h3lib._library_root()
+            if not lib_root:
+                notes.append("全局库不可用：文件已删，但库内登记没能清掉（刷新后会重新出现）")
+            else:
+                for aid, f in global_drops:
+                    got = asset_store.remove_asset(lib_root, asset_id=aid, file=f)
+                    if got.get("removed"):
+                        removed_global.append(got["removed"])
+        # ①b 本项目也链着它吗？那就顺手解开 —— 用户正站在这个项目里删它，
+        #     留一条指向已删文件的链接只会让项目编译报"文件缺失"。
+        #     （别的项目不动，只在下面出提醒：不替用户改别的项目的存档。）
+        if removed_global and dir_name:
+            cur_ids = set()
+            try:
+                cur_mf = projects.read_project(dir_name) or {}
+                for x in (cur_mf.get("asset_links") or []):
+                    if isinstance(x, dict) and x.get("asset_id"):
+                        cur_ids.add(str(x["asset_id"]))
+            except Exception:
+                cur_ids = set()
+            for e in removed_global:
+                aid = str(e.get("asset_id") or "")
+                if not aid or aid not in cur_ids:
+                    continue
+                try:
+                    projects.unlink_asset(dir_name, asset_id=aid)
+                    unlinked.append(str(e.get("orig_name") or aid))
+                    notes.append("本项目里指向它的链接已一并解开"
+                                 f"（{e.get('orig_name') or aid}）")
+                except (ValueError, OSError) as ex:
+                    notes.append(f"本项目解链失败：{ex}")
+        # ② 项目清单（导演台「资产引用」栏的唯一真相）
+        if drop_labels or drop_ids or drop_files:
+            try:
+                projects.remove_assets(dir_name, labels=drop_labels, asset_ids=drop_ids,
+                                       files=drop_files)
+            except (ValueError, OSError) as e:
+                notes.append(f"项目清单清理失败：{e}")
+        if latent_files:
+            try:
+                projects.remove_latents(dir_name, latent_files)
+            except (ValueError, OSError) as e:
+                notes.append(f"latent 清单清理失败：{e}")
         res = h3lib.delete_items(paths)
-        h3lib.invalidate(dir_name)
+        # 全局库缓存键是 "global|"（不含项目名），invalidate(dir_name) 清不到它
+        if global_drops:
+            h3lib.invalidate()
+        else:
+            h3lib.invalidate(dir_name)
+        # ③ 删掉的全局资产还有别的项目在链吗？断了要说出来，别让人过两天才发现
+        if removed_global:
+            aids = [str(e.get("asset_id") or "") for e in removed_global]
+            try:
+                hit = projects.projects_linking(aids, exclude=dir_name)
+            except Exception:
+                hit = {}
+            for e in removed_global:
+                users = hit.get(str(e.get("asset_id") or "")) or []
+                if users:
+                    notes.append(
+                        f"⚠「{e.get('orig_name') or e.get('file')}」仍被 {len(users)} 个项目引用"
+                        f"（{'、'.join(sorted(users))}）：那边的引用已失效，"
+                        f"请重开项目重新挑素材")
         return web.json_response({"ok": True, **res, "unlinked": unlinked,
-                                  "requested": len(ids)})
+                                  "detached": len(removed_global) + len(drop_labels),
+                                  "notes": notes, "requested": len(ids)})
 
     async def lib_archive(request):
         """把非全局库的条目存一份进全局库（成片产物自动备份，跨项目复用）。

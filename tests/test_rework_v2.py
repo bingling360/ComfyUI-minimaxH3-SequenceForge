@@ -476,8 +476,8 @@ def test_v2_group_form_wired():
         assert sym in d, sym
     # 校验入口：编译预览+模式徽
     assert "编译预览+校验" in d and "detectMode" in d
-    # 5.3 最小接线：AI扩写复制命令行
-    assert "AI扩写" in d and "h3_prompt_expander" in d
+    # 5.3 最小接线：扩写链路（B02 起按钮改叫「AI 扩写 + 优化」，扩写工具仍在 tools/ 下）
+    assert "AI 扩写" in d and "h3_prompt_expander" in d
     # 焦点守卫：v2 输入聚焦不重建（防丢焦）
     assert "input:focus, select:focus" in d
 
@@ -544,17 +544,21 @@ def test_optimizer_routes_mount(routes):
 def test_segment_tabs_and_optimizer_ui():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     a = open(os.path.join(ROOT, "web", "h3_api.js"), encoding="utf-8").read()
-    # 切换式三页
-    assert "h3d-tabs" in d and "paneMain" in d and "paneV2" in d and "paneSet" in d
+    # 切换式两页（B05 起「具象化」不再是常驻页 —— 它是工具条上的「⇄ 结构化提示词」弹窗）
+    assert "h3d-tabs" in d and "paneMain" in d and "paneSet" in d
+    assert "paneV2" not in d
     assert "_segTab" in d
+    # 老存档里记着 "v2" 页名时要回落「提示词」，否则 paintTabs 把 pane 全藏掉（一片空白）
+    assert "tabKeys.includes(curTab)" in d
     # 旧四框 UI 已删（后端仍兼容旧键，仅前端不编辑）
     assert "场景提示词" not in d and "角色提示词" not in d
     # 段片瘦身：无大 thumb 网格，全屏入口保留
     assert "segMediaInfo" in d and "openSegViewer" in d and "h3d-viewer" in d
     assert "▶ 预览" in d
     assert "grid-template-columns:minmax(0,1fr)" in d
-    # 双写同步（具象化 ⇄ 结果框，文案已统一为「具象化」）
-    assert "同步到主框" in d and "从具象化同步" in d and "同步到具象化" in d
+    # 双向转换（B05：具象化面板从常驻 tab 搬进弹窗，结构化 ⇄ 文本 等价互转）
+    assert "⇄ 结构化提示词" in d and "openStructuredModal" in d
+    assert "← 文本 → 结构化" in d and "同步到主框" in d
     # AI优化条（自研后端）
     for sym in ["paintOptbar", "runOptForSegment", "openOptSettings", "opt_hist",
                 "optimizer-config", "/h3chain/optimize"]:

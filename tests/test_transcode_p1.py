@@ -168,11 +168,14 @@ def test_link_asset_roundtrip(projects):
     m2 = projects.link_asset("t_link", "a_1234567890ab", "主角", "image",
                              base_revision=m["revision"])
     assert m2["revision"] == m["revision"] + 1
-    assert m2["asset_links"] == [{"asset_id": "a_1234567890ab", "alias": "主角", "kind": "image"}]
-    # 同 alias 重指向
+    # mark 由标注层（B00）自动附加：入库序第一个 → 图片1（缺 mark_auto = 自动）
+    assert m2["asset_links"] == [{"asset_id": "a_1234567890ab", "alias": "主角",
+                                  "kind": "image", "mark": "图片1"}]
+    # 同 alias 重指向（标注随槽位不动）
     m3 = projects.link_asset("t_link", "a_abcdefabcdef", "主角", "video",
                              base_revision=m2["revision"])
-    assert m3["asset_links"] == [{"asset_id": "a_abcdefabcdef", "alias": "主角", "kind": "video"}]
+    assert m3["asset_links"] == [{"asset_id": "a_abcdefabcdef", "alias": "主角",
+                                  "kind": "video", "mark": "图片1"}]
     # 同 id 改名
     m4 = projects.link_asset("t_link", "a_abcdefabcdef", "主角2", "video",
                              base_revision=m3["revision"])

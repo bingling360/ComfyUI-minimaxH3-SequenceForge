@@ -82,7 +82,7 @@
     return (pool || []).map((a) => String(a?.label || "")).filter(Boolean);
   }
 
-  // 全池引用关系：label -> [段号...]（refs 勾选 + [[标签]] 文本 + tail_src + 首尾帧标注）
+  // 全池引用关系：label -> [段号...]（refs 勾选 + 正文 @别名 + tail_src + 首尾帧标注）
   // refs 内 asset_id 归一为别名（与后端 compile_refs 同口径，徽标才能对上瓦片）
   function segUsage(ds) {
     const usage = {};
@@ -99,6 +99,7 @@
     };
     const prompts = (ds && ds.prompts) || [];
     const segs = (ds && ds.segments) || [];
+    const pool = (ds && ds.ref_assets) || [];
     const n = Math.max(prompts.length, segs.length);
     for (let i = 0; i < n; i++) {
       const seg = segs[i] || {};
@@ -107,12 +108,25 @@
         touch(k, i + 1);
       }
       const txt = String(prompts[i] || "");
+      /* 正文里的 @别名 —— 与后端 _find_refs / 前端 refsFromText **同口径**：
+       * 池标签最长优先 + 负向后顾防 `a@b.com`。
+       * 旧实现只认 `[[标签]]`（v1 语法），早已废弃 → "素材被哪些段引用"永远算不准。 */
+      const labs = pool.map((a) => String(a?.label || "")).filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+      let p = 0;
+      while (p < txt.length) {
+        if (txt[p] === "@" && !/[0-9A-Za-z_]/.test(txt[p - 1] || "")) {
+          const hit = labs.find((l) => txt.startsWith(l, p + 1));
+          if (hit) { touch(hit, i + 1); p += hit.length + 1; continue; }
+        }
+        p += 1;
+      }
+      /* 老存档兼容：v1 的 `[[标签]]` 仍需认（历史项目没迁移过正文） */
       const re = /\[\[([^\[\]]{1,24})\]\]/g;
       let m;
       while ((m = re.exec(txt))) touch(m[1].trim(), i + 1);
       if (seg.tail_src && seg.tail_src.asset) touch(seg.tail_src.asset, i + 1);
     }
-    const pool = (ds && ds.ref_assets) || [];
     for (const a of pool) {
       for (const role of a?.roles || []) {
         if (role === "首帧图" || role === "尾帧图") {

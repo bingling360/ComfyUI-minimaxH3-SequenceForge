@@ -144,13 +144,14 @@ def test_link_roles_tristate(projects):
     m = projects.create_project("t_roles")
     m2 = projects.link_asset("t_roles", "a_1234567890ab", "主角", "image",
                              base_revision=m["revision"], roles=["首帧图", "野标注"])
+    # mark 由标注层（B00）自动附加：图片1 是入库序第一个（缺 mark_auto = 自动）
     assert m2["asset_links"] == [{"asset_id": "a_1234567890ab", "alias": "主角",
-                                  "kind": "image", "roles": ["首帧图"]}]
-    # 不传 roles -> 保持旧标注
+                                  "kind": "image", "roles": ["首帧图"], "mark": "图片1"}]
+    # 不传 roles -> 保持旧标注；同 alias 重指向，标注随槽位不动
     m3 = projects.link_asset("t_roles", "a_1234567890ab", "主角2", "image",
                              base_revision=m2["revision"])
     assert m3["asset_links"][0] == {"asset_id": "a_1234567890ab", "alias": "主角2",
-                                    "kind": "image", "roles": ["首帧图"]}
+                                    "kind": "image", "roles": ["首帧图"], "mark": "图片1"}
     # 传空列表 -> 清标注
     m4 = projects.link_asset("t_roles", "a_1234567890ab", "主角2", "image",
                              base_revision=m3["revision"], roles=[])

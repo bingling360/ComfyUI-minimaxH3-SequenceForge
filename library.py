@@ -452,6 +452,15 @@ def _link_entries(project, root) -> list:
         e["bytes"] = int(g.get("bytes") or 0)
         e["roles"] = [str(r) for r in (L.get("roles") or [])
                       if str(r) in ("首帧图", "尾帧图")]
+        # 标注（发给 LLM 的稳定短编号）透到条目上，素材库瓦片/引用条能直接显示
+        try:
+            from . import asset_store as _as
+        except ImportError:
+            import asset_store as _as
+        mk = _as.clean_mark(L.get("mark"))
+        if mk:
+            e["mark"] = mk
+            e["mark_auto"] = L.get("mark_auto") is not False
         out.append(e)
     return out
 

@@ -72,7 +72,13 @@ def clean_alias(alias) -> str:
         s = stem
     s = _ALIAS_BAD.sub("_", s)
     s = re.sub(r"[_\-]{2,}", "_", s).strip("_-")
-    return s[:ALIAS_MAX].strip("_-")
+    s = s[:ALIAS_MAX].strip("_-")
+    # 别名不能长成「标注」形态（图片1 / 视频2 / 音频3）：标注是发给 LLM 的稳定编号，
+    # 与别名同形时，`@图片1` 到底指别名还是标注无法判定 —— 编码/解码会串号。
+    # 统一加一个尾下划线错开（`图片1` -> `图片1_`），语义不变、可见、可改名。
+    if s and _MARK_RE.match(s):
+        s = (s + "_")[:ALIAS_MAX]
+    return s
 
 
 def alias_of(*cands) -> str:
@@ -86,6 +92,99 @@ def alias_of(*cands) -> str:
         if a:
             return a
     return "素材"
+
+
+# ---- 素材标注（mark）----
+#
+# 标注 ≠ 别名。别名（alias）是 `@别名` 引用语法的载体，用户可见可编辑；标注是
+# **发给 LLM 用的稳定短编号**（图片1 / 视频2 / 音频1），只在「提示词 ⇄ LLM」这一跳
+# 上代替原文名出现：长文件名进 LLM 既费 token 又容易被抄错。
+#
+# 与官方 <Picture N> **不是一回事**（那是执行期按"本段挂载顺序"重算的 token，
+# 见 compile_refs）—— 某段只引用「图片3」时它仍须编译成 <Picture 1>。
+# 两层编号必须分离，把标注当 token 用会导致挂载数与编号对不上（模型收不到图）。
+
+MARK_MAX = 999
+MARK_KINDS = ("image", "video", "audio")
+_MARK_RE = re.compile(r"^(图片|视频|音频)(\d{1,3})$")
+
+
+def mark_shaped(text) -> bool:
+    """字符串是否是标注形态（图片1 / 视频12 / 音频3）。"""
+    return bool(_MARK_RE.match(str(text or "").strip()))
+
+
+def clean_mark(mark) -> str:
+    """标注归一：只认「图片N / 视频N / 音频N」，非法一律返回 ""（由调用方发新号）。"""
+    m = _MARK_RE.match(str(mark or "").strip())
+    if not m:
+        return ""
+    n = int(m.group(2))
+    if n < 1 or n > MARK_MAX:
+        return ""
+    return f"{m.group(1)}{n}"
+
+
+def next_mark(items, kind) -> str:
+    """同类下一个可用标注 = **最小空闲序号**（图片1 → 图片2 → 图片3 …）。
+
+    取"最小空闲"而不是"最大 +1"：手动把某个素材标成「图片9」时，不该把整条
+    自动序列顶到 10（新素材照样拿空缺的 3）。
+    复用小号是安全的 —— 标注**只活在"提示词 ⇄ LLM"这一跳**，从不落盘进
+    `prompts`（盘上永远是 `@别名`），所以历史文本里不会残留旧号。
+    """
+    k = normalize_kind(kind)
+    prefix = KIND_CN[k]
+    used = set()
+    for x in (items or []):
+        if not isinstance(x, dict):
+            continue
+        m = _MARK_RE.match(str(x.get("mark") or "").strip())
+        if m and m.group(1) == prefix:
+            used.add(int(m.group(2)))
+    n = 1
+    while n in used and n < MARK_MAX:
+        n += 1
+    return f"{prefix}{n}"
+
+
+def assign_marks(items) -> bool:
+    """就地为缺 mark 的条目按**数组序**补号（幂等）。返回是否有改动。
+
+    顺序即"进项目库的顺序"（`_dedupe_assets` 已保证保持入库序、`asset_links`
+    是增量追加），所以标注天然与入库顺序一一对应。手动改过的条目带
+    `mark_auto=False`，本函数不碰。
+
+    **不写 `mark_auto=True`**：落盘口径是「缺省即自动、只有手动才存 False」，
+    这样字段出现时机确定（不会出现"首次 True、二次消失"这种同义不同形的漂移）。
+    """
+    changed = False
+    for x in (items or []):
+        if not isinstance(x, dict):
+            continue
+        if clean_mark(x.get("mark")):
+            continue
+        x["mark"] = next_mark(items, x.get("kind") or "image")
+        changed = True
+    return changed
+
+
+def mark_taken(items, mark, exclude_id=None, exclude_label=None) -> bool:
+    """标注是否已被别的条目占用（手动改标注时查重）。"""
+    want = clean_mark(mark)
+    if not want:
+        return False
+    for x in (items or []):
+        if not isinstance(x, dict):
+            continue
+        if exclude_id and str(x.get("asset_id") or "") == str(exclude_id):
+            continue
+        if exclude_label and str(x.get("alias") or x.get("label") or "") == str(exclude_label):
+            continue
+        if clean_mark(x.get("mark")) == want:
+            return True
+    return False
+
 
 
 def asset_id_for_content(sha_hex: str) -> str:

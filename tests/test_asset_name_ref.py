@@ -10,9 +10,10 @@
 - 顺序无关（名字唯一），外部 agent 只凭素材名就能独立写完直接贴。
 
 链路三处必须配套（缺一处就断）：
-1. 前端 `collectSegMedia` 把**素材名**放进 media.label（不是 `<Picture N>`）；
-2. 后端 `build_system_prompt` 告诉模型「可用素材：@名字」；
-3. AI 扩写链的 `system_compile.md` 同样要求写 `@素材名`。
+1. 前端 `collectSegMedia` 把**标注**（图片1，B03 起）放进 media.label；
+2. 后端 `build_system_prompt` 把 media.label 拼成「可用素材：@图片1」；
+3. AI 扩写链的 `system_compile.md` 同样要求写 `@素材名`（标注只在 LLM 往返那一跳存在，
+   盘上仍存 @素材名 —— 换码见 web/h3_prompts.js 的 marksToText / textToMarks）。
 """
 import importlib.util
 import os
@@ -75,24 +76,46 @@ def test_subject_tag_still_documented():
 
 
 # ------------------------------------------------ 前端取图（源码守卫）
+#
+# B03 起这一跳的契约升级：media.label / note 用**标注**（图片1）而不是素材名 ——
+# 长文件名进 LLM 费 token 又容易被抄错（抄错=静默丢图）。盘上仍存 @素材名，
+# 换码规则唯一在 web/h3_prompts.js（marksToText / textToMarks，
+# 运行期真跑见 tests/js/mark_codec_check.js）。
 
-def test_collect_seg_media_uses_asset_label():
-    """media.label 必须是素材名 —— 后端 build_system_prompt 直接用它拼名单。"""
+def test_collect_seg_media_uses_mark_not_raw_name():
+    """media.label 必须是**标注** —— 后端 build_system_prompt 直接用它拼名单。"""
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     i = src.index("async function collectSegMedia")
-    block = src[i:i + 2200]
-    assert "label: nm" in block or "label: String(asset.label" in block, \
-        "media.label 应取素材名"
+    block = src[i:i + 2600]
+    assert "label: mk" in block, "media.label 应取标注（mark）"
+    assert "markOf(pool, nm)" in block, "标注从池子里按素材名查"
     assert "`<Picture ${media.length + 1}>`" not in block, \
         "不应再用 <Picture N> 当 media.label"
 
 
-def test_collect_seg_media_note_mentions_asset_names():
+def test_collect_seg_media_note_mentions_marks():
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     i = src.index("async function collectSegMedia")
-    block = src[i:i + 2400]
-    assert "@${nm}" in block or "`@${" in block, "note 里应给出 @素材名"
+    block = src[i:i + 2800]
+    assert "`@${mk}`" in block, "note 里应给出 @标注"
     assert "不要写 <Picture N>" in block
+    assert "@图片N" in block, "note 要说明标注形态（@图片N）"
+
+
+def test_llm_roundtrip_uses_mark_codec():
+    """两条 LLM 链路（单步优化 / 扩写+优化）都必须换码，否则引用会丢。"""
+    src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    assert "function toLLMText(text, pool)" in src
+    assert "function fromLLMText(text, pool)" in src
+    for fn in ("async function runOptForSegment(", "async function runExpandOptimize("):
+        i = src.index(fn)
+        block = src[i:i + 4200]
+        assert "toLLMText(" in block, f"{fn} 出参未换码"
+        assert "fromLLMText(" in block, f"{fn} 回参未换码"
+    # 编解码规则只在 h3_prompts.js 一份（前端不许再写一套）
+    hp = open(os.path.join(ROOT, "web", "h3_prompts.js"), encoding="utf-8").read()
+    assert "function marksToText(text, pool)" in hp
+    assert "function textToMarks(text, pool)" in hp
 
 
 # ------------------------------------------------ AI 扩写链 prompt

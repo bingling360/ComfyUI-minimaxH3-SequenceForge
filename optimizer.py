@@ -35,8 +35,10 @@ DEFAULT_CONFIG = {
     "local_mmproj": "",
     "local_device": "cuda",
     "max_tokens": 4096,
-    "auto_optimize": False,
     "rule_file": "auto",
+    # 「AI 扩写优化设置」：单框提示词主按钮「AI 扩写 + 优化」的参数。
+    # sec_min/sec_max = 0 表示"跟随本段时长 ±2 秒"（前端 optExpandSettings 负责换算）。
+    "expand": {"sec_min": 0, "sec_max": 0, "style": "balanced", "run_optimize": True},
 }
 
 PROVIDERS = {
@@ -147,8 +149,36 @@ def normalize_config(raw: dict | None) -> dict:
         "local_mmproj": str(raw.get("local_mmproj") or cur["local_mmproj"] or "").strip(),
         "local_device": str(raw.get("local_device") or cur["local_device"] or "cuda").lower(),
         "max_tokens": max_tokens,
-        "auto_optimize": bool(raw.get("auto_optimize", cur["auto_optimize"])),
         "rule_file": str(raw.get("rule_file") or cur["rule_file"]),
+        "expand": _clean_expand(raw.get("expand"), cur.get("expand")),
+    }
+
+
+def _clean_expand(raw, cur=None) -> dict:
+    """「AI 扩写优化设置」收敛：秒数 0=跟随本段时长、风格白名单、布尔开关。
+
+    风格取值与 tools/h3_prompt_expander/h3_expand.STYLES 对齐（strict/balanced/creative），
+    非法值一律回落 balanced，绝不把脏值原样透给扩写器。
+    """
+    base = {"sec_min": 0, "sec_max": 0, "style": "balanced", "run_optimize": True}
+    base.update(cur if isinstance(cur, dict) else {})
+    r = raw if isinstance(raw, dict) else {}
+
+    def _sec(v, d):
+        try:
+            n = int(float(v))
+        except (TypeError, ValueError):
+            return d
+        return max(0, min(15, n))
+
+    style = str(r.get("style") or base["style"]).lower()
+    if style not in ("strict", "balanced", "creative"):
+        style = "balanced"
+    return {
+        "sec_min": _sec(r.get("sec_min"), base["sec_min"]),
+        "sec_max": _sec(r.get("sec_max"), base["sec_max"]),
+        "style": style,
+        "run_optimize": bool(r.get("run_optimize", base["run_optimize"])),
     }
 
 

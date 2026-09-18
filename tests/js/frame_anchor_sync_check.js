@@ -79,14 +79,21 @@ function envWith(frameImg) {
     ok(m.mode === "T2VA" && !m.first && !m.end, `无锚应 T2VA 无编号，实际 ${m.mode}`);
 }
 
-/* ---------- 3) 端到端：清锚后具象化面板的对齐预览要跟着变 ---------- */
+/* ---------- 3) 端到端：清锚后结构化面板的对齐预览要跟着变 ----------
+ * B05 起「具象化」不再是段卡里的常驻 tab，而是提示词工具条上的
+ * 「⇄ 结构化提示词」弹窗 —— 所以这里改成**打开弹窗**再看 .h3d-v2out。 */
+function openStruct(w, doc, node) {
+    for (const o of [...doc.querySelectorAll(".h3d-overlay")]) o.remove();
+    w.eval("openStructuredModal")(node, { ds: w.eval("getDs")(node) }, 0, null);
+    for (const d of doc.querySelectorAll("details")) { d.open = true; }
+}
+
 (async () => {
     const { w, dom, node } = envWith({ first: "assets/A.png" });
     const doc = w.document;
     w.eval("openDesk")();
     await new Promise((r) => setTimeout(r, 60));
-    /* 展开具象化抽屉，否则 .h3d-v2out 不在 DOM 里 */
-    for (const d of doc.querySelectorAll("details")) { d.open = true; }
+    openStruct(w, doc, node);
 
     const outText = () => [...doc.querySelectorAll(".h3d-v2out")]
         .map((n) => n.textContent || "").join(" | ");
@@ -97,7 +104,7 @@ function envWith(frameImg) {
     w.eval("setSegmentFrameImg")(node, 0, "first", "");
     await w.eval("refresh")();
     await new Promise((r) => setTimeout(r, 30));
-    for (const d of doc.querySelectorAll("details")) { d.open = true; }
+    openStruct(w, doc, node);
 
     const after = outText();
     ok(after.indexOf("fully referenced") < 0 && after.indexOf("0.00-second mark") < 0,

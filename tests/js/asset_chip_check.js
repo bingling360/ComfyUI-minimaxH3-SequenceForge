@@ -58,6 +58,13 @@ const code = [
     extractFn("assetPreviewUrl"),
     extractFn("buildAssetThumb"),
     extractConst("_rolesOf"),
+    /* 素材标注（mark）层：poolFromManifest 依赖它补号，必须一起抽出来 */
+    extractConst("MARK_RE"),
+    extractConst("MARK_MAX"),
+    extractFn("cleanMark"),
+    extractFn("markShaped"),
+    extractFn("nextMark"),
+    extractFn("assignMarks"),
     extractFn("poolFromManifest"),
 ].join("\n");
 
@@ -66,7 +73,7 @@ const { window } = dom;
 
 const make = new Function("window", "document",
     code + "\nreturn { chipLabelText, assetPreviewUrl, buildAssetThumb, poolFromManifest," +
-    " KIND_ICON, KIND_NAME };");
+    " KIND_ICON, KIND_NAME, cleanMark, nextMark };");
 const M = make(window, window.document);
 
 const fails = [];

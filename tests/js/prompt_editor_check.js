@@ -64,6 +64,8 @@ const code = [
     "const REF_REPEAT_MAX = 9;",
     extractDecl("REF_TEMPLATES", "[", "]"),
     extractConstLine("_CHIP_EXT_RE"),
+    // 引用键：ref_name（含后缀）优先、别名兜底 —— refsFromText / canAddRef 都依赖它
+    extractConstLine("refKeyOf"),
     extractFn("chipLabelText"),
     extractFn("shortLabel"),
     extractConstLine("_LIB_REL_RE"),

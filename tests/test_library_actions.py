@@ -127,7 +127,8 @@ def proj(tmp_path, h3lib, routes, monkeypatch):
     monkeypatch.setattr(projects_mod, "read_project", lambda n: state["mf"], raising=False)
     monkeypatch.setattr(projects_mod, "safe_name", lambda n: str(n or ""), raising=False)
 
-    def _link(n, aid, alias, kind="image", base_revision=None, roles=None):
+    def _link(n, aid, alias, kind="image", base_revision=None, roles=None,
+              ref_name=None, orig_name=None):
         state["mf"]["asset_links"] = [{"asset_id": aid, "alias": alias, "kind": kind}]
         state["mf"]["revision"] = int(state["mf"]["revision"]) + 1
         return state["mf"]
@@ -261,7 +262,8 @@ def test_mirror_link_not_copy(handlers, proj, tmp_path, monkeypatch):
     aid = "a_0123456789ab"
     links = []
 
-    def _link(n, asset_id, alias, kind="image", base_revision=None, roles=None):
+    def _link(n, asset_id, alias, kind="image", base_revision=None, roles=None,
+              ref_name=None, orig_name=None):
         links.append({"asset_id": asset_id, "alias": alias, "kind": kind})
         proj["state"]["mf"]["asset_links"] = links
         return proj["state"]["mf"]

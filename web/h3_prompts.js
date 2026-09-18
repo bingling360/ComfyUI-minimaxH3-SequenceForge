@@ -15,9 +15,13 @@
     };
   }
 
+  /* 字段表必须与后端 prompts.default_prompt() **逐字一致**：后端有 visual
+   * （画面整述，导演台合并框）、前端曾缺，于是「结构 → 文本 → 结构」不幂等
+   * （前端造出来的对象少一个键，后端 clean_prompt 补上默认值就变了）。
+   * 这里补上并加单测锁死（tests/test_struct_roundtrip.py）。 */
   function defaultPromptV2() {
     return {
-      intent_zh: "", medium_style: "", composition: "", environment: "",
+      intent_zh: "", visual: "", medium_style: "", composition: "", environment: "",
       lighting: "", characters: "", props: "", shots: [defaultShot(1)],
       diegetic_music: "", soundscape: "", non_diegetic_music: "",
       references: [], subjects: [], task_types: [], summary_override: "",

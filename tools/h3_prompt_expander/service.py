@@ -99,6 +99,46 @@ def expand_via_config(config_in, payload):
     }
 
 
+def expand_optimize_via_config(config_in, payload):
+    """**一步到位**：中文意图 -> 剧本（扩写）-> H3 官方格式（优化）-> 最终文本。
+
+    三框合一之后段卡只有一个框，不再有"① 意图 / ② 剧本"两个中间稿可点，
+    所以把原来"AI扩写 → 剧本 → 提示词优化"两步并在后端一次做完：
+    前端只有一个按钮、不弹窗，中间剧本不落库（只在返回里带一份，便于排查）。
+
+    payload 与 screenplay_via_config / optimize_once 同源：
+      prompt / style / style_note / segment_count / seconds_min、max / media
+      task / duration / context（优化阶段用）
+    返回 {ok, prompt（最终结果）, script（中间剧本，仅回看用）, seconds, meta}
+    """
+    cfg = _opt_backend.normalize_config(config_in)
+    payload = payload if isinstance(payload, dict) else {}
+
+    # ① 扩写：出剧本（中文自由格式，内容发散）
+    sp = screenplay_via_config(cfg, payload)
+    segs = [s for s in (sp.get("segments") or []) if isinstance(s, dict)]
+    script = str((segs[0] if segs else {}).get("script") or "").strip()
+    if not script:
+        raise ValueError("扩写返回为空：换个模型，或把意图写得具体一点再试")
+
+    # ② 优化：把剧本压成官方格式（这一步才决定进模型的文本长什么样）
+    seconds = (segs[0] or {}).get("seconds") or payload.get("duration") or 5
+    prompt = _opt_backend.optimize_once(cfg, {
+        "prompt": script,
+        "task": payload.get("task") or "T2VA",
+        "duration": seconds,
+        "media": payload.get("media") if isinstance(payload.get("media"), list) else [],
+        "context": payload.get("context") if isinstance(payload.get("context"), dict) else {},
+    })
+    return {
+        "ok": bool(str(prompt or "").strip()),
+        "prompt": str(prompt or "").strip(),
+        "script": script,               # 中间稿：只回传，不落库
+        "seconds": seconds,
+        "meta": dict(sp.get("meta") or {}),
+    }
+
+
 def validate_only(payload):
     """只校验（不调 LLM）：给前端"校验"按钮用。"""
     env = payload.get("envelope") or payload

@@ -58,6 +58,13 @@ const code = [
     extractFn("assetPreviewUrl"),
     extractFn("buildAssetThumb"),
     extractConst("_rolesOf"),
+    /* poolFromManifest 依赖引用名归一化 + 标注兜底（B1/B2）——
+     * 抽函数时漏了它们会直接 ReferenceError，别只补一个。 */
+    extractConst("REF_NAME_MAX"),
+    extractFn("cleanRefName"),
+    extractConst("refKeyOf"),
+    extractConst("markOf"),
+    extractFn("assignMarks"),
     extractFn("poolFromManifest"),
 ].join("\n");
 
@@ -106,6 +113,26 @@ eq(M.chipLabelText(null), "", "null");
     eq(labels.includes("项目图"), true, "项目资产正常进池");
     eq(labels.includes("坏条目"), false, "既无 file 又无 asset_id 的条目才丢弃");
     eq(labels.includes("空链接"), false, "无 asset_id 的链接丢弃");
+    /* B1：池子条目必须带**含后缀的引用名**（正文里 `@` 后面写的就是它）；
+     * 落盘文件名带 sha 前缀时要用 ref_name / orig_name，不能用 file。 */
+    const g = pool.find((a) => a.label === "全局图");
+    /* 链接条目**不用落盘 file 当引用名**：全局库 file 形如 images/<sha12>_猫.png，
+     * 带 sha 前缀，直接拿来当引用名就是一串没人认得的乱码。真名来自
+     * ref_name > orig_name（入库时带上），都没有才回落别名（至少能被解析到）。 */
+    eq(g && g.ref_name, "全局图", "无真名时回落到别名（不用带 sha 前缀的落盘名）");
+    const g2 = M.poolFromManifest({ assets: [] },
+        [{ asset_id: "a_222222222222", alias: "带真名", kind: "image",
+           file: "images/a_222222222222_猫.png", ref_name: "猫.png" }]);
+    eq(g2[0] && g2[0].ref_name, "猫.png", "链接带了 ref_name 就用它（含后缀）");
+    const g3 = M.poolFromManifest({ assets: [] },
+        [{ asset_id: "a_333333333333", alias: "带原名", kind: "image",
+           file: "images/a_333333333333_狗.png", orig_name: "小狗 (1).png" }]);
+    eq(g3[0] && g3[0].ref_name, "小狗_1_.png", "orig_name 归一（空格/括号压成 _）");
+    /* B2：标注按类型独立编号、池子统一兜底（后端落盘的为准） */
+    const marks = pool.map((a) => a.mark);
+    ok(marks.includes("图片1") && marks.includes("视频1") && marks.includes("音频1"),
+        "标注应按类型独立编号（图片1/视频1/音频1），实际 " + JSON.stringify(marks));
+    eq(new Set(marks.filter(Boolean)).size, marks.filter(Boolean).length, "标注不得重复");
 }
 
 /* ③ assetPreviewUrl：全局库路径不得回落 input */

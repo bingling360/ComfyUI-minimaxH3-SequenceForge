@@ -91,6 +91,17 @@ def _alias_of(*cands) -> str:
     return asset_store.alias_of(*cands)
 
 
+def _assign_marks(items) -> list:
+    """补标注（图片1 / 视频1 / 音频1）；规则唯一在 asset_store.assign_marks。"""
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    fn = getattr(asset_store, "assign_marks", None)
+    # 拿不到就原样返回（stub / 旧版 store）：标注是增强信息，不该让整个列表失败
+    return fn(items) if callable(fn) else items
+
+
 def unique_label(base, taken, cap=ASSET_LABEL_MAX):
     """在 taken 之外找一个不冲突的标签，**保证能停**。
 
@@ -382,9 +393,14 @@ def scan_scope(scope, project=None) -> list:
             k = kind_of(rel)
             if k not in MEDIA_KINDS:
                 continue
-            items.append(_entry("project", k, os.path.basename(rel), rel, full))
+            _e = _entry("project", k, os.path.basename(rel), rel, full)
+            # 引用名（含后缀全名）：项目资产没有 orig_name，落盘文件名就是真名
+            _e["ref_name"] = os.path.basename(rel)
+            items.append(_e)
         items.extend(_link_entries(project, root))
-        return items
+        # 标注：两种来源汇合后统一补号 —— 项目资产（刚扫目录）自己没有 mark，
+        # 链接条目的 mark 已落盘（保持不动）。缺的按类型独立、顺序递增。
+        return _assign_marks(items)
 
     if scope == "finals":
         for sub in ("videos", "finals", "merges", "clips"):
@@ -452,6 +468,13 @@ def _link_entries(project, root) -> list:
         e["bytes"] = int(g.get("bytes") or 0)
         e["roles"] = [str(r) for r in (L.get("roles") or [])
                       if str(r) in ("首帧图", "尾帧图")]
+        # 引用名（含后缀全名）：提示词里 @ 后面写的就是它。缺省由原始文件名推导，
+        # 再不行退回显示名（无后缀，但至少能被解析到）。
+        _rn = L.get("ref_name") or g.get("orig_name") or f.split("/")[-1] \
+            or str(L.get("alias") or "")
+        e["ref_name"] = _rn
+        # 标注（图片1 / 视频1 / 音频1）：给 LLM 看的短名，链接条目自己带着
+        e["mark"] = str(L.get("mark") or "")
         out.append(e)
     return out
 

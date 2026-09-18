@@ -443,11 +443,12 @@ def test_v2_group_form_wired():
     # 具象化精简：画面合并为 visual 单框；每镜低频项收进「更多」
     for sym in ["pv0.visual", '"visual"', "更多 · 换镜时间"]:
         assert sym in d, sym
-    # 主框三段式：①中文意图 → ②剧本 → ③结果（只有 ③ 进模型）
-    for sym in ["① 中文意图（不进模型 · 可用 @素材）", "② 剧本（扩写产物 · 可手工改）",
-                "③ 结果（最终进模型）", "同步到具象化", "← 从具象化同步",
-                "✨ 提示词优化 → 结果"]:
+    # 三框合一：段卡只剩**一个**提示词框（意图 / 剧本 已从 UI 撤下）
+    for sym in ["提示词（最终进模型）", "✨ AI扩写+优化", "✨ 提示词优化", "引用素材"]:
         assert sym in d, sym
+    for old in ["① 中文意图（不进模型 · 可用 @素材）", "② 剧本（扩写产物 · 可手工改）",
+                "③ 结果（最终进模型）", "① 意图", "② 剧本", "③ 结果"]:
+        assert old not in d, f"旧三框文案应已下线：{old}"
     assert "gMore.append(gMoreBody)" in d, "镜头「更多」内容没挂进 details"
     # 复位后开合状态要记下来（否则加对白/重建会被 details 默认收起打断）
     assert "const _v2Open = new Map();" in d, "缺 details 开合记忆"
@@ -463,11 +464,14 @@ def test_v2_group_form_wired():
         assert "return " + m + ";" in d, "defaultV2Mode 缺分支 " + m
     assert "未检测到首帧/尾帧图" in d, "无锚时应给说明而非报错"
     assert "需要首帧图＋尾帧图" not in d, "旧的强制文案应移除"
-    # 素材调度 ⇄ 官方引用双向同步（否则前后端模式判定打架）
+    # 官方引用**由素材调度派生**（不再手填标签）：参考组渲染时现算 want，
+    # pv.references 里只存用户写的说明（note），改勾选不用同步、也不会打架。
+    # 早先这里断言过一个 syncV2RefsFromSchedule() —— 那个函数会把已写的 note
+    # 一起抹掉，最后没做（改为「↻ 按素材调度重建」显式按钮 + 有说明时确认），
+    # 断言因此改钉现在这套口径。
     assert "function v2RefsFromSchedule(" in d
-    assert "function syncV2RefsFromSchedule(" in d
-    assert "syncV2RefsFromSchedule(node, idx);" in d
     assert "const want = v2RefsFromSchedule(data.ds, segIdx);" in d
+    assert "按素材调度重建" in d and "已写的说明会清空" in d, "缺显式重建入口/提示"
     for t in ["<Picture ", "<Video ", "<Audio "]:
         assert t in d, t
     # 中文显示 ⇄ 英文存储：运镜/说话人/语言/任务类型映射齐全
@@ -553,8 +557,11 @@ def test_segment_tabs_and_optimizer_ui():
     assert "segMediaInfo" in d and "openSegViewer" in d and "h3d-viewer" in d
     assert "▶ 预览" in d
     assert "grid-template-columns:minmax(0,1fr)" in d
-    # 双写同步（具象化 ⇄ 结果框，文案已统一为「具象化」）
-    assert "同步到主框" in d and "从具象化同步" in d and "同步到具象化" in d
+    # 具象化已降级为「结构化 ⇄ 文本」页内切换（不再是独立 tab、不再双向同步按钮）
+    assert "结构化 ⇄ 文本" in d and "_segStructView" in d
+    assert "从具象化同步" not in d and "同步到具象化" not in d, "旧的双向同步按钮应已下线"
+    assert "function applyAiToV2(" not in d, "旧 applyAiToV2（整段塞进 shots[0]）应已删除"
+    assert "function applyH3TextToSeg(" in d and "function splitH3Sections(" in d
     # AI优化条（自研后端）
     for sym in ["paintOptbar", "runOptForSegment", "openOptSettings", "opt_hist",
                 "optimizer-config", "/h3chain/optimize"]:

@@ -144,13 +144,14 @@ def test_link_roles_tristate(projects):
     m = projects.create_project("t_roles")
     m2 = projects.link_asset("t_roles", "a_1234567890ab", "主角", "image",
                              base_revision=m["revision"], roles=["首帧图", "野标注"])
+    # 入库自动分配标注（图片1 / 视频1 / 音频1，按类型独立编号）
     assert m2["asset_links"] == [{"asset_id": "a_1234567890ab", "alias": "主角",
-                                  "kind": "image", "roles": ["首帧图"]}]
-    # 不传 roles -> 保持旧标注
+                                  "kind": "image", "roles": ["首帧图"], "mark": "图片1"}]
+    # 不传 roles -> 保持旧标注；标注已存在则**不动**（改名不会改指向）
     m3 = projects.link_asset("t_roles", "a_1234567890ab", "主角2", "image",
                              base_revision=m2["revision"])
     assert m3["asset_links"][0] == {"asset_id": "a_1234567890ab", "alias": "主角2",
-                                    "kind": "image", "roles": ["首帧图"]}
+                                    "kind": "image", "roles": ["首帧图"], "mark": "图片1"}
     # 传空列表 -> 清标注
     m4 = projects.link_asset("t_roles", "a_1234567890ab", "主角2", "image",
                              base_revision=m3["revision"], roles=[])
@@ -194,7 +195,8 @@ def test_mirrors_skip_global():
 def test_paste_and_optimizer_id_aware():
     d = _director_src()
     assert "(a.label || a.asset_id)" in d
-    assert "a.label === key || a.asset_id === key" in d
+    # 引用键换轨后按 refKeyOf（引用名，含后缀）匹配，asset_id 仍可命中
+    assert "refKeyOf(a) === key || a.asset_id === key" in d
     assert "assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id)" in d
 
 

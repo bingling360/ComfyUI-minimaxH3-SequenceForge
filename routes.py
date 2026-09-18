@@ -78,6 +78,7 @@ ROUTES = [
     ("POST", "/h3chain/redo_cancel"),
     ("POST", "/h3chain/expand"),
     ("POST", "/h3chain/expand_multi"),
+    ("POST", "/h3chain/expand_optimize"),
     ("POST", "/h3chain/optimize_multi"),
     ("POST", "/h3chain/expand_validate"),
     ("GET", "/h3chain/lib_list"),
@@ -1104,6 +1105,31 @@ def add_routes(routes):
             return _err(f"剧本扩写失败：{e}", code="EXPAND_FAILED", status=500)
         return web.json_response(result)
 
+    async def expand_optimize(request):
+        """扩写 + 优化**一步到位**：中文意图 -> 剧本 -> H3 官方格式文本。
+
+        三框合一后段卡只有一个框，前端不再有中间稿可点，所以两步在后端串起来：
+        一次请求、一次回填，中间剧本不落库（只在响应里带回一份便于排查）。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            svc = _load_expander()
+        except Exception as e:
+            return _err(f"扩写模块未就绪：{e}", code="EXPAND_UNAVAILABLE", status=500)
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, svc.expand_optimize_via_config, data.get("config"), data)
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        except RuntimeError as e:
+            return _err(str(e), code="EXPAND_FAILED", status=502)
+        except Exception as e:
+            return _err(f"扩写+优化失败：{e}", code="EXPAND_FAILED", status=500)
+        return web.json_response(result)
+
     async def optimize_multi(request):
         """多段提示词优化：把 N 段剧本逐段压成 H3 官方格式并校验。"""
         try:
@@ -1539,8 +1565,11 @@ def add_routes(routes):
                         code="NO_ASSET_ID", status=400)
         lbl = str(data.get("label") or "").strip() or str(it.get("name") or "")
         try:
+            # orig_name：原始文件名（含后缀）——引用名由它生成，不用带 sha 前缀的
+            # 落盘名（全局库 file 形如 images/<sha12>_猫.png）
             mf = projects.link_asset(dir_name, aid, lbl, it.get("kind") or "image",
-                                     data.get("base_revision"))
+                                     data.get("base_revision"),
+                                     orig_name=it.get("orig_name") or it.get("name") or "")
         except ValueError as e:
             msg = str(e)
             if msg.startswith("REVISION_CONFLICT"):
@@ -1833,8 +1862,10 @@ def add_routes(routes):
                          for L in (mf.get("asset_links") or []))
             if not linked:
                 try:
-                    out = projects.link_asset(dir_name, it["asset_id"], it["name"],
-                                              it.get("kind") or "image", None, None)
+                    out = projects.link_asset(
+                        dir_name, it["asset_id"], it["name"],
+                        it.get("kind") or "image", None, None,
+                        orig_name=it.get("orig_name") or it.get("name") or "")
                 except ValueError as e:
                     return _err(str(e), code="BAD_ARGS", status=400)
                 if out is None:
@@ -2324,6 +2355,7 @@ def add_routes(routes):
         ("POST", "/h3chain/optimize", optimize),
         ("POST", "/h3chain/expand", expand),
         ("POST", "/h3chain/expand_multi", expand_multi),
+        ("POST", "/h3chain/expand_optimize", expand_optimize),
         ("POST", "/h3chain/optimize_multi", optimize_multi),
         ("POST", "/h3chain/expand_validate", expand_validate),
         ("POST", "/h3chain/create_project", create_project),

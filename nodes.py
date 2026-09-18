@@ -984,6 +984,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _ASSET_ROLES = ("首帧图", "尾帧图")
         pool_files = []   # [(kind, label, file, roles)]
         pool_ids = []     # P3：与 pool_files 同下标的 asset_id（""=无，ds 活池自带）
+        pool_refs = []    # 与 pool_files 同下标的**引用名**（含格式后缀，如 女主.png）
         _kind_n = {"image": 0, "video": 0, "audio": 0}
         if isinstance(ds.get("ref_assets"), list) and ds["ref_assets"]:
             for item in ds["ref_assets"]:
@@ -999,11 +1000,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     label = f"{_KIND_NAME[_k]}{_kind_n[_k]}"
                 _roles = [str(r).strip() for r in (item.get("roles") or [])
                           if str(r).strip() in _ASSET_ROLES] if isinstance(item.get("roles"), list) else []
+                # 引用名：显式字段 > 落盘文件名 basename > 别名（旧档兜底，无后缀）。
+                # 正文里的 `@xxx` 按它解析 —— 用别名解析会把 `.png` 留在正文里。
+                _rn = str(item.get("ref_name") or "").strip()
+                if not _rn:
+                    _rn = str(item["file"]).replace("\\", "/").split("/")[-1].strip()
                 pool_files.append((_k, label[:24], str(item["file"]), _roles))
                 pool_ids.append(str(item.get("asset_id") or "").strip())
+                pool_refs.append(_rn or label[:24])
         elif ds.get("ref_images") and isinstance(ds["ref_images"], list):
             pool_files = [("image", f"图片{i + 1}", str(fn), []) for i, fn in enumerate(ds["ref_images"]) if fn]
             pool_ids = [""] * len(pool_files)
+            pool_refs = [str(fn).replace("\\", "/").split("/")[-1] for _, _, fn, _ in pool_files]
         _seen = set()
         for _i, (_k, _lbl, _fn, _rl) in enumerate(pool_files):
             _base, _n = _lbl, 2
@@ -1016,8 +1024,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
         pool_kind = {lbl: k for k, lbl, _, _ in pool_files}
         pool_file_of = {lbl: fn for _, lbl, fn, _ in pool_files}
         pool_roles_of = {lbl: list(rl) for _, lbl, _, rl in pool_files}
+        # 引用名匹配表：**引用名优先，别名兜底**（旧档正文里写的是 `@别名`）。
+        # `_find_refs` 按池内最长前缀匹配，两份名字都给它才能新旧正文都解析得出来。
+        ref_names_for_match = [x for x in dict.fromkeys(
+            [str(r).strip() for r in pool_refs if str(r).strip()]
+            + [str(l).strip() for l in pool_labels if str(l).strip()])]
         # P3：活池 asset_id 随去重后的 label 对齐（去重只改名不换序，下标对齐天然保持）
         pool_id_of = {lbl: aid for lbl, aid in zip(pool_labels, pool_ids) if aid}
+        pool_ref_name_of = {lbl: str(rn or "").strip()
+                            for lbl, rn in zip(pool_labels, pool_refs)}
         # P2：执行期资产注册表（store 双层）：pool 转 legacy + 项目 asset_links + 全局库。
         # refs 元素兼容四形态：旧 label / alias / asset_id / {asset,use} dict；
         # 校验核走 compile_refs，报错文案映射回旧链逐字格式。best-effort：
@@ -1056,7 +1071,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 try:
                     for _lbl, _aid in pool_id_of.items():
                         _links.append({"asset_id": _aid, "alias": _lbl,
-                                       "kind": pool_kind.get(_lbl, "image")})
+                                       "kind": pool_kind.get(_lbl, "image"),
+                                       "ref_name": pool_ref_name_of.get(_lbl, "")})
                 except Exception:
                     pass
                 if _proot:
@@ -1138,7 +1154,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     seg_custom_refs += 1
                     # 提示词里 @标签 提到但没勾选的素材：按出现顺序并入，防勾选/文本失配报错
                     # （传池：标签边界由池内最长匹配决定，`@图片让这张图动起来` 不会吞掉「让」）
-                    for lbl in _find_refs(full, pool_labels):
+                    for lbl in _find_refs(full, ref_names_for_match):
                         lbl = lbl.strip()
                         if lbl and lbl not in _keys:
                             _keys.append(lbl)
@@ -1146,7 +1162,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 缺省 = 只用提示词文本 @标签 里出现的素材（按出现顺序）；
                     # 没出现 = 本段无引用（纯文本段）。资产库总量不限，只卡单段上
                     # 限——库再大也不会逼每段显式勾选。
-                    for lbl in _find_refs(full, pool_labels):
+                    for lbl in _find_refs(full, ref_names_for_match):
                         lbl = lbl.strip()
                         if lbl and lbl not in _keys:
                             _keys.append(lbl)

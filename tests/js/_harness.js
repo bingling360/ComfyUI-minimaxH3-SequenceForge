@@ -96,7 +96,11 @@ function mkNode(ds) {
     ];
     return {
         id: 7,
-        type: "H3SeamlessChain",
+        /* 必须是导演台 findNode() 认的那个 NODE_TYPE（"H3SeamlessChainSampler"）：
+         * 写成 "H3SeamlessChain" 的话 findNode() 永远返回 null，所有依赖真节点的
+         * 链路（打开工作台 / 落地写回 / 上传）都会静默走"画布上未找到节点"分支，
+         * 测试看起来在跑、其实一条都没验到。 */
+        type: "H3SeamlessChainSampler",
         widgets,
         setDirtyCanvas() {},
         graph: { change() {} },

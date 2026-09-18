@@ -96,6 +96,8 @@
     expandValidate: (payload) => _json("POST", "/h3chain/expand_validate", payload),
     /* 剧本扩写（内容发散器）：总意图 + 时长范围 + 段数 -> N 段中文剧本 */
     expandMulti: (payload) => _json("POST", "/h3chain/expand_multi", payload),
+    /* 扩写 + 优化一步到位：中文意图 -> 剧本 -> H3 官方格式文本（三框合一后段卡唯一入口） */
+    expandOptimize: (payload) => _json("POST", "/h3chain/expand_optimize", payload),
     /* 多段提示词优化（格式编译器）：N 段剧本 -> N 段 H3 官方格式 + 逐段校验 */
     optimizeMulti: (payload) => _json("POST", "/h3chain/optimize_multi", payload),
     /* ---- 素材库（Library）：一个浏览器 + 四个 scope ---- */

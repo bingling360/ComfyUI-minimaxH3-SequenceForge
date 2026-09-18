@@ -51,6 +51,8 @@ def _extract_fn(src, name):
 def test_refs_from_text_runtime():
     """正文 → 引用集合：真跑（node），覆盖重复计数/最长优先/邮箱不误伤。"""
     code = "\n".join([
+        # refsFromText 依赖模块级的 refKeyOf（引用键：ref_name 优先、别名兜底）
+        "const refKeyOf = (a) => String((a && (a.ref_name || a.label)) || \"\");",
         _extract_fn(_src(), "refsFromText"),
         """
         const pool = [{label: "女主"}, {label: "女主的家"}, {label: "背景"}];
@@ -125,7 +127,7 @@ def test_editor_source_points():
     assert 'classList.add("h3d-rtag")' not in d            # 绿框类由 className 赋值
     assert '"h3d-rtag"' in d and '"h3d-rtagx"' in d
     assert "取消这一处引用" in d                              # 绿框 ✕ 的 tooltip
-    assert "取消本段对「${a.label}」的全部引用" in d            # 引用条 chip ✕ 的 tooltip
+    assert "取消本段对「${key}」的全部引用" in d               # 引用条 chip ✕ 的 tooltip
     # 编辑器对外暴露 textarea 兼容面（@补全/AI 优化/编译预览零改动）
     for api in ("insertText(text)", "insertTag", "removeTag", "removeOneTag", "tagCount",
                 "normalizeLoose", "get value()", "set value(v)", "setSelectionRange"):
@@ -148,7 +150,7 @@ def test_two_level_remove_semantics():
     assert "removeOneTag(sp);" in d[i:i + 400], "绿框 ✕ 必须调 removeOneTag"
     assert "function removeOneTag(tagEl)" in d
     # 引用条那一层仍是清全部
-    assert "removeTag(a.label);" in d                     # chip ✕ / 右键 chip 的 clearAll
+    assert "removeTag(key);" in d                         # chip ✕ / 右键 chip 的 clearAll
     assert "function removeTag(label)" in d
     # 段卡 onRemove：写回失败才退回 removeSegmentRef（不能无条件再减一次）
     assert "if (!applyPromptEdit(node, it.idx, ta)) removeSegmentRef(node, it.idx, label);" in d
@@ -208,31 +210,28 @@ def test_clear_prompts_drops_refs():
     assert "refs: []," in block
 
 
-def test_three_pane_refbars_independent():
-    """三栏引用条互不串味（源码点）。
+def test_single_pane_refbar():
+    """三框合一后引用条只剩**一条**（源码点）。
 
-    ① 中文意图 / ② 剧本 / ③ 结果 各自持有一条引用栏，谁也不改谁：
-    每条只读自己正文里的 @别名（正文即真相），点 chip 只写自己的正文。
-    只有 ③ 走官方 9/3/3 上限并回写 seg.refs —— 也只有它进模型。
-    具象化的引用归它自己的参考组，不与主框三栏互写。
+    旧版 ① 中文意图 / ② 剧本 / ③ 结果 各挂一条引用栏，谁也不改谁；三框合一后
+    只有一个提示词框，引用条自然只剩一条：`gate: true`（走官方 9/3/3、写
+    seg.refs），也是唯一进模型的那条。
     """
     d = _src()
     assert "function buildRefBar(RB)" in d
     assert "const mkRefBar = (cfg) =>" in d
     assert "const refBars = []" in d
-    # 三栏都挂上了自己的引用条
-    assert "refIntent" in d and "refScript" in d and "refResult" in d
-    # 只有结果栏 gate=true（官方上限 + 写 seg.refs），①② 是纯标注
+    # 旧的意图 / 剧本两条引用条已随三框合一撤掉
+    assert "refIntent" not in d and "refScript" not in d
+    assert "引用素材 · 意图" not in d and "引用素材 · 剧本" not in d
+    assert "refResult" in d
+    # 只有那一条走官方上限并写 seg.refs
     assert d.count("gate: true") == 1
-    assert d.count("gate: false") == 2
-    # 首尾帧按钮已从结果栏搬走：它是段级运行参数，不属于任何一栏的"引用"。
-    # 现在挂在卡片公共区（三页之上常驻），三栏一律 showFrames: false。
+    assert d.count("gate: false") == 0
+    # 首尾帧按钮不属于任何引用条（它是段级运行参数，挂卡片公共区）
     assert d.count("showFrames: true") == 0
-    assert d.count("showFrames: false") == 3
+    assert d.count("showFrames: false") == 1
     assert "h3d-anchorbar" in d and "mkFrameBtns(node, it.idx" in d
-    # ①② 各写各的字段，不碰 seg.refs
-    assert chr(34).join(['setSegmentField(node, it.idx, ', 'intent_zh', ', ed.value)']) in d
-    assert chr(34).join(['setSegmentField(node, it.idx, ', 'script', ', ed.value)']) in d
     # 具象化模式判定不再吃主框的 seg.refs
     assert 'if (seg && Array.isArray(seg.refs) && seg.refs.length) return ' + chr(34) + 'Ref2VA' + chr(34) + ';' not in d
     # 优化器任务判定与 defaultV2Mode 同口径（不再写死 FL2VA）

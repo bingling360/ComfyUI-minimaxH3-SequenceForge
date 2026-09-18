@@ -163,6 +163,14 @@ def _clean_asset(raw) -> dict | None:
     if not os.path.splitext(parts[-1])[1]:
         return None
     ent = {"label": label, "kind": kind, "file": "/".join(parts)}
+    # 引用名（含格式后缀的全名）：提示词里 `@` 后面写的就是这个，不用截过尾的 label
+    _rn = _ref_name_of(raw.get("ref_name"), parts[-1], label)
+    if _rn:
+        ent["ref_name"] = _rn
+    # 标注（图片1 / 视频1 / 音频1）：给 LLM 看的短名，落盘才有稳定性
+    _mk = str(raw.get("mark") or "").strip()
+    if _mk:
+        ent["mark"] = _mk[:16]
     # 资产标注 roles 白名单透存（首帧图/尾帧图；单张冲突校验在执行期做）
     rl = raw.get("roles")
     if isinstance(rl, list):
@@ -221,6 +229,46 @@ def _alias_of(*cands) -> str:
     return asset_store.alias_of(*cands)
 
 
+def _ref_name_of(*cands) -> str:
+    """引用名归一（规则唯一在 asset_store.ref_name_of —— 保留扩展名、不砍尾巴）。
+
+    与 `_alias_of` 的区别：引用名**含格式后缀**（`@猫.png`），别名是 stem。
+    前端 `cleanRefName` 必须与它同规则，否则 `@全名` 会在一边解析不出来。
+    """
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    return asset_store.ref_name_of(*cands)
+
+
+def _mark_of(kind, seq) -> str:
+    """标注文本（图片1 / 视频1 / 音频1）；规则唯一在 asset_store.mark_of。"""
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    return asset_store.mark_of(kind, seq)
+
+
+def _assign_marks(entries) -> list:
+    """补标注（图片1 / 视频1 / 音频1）；规则唯一在 asset_store.assign_marks。"""
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    return asset_store.assign_marks(entries)
+
+
+def _next_mark_seq(kind, used) -> int:
+    """下一个标注序号（编号不回收）；规则唯一在 asset_store.next_mark_seq。"""
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    return asset_store.next_mark_seq(kind, used)
+
+
 def _unique_filename(directory, want, sep="_"):
     """directory 里找一个不冲突文件名（同名加 _2），**保证能停**。"""
     d, w = str(directory or ""), str(want or "")
@@ -256,7 +304,7 @@ def save_assets(name: str, assets, base_revision=None):
         if int(manifest.get("revision") or 1) != br:
             raise ValueError(
                 f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
-    manifest["assets"] = _dedupe_assets(assets)
+    manifest["assets"] = _assign_marks(_dedupe_assets(assets))
     manifest["updated_at"] = time.time()
     manifest["revision"] = int(manifest.get("revision") or 1) + 1
     manifest["manifest_schema"] = MANIFEST_SCHEMA
@@ -279,6 +327,18 @@ def _clean_asset_link(raw) -> dict | None:
     if kind not in _ASSET_KINDS:
         kind = "image"
     ent = {"asset_id": aid, "alias": alias, "kind": kind}
+    # 引用名（含后缀全名）透存：只认**真名**（显式字段 / 原始文件名 / 落盘文件名）。
+    # 不用 alias 兜底 —— alias 是 stem（没后缀），拿它当引用名等于把旧问题固化；
+    # 拿不到真名就先不落，等 next hydrate 时由 build_registry 兜底解析。
+    _rn = _ref_name_of(raw.get("ref_name"), raw.get("orig_name"),
+                       str(raw.get("file") or "").replace("\\", "/").split("/")[-1])
+    if _rn:
+        ent["ref_name"] = _rn
+    # 标注（图片1 / 视频1 / 音频1，按类型独立编号）：给 LLM 看的短名。
+    # 可手动改（空串 = 交给自动分配重新编一个）。
+    _mk = str(raw.get("mark") or "").strip()
+    if _mk:
+        ent["mark"] = _mk[:16]
     # P3：标注透存（首帧图/尾帧图，与 _clean_asset 同口径；执行期 roles 仍以 ds 池为准）
     rl = raw.get("roles")
     if isinstance(rl, list):
@@ -326,11 +386,13 @@ def _purge_alias_refs(manifest: dict, aliases) -> bool:
 
 
 def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision=None,
-               roles=None):
+               roles=None, ref_name=None, orig_name=None, mark=None):
     """全局库链接进项目：manifest["asset_links"] 增量追加/重指向，revision+1。
 
     P1（双层存储）：全局 asset_id 一次入库，多项目链接引用不复制文件；
     alias 是项目内显示别名（旧 label 命名空间，compile_refs 同口径解析）。
+    ref_name：引用名（**含格式后缀**，如 `女主.png`）——提示词里 `@` 后面写的
+    就是它；缺省时由 orig_name / 落盘文件名 / alias 兜底推导。
     同 alias 已存在则重指向新 asset_id；同 asset_id 已存在则只改 alias。
     roles：None=不动旧标注；列表（含空）=覆盖（含取消标注）。
     目录或 manifest 不存在返回 None；base_revision 不一致抛
@@ -338,9 +400,11 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
     """
     name = safe_name(name)
     ent = _clean_asset_link({"asset_id": asset_id, "alias": alias, "kind": kind,
-                             "roles": roles})
+                             "roles": roles, "ref_name": ref_name,
+                             "orig_name": orig_name, "mark": mark})
     if not name or ent is None:
         return None
+    _rn = ent.get("ref_name") or ""
     # roles 三态：None=不动旧标注；列表（含空）=覆盖
     role_override = ("__keep__" if roles is None else
                      [str(r).strip() for r in roles
@@ -360,19 +424,41 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
                 f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
     links = [x for x in (manifest.get("asset_links") or []) if isinstance(x, dict)]
     links = [x for x in (_clean_asset_link(x) for x in links) if x is not None]
+    # 标注：显式给了就用它（改标注），没给就按"已有最大序号 +1"自动分配
+    # （编号不回收 —— 删掉的号留空，避免旧提示词悄悄改指向）。
+    _mk = str(ent.get("mark") or "").strip()
+    _mk_explicit = bool(_mk)
+    if not _mk:
+        _mk = _mark_of(ent["kind"],
+                       _next_mark_seq(ent["kind"], [x.get("mark") for x in links]))
     hit = False
     for x in links:
         if x["alias"] == ent["alias"]:
+            # 类型换轨（图片→视频）时标注必须跟着换：标注是"给 LLM 看的短名"，
+            # 留着 `图片1` 指代一个视频，等于亲手喂给模型一条错信息。
+            _kind_changed = str(x.get("kind") or "image") != ent["kind"]
             x["asset_id"], x["kind"], hit = ent["asset_id"], ent["kind"], True
+            if _rn:
+                x["ref_name"] = _rn
+            # _mk 已按**新类型**算过（见上），换轨时直接换上即可
+            if _mk and (_mk_explicit or _kind_changed or not x.get("mark")):
+                x["mark"] = _mk
             if role_override != "__keep__":
                 x["roles"] = role_override
         elif x["asset_id"] == ent["asset_id"] and not hit:
+            _kind_changed = str(x.get("kind") or "image") != ent["kind"]
             x["alias"], x["kind"] = ent["alias"], ent["kind"]
+            if _rn:
+                x["ref_name"] = _rn
+            # _mk 已按**新类型**算过（见上），换轨时直接换上即可
+            if _mk and (_mk_explicit or _kind_changed or not x.get("mark")):
+                x["mark"] = _mk
             if role_override != "__keep__":
                 x["roles"] = role_override
     if not any(x["asset_id"] == ent["asset_id"] for x in links):
         if role_override != "__keep__":
             ent["roles"] = role_override
+        ent["mark"] = _mk
         links.append(ent)
     manifest["asset_links"] = links
     manifest["updated_at"] = time.time()

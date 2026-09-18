@@ -31,8 +31,14 @@ KINDS = ("image", "video", "audio")
 KIND_CN = {"image": "图片", "video": "视频", "audio": "音频"}
 REF_CAPS = {"image": 9, "video": 3, "audio": 3}
 ALIAS_MAX = 24
+# 引用名（@全名）上限：比别名宽松得多 —— 引用名要**含格式后缀**且不能砍掉尾巴
+# （两个素材常常只差尾部几位），截断只在极端长名时兜底，且保尾不保头。
+REF_NAME_MAX = 96
 # 别名里一律不允许的字符（空白与标点）：`@别名` 的解析按它们断句，留着就是死引用。
 _ALIAS_BAD = re.compile(r"[^\w\-]+")
+# 引用名允许的字符集：**比别名多点号**（`猫.png` 的后缀是引用名的一部分）。
+# 解析靠池内最长前缀精确匹配，点号不会像别名那样造成断句歧义。
+_REF_NAME_BAD = re.compile(r"[^\w.\-]+")
 # 只剥这些真媒体扩展名；`v1.0` / `2.5` 之类不在名单里的尾巴保持原样（再被 `_ALIAS_BAD` 压成 `_`）。
 _MEDIA_EXT = (
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "avif",
@@ -88,6 +94,44 @@ def alias_of(*cands) -> str:
     return "素材"
 
 
+def clean_ref_name(name) -> str:
+    """引用名归一：**提示词里 `@` 后面写的那个名字**（含格式后缀）。
+
+    与别名的区别只有一条：**保留扩展名**。历史上引用名就是别名（stem），于是
+    用户/LLM 写 `@猫.png` 时分词器只能匹配到 `猫`，剩下的 `.png` 当普通文本留在
+    正文里 —— 绿框后面挂个裸后缀（"奇怪的后缀溢出"）。引用名带后缀后，
+    `@猫.png` 整体命中池内条目，后缀不再溢出。
+
+    规则：取文件名 -> 空白/括号等非法字符压成 `_`（**保留 `.` `_` `-`**）-> 折叠
+    连续 `_-` 与 `..` -> 去首尾 `._-` -> 超长时**保尾**（尾巴是两条同名素材的
+    唯一区分点，砍头不砍尾）。
+    """
+    s = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    if not s:
+        return ""
+    s = _REF_NAME_BAD.sub("_", s)
+    s = re.sub(r"[_\-]{2,}", "_", s)
+    s = re.sub(r"\.{2,}", ".", s)
+    s = s.strip("._-")
+    if len(s) > REF_NAME_MAX:
+        s = s[:REF_NAME_MAX - 12] + s[-12:]
+        s = s.strip("._-")
+    return s
+
+
+def ref_name_of(*cands) -> str:
+    """挑一个引用名并归一（候选串通常是原始文件名 orig_name / 落盘文件名）。
+
+    候选顺序由调用方给：显式 ref_name > 原始文件名 > 落盘文件名的 basename
+    > 别名（别名没有后缀，是最后兜底 —— 那种情况下引用名不带后缀，但至少能用）。
+    """
+    for c in cands:
+        r = clean_ref_name(c)
+        if r:
+            return r
+    return ""
+
+
 def asset_id_for_content(sha_hex: str) -> str:
     """内容寻址 ID：sha256 hex -> a_<12>。"""
     h = str(sha_hex or "").strip().lower()
@@ -101,6 +145,97 @@ def asset_id_for_legacy(label, kind, file) -> str:
     blob = "|".join([clean_alias(label), normalize_kind(kind),
                      str(file or "").strip().replace("\\", "/")])
     return "a_" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def assign_marks(entries) -> list:
+    """给条目列表补标注（`mark`）：**已有的不动，缺的按类型独立、列表顺序递增**。
+
+    标注是给 LLM 看的短名（图片1 / 视频1 / 音频1）—— LLM 看见 `微信图片_2026….png`
+    这种长名很容易抄错，看见 `图片1` 不会。
+
+    **编号不回收**：删掉的号留空，新条目从"当前最大序号 +1"接着编。回收会让旧
+    提示词里的 `@图片2` 悄悄指向另一张素材 —— 比留个空号危险得多。
+    """
+    out = []
+    seq = {"图片": 0, "视频": 0, "音频": 0}
+    for e in entries or []:
+        m = re.fullmatch(r"(图片|视频|音频)(\d+)", str((e or {}).get("mark") or "").strip())
+        if m:
+            seq[m.group(1)] = max(seq.get(m.group(1), 0), int(m.group(2)))
+    for e in entries or []:
+        ent = dict(e or {})
+        if not str(ent.get("mark") or "").strip():
+            k = KIND_CN.get(normalize_kind(ent.get("kind")), "图片")
+            seq[k] = seq.get(k, 0) + 1
+            ent["mark"] = f"{k}{seq[k]}"
+        out.append(ent)
+    return out
+
+
+def _replace_at_tokens(text, mapping) -> str:
+    """按池内最长前缀把 `@key` 换成 `@映射值`（key 不含 `@`）。
+
+    encode / decode 共用一份实现：两边都是"把 @后面那段名字换掉"，只是映射方向
+    相反。最长优先是必须的 —— 否则 `图片1` 会吃掉 `图片10` 的前缀。
+    """
+    s = str(text or "")
+    if not s or "@" not in s or not mapping:
+        return s
+    keys = sorted((str(k) for k in mapping if k), key=len, reverse=True)
+    out, i = [], 0
+    while i < len(s):
+        # 注意：i == 0 时 s[i-1] 在 Python 里是**最后一个字符**（负索引！），
+        # 会把"开头就是 @引用"误判成前面有字母数字 → 该替换的没替换。
+        prev = s[i - 1] if i > 0 else ""
+        if s[i] == "@" and not re.match(r"[0-9A-Za-z_]", prev):
+            hit = next((k for k in keys if s.startswith(k, i + 1)), None)
+            if hit:
+                out.append("@" + str(mapping[hit]))
+                i += len(hit) + 1
+                continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def encode_marks(text, name_to_mark) -> str:
+    """正文里的 `@素材全名` → `@标注`（**发给 LLM 之前**用它）。
+
+    LLM 看见的是 `图片1` 这种短而稳的名字，不会把 `微信图片_20260730…png`
+    这种长名抄错，也不会凭空造出一个不存在的素材名。返回时用 decode_marks
+    把它译回真名。
+    """
+    return _replace_at_tokens(text, name_to_mark or {})
+
+
+def decode_marks(text, mark_to_name) -> str:
+    """LLM 返回的 `@标注` → `@素材全名`（写回提示词框之前用它）。
+
+    译不出来的标注（模型造了个 `@图片99`）**原样保留** —— 前端会把它渲染成
+    红框（悬空引用），而不是静默丢掉。
+    """
+    return _replace_at_tokens(text, mark_to_name or {})
+
+
+def mark_of(kind, seq) -> str:
+    """标注文本：图片1 / 视频1 / 音频1（按类型独立编号）。"""
+    return f"{KIND_CN.get(normalize_kind(kind), '图片')}{max(1, int(seq))}"
+
+
+def next_mark_seq(kind, used_marks) -> int:
+    """下一个可用序号（**编号不回收**：删掉的号留空，新增继续递增）。
+
+    为什么不回收：提示词里写的是 `@图片2`，如果删掉 2 号素材后把后面的整体前移，
+    旧提示词就会悄悄指向另一张图 —— 比留一个空号危险得多。
+    """
+    k = normalize_kind(kind)
+    prefix = KIND_CN.get(k, "图片")
+    mx = 0
+    for m in used_marks or []:
+        mm = re.fullmatch(rf"{re.escape(prefix)}(\d+)", str(m or "").strip())
+        if mm:
+            mx = max(mx, int(mm.group(1)))
+    return mx + 1
 
 
 def new_asset_id() -> str:
@@ -294,17 +429,21 @@ def migrate_legacy_assets(legacy_assets) -> list:
             continue
         seen.add(alias)
         out.append({"asset_id": asset_id_for_legacy(alias, kind, f),
-                    "alias": alias, "kind": kind, "legacy_file": f})
+                    "alias": alias, "kind": kind, "legacy_file": f,
+                    # 旧档没有 ref_name：落盘文件名的 basename 就是引用名（含后缀）
+                    "ref_name": ref_name_of(a.get("ref_name"), f.split("/")[-1], alias)})
     return out
 
 
 def build_registry(global_assets=None, project_links=None, legacy_assets=None) -> dict:
-    """三源汇合 -> {by_id, by_alias}，冲突时首个为准并记 warnings。
+    """三源汇合 -> {by_id, by_alias, by_ref_name}，冲突时首个为准并记 warnings。
 
-    by_id: asset_id -> {asset_id, alias, kind, origin, file?}
+    by_id: asset_id -> {asset_id, alias, kind, origin, file?, ref_name?}
     by_alias: alias/label -> 同上（旧 label 与新 alias 同一命名空间）。
+    by_ref_name: 引用名（含后缀的全名）-> 同上。**引用名的解析只走这个索引**
+    （别名是 stem，用它解析会把 `.png` 留在正文里 —— 见 clean_ref_name）。
     """
-    by_id, by_alias, warnings = {}, {}, {}
+    by_id, by_alias, by_ref_name, warnings = {}, {}, {}, {}
 
     def _put(ent, origin):
         aid = str(ent.get("asset_id") or "")
@@ -312,8 +451,14 @@ def build_registry(global_assets=None, project_links=None, legacy_assets=None) -
             return
         alias = clean_alias(ent.get("alias") or ent.get("label") or "")
         kind = normalize_kind(ent.get("kind"))
+        # 引用名：显式字段 > 原始文件名 > 落盘文件名 basename > 别名（无后缀兜底）
+        f_now = str(ent.get("file") or ent.get("legacy_file") or "").replace("\\", "/")
+        rname = ref_name_of(ent.get("ref_name"), ent.get("orig_name"),
+                            f_now.split("/")[-1], alias)
         if aid not in by_id:
             rec = {"asset_id": aid, "alias": alias, "kind": kind, "origin": origin}
+            if rname:
+                rec["ref_name"] = rname
             for k in ("file", "legacy_file"):
                 if ent.get(k):
                     rec[k] = ent[k]
@@ -324,6 +469,8 @@ def build_registry(global_assets=None, project_links=None, legacy_assets=None) -
             rec = by_id[aid]
             if alias and not rec.get("alias"):
                 rec["alias"] = alias
+            if rname and not rec.get("ref_name"):
+                rec["ref_name"] = rname
             for k in ("file", "legacy_file"):
                 if ent.get(k) and not rec.get(k):
                     rec[k] = ent[k]
@@ -332,6 +479,11 @@ def build_registry(global_assets=None, project_links=None, legacy_assets=None) -
                 by_alias[alias] = rec
             elif by_alias[alias] is not rec:
                 warnings.setdefault("dup_alias", []).append(alias)
+        if rname:
+            if rname not in by_ref_name:
+                by_ref_name[rname] = rec
+            elif by_ref_name[rname] is not rec:
+                warnings.setdefault("dup_ref_name", []).append(rname)
 
     for e in global_assets or []:
         if isinstance(e, dict):
@@ -351,7 +503,8 @@ def build_registry(global_assets=None, project_links=None, legacy_assets=None) -
                 rec["file"] = e["file"]
                 rec["origin"] = "linked"
                 break
-    return {"by_id": by_id, "by_alias": by_alias, "warnings": warnings}
+    return {"by_id": by_id, "by_alias": by_alias, "by_ref_name": by_ref_name,
+            "warnings": warnings}
 
 
 def _ref_key(ref) -> tuple:
@@ -377,13 +530,15 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
     """
     by_id = (registry or {}).get("by_id") or {}
     by_alias = (registry or {}).get("by_alias") or {}
+    by_ref_name = (registry or {}).get("by_ref_name") or {}
     errors, order = [], []
     seen = {}          # asset_id -> order 下标：同一素材重复引用只编号一次
     for r in refs or []:
         key, use = _ref_key(r)
         if not key:
             continue
-        rec = by_id.get(key) or by_alias.get(key)
+        # 引用名（含后缀全名）优先：正文里写的就是它，别名（stem）只作旧档兜底
+        rec = by_id.get(key) or by_ref_name.get(key) or by_alias.get(key)
         if rec is None:
             errors.append({"code": "E_REF_UNKNOWN",
                            "message": f"段{seg_no} 引用未知资产「{key}」"})
@@ -414,11 +569,16 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
         tok = _TOKEN_FMT[rec["kind"]].format(counters[rec["kind"]])
         b = {"asset_id": rec["asset_id"], "alias": rec["alias"],
              "kind": rec["kind"], "token": tok}
+        if rec.get("ref_name"):
+            b["ref_name"] = rec["ref_name"]
         if use:
             b["use"] = use
         blocks.append(b)
         tag_map[rec["alias"] or rec["asset_id"]] = tok
         tag_map[rec["asset_id"]] = tok
+        # 正文里的 @引用名 也映射到同一 token（@猫.png -> <Picture 1>）
+        if rec.get("ref_name"):
+            tag_map[rec["ref_name"]] = tok
     return {"ok": not errors, "blocks": blocks, "tag_map": tag_map, "errors": errors}
 
 

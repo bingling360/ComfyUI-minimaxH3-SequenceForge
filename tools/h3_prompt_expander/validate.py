@@ -210,10 +210,16 @@ def validate_envelope(obj):
         if n_sent > 3:
             warn("W_MUSIC_LONG", f"配乐 {n_sent} 句，官方建议 1-3 句")
 
-    # 长度：5s 配 60-120 词，过长多为企划书直翻
-    words = len(re.findall(r"[A-Za-z']+", desc))
+    # 长度：5s 配 60-120 词，过长多为企划书直翻。
+    # 只数英文词会对全中文描述永久误报：官方同档位是「中文约 100-200 字」，
+    # 与 60-120 英文词等价，故按 1 中文字 ≈ 0.6 英文词折算后合并计数。
+    words_en = len(re.findall(r"[A-Za-z']+", desc))
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", desc))
+    words = words_en + int(cjk * 0.6)
     if words and (words < 20 or words > 260):
-        warn("W_LENGTH", f"description 约 {words} 词，建议 5s 配 60-120 词（过短太空、过长必 rush）")
+        detail = f"英文 {words_en} 词" + (f" + 中文 {cjk} 字" if cjk else "")
+        warn("W_LENGTH", f"description 约 {words} 词（{detail}），建议 5s 配 60-120 词"
+                         f"（中文约 100-200 字，过短太空、过长必 rush）")
 
     # ---- 镜头时间戳 ----
     shots = list(SHOT_RE.finditer(desc))
@@ -222,7 +228,14 @@ def validate_envelope(obj):
     else:
         nums = [int(m.group(1)) for m in shots]
         if nums[0] != 1 or nums != sorted(nums):
-            err("E_SHOT_ORDER", f"Shot 编号必须从 1 递增，当前 {nums}")
+            msg = f"Shot 编号必须从 1 递增，当前 {nums}"
+            # desc 已被 _align_blocks 剥掉对齐指令块，空行随之消失；
+            # 判断"多镜误用空行"必须回原始字段看，否则永远检测不到。
+            raw = pe.get(REF_MAIN_FIELD if is_ref else BASE_FIELD) or ""
+            if "\n\n" in str(raw):
+                msg += ("；description 内出现了空行，多镜之间只能用单个换行——"
+                        "空行会被当成关键帧对齐指令块的分隔符，导致后续镜头被整段截掉")
+            err("E_SHOT_ORDER", msg)
         times = []
         for m in shots:
             if m.group(2) is not None:

@@ -377,6 +377,18 @@ function chipLabelText(s) {
     return t.replace(_CHIP_EXT_RE, "").trim() || t;
 }
 
+/** 超长素材名的显示形态：保留首尾、中间省略。
+ *
+ * 素材名常常是长文件名，而两个素材可能只差尾部几位
+ * （`…_14_02_12` / `…_14_02_03`）。纯前缀截断会让它们在界面上长得
+ * 一模一样 —— 尾巴才是区分点，必须留着，否则用户根本看不出引用了哪个。
+ * 短名字行为不变（仍走 chipLabelText 的剥媒体后缀语义）。 */
+function shortLabel(s, head = 13, tail = 10) {
+    const t = chipLabelText(s);
+    if (t.length <= head + tail + 1) return t;
+    return t.slice(0, head) + "…" + t.slice(-tail);
+}
+
 function uniqueLabelFrom(taken, base) {
     if (!taken.has(base)) return base;
     let n = 2;
@@ -474,7 +486,7 @@ function createPromptEditor(opts) {
         sp.append(buildAssetThumb(dirOf(), ainfo));
         /* 显示剥掉夹带的格式后缀（chipLabelText）：dataset.label 保持原值，
          * 序列化/匹配仍按原别名走，只是不把 ".png" 摆到用户眼前。 */
-        sp.append(document.createTextNode(chipLabelText(label)));
+        sp.append(document.createTextNode(shortLabel(label)));
         /* ✕ 用 span 而不是 <button>：contenteditable 内的交互元素在 Chromium 下
          * 行为不一致（button 的 click 有时被选区逻辑吃掉 → "点了没反应"）。
          * 直接吃 mousedown：不依赖 click 配对，也不会因为重绘换节点而丢事件。 */
@@ -980,7 +992,7 @@ function buildRefBar(RB) {
                     || !c.querySelector(":scope > .h3d-thumb, :scope > .h3d-kindmark, :scope > .h3d-chipbtn-text")) {
                     buildChipBody(c, a);
                 }
-                const lbl = chipLabelText(a.label) || a.label || "素材";
+                const lbl = shortLabel(a.label) || a.label || "素材";
                 const txt = c.querySelector(":scope > .h3d-chipbtn-text")
                     || c.appendChild(Object.assign(document.createElement("span"),
                         { className: "h3d-chipbtn-text" }));
@@ -6362,7 +6374,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     chip.append(buildAssetThumb(getDirValue(node), a));
                     /* 显示时把夹带的格式后缀剥掉（详见 chipLabelText 注释）。alias 落库
                      * 早就去扩展名了；这里是给老 manifest / 边缘路径兜底。 */
-                    chip.append(document.createTextNode(chipLabelText(a.label) + roles));
+                    chip.append(document.createTextNode(shortLabel(a.label) + roles));
                     chip.onclick = () => { toggleSegmentRef(node, segIdx, a.label); scheduleRefresh(80); };
                     sched.append(chip);
                 });

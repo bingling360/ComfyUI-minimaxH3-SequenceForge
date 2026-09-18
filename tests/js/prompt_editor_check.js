@@ -65,6 +65,7 @@ const code = [
     extractDecl("REF_TEMPLATES", "[", "]"),
     extractConstLine("_CHIP_EXT_RE"),
     extractFn("chipLabelText"),
+    extractFn("shortLabel"),
     extractConstLine("_LIB_REL_RE"),
     extractFn("viewUrl"),
     extractFn("inputViewUrl"),

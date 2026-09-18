@@ -348,6 +348,31 @@ const ta10 = M.createPromptEditor({
 eq(ta10.el.querySelectorAll(".h3d-rtok").length, 0, "未传 tokenMap：不渲染 token 框");
 eq(ta10.value, "@阿依 与 <Picture 2>", "未传 tokenMap：正文原样");
 
+/* ⑯ 未知 @素材名 标红：LLM 抄错素材名时不会有任何反馈（refsFromText 只认池里的
+ * 名字，未知的当普通文本静默留下），要等出片才发现没挂上图。这里让它立刻可见。
+ * 同时要挡住误报：邮箱里的 @、@2x 这类技术写法、过短的 @ab 都不能标红。 */
+const ta11 = M.createPromptEditor({
+    value: "@阿依：对的\n@阿衣：抄错的\n联系 a@b.com\n图片 @2x 缩放\n@ab 太短",
+    labels: () => ds.ref_assets.map((a) => a.label),
+    assets: tokAssets,
+    dir: () => "",
+    tokenMap: () => ({}),
+});
+window.document.body.append(ta11.el);
+eq(ta11.el.querySelectorAll(".h3d-rtag:not(.h3d-rtok)").length, 1, "已知 @别名 渲染成绿框");
+eq(ta11.el.querySelectorAll(".h3d-rtok-missing").length, 1, "抄错的 @名字 标红（只此一个）");
+eq(ta11.value, "@阿依：对的\n@阿衣：抄错的\n联系 a@b.com\n图片 @2x 缩放\n@ab 太短",
+    "未知 @ 检测不得改写正文");
+
+/* 未传 tokenMap 的框（①②）不做未知识别，避免误伤普通文本 */
+const ta12 = M.createPromptEditor({
+    value: "@阿衣：抄错的",
+    labels: () => ds.ref_assets.map((a) => a.label),
+    assets: tokAssets,
+    dir: () => "",
+});
+eq(ta12.el.querySelectorAll(".h3d-rtok-missing").length, 0, "未传 tokenMap：不做未知 @ 检测");
+
 if (fails.length) {
     console.error("FAIL:\n - " + fails.join("\n - "));
     process.exit(1);

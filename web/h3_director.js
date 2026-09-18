@@ -520,8 +520,11 @@ function createPromptEditor(opts) {
             sp.title = `${token}：官方格式引用，指向素材「${label}」（按素材调度顺序编号）`;
         } else {
             sp.classList.add("h3d-rtok-missing");
-            sp.title = `${token}：没有挂到任何素材 —— 生成时不会有图。`
-                + "请到「引用素材」按顺序挂上对应素材，或删掉这个标签。";
+            sp.title = token.startsWith("@")
+                ? `${token}：素材池里没有这个名字（多半是抄错了）—— 生成时不会有图。`
+                  + "请核对「引用素材」里的名字，或改成正确的 @素材名。"
+                : `${token}：没有挂到任何素材 —— 生成时不会有图。`
+                  + "请到「引用素材」按顺序挂上对应素材，或删掉这个标签。";
         }
         sp.append(document.createTextNode(token));
         return sp;
@@ -559,6 +562,23 @@ function createPromptEditor(opts) {
                     if (buf) { out.push({ text: buf }); buf = ""; }
                     out.push({ label: hit });
                     i += hit.length + 1;
+                    continue;
+                }
+                /* 未知 @xxx：素材池里没有这个名字。LLM 抄错素材名时不会有任何反馈
+                 * —— 它只会当普通文本静默留在正文里，等出片才发现没挂上图。
+                 * 借 token 形态（label 为空）渲染成红框，让抄错立刻可见。
+                 * 仅在启用 token 可视化的框（③结果框）里做，且要求 @ 后至少 2 个
+                 * 非空白非标点字符，避免误伤 @2x 之类。 */
+                const mu = tokenOn()
+                    ? /^@[^\s@，。；：、,.;:!?（）()\[\]【】<>"'`|]{2,80}/.exec(s.slice(i))
+                    : null;
+                /* 还要排除 @2x 这类技术写法：要求含中文，或整体长度≥4
+                 * （@2x 只有 3 字符且纯 ASCII → 不标红）。 */
+                const looksNamed = mu && (/[\u4e00-\u9fff]/.test(mu[0]) || mu[0].length >= 4);
+                if (looksNamed) {
+                    if (buf) { out.push({ text: buf }); buf = ""; }
+                    out.push({ token: mu[0], label: "" });
+                    i += mu[0].length;
                     continue;
                 }
             }

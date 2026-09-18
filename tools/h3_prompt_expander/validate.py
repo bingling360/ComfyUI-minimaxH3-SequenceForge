@@ -157,9 +157,14 @@ def validate_envelope(obj):
         # detailed_description：风格须在 [Shot 1] 之前先立
         if desc.strip() and desc.lstrip().startswith("[Shot 1]"):
             warn("W_REF_STYLE_AFTER_SHOT", "Ref2VA 风格应在 [Shot 1] 之前用一到两句先立，当前直接从 [Shot 1] 开始")
-        if words_ref := len(re.findall(r"[A-Za-z']+", desc)):
-            if words_ref and not (200 <= words_ref <= 700):
-                warn("W_REF_LENGTH", f"detailed_description 约 {words_ref} 词，官方生成任务参考区间 350-500 词")
+        # 同 W_LENGTH：只数英文词会对中文主体永久误报，按 1 中文字 ≈ 0.6 英文词折算。
+        words_ref_en = len(re.findall(r"[A-Za-z']+", desc))
+        cjk_ref = len(re.findall(r"[\u4e00-\u9fff]", desc))
+        words_ref = words_ref_en + int(cjk_ref * 0.6)
+        if words_ref and not (200 <= words_ref <= 700):
+            detail = f"英文 {words_ref_en} 词" + (f" + 中文 {cjk_ref} 字" if cjk_ref else "")
+            warn("W_REF_LENGTH", f"detailed_description 约 {words_ref} 词（{detail}），"
+                                 f"官方生成任务参考区间 350-500 词（中文约 580-830 字）")
         # 标签一致性补充：subject_definitions 里 <Audio N> 绑定时须复用 (Sx)
         for m in re.finditer(r"<Audio\s+\d+>[^\n]*<Subject\s+\d+>", subj, re.I):
             line = m.group(0)

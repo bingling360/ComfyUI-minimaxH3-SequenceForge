@@ -117,5 +117,35 @@ def test_compile_prompt_forbids_blank_line():
     assert "单个换行" in src
 
 
+# ------------------------------------------------------ Ref2VA 长度折算
+
+def _ref_env(desc):
+    return {
+        "intent": {"logline_zh": "测试", "constraints": {"duration": 10, "shots": 2,
+                                                         "mode": "Ref2VA"}},
+        "pe": {"mode": "Ref2VA", "duration": 10,
+               "subject_definitions": "<Subject 1>：少女，深色短斗篷，来自 Picture 1。",
+               "summary": "[reference generation] 少女在回廊中与圣骑士交手一个回合。",
+               "retention_analysis": "<Subject 1> (appears in [Shot 1], [Shot 2]): "
+                                     "fully_preserved - 装束与发型全片一致。",
+               "detailed_description": desc,
+               "overall_soundscape": "风声与铠甲摩擦声。",
+               "non_diegetic_music": "N/A"},
+    }
+
+
+def test_w_ref_length_no_false_alarm_for_chinese():
+    """Ref2VA 的 detailed_description 也曾只数英文词，中文主体会误报。"""
+    desc = ("实拍冷色调奇幻写实。\n[Shot 1] " + "少女沿回廊侧身后退" * 40
+            + "\n[Shot 2] At 00:05.000, " + "圣骑士持盾冲来" * 40)
+    v = validate.validate_envelope(_ref_env(desc))
+    assert "W_REF_LENGTH" not in _codes(v), f"中文主体被误报：{v['warnings']}"
+
+
+def test_w_ref_length_still_fires_when_too_short():
+    v = validate.validate_envelope(_ref_env("实拍冷色调。\n[Shot 1] 少女后退。"))
+    assert "W_REF_LENGTH" in _codes(v)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

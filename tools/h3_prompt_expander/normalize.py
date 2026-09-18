@@ -38,6 +38,11 @@ RISK_TOPICS = [
 READING_HINTS = ("写着", "刻着", "印着", "显示", "招牌", "屏幕", "霓虹", "reading", "sign", "neon")
 DIALOGUE_RE = re.compile(r"「([^」]{1,80})」")
 QUOTE_RE = re.compile(r'"([^"]{1,60})"|“([^”]{1,60})”')
+# 资产引用语法（@image#1:"a.png"）与媒体文件名都不是对白。
+# 不排除的话会被判成"引号误用"并生成"须移入 <d>"的指令，
+# 模型照做就会把图片文件名当台词念出来（念提示词类翻车）。
+ASSET_REF_RE = re.compile(r"@(?:image|video|audio|ref)#\d+\s*:\s*$")
+FILE_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp|bmp|gif|mp4|mov|webm|wav|mp3|m4a)$", re.I)
 DUR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:s|秒)")
 ACTION_VERBS = ("走", "跑", "转身", "抬头", "坐下", "站起", "推开", "拿起", "放下", "看向",
                 "望向", "笑", "哭", "说", "喊", "跳", "追", "逃", "飞", "倒", "撞", "开", "关",
@@ -62,7 +67,9 @@ def analyze(raw):
 
     for m in QUOTE_RE.finditer(raw):
         text = m.group(1) if m.group(1) is not None else m.group(2)
-        before = raw[max(0, m.start() - 10):m.start()]
+        before = raw[max(0, m.start() - 16):m.start()]
+        if ASSET_REF_RE.search(before) or FILE_EXT_RE.search(text.strip()):
+            continue
         likely = "visible" if _likely_visible(text, before) else "dialogue-misuse?"
         out["quotes"].append({"text": text, "likely": likely})
         if likely != "visible" and re.search(r"[\u4e00-\u9fff]", text):

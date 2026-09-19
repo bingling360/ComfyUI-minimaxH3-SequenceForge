@@ -1031,7 +1031,9 @@ def mirror_to_project(project, item, label=None) -> dict:
     taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
     lbl = _alias_of(label, item.get("name"), os.path.splitext(cand)[0])
     lbl = unique_label(lbl, taken)
-    assets.append({"label": lbl, "kind": kind, "file": rel})
+    # 同 store_to_project：ref_name 显式写**落盘全名（含后缀）**，别靠反推。
+    # 注意 want 可能是"显示名 + 补上的后缀"，真正落盘的是 cand（同名会加 _2）。
+    assets.append({"label": lbl, "kind": kind, "file": rel, "ref_name": cand})
     out = _pj.save_assets(name, assets, None)
     if out is None:
         raise ValueError("写入项目清单失败")
@@ -1071,7 +1073,11 @@ def store_to_project(project, src_abs, name=None, kind="image", label=None) -> d
     taken = {str(a.get("label")) for a in assets if isinstance(a, dict) and a.get("label")}
     lbl = _alias_of(label, os.path.splitext(cand)[0])
     lbl = unique_label(lbl, taken)
-    assets.append({"label": lbl, "kind": kk, "file": rel})
+    # ref_name **显式写全名（含后缀）**：它是提示词里 `@` 后面写的那个名字。
+    # 以前靠 _clean_asset 从 file 的 basename 反推，能推出来但很隐晦 ——
+    # 一旦哪天落盘改名（加前缀/去后缀）而这里没跟着改，用户从外面贴进来的
+    # `@猫.png` 就再也匹配不上（表现为"名字识别不出来"）。写死在这里更抗改。
+    assets.append({"label": lbl, "kind": kk, "file": rel, "ref_name": cand})
     out = _pj.save_assets(proj, assets, None)
     if out is None:
         raise ValueError("写入项目清单失败")

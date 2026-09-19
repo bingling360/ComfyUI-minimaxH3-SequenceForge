@@ -515,6 +515,54 @@ function insertAtCursor(ta, text) {
  *   零改动即可复用。
  * - 绿框是 contenteditable=false 的原子节点：光标进不去，退格整块删。
  */
+/* —— 引用名表：一个素材在正文里可被写成**两种**名字 ——
+ *
+ *   · 全名（ref_name，含格式后缀，如 `猫.png`）—— 现在的落盘口径
+ *   · 别名（alias/label，无后缀，如 `猫`）—— 旧档与用户手打的写法
+ *
+ * 两张表必须**同时**喂给分词器，否则就是那条著名的"后缀溢出"：
+ * 只认别名时，用户从外面贴进来的 `@猫.png` 只能匹配到 `猫`，剩下的 `.png`
+ * 当普通文本留在正文里（绿框后面挂个裸后缀）。
+ *
+ * 分词器按**长度降序**匹配，所以更长的全名会先命中 —— 正文里存什么取决于
+ * 表里给它什么名字：给了全名，插入/序列化就自然写成 `@猫.png`（不用另写规则）。
+ *
+ * 只补全名还不够：素材**进项目库时必须保留完整文件名（含后缀）**，
+ * ref_name 才推导得出来（见后端 asset_store.clean_ref_name / projects._ref_name_of）。
+ */
+function refLabelsOf(pool) {
+    const out = [];
+    for (const a of (pool || [])) {
+        if (!a) continue;
+        const rn = String(a.ref_name || "").trim();
+        const lb = String(a.label || a.alias || "").trim();
+        if (rn) out.push(rn);
+        if (lb && lb !== rn) out.push(lb);
+    }
+    return out;
+}
+
+/* 名字 -> 素材信息 {kind, file, asset_id, mark}：绿框按它挑缩略图/图标。
+ * 全名与别名**指向同一份信息**（同一个 key 存两次），
+ * 否则按全名插进来的绿框会因为查不到信息而退化成默认图标。 */
+function refInfoMapOf(pool) {
+    const m = {};
+    for (const a of (pool || [])) {
+        if (!a) continue;
+        const lb = String(a.label || a.alias || "").trim();
+        if (!lb && !a.ref_name) continue;
+        const info = {
+            kind: KIND_LIST.includes(a.kind) ? a.kind : "image",
+            file: String(a.file || ""),
+            asset_id: String(a.asset_id || ""),
+            mark: String(a.mark || ""),
+        };
+        if (a.ref_name) m[String(a.ref_name).trim()] = info;
+        if (lb) m[lb] = info;
+    }
+    return m;
+}
+
 function createPromptEditor(opts) {
     const o = opts || {};
     const box = document.createElement("div");
@@ -5324,7 +5372,9 @@ function cardsSignature(data) {
         frames: [ds?.first_frame ?? "", ds?.end_frame ?? "",
             ...(ds?.segments || []).map(
                 (s) => `${s?.frame_img?.first || ""}/${s?.frame_img?.end || ""}`)],
-        labels: (ds?.ref_assets || []).map((a) => a.label),
+        /* 全名 + 别名都进签名：只放别名的话，素材换了个全名（改名/重传）
+         * 签名却不变 → 段卡不重绘 → 绿框继续指着旧名字。 */
+        labels: refLabelsOf(ds?.ref_assets || []),
         mode: ds?.mode ?? "",
         /* 重摇标记/运行队列进签名：标记/取消/队列消费后待重摇徽章即时刷新 */
         redo: [(ds?.redo_segs || []).map((x) => `${x.slot}:${x.mode}`).join(","),
@@ -7110,27 +7160,22 @@ function buildCards(data) {
                 value: it.text || "",
                 /* 别名表读**活的**节点状态，不用 collectData 的快照：上传/改名/删除素材后
                  * 快照会一直停在建卡那一刻，新素材的 @别名就永远渲染不成绿框。 */
+                /* 引用名表读**活的**节点状态，不用 collectData 的快照：上传/改名/删除
+                 * 素材后快照会停在建卡那一刻，新素材的 @名字 就永远渲染不成绿框。
+                 * 用 refLabelsOf 而不是 `.map(a => a.label)`：表里必须**同时有全名和
+                 * 别名**，只给别名就会重现「@猫.png 只认出 猫、.png 溢出成正文」。 */
                 labels: () => {
                     let arr = data.ds.ref_assets;
                     if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
-                    return (arr || []).map((a) => a.label);
+                    return refLabelsOf(arr);
                 },
-                /* 别名 -> 素材信息 {kind,file,asset_id}（绿框据此挑缩略图/图标）。
-                 * 同样读活的节点状态——上传/换类别后旧绿框的标识能立刻对得上。 */
+                /* 名字 -> 素材信息 {kind,file,asset_id,mark}（绿框据此挑缩略图/图标）。
+                 * 同样读活的节点状态——上传/换类别后旧绿框的标识能立刻对得上。
+                 * 全名与别名指向同一份信息，否则按全名插进来的绿框会没有缩略图。 */
                 assets: () => {
                     let arr = data.ds.ref_assets;
                     if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
-                    const m = {};
-                    for (const a of (arr || [])) {
-                        if (a && a.label) {
-                            m[a.label] = {
-                                kind: a.kind || "image",
-                                file: String(a.file || ""),
-                                asset_id: String(a.asset_id || ""),
-                            };
-                        }
-                    }
-                    return m;
+                    return refInfoMapOf(arr);
                 },
                 /* 官方标签 → 素材别名：{"<Picture 1>": "回廊场景", ...}。
                  * 外部 agent 写的官方格式文本里是 `<Picture N>`，靠它渲染成缩略图，

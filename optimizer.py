@@ -999,7 +999,8 @@ def _validate_optimized(text: str, mode: str, seconds: float) -> dict:
         return {"ok": True, "errors": [], "warnings": []}
 
 
-def optimize_multi_once(config_in: dict | None, payload: dict | None) -> dict:
+def optimize_multi_once(config_in: dict | None, payload: dict | None,
+                        on_progress=None) -> dict:
     """多段一次性优化：把 N 段剧本（自由格式）逐段压成 H3 官方格式并校验。
 
     payload:
@@ -1007,6 +1008,14 @@ def optimize_multi_once(config_in: dict | None, payload: dict | None) -> dict:
       task / media: 缺省值（各段未给时用它）
     返回 {ok, segments:[{index, seconds, task, result, errors, warnings, ok}], meta}
     ok = 所有非空段都通过官方校验（空段跳过不计）。
+
+    on_progress(ev)：可选进度回调。**逐段转发 `optimize_once` 的流式事件，
+    并补上段序号**，于是前端能画「第 i/N 段」的整条进度：
+        {"seg": 原始下标, "seg_no": 第几段(1 起，只数非空段), "total": 非空段总数,
+         "phase": "thinking"|"writing", "reasoning_chars": n, "content_chars": m,
+         "tokens": k, "max_tokens": N, "elapsed": 秒}
+    没有流式的通道（gemini/responses/本地模型）不会产生任何事件 ——
+    调用方要自己显示不确定态，别把"没有帧"当成失败。
     """
     cfg = normalize_config(config_in)
     payload = payload if isinstance(payload, dict) else {}
@@ -1016,6 +1025,11 @@ def optimize_multi_once(config_in: dict | None, payload: dict | None) -> dict:
     if len(segs) > 24:
         raise ValueError(f"段数 {len(segs)} 过多，一次最多 24 段")
     shared_media = payload.get("media") if isinstance(payload.get("media"), list) else []
+    # 先数一遍非空段：前端要显示「第 i/N 段」，分母必须是**真正要跑的段数**，
+    # 不能拿 len(segs) —— 空段会被跳过，分母虚高则进度永远到不了 100%。
+    total = sum(1 for s in segs
+                if str((s if isinstance(s, dict) else {}).get("prompt") or "").strip())
+    seg_no = 0
     out, all_ok = [], True
     for i, s in enumerate(segs):
         s = s if isinstance(s, dict) else {}
@@ -1029,11 +1043,24 @@ def optimize_multi_once(config_in: dict | None, payload: dict | None) -> dict:
             out.append({"index": i, "seconds": seconds, "task": task, "result": "",
                         "skipped": True, "errors": [], "warnings": [], "ok": True})
             continue
+        seg_no += 1
+
+        # 用默认参数把 i / seg_no 钉住：闭包直接引用循环变量的话，
+        # 所有回调拿到的都会是最后一段的值（经典坑）。
+        def _relay(ev, _i=i, _no=seg_no):
+            if not on_progress:
+                return
+            e = dict(ev) if isinstance(ev, dict) else {}
+            e["seg"] = _i
+            e["seg_no"] = _no
+            e["total"] = total
+            on_progress(e)
+
         text = optimize_once(cfg, {
             "prompt": script, "task": task, "duration": seconds,
             "media": s.get("media") if isinstance(s.get("media"), list) else shared_media,
             "context": {"main_mode": task},
-        })
+        }, on_progress=_relay if on_progress else None)
         verdict = _validate_optimized(text, task, seconds)
         ok = bool(verdict.get("ok"))
         all_ok = all_ok and ok

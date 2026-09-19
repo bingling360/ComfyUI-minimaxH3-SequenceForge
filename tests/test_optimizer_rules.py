@@ -126,7 +126,7 @@ def test_validate_optimized_catches_ref_style_on_base_mode():
 def test_optimize_multi_validates_each_segment(monkeypatch):
     calls = []
 
-    def fake_optimize_once(cfg, payload):
+    def fake_optimize_once(cfg, payload, on_progress=None):
         calls.append(payload)
         # 甲段返回旧 bug 风格的产物（应被判不合格），乙段返回合规的官方三字段
         return REF_STYLE_BAD if payload.get("prompt") == "剧本甲" else BASE_OK
@@ -145,7 +145,7 @@ def test_optimize_multi_validates_each_segment(monkeypatch):
 
 
 def test_optimize_multi_skips_empty_and_rejects_oversize(monkeypatch):
-    monkeypatch.setattr(optimizer, "optimize_once", lambda cfg, p: BASE_OK)
+    monkeypatch.setattr(optimizer, "optimize_once", lambda cfg, p, on_progress=None: BASE_OK)
     res = optimizer.optimize_multi_once(
         {"mode": "api", "provider": "openai", "api_key": "sk-x"},
         {"segments": [{"prompt": "  ", "seconds": 5}, {"prompt": "有内容", "seconds": 5}]})
@@ -164,7 +164,7 @@ def test_optimize_multi_passes_task_to_rule_pick(monkeypatch):
     """task 必须传到 pick_rule_text，否则又回到"一律注入 ref 规则"的老路。"""
     picked = []
 
-    def fake_optimize_once(cfg, payload):
+    def fake_optimize_once(cfg, payload, on_progress=None):
         picked.append(optimizer.pick_rule_text(cfg, optimizer.load_rule_files(),
                                                payload.get("task")))
         return BASE_OK
@@ -175,3 +175,57 @@ def test_optimize_multi_passes_task_to_rule_pick(monkeypatch):
          "output_language": "中文"},
         {"segments": [{"prompt": "x", "seconds": 5, "task": "T2VA"}]})
     assert picked and "<@" not in (picked[0] or "")
+
+
+def test_optimize_multi_relays_progress_with_segment_numbering(monkeypatch):
+    """多段优化必须把每段的流式事件转发出去，并带上**段序号**。
+
+    前端靠 seg_no / total 画「第 i/N 段」的整条进度。三个易错点各钉一条：
+    1. **分母是非空段数**：空段会被跳过，用 len(segments) 当分母 → 进度永远到不了 100%；
+    2. **闭包必须钉住 i / seg_no**：直接引用循环变量的话，所有回调拿到的都是
+       最后一段的值（第 2 段的帧会说自己还是第 1 段）；
+    3. 事件要**原样透传** reasoning_chars / content_chars，别在转发层丢掉。
+    """
+    def fake_optimize_once(cfg, payload, on_progress=None):
+        if on_progress:
+            on_progress({"phase": "thinking", "reasoning_chars": 10, "content_chars": 0,
+                         "tokens": 0, "max_tokens": 8192, "elapsed": 0.5})
+            on_progress({"phase": "writing", "reasoning_chars": 10, "content_chars": 99,
+                         "tokens": 0, "max_tokens": 8192, "elapsed": 1.5})
+        return BASE_OK
+
+    monkeypatch.setattr(optimizer, "optimize_once", fake_optimize_once)
+    events = []
+    optimizer.optimize_multi_once(
+        {"mode": "api", "provider": "openai", "api_key": "sk-x"},
+        {"segments": [{"prompt": "   ", "seconds": 5},   # 空段：跳过，不进分母
+                      {"prompt": "甲", "seconds": 9},
+                      {"prompt": "乙", "seconds": 8}]},
+        on_progress=events.append)
+
+    assert len(events) == 4, events                    # 2 个非空段 × 2 帧
+    assert [e["total"] for e in events] == [2] * 4, "分母必须是非空段数，不是 len(segments)"
+    assert [e["seg_no"] for e in events] == [1, 1, 2, 2], "段序号必须跟着走（闭包钉住）"
+    assert [e["seg"] for e in events] == [1, 1, 2, 2], "原始下标要保留（空段占了 0）"
+    assert [e["phase"] for e in events] == ["thinking", "writing"] * 2
+    assert events[0]["content_chars"] == 0 and events[1]["content_chars"] == 99
+    assert events[0]["max_tokens"] == 8192
+
+
+def test_optimize_multi_without_progress_passes_none(monkeypatch):
+    """没有进度回调时也要**显式**传 on_progress=None（调用形状统一）。
+
+    这样 mock 只要照抄真签名就永远不会因"多了一个 kwarg"炸掉 ——
+    比"按需才传"更难写错。
+    """
+    got = []
+
+    def fake_optimize_once(cfg, payload, on_progress=None):
+        got.append(on_progress)
+        return BASE_OK
+
+    monkeypatch.setattr(optimizer, "optimize_once", fake_optimize_once)
+    optimizer.optimize_multi_once(
+        {"mode": "api", "provider": "openai", "api_key": "sk-x"},
+        {"segments": [{"prompt": "x", "seconds": 5}]})
+    assert got == [None]

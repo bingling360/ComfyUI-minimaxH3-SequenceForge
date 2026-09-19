@@ -292,6 +292,81 @@ const meta = (w) => (w.document.querySelector(".h3d-opt-prog-meta")?.textContent
         assert.strictEqual(btn.textContent, "扩写中…", "按钮文案没跟着阶段走");
     });
 
+    console.log("\n== 5 多段优化：「第 i/N 段」 ==");
+
+    await ta("N 段串行：整条进度按段切分，第 2 段从 1/N 附近起且不回退", async () => {
+        const p = w.optProgressStart("总提示词框 · 优化 3 段");
+        const ev = (o) => p.update(Object.assign({ type: "progress" }, o));
+        ev({ seg_no: 1, total: 3, phase: "thinking", reasoning_chars: 0, content_chars: 0 });
+        const a = pct(w);
+        ev({ seg_no: 1, total: 3, phase: "writing", reasoning_chars: 900, content_chars: 2000 });
+        const b = pct(w);
+        assert.ok(b > a, `第 1 段内该推进：${a} -> ${b}`);
+        assert.ok(b <= 100 / 3 + 0.5, `第 1 段不该越过 1/3 太多：${b}`);
+        ev({ seg_no: 2, total: 3, phase: "thinking", reasoning_chars: 0, content_chars: 0 });
+        const c = pct(w);
+        assert.ok(c >= b - 0.5, `换段不许回退：${b} -> ${c}`);
+        assert.ok(c >= 100 / 3 - 1 && c < 100 / 3 + 3, `第 2 段起点该在 1/3 附近：${c}`);
+        assert.ok(/第 2\/3 段/.test(meta(w)), "文案没带段序号：" + meta(w));
+        p.close();
+    });
+
+    await ta("换段后段内进度从该段起点重算（不继承上一段的字数）", async () => {
+        const p = w.optProgressStart("t");
+        const ev = (o) => p.update(Object.assign({ type: "progress" }, o));
+        ev({ seg_no: 1, total: 2, phase: "writing", reasoning_chars: 500, content_chars: 3000 });
+        const before = pct(w);
+        assert.ok(before > 40, "第 1 段该跑过 40%：" + before);
+        ev({ seg_no: 2, total: 2, phase: "thinking", reasoning_chars: 0, content_chars: 0 });
+        const s = pct(w);
+        assert.ok(s < before + 8, `第 2 段刚开头不该跳一大格：${before} -> ${s}`);
+        assert.ok(/推理 0 字/.test(meta(w)), "段内字数没跟着新段走：" + meta(w));
+        p.close();
+    });
+
+    await ta("段文案：撰写/思考两种阶段都带「第 i/N 段」", async () => {
+        const p = w.optProgressStart("t");
+        p.update({ type: "progress", seg_no: 1, total: 4, phase: "writing", content_chars: 800 });
+        assert.ok(/第 1\/4 段 · 撰写中/.test(meta(w)), "撰写文案不对：" + meta(w));
+        p.update({ type: "progress", seg_no: 3, total: 4, phase: "thinking", reasoning_chars: 700 });
+        assert.ok(/第 3\/4 段 · 思考中/.test(meta(w)), "思考文案不对：" + meta(w));
+        p.close();
+    });
+
+    await ta("只有 1 段真跑时不切多段模式（单段曲线更准）", async () => {
+        const p = w.optProgressStart("t");
+        p.update({ type: "progress", seg_no: 1, total: 1, phase: "thinking", reasoning_chars: 100 });
+        assert.ok(!/第 1\/1 段/.test(meta(w)), "total=1 不该显示「第 1/1 段」：" + meta(w));
+        assert.ok(/思考中/.test(meta(w)), "该走单段曲线：" + meta(w));
+        p.close();
+    });
+
+    await ta("多段走 optCallStream：路由到 optimizeMultiStream", async () => {
+        let called = 0;
+        const { w: w2 } = load({ H3Api: {
+            async optimizeMultiStream(body, onEvent) {
+                called += 1;
+                onEvent({ type: "progress", seg_no: 1, total: 2, phase: "thinking", reasoning_chars: 5 });
+                return { status: 200, body: { ok: true, segments: [] }, events: [] };
+            },
+        } });
+        const r = await w2.optCallStream({ segments: [] }, "标题", null,
+            { stream: "optimizeMultiStream", fallback: "optimizeMulti" });
+        assert.strictEqual(called, 1, "没走 optimizeMultiStream");
+        assert.strictEqual(r.body.ok, true);
+    });
+
+    await ta("多段流式不存在时静默退回整包 optimizeMulti", async () => {
+        let called = 0;
+        const { w: w2 } = load({ H3Api: {
+            async optimizeMulti() { called += 1; return { status: 200, body: { ok: true, segments: [1] } }; },
+        } });
+        const r = await w2.optCallStream({ segments: [] }, "标题", null,
+            { stream: "optimizeMultiStream", fallback: "optimizeMulti" });
+        assert.strictEqual(called, 1, "没退回 optimizeMulti");
+        assert.deepStrictEqual(r.body.segments, [1]);
+    });
+
     results.forEach((r) => console.log(r));
     if (errors.length) { console.log("\n页面错误: " + errors.join(" | ")); ok = false; }
     console.log(ok ? "\nopt_progress_check 全部通过" : "\nopt_progress_check 失败");

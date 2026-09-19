@@ -50,6 +50,7 @@ ROUTES = [
     ("POST", "/h3chain/optimize"),
     ("POST", "/h3chain/optimize_stream"),
     ("POST", "/h3chain/expand_optimize_stream"),
+    ("POST", "/h3chain/optimize_multi_stream"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
     ("POST", "/h3chain/compile"),
@@ -1318,6 +1319,24 @@ def add_routes(routes):
             return _err(f"多段优化失败：{e}", code="OPTIMIZE_FAILED", status=500)
         return web.json_response({"ok": bool(result.get("ok")), **result})
 
+    async def optimize_multi_stream(request):
+        """多段优化 · SSE 流式：进度帧带 seg / seg_no / total，前端画「第 i/N 段」。
+
+        与 /h3chain/optimize_multi 走**同一条链**（optimizer.optimize_multi_once），
+        区别只是边跑边推帧。N 段是**串行**调用，没有进度就是"点完盯着不动
+        几十秒到几分钟"，段数越多越像卡死。
+        """
+        def _work(data, emit):
+            try:
+                from . import optimizer as _opt
+            except ImportError:
+                import optimizer as _opt
+            return _opt.optimize_multi_once(
+                data.get("config"), data,
+                on_progress=lambda ev: emit("progress", ev))
+
+        return await _sse_stream(request, _work, error_code="OPTIMIZE_FAILED")
+
     async def expand_validate(request):
         """只校验已有信封（不调 LLM）：给前端"校验"按钮用。"""
         try:
@@ -2526,6 +2545,7 @@ def add_routes(routes):
         ("POST", "/h3chain/expand_optimize", expand_optimize),
         ("POST", "/h3chain/expand_optimize_stream", expand_optimize_stream),
         ("POST", "/h3chain/optimize_multi", optimize_multi),
+        ("POST", "/h3chain/optimize_multi_stream", optimize_multi_stream),
         ("POST", "/h3chain/expand_validate", expand_validate),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),

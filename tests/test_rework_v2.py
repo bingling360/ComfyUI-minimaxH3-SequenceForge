@@ -571,9 +571,10 @@ def test_optimizer_routes_mount(routes):
     r = _Router()
     routes.add_routes(r)
     for p in ["/h3chain/prompt-rules", "/h3chain/optimizer-config", "/h3chain/optimize",
-              # 流式那两条（进度条用）：必须**两份都挂**，新版前端 api.fetchApi()
+              # 流式那三条（进度条用）：必须**两份都挂**，新版前端 api.fetchApi()
               # 会给所有不以 /api 开头的路径强制加前缀，只挂根路径会 404。
-              "/h3chain/optimize_stream", "/h3chain/expand_optimize_stream"]:
+              "/h3chain/optimize_stream", "/h3chain/expand_optimize_stream",
+              "/h3chain/optimize_multi_stream"]:
         assert ("GET", p) in r.paths or ("POST", p) in r.paths
         assert ("GET", "/api" + p) in r.paths or ("POST", "/api" + p) in r.paths
 
@@ -607,6 +608,11 @@ def test_segment_tabs_and_optimizer_ui():
     # 「思考强度」就退化成只能开/关（用户报的"强度不能选"会复现）。
     assert "optimizeStream" in a and "/h3chain/optimize_stream" in a
     assert "expandOptimizeStream" in a and "/h3chain/expand_optimize_stream" in a
+    assert "optimizeMultiStream" in a and "/h3chain/optimize_multi_stream" in a
+    # 多段那条也得真的接上流式（总提示词框的「AI 分段优化」）：
+    # 少了 stream 名就退回整包，N 段串行跑起来就是"点完盯着不动好几分钟"。
+    assert 'stream: "optimizeMultiStream"' in d
+    assert 'fallback: "optimizeMulti"' in d
     for sym in ["optProgressStart", "optCallStream", "rebuildThinking",
                 "optModelCaps", "optCapsLoad", "思考强度", "h3d-opt-prog"]:
         assert sym in d, sym

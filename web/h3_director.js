@@ -3528,7 +3528,7 @@ function optProgressStart(title) {
     _optProg.box = box;
 
     const st = { pct: 4, phase: "connect", rchars: 0, cchars: 0, tokens: 0, maxTokens: 0,
-                 stage: "", two: false, t0: Date.now() };
+                 stage: "", two: false, segNo: 0, total: 0, t0: Date.now() };
     let cancelled = false;
     let onPhase = null;
     /* 渐近推进：字数越接近"典型量"越慢，永不越过阶段上界。
@@ -3544,7 +3544,25 @@ function optProgressStart(title) {
     const render = () => {
         let pct = st.pct;
         let phaseText = "正在连接模型…";
-        if (st.two && st.stage === "expand") {
+        if (st.total > 1) {
+            /* 多段（optimizeMulti）：N 段**串行**，每段内部仍是 thinking/writing。
+             * 整条 = 已完成段数 + 本段内部进度：段内 连接 0→5% / 思考 5→50% /
+             * 撰写 50→100%，跨段靠 st.pct 的单调守卫接续（看不到回退）。
+             * 用 `total > 1` 判定而不是"调用方自称多段"：只有一段真要跑时，
+             * 单段那条曲线更准确（空段已被后端跳过，不进分母）。 */
+            const per = 100 / st.total;
+            const base = (st.segNo - 1) * per;
+            if (st.phase === "thinking") {
+                pct = base + per * (0.05 + 0.45 * creep(st.rchars, 2500));
+                phaseText = `第 ${st.segNo}/${st.total} 段 · 思考中 · 推理 ${st.rchars} 字`;
+            } else if (st.phase === "writing") {
+                pct = base + per * (0.5 + 0.5 * creep(st.cchars, 1600));
+                phaseText = `第 ${st.segNo}/${st.total} 段 · 撰写中 · 正文 ${st.cchars} 字`;
+            } else {
+                pct = base + per * 0.05;
+                phaseText = `第 ${st.segNo}/${st.total} 段 · 连接中…`;
+            }
+        } else if (st.two && st.stage === "expand") {
             /* 第①格：扩写。它内部也有 thinking/writing 之分，但对用户是**一个**
              * 步骤（"先把意图写开"），所以两段合起来占 4→45%。
              * 字数取 cchars || rchars：思考阶段只有推理字数，撰写阶段才有正文。 */
@@ -3601,6 +3619,17 @@ function optProgressStart(title) {
             /* `stage` 是「扩写+优化」才有的字段（expand / optimize）；单段优化
              * 的帧里没有 → 保持一格进度。 */
             if (evt.stage) { st.stage = String(evt.stage); st.two = true; }
+            /* `seg_no` / `total` 是「多段优化」才有的字段。换段时**显式清零**
+             * 段内计数器：每段是一次独立的 LLM 调用，字数各自从零开始。
+             * 流式帧通常会把三个字段全带上（等于自动覆盖），所以这里是防御性的 ——
+             * 但换段是个真实的状态边界，靠"事件一定带全字段"这种隐式约定，
+             * 容易在别的协议（gemini/responses）或本地模型分支上加流式时翻车。 */
+            if (evt.total) st.total = Number(evt.total) || 0;
+            const no = Number(evt.seg_no) || 0;
+            if (no && no !== st.segNo) {
+                st.segNo = no;
+                st.rchars = 0; st.cchars = 0; st.tokens = 0;
+            }
             if (evt.phase) st.phase = String(evt.phase);
             st.rchars = Number(evt.reasoning_chars) || 0;
             st.cchars = Number(evt.content_chars) || 0;
@@ -9981,7 +10010,9 @@ function openMasterPromptModal() {
              * 的素材也要换，否则模型看见一半 @猫.png 一半 @图片1，两边对不上。 */
             const pool = mpPool();
             const task = modeSel.value;
-            const res = await window.H3Api.optimizeMulti({
+            /* 走 SSE 流式：N 段是**串行**跑的，段数一多就是"点完盯着不动好几分钟"。
+             * 老后端没有 optimize_multi_stream 时静默退回整包（功能不丢，只是没进度）。 */
+            const res = await optCallStream({
                 config: st,
                 media: mm.media,
                 task,
@@ -9990,7 +10021,11 @@ function openMasterPromptModal() {
                     seconds: t.seconds,
                     task,
                 })),
+            }, `总提示词框 · 优化 ${targets.length} 段`, { btn: btnOpt }, {
+                stream: "optimizeMultiStream", fallback: "optimizeMulti",
+                busy: { thinking: "优化中…", writing: "优化中…" },
             });
+            if (res.body?.cancelled) return;      // 用户主动取消：不弹错
             if (res.status >= 400 || res.body?.error) {
                 err.textContent = window.H3Api.errText(res, "多段优化失败");
                 return;

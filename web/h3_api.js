@@ -204,6 +204,10 @@
       _postStream("/h3chain/expand_optimize_stream", payload, onEvent, opts),
     /* 多段提示词优化（格式编译器）：N 段剧本 -> N 段 H3 官方格式 + 逐段校验 */
     optimizeMulti: (payload) => _json("POST", "/h3chain/optimize_multi", payload),
+    /* 同上，**流式版**：N 段串行跑，进度帧多带 seg / seg_no / total
+     * （前端据此画「第 i/N 段」的整条进度）。 */
+    optimizeMultiStream: (payload, onEvent, opts) =>
+      _postStream("/h3chain/optimize_multi_stream", payload, onEvent, opts),
     /* ---- 素材库（Library）：一个浏览器 + 四个 scope ---- */
     libList: (p) => _call("/h3chain/lib_list?" + _qs(p)),
     libItem: (p) => _call("/h3chain/lib_item?" + _qs(p)),

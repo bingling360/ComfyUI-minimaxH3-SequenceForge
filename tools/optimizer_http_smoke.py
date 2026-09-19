@@ -218,12 +218,19 @@ async def _run(args) -> int:
             print("\n[2] SSE 流式路由（不花钱：故意指向死地址，验帧格式与错误路径）")
             dead = _frontend_config({"api_url": "http://127.0.0.1:1/v1", "timeout": 5,
                                      "max_tokens": 512})
-            for route in ("/h3chain/optimize_stream", "/h3chain/expand_optimize_stream"):
+            for route in ("/h3chain/optimize_stream", "/h3chain/expand_optimize_stream",
+                          "/h3chain/optimize_multi_stream"):
                 for path in (route, "/api" + route):
+                    payload = {"prompt": "测试", "task": "REF2VA", "duration": 5,
+                               "config": dead, "media": []}
+                    if route.endswith("optimize_multi_stream"):
+                        # 多段那条吃的是 segments：不带的话会先在**参数校验**上失败，
+                        # 那就验不到"连不上 LLM"这条错误路径了（末帧同样是 error，
+                        # 但 message 不一样，等于这条断言变成假阳性）。
+                        payload["segments"] = [{"prompt": "测试", "seconds": 5,
+                                                "task": "REF2VA"}]
                     t0 = time.time()
-                    async with sess.post(base + path, json={
-                            "prompt": "测试", "task": "REF2VA", "duration": 5,
-                            "config": dead, "media": []}) as r:
+                    async with sess.post(base + path, json=payload) as r:
                         ctype = r.headers.get("Content-Type", "")
                         events, _fp = await _read_sse(r)
                     kinds = [e.get("type") for e in events]
@@ -337,6 +344,47 @@ async def _run(args) -> int:
                     check(len(txt) > 200, "%s 成品长度 %d" % (path, len(txt)))
                     print("        %.1fs  首帧 %.1fs  %d 进度帧  阶段=%s  %d 字"
                           % (dt, first or -1, len(prog), stages, len(txt)))
+
+                print("\n[6] 真实流式「多段优化」（POST optimize_multi_stream，验「第 i/N 段」）")
+                mbody = {
+                    "config": _frontend_config({"model": args.stream_model,
+                                                "thinking": "disabled",
+                                                "max_tokens": 16384,
+                                                "read_media": bool(media)}),
+                    "task": args.task, "media": media,
+                    "segments": [
+                        {"prompt": "少女在石柱廊里回头看向镜头。",
+                         "seconds": 5, "task": args.task},
+                        {"prompt": "她肩上的微缩自己抬手挥了挥。",
+                         "seconds": 5, "task": args.task},
+                    ],
+                }
+                for path in ("/h3chain/optimize_multi_stream",
+                             "/api/h3chain/optimize_multi_stream"):
+                    t0 = time.time()
+                    async with sess.post(base + path, json=mbody) as r:
+                        events, first = await _read_sse(r)
+                    dt = time.time() - t0
+                    prog = [e for e in events if e.get("type") == "progress"]
+                    nos = []
+                    for e in prog:
+                        n = e.get("seg_no")
+                        if n and (not nos or nos[-1] != n):
+                            nos.append(n)
+                    last = events[-1] if events else {}
+                    check(r.status == 200 and last.get("type") == "done",
+                          "POST %s 以 done 收尾" % path,
+                          json.dumps(last, ensure_ascii=False)[:200])
+                    check(nos == [1, 2], "%s 段序号按 1→2 推进" % path, str(nos))
+                    check(bool(prog) and all(e.get("total") == 2 for e in prog),
+                          "%s total 恒为 2" % path,
+                          str(sorted({e.get("total") for e in prog})))
+                    check(first is not None and first < dt * 0.8,
+                          "%s 首帧进度早于结束（%.1fs / 共 %.1fs）" % (path, first or -1, dt))
+                    segs = last.get("segments") or []
+                    check(len(segs) == 2, "%s 回传 2 段结果" % path, str(len(segs)))
+                    print("        %.1fs  首帧 %.1fs  %d 进度帧  段=%s  %d 段结果"
+                          % (dt, first or -1, len(prog), nos, len(segs)))
             else:
                 print("     跳过（未给 --stream）")
     finally:

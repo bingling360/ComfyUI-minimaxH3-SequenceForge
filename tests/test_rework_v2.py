@@ -446,12 +446,15 @@ def test_v2_group_form_wired():
     assert "function setPromptV2Field(node, idx, mutate" in d
     assert "function debouncePromptV2Write" in d
     assert "function getSegPromptV2" in d
-    # 三组中文标题齐全（**官方字段名**口径）：
-    # 画面设定与分镜合进「整体描述」一组 —— 它们编译出去是同一个官方字段，
-    # 分成两组看着像官方有两个字段（这正是"结构化对不上官方格式"的来源）。
+    # 各组标题**必须写官方字段名**（用户明说"一定要符合 h3 官方提示词 skill 的格式"）：
+    # 六段式 ①subject_definitions ②summary ③retention_analysis ④detailed_description
+    # ⑤overall_soundscape ⑥non_diegetic_music；三段式 ④=integrated_multimodal_description。
+    # 画面设定已并进 ④ 一组（它们编译出去是同一个官方字段，分成两组看着像官方有两个）。
     # 源码覆盖已迁出到主框结果区。
-    for g in ["整体描述 ×", "声音 · overall_soundscape",
-              "参考 · 主体定义 / 总结 / 保留分析"]:
+    for g in ["subject_definitions", "summary", "retention_analysis",
+              "detailed_description", "integrated_multimodal_description",
+              "overall_soundscape", "non_diegetic_music"]:
+        assert g in d, f"结构化组标题缺官方字段名 {g}"
         assert g in d, g
     assert "高级 · 源码覆盖" not in d, "源码覆盖应已移除"
     assert "源码覆盖 · 直接改写最终结果" not in d, "源码覆盖应已彻底移除"
@@ -474,11 +477,16 @@ def test_v2_group_form_wired():
     assert "const _v2Open = new Map();" in d, "缺 details 开合记忆"
     assert 'function v2Details(key, cls, summaryHtml, defOpen)' in d, "缺 v2Details 工厂"
     assert '_v2Open.set(key, g.open)' in d, "toggle 未记录开合"
-    # 「画面」不再单独成组（pic${segIdx}）：已并进「整体描述」组，见上面标题断言
-    for k in ["v2${segIdx}", "shot${segIdx}", "snd${segIdx}", "ref${segIdx}",
+    # 组 key：官方六段的前三段拆成 sub/sum/ret 三组（不再塞在一个 ref 里），
+    # 素材调度单独成组（它不是官方字段）；「画面」组（pic）已并入整体描述组。
+    for k in ["v2${segIdx}", "shot${segIdx}", "snd${segIdx}", "sub${segIdx}",
+              "sum${segIdx}", "ret${segIdx}", "sched${segIdx}",
               "more${segIdx}_${si}"]:
         assert k in d, k
     assert "pic${segIdx}" not in d, "画面组应已并入整体描述组"
+    assert "ref${segIdx}" not in d, "旧的「参考」大组应已拆成官方前三段"
+    # 挂载顺序 = 官方字段顺序（在函数末尾统一 append，不是想到哪挂到哪）
+    assert "vbody.append(gSub, gSum, gRet, gShot, gSnd, gSched);" in d
     # 重建只在会丢东西时才问（否则 confirm 抢焦点导致输入框卡住）
     assert "hasNote" in d and "按当前素材调度重建引用列表" in d, "重建应改为条件确认"
     # 模式必须按本段数据自动判定，不能写死

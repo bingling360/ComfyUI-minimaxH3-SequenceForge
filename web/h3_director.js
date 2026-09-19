@@ -6489,6 +6489,14 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         const effMode = effV2Mode(data.ds, segIdx);
         const isManual = V2_MODES.includes(seg.v2mode);
         const isRef = effMode === "Ref2VA";
+        /* 官方字段序号（钉在组标题上）：六段式 1..6，三段式只有 1..3。
+         * 让"这一段是官方第几个字段"一眼可见 —— 官方格式是**有序**的，
+         * 面板顺序和它不一致时，用户照面板填就会编译出官方不认的顺序。 */
+        const _ORD = "①②③④⑤⑥";
+        const ordNo = isRef
+            ? { sub: 1, sum: 2, ret: 3, desc: 4, snd: 5, mus: 6 }
+            : { desc: 1, snd: 2, mus: 3 };
+        const ord = (k) => (ordNo[k] ? _ORD[ordNo[k] - 1] + " " : "");
         const det = v2Details(`v2${segIdx}`,
             "h3d-seg-panel h3d-v2panel" + (hasV2 ? " has-content" : ""),
             `结构化 · ${escapeHtml(V2_MODE_ZH[effMode] || effMode)}`
@@ -6630,7 +6638,8 @@ function renderPromptV2Panel(body, node, data, segIdx) {
          * （画面设定拼在首镜开头）。以前分成「画面」「镜头」两组，看着像官方有
          * 两个字段，其实官方只有一个 —— 这正是"结构化字段对不上官方格式"的来源。 */
         const gShot = v2Details(`shot${segIdx}`, "h3d-v2group",
-            `整体描述 ×${(pv0.shots || []).length} · ${isRef ? "detailed_description（详细描述）" : "integrated_multimodal_description（整体描述）"}`,
+            `${ord("desc")}${isRef ? "详细描述 · detailed_description" : "整体描述 · integrated_multimodal_description"}`
+            + ` ×${(pv0.shots || []).length}（画面设定＋分镜）`,
             hasV2);
         const gShotBody = el("div", "h3d-v2grid");
         /* 画面设定：整段共用的风格/构图/环境/光照/角色/道具，编译拼进首镜开头 */
@@ -6829,11 +6838,12 @@ function renderPromptV2Panel(body, node, data, segIdx) {
         };
         gShotBody.append(addShot);
         gShot.append(gShotBody);
-        vbody.append(gShot);
+        /* 不在这里 append：顺序统一在函数末尾按官方字段顺序排（见文末 vbody.append） */
 
         // —— 声音组 ——
         const gSnd = v2Details(`snd${segIdx}`, "h3d-v2group",
-            "声音 · overall_soundscape / non_diegetic_music（无配乐写 N/A；剧中音乐写进各镜头）",
+            `${ord("snd")}环境音 · overall_soundscape ／ ${ord("mus")}背景配乐 · non_diegetic_music`
+            + "（无配乐写 N/A；剧中音乐写进各镜头）",
             false);
         const gSndBody = el("div", "h3d-v2grid");
         for (const [k, zh, ph] of [["soundscape", "环境音", "环境＋动作音（对白禁入此）"], ["non_diegetic_music", "背景配乐", "角色听不到的配乐，无则 N/A"]]) {
@@ -6848,17 +6858,17 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 }));
         }
         gSnd.append(gSndBody);
-        vbody.append(gSnd);
 
-        // —— 参考组（常驻：官方六段式之 subject_definitions / summary / retention_analysis ＋ 素材调度）——
-        /* 以前这里 `if (isRef)` 才挂载，而 isRef 又要求 references/subjects 非空，
+        /* 官方六段式前三段：主体定义 / 总结 / 保留分析 —— **常驻**挂载，
+         * 以前这里 `if (isRef)` 才挂载，而 isRef 又要求 references/subjects 非空，
          * 条目却只能在本组里加 —— 死锁：没有上传渠道就永远进不了多参。
          * 常驻之后靠数据驱动：本组有条目 → 六段式（多参），清空 → 三段式（文/首尾帧）。 */
-        const gRef = v2Details(`ref${segIdx}`, "h3d-v2group",
-            "参考 · 主体定义 / 总结 / 保留分析 ＋ 素材调度"
-            + "（有条目 → 多参六段式；清空 → 文/首尾帧三段式）", isRef);
-        const gRefBody = el("div", "h3d-v2grid");
-        gRefBody.append(mkLabel(`主体定义 ×${(pv0.subjects || []).length}（<Subject N>）`));
+        const gSub = v2Details(`sub${segIdx}`, "h3d-v2group",
+            `${ord("sub")}主体定义 · subject_definitions（<Subject N> ＋ 素材引用）`
+            + (isRef ? "" : " · 三段式无此段：本段有参考条目时才参与编译"),
+            isRef);
+        const gSubBody = el("div", "h3d-v2grid");
+        gSubBody.append(mkLabel(`主体定义 ×${(pv0.subjects || []).length}（<Subject N>）`));
         (pv0.subjects || []).forEach((st, ti) => {
             const row = el("div", "h3d-v2row");
             row.append(mkTa(st.definition || "", "主体定义，如 <Subject 1> is the young woman in <Picture 1>, ...", (v) => {
@@ -6871,7 +6881,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 scheduleRefresh(60);
             };
             row.append(rm);
-            gRefBody.append(row);
+            gSubBody.append(row);
         });
         const addSub = el("button", "h3d-btn", "＋ 主体");
         addSub.style.cssText = "padding:3px 8px;font-size:11px;justify-self:start";
@@ -6879,16 +6889,16 @@ function renderPromptV2Panel(body, node, data, segIdx) {
             setPromptV2Field(node, segIdx, (pv) => { (pv.subjects = pv.subjects || []).push({ definition: "" }); });
             scheduleRefresh(60);
         };
-        gRefBody.append(addSub);
+        gSubBody.append(addSub);
         /* 素材引用：由「分段素材调度」的勾选自动生成（按 kind 分别编号
          * <Picture/Video/Audio k>，与后端 by_alias 同口径），不再手填标签。
          * note 仍可写，存在 pv.references 里按 label 匹配。 */
         {
             const want = v2RefsFromSchedule(data.ds, segIdx);
             const stored = Array.isArray(pv0.references) ? pv0.references : [];
-            gRefBody.append(mkLabel(`素材引用 ×${want.length}（按素材调度自动生成）`));
+            gSubBody.append(mkLabel(`素材引用 ×${want.length}（按素材调度自动生成）`));
             if (!want.length) {
-                gRefBody.append(el("div", "h3d-secs-hint",
+                gSubBody.append(el("div", "h3d-secs-hint",
                     "未调度素材：在下方「分段素材调度」勾选后自动生成，无需手填标签"));
             }
             for (const w of want) {
@@ -6904,7 +6914,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                         else list.push({ label: w.label, note });
                     });
                 }));
-                gRefBody.append(row);
+                gSubBody.append(row);
             }
             const rebuild = el("button", "h3d-btn", "↻ 按素材调度重建");
             rebuild.style.cssText = "padding:3px 8px;font-size:11px;justify-self:start";
@@ -6918,20 +6928,31 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 setPromptV2Field(node, segIdx, (pv) => {
                     pv.references = want.map((w) => ({ label: w.label, note: "" }));
                 });
-                _v2Open.set(`ref${segIdx}`, true);
+                _v2Open.set(`sub${segIdx}`, true);
                 scheduleRefresh(80);
             };
-            gRefBody.append(rebuild);
+            gSubBody.append(rebuild);
         }
+        gSub.append(gSubBody);
+        vbody.append(gSub);
+
         /* 分段素材调度：本段实际喂 conditioning 的资产集合（单段上限 图9/视3/音3）。
          * 缺省（全空）= 只用提示词文本 @标签 出现的；与上方参考条目是两回事：
-         * 上方管官方六段式文本，下面管本段 conditioning 调度。 */
+         * 上方管官方六段式文本，这里管本段 conditioning 调度。
+         * **它不是官方字段** —— 官方六段式里没有"本段挂哪些图"这一项，
+         * 那是产品侧的调度。单独成组并点明，免得被当成官方格式的一部分。 */
+        const gSched = v2Details(`sched${segIdx}`, "h3d-v2group",
+            "素材调度 · 本段 conditioning（非官方字段：官方六段式里没有这一项）",
+            false);
+        const gSchedBody = el("div", "h3d-v2grid");
+        gSchedBody.append(el("div", "h3d-secs-hint",
+            "勾了才真的送图进 conditioning；官方文本里的 <Picture N> 编号按这里的勾选顺序算"));
         {
             const pool2 = (data.ds.ref_assets || []);
             const seg2 = (data.ds.segments || [])[segIdx] || defaultSegment();
-            gRefBody.append(mkLabel("分段素材调度（本段 conditioning，单段上限）"));
+            gSchedBody.append(mkLabel("本段要送的素材（单段上限 图9/视3/音3）"));
             if (!pool2.length) {
-                gRefBody.append(el("div", "h3d-empty", "资产库为空：去三库资产页上传入库"));
+                gSchedBody.append(el("div", "h3d-empty", "资产库为空：去三库资产页上传入库"));
             } else {
                 const sched = el("div", "h3d-refrow");
                 const picked = { image: 0, video: 0, audio: 0 };
@@ -6969,11 +6990,19 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     sched.insertAdjacentHTML("beforeend",
                         '<span class="h3d-secs-hint">未调度=只用文本@标签</span>');
                 }
-                gRefBody.append(sched);
+                gSchedBody.append(sched);
             }
         }
-        gRefBody.append(mkLabel("总结 · 任务类型（六选，可多选，＋ 连接）"));
-        gRefBody.append(mkInp(zhTasks(pv0.task_types), "或手动输入、顿号分隔", (v) => {
+        gSched.append(gSchedBody);
+        vbody.append(gSched);
+
+        // —— ② 总结 · summary ——
+        const gSum = v2Details(`sum${segIdx}`, "h3d-v2group",
+            `${ord("sum")}总结 · summary（任务类型＋正文；空 = 自动生成）`
+            + (isRef ? "" : " · 三段式无此段"), isRef);
+        const gSumBody = el("div", "h3d-v2grid");
+        gSumBody.append(mkLabel("任务类型（可多选，＋ 连接）"));
+        gSumBody.append(mkInp(zhTasks(pv0.task_types), "或手动输入、顿号分隔", (v) => {
             setPromptV2Field(node, segIdx, (pv) => { pv.task_types = enTasks(v); });
         }));
         {
@@ -6995,14 +7024,22 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 };
                 qrow.append(qb);
             }
-            gRefBody.append(qrow);
+            gSumBody.append(qrow);
         }
-        gRefBody.append(mkLabel("总结 · 正文（空=自动生成）"));
-        gRefBody.append(mkTa(pv0.summary_override || "", "覆写总结全文", (v) => debouncePromptV2Write(node, segIdx, "summary_override", v), (v) => {
+        gSumBody.append(mkLabel("总结正文（空 = 自动生成）"));
+        gSumBody.append(mkTa(pv0.summary_override || "", "覆写总结全文", (v) => debouncePromptV2Write(node, segIdx, "summary_override", v), (v) => {
             setPromptV2Field(node, segIdx, (pv) => { pv.summary_override = v; });
             scheduleRefresh(200);
         }));
-        gRefBody.append(mkLabel(`保留分析 ×${(pv0.retention || []).length}（标签 / 关系 / 镜头 / 备注）`));
+        gSum.append(gSumBody);
+        vbody.append(gSum);
+
+        // —— ③ 保留分析 · retention_analysis ——
+        const gRet = v2Details(`ret${segIdx}`, "h3d-v2group",
+            `${ord("ret")}保留分析 · retention_analysis`
+            + (isRef ? "" : " · 三段式无此段"), isRef);
+        const gRetBody = el("div", "h3d-v2grid");
+        gRetBody.append(mkLabel(`条目 ×${(pv0.retention || []).length}（标签 / 关系 / 镜头 / 备注）`));
         const MARKERS = HP.RETENTION_MARKERS || ["fully_preserved"];
         (pv0.retention || []).forEach((rt, rti) => {
             const row = el("div", "h3d-v2row");
@@ -7033,17 +7070,17 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 scheduleRefresh(60);
             };
             row.append(rm);
-            gRefBody.append(row);
-            gRefBody.append(mkInp((rt.shots || []).join(", "), "镜头，如 1,2（空=全镜）", (v) => {
+            gRetBody.append(row);
+            gRetBody.append(mkInp((rt.shots || []).join(", "), "镜头，如 1,2（空=全镜）", (v) => {
                 setPromptV2Field(node, segIdx, (pv) => {
                     pv.retention[rti].shots = String(v).split(/[,，、;；\s]+/).map((x) => x.trim()).filter(Boolean).slice(0, 16);
                 });
             }));
-            gRefBody.append(mkInp(rt.note || "", "备注", (v) => {
+            gRetBody.append(mkInp(rt.note || "", "备注", (v) => {
                 setPromptV2Field(node, segIdx, (pv) => { pv.retention[rti].note = String(v).slice(0, 300); });
             }));
         });
-        const addRet = el("button", "h3d-btn", "＋ 保留分析");
+        const addRet = el("button", "h3d-btn", "＋ 保留分析条目");
         addRet.style.cssText = "padding:3px 8px;font-size:11px;justify-self:start";
         addRet.onclick = () => {
             setPromptV2Field(node, segIdx, (pv) => {
@@ -7051,9 +7088,15 @@ function renderPromptV2Panel(body, node, data, segIdx) {
             });
             scheduleRefresh(60);
         };
-        gRefBody.append(addRet);
-        gRef.append(gRefBody);
-        vbody.append(gRef);
+        gRetBody.append(addRet);
+        gRet.append(gRetBody);
+
+        /* 按**官方字段顺序**挂载（不是"想到哪挂到哪"）：
+         *   六段式 ①主体定义 ②总结 ③保留分析 ④详细描述 ⑤环境音 ⑥背景配乐
+         *   三段式 ①整体描述 ②环境音 ③背景配乐（前三组留着不参与编译，
+         *   但也**不能**只在六段式时才挂 —— 条目只能在这几组里加，条件挂载会死锁）。
+         * 「素材调度」不是官方字段，放最后并标出来。 */
+        vbody.append(gSub, gSum, gRet, gShot, gSnd, gSched);
 
         /* 高级组已移除：源码覆盖（override_text）不是"浏览"也不是"微调"，
          * 它是直接改写最终结果，归入主框的「结果浏览框」里作为直接编辑入口。 */

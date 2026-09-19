@@ -9440,11 +9440,74 @@ function _tsToSec(ts) {
     return Number(m[1]) * 60 + Number(m[2]) + Number(`0.${m[3]}`);
 }
 
+/* 官方标签形态：<Subject N> / <Picture N> / <Video N> / <Audio N> */
+const _H3_TAG_RE = /^<Subject\s+(\d+)>|<(Picture|Video|Audio)\s+(\d+)>/;
+
+/** 官方 `subject_definitions` → {subjects, references}（反向解析）。
+ *
+ * 编译（后端 compose_reference）每行一条：
+ *   `<Subject 1>: 定义`      → subjects[i].definition
+ *   `<Picture 1>: 说明`      → references[i].note
+ * 反向解析要同时认**换行**和**分号**：官方案例里常一条写到底、用「；」分隔，
+ * 只按换行切的话整段会被当成一个条目（参考素材"转换不出来"就是这么来的）。
+ */
+function parseSubjectDefs(text) {
+    const subs = [], refs = [];
+    const flat = String(text || "").replace(/[；;]\s*/g, "\n");
+    for (const raw of flat.split("\n")) {
+        const line = String(raw || "").trim();
+        if (!line) continue;
+        /* 冒号**可选**：后端编译写 `<Subject 1>: 定义`（有冒号），
+         * 而官方 ref-en 的案例写 `<Subject 1> 撑伞的女孩：二十岁上下`（无冒号，
+         * 冒号出现在描述内部）。只认带冒号的写法会把官方原文整段丢掉。 */
+        const m = /^(<Subject\s+\d+>|<(?:Picture|Video|Audio)\s+\d+>)\s*[:：]?\s*([\s\S]*)$/.exec(line);
+        if (!m) continue;                      // 不是标签行（可能是续行/杂文），跳过
+        const label = m[1], body = String(m[2] || "").trim();
+        if (/^<Subject/i.test(label)) subs.push({ definition: body });
+        else refs.push({ label, note: body });
+    }
+    return { subs, refs };
+}
+
+/** 官方 `retention_analysis` → retention 条目（反向解析）。
+ *
+ * 每行 `{label}: {marker}` 或 `{label}: {marker}, {note}`。
+ * marker 必须在官方词表内（瞎写的值编译期会被兜底成 fully_preserved，
+ * 不校验的话「解析 → 编译」会对不上）。
+ *
+ * 要**跳过编译期自动补的占位行**（note 固定为 `layout and mood kept`）：
+ * 那是给"没写保留度的参考"兜的，回写进结构后再编译就会再补一条，
+ * 每跑一轮「结构 ⇄ 文本」多一批条目。 */
+const _AUTO_RETENTION_NOTE = "layout and mood kept";
+function parseRetention(text) {
+    const valid = ((window.H3Prompts || {}).RETENTION_MARKERS) || [
+        "fully_preserved", "partially_preserved", "attribute_transfer",
+        "weak_reference", "fully_copy", "partially_copy", "reference"];
+    const out = [];
+    for (const raw of String(text || "").split("\n")) {
+        const line = String(raw || "").trim();
+        if (!line) continue;
+        /* note 分隔符官方用 `-`（`<Picture 1>: fully_copy - 场景光照沿用`），
+         * 后端编译用 `,`。两种都要认，只认逗号的话官方原文的 note 全丢。 */
+        const m = /^(<Subject\s+\d+>|<(?:Picture|Video|Audio)\s+\d+>)\s*[:：]\s*([A-Za-z_]+)\s*(?:[,，\-–—]\s*([\s\S]*))?$/.exec(line);
+        if (!m) continue;
+        const marker = String(m[2] || "").trim();
+        if (!valid.includes(marker)) continue;
+        const note = String(m[3] || "").trim();
+        if (note === _AUTO_RETENTION_NOTE) continue;      // 编译兜底行，不回写
+        out.push({ label: m[1], marker, note });
+    }
+    return out;
+}
+
 /** 把官方格式正文回填到段的 prompt_v2：主字段拆成 shots，环境音/配乐直写。 */
 function applyH3TextToSeg(node, segIdx, h3Text) {
     const secs = splitH3Sections(h3Text);
     const main = secs.integrated_multimodal_description || secs.detailed_description || "";
-    if (!main && !secs.overall_soundscape && !secs.non_diegetic_music) return false;
+    /* 参考/主体/保留度也要算"有内容"：只贴了 subject_definitions 的官方文本
+     * （外部 agent 常这么给）以前会被判成空、整段不回填。 */
+    const hasRefSecs = !!(secs.subject_definitions || secs.summary || secs.retention_analysis);
+    if (!main && !secs.overall_soundscape && !secs.non_diegetic_music && !hasRefSecs) return false;
     setPromptV2Field(node, segIdx, (pv) => {
         if (main) {
             /* [Shot N] 开头的块切成多镜；无标记则整段作为单镜。
@@ -9466,6 +9529,21 @@ function applyH3TextToSeg(node, segIdx, h3Text) {
         }
         if (secs.overall_soundscape) pv.soundscape = secs.overall_soundscape;
         if (secs.non_diegetic_music) pv.non_diegetic_music = secs.non_diegetic_music;
+        /* 六段式里那三段此前**完全没解析**：贴进来的官方文本只有 shots/环境音/配乐
+         * 落到结构里，主体定义、总结、保留度整段丢失 ——
+         * 表现就是"参考素材转不过去"（references 一直是空的，编译也就出不图）。 */
+        if (secs.subject_definitions) {
+            const sd = parseSubjectDefs(secs.subject_definitions);
+            if (sd.subs.length) pv.subjects = sd.subs;
+            if (sd.refs.length) pv.references = sd.refs;
+        }
+        if (secs.summary) pv.summary_override = String(secs.summary).trim();
+        if (secs.retention_analysis) {
+            const ret = parseRetention(secs.retention_analysis);
+            /* 只在**解析出东西**或原文那段本来就是空时覆盖：空结果不抹掉已有保留度，
+             * 免得"切一次视图把用户填的保留度清了"。 */
+            if (ret.length || !String(secs.retention_analysis || "").trim()) pv.retention = ret;
+        }
     });
     return true;
 }

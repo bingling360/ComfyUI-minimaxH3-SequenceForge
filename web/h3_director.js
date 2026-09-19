@@ -556,6 +556,9 @@ function refInfoMapOf(pool) {
             file: String(a.file || ""),
             asset_id: String(a.asset_id || ""),
             mark: String(a.mark || ""),
+            /* 规范化名字：正文里该写成什么。解析按钮靠它把别名/标注统一成全名，
+             * 否则"从外面复制来的提示词"里三种写法混着，每次解析结果都不一样。 */
+            ref_name: String(a.ref_name || lb || "").trim(),
         };
         if (a.ref_name) m[String(a.ref_name).trim()] = info;
         if (lb) m[lb] = info;
@@ -984,6 +987,7 @@ function createPromptEditor(opts) {
         removeOneTag,
         tagCount,
         normalizeLoose,
+        resolveRefs,
         setLabels(fn) { o.labels = fn; },
         setAssets(fn) { o.assets = fn; },
         setDir(fn) { o.dir = fn; },
@@ -1028,8 +1032,51 @@ function createPromptEditor(opts) {
         e.preventDefault();
         api.insertText(t);
     });
-    /* 失焦时规范化：手打的 @别名 也变成绿框 */
-    box.addEventListener("blur", () => { render(api.value); });
+    /* 解析（手动按钮用）：把正文里的素材名**统一成池内全名**再成框。
+     *
+     * 与 normalizeLoose 的区别：那个只"补框"（文本不变），这个还会把别名/标注
+     * 规范化成全名 —— 从外面复制来的提示词里 `@猫` `@猫.png` `@图片1` 三种写法
+     * 常常混着，不统一的话每次解析出的引用都不一样，正文也永远稳定不下来。
+     *
+     * 同时收集**认不出的 @名字**返回给调用方提示 —— 复制来的文本里最常见的就是
+     * 素材名对不上（改名过 / 没入库），不提示的话用户只会觉得"解析了没反应"。
+     * 返回 {changed, hits, unknown, missing}。 */
+    function resolveRefs() {
+        const text = api.value;
+        const labs = [...labelsOf()].sort((a, b) => b.length - a.length);
+        const toks = refTokens(text);
+        const info = infoOf();
+        let out = "", hits = 0;
+        for (const t of toks) {
+            if (t.text != null) { out += t.text; continue; }
+            /* 官方标签 <Picture N> 原样保留：它是官方格式的一部分，不是导演台语法 */
+            if (t.token) { out += t.token; continue; }
+            const canon = String((info[t.label] || {}).ref_name || t.label || "").trim();
+            out += "@" + (canon || t.label);
+            hits += 1;
+        }
+        /* 认不出的 `@xxx`：逐个挑出来（refTokens 只在开了 token 可视化的框里标红，
+         * 这里必须独立扫一遍，否则普通提示词框里的悬空引用毫无提示）。 */
+        const unknown = [];
+        const re = /@([^\s@，。；：、,.;:!?（）()\[\]【】<>"'`|]{1,80})/g;
+        for (let m = re.exec(text); m; m = re.exec(text)) {
+            const nm = String(m[1] || "");
+            if (!nm || /^[0-9A-Za-z_]{1,3}$/.test(nm)) continue;   // @2x 之类不是素材名
+            if (labs.some((l) => nm === l || nm.startsWith(l))) continue;
+            if (!unknown.includes(nm)) unknown.push(nm);
+        }
+        const changed = out !== text;
+        if (changed) api.value = out; else render(text);
+        return { changed, hits, unknown };
+    }
+
+    /* 失焦/打字停顿后**自动**成框：默认**关闭**。
+     * 自动改 DOM 会在打字时打断中文输入法组合，也会让人觉得"我打的字被改了"。
+     * 现在的分工是：初始渲染照常把已有引用显示成绿框（看得见），
+     * 手打的名字不再自动变，要点提示词框上的「解析」按钮（resolveRefs）。 */
+    if (o.autoNormalize) {
+        box.addEventListener("blur", () => { render(api.value); });
+    }
 
     /* 打字停顿后自动成框：手打 @别名 也会变成绿框（700ms 防抖 + IME 保护，
      * 只在"确实还有没成框的 @别名"时才动 DOM，避免打断中文输入法组合）。
@@ -1064,6 +1111,7 @@ function createPromptEditor(opts) {
     }
     box.addEventListener("input", (e) => {
         if (e && e.h3synthetic) return;
+        if (!o.autoNormalize) return;      // 手动模式：打字不自动补框（见 resolveRefs）
         clearTimeout(normTimer);
         normTimer = setTimeout(normalizeLoose, 700);
     });
@@ -7377,7 +7425,45 @@ function buildCards(data) {
             bOptRun.title = "只做格式规范化：把框里的内容按 H3 官方格式重写，不改你的意思";
             bOptRun.disabled = !canEdit;
             bOptRun.onclick = () => runOptForSegment(node, it.idx, ta, { btn: bOptRun });
-            aiBar.append(bExpandOpt, bOptRun);
+            /* 「解析引用」：把正文里的素材名对应到素材库 —— 别名/标注统一写成
+             * 完整文件名（含后缀），并渲染成绿框。
+             * **只在这里手动触发**：打字和失焦都不再自动改文本（自动改会打断
+             * 中文输入法组合，也会让人觉得"我打的字被改了"）。
+             * 典型用法是从别处复制一大段提示词粘进来，点它一次把引用认全。 */
+            const bResolve = el("button", "h3d-btn", "🔗 解析引用");
+            bResolve.type = "button";
+            bResolve.title = "把正文里的素材名对应到素材库：别名 / 标注统一写成完整文件名"
+                + "（含后缀），认不出来的名字会点名提示。\n"
+                + "从别处复制来的提示词粘进来后点它一次即可。";
+            bResolve.disabled = !canEdit;
+            bResolve.onclick = () => {
+                if (!ta.resolveRefs) { setLed("idle", "本框不支持解析"); return; }
+                let r = null;
+                try {
+                    r = ta.resolveRefs();
+                } catch (e) {
+                    setLed("err", `解析失败：${e && e.message ? e.message : e}`);
+                    return;
+                }
+                if (!r) { setLed("idle", "解析无结果"); return; }
+                if (r.unknown && r.unknown.length) {
+                    /* 认不出必须点名：静默跳过的话，用户只会看到"解析了没反应"，
+                     * 而出片时那张图根本不会挂上。 */
+                    setLed("warn", `${r.unknown.length} 个名字在素材库里找不到：`
+                        + r.unknown.slice(0, 6).join("、")
+                        + (r.unknown.length > 6 ? " …" : ""));
+                    alert("这些名字在素材库里对不上（不会挂上素材）：\n- "
+                        + r.unknown.join("\n- ")
+                        + "\n\n请核对素材名，或先把素材加进项目库。");
+                } else if (r.hits) {
+                    setLed("done", `已解析 ${r.hits} 处引用`
+                        + (r.changed ? "（名字已统一成完整文件名）" : ""));
+                } else {
+                    setLed("idle", "正文里没有 @引用");
+                }
+                scheduleRefresh(60);
+            };
+            aiBar.append(bExpandOpt, bOptRun, bResolve);
             pResult.body.append(aiBar);
             /* 工具条：原稿切换 / 结构化切换（paintOptbar 填）。
              * 挂在**两个视图之外**（paneMain 上，不在 pResult.body 里）——

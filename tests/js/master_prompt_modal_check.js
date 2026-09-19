@@ -45,10 +45,15 @@ if (!dialog) {
     process.exit(1);
 }
 
-/* 1. 只有一个输入框 */
-const boxes = dialog.querySelectorAll("textarea.h3d-mpbox");
+/* 1. 只有一个输入框
+ * 只按类名找，**别钉 textarea 标签**：总提示词框已从裸 textarea 换成与段卡
+ * 同一套富文本编辑器（div.h3d-rta，正文在 api.value 上，DOM 元素没有 .value）。 */
+const boxes = dialog.querySelectorAll(".h3d-mpbox");
 ok(boxes.length === 1, `输入框应为 1 个，实际 ${boxes.length} 个`);
-const ta = boxes[0];
+const taEl = boxes[0];
+/* 编辑器实例挂在元素上（box.__h3Editor），正文要从它读 */
+const ta = taEl.__h3Editor || taEl;
+ok(!!taEl.__h3Editor, "编辑器实例未挂到 DOM 元素上（拿不到正文）");
 
 /* 2. 打开即载入：出现两段，且不写旧标签 */
 ok(ta.value.indexOf("【段1】") >= 0, "载入后缺【段1】：" + JSON.stringify(ta.value));

@@ -1116,6 +1116,10 @@ function createPromptEditor(opts) {
         normTimer = setTimeout(normalizeLoose, 700);
     });
     api.value = String(o.value || "");
+    /* 把 api 挂回 DOM 元素：拿着元素（从 querySelector / 事件 target 来的）也能读到
+     * 正文 —— contenteditable 的 div 本身没有 `.value`，不挂的话外部只能去解析
+     * innerHTML（会被绿框的 span 污染）。测试与工具条按钮都靠这个反查。 */
+    box.__h3Editor = api;
     return api;
 }
 
@@ -9111,13 +9115,63 @@ function openMasterPromptModal() {
     btnUndo.classList.add("h3d-mpboxbtn");
     btnUndo.style.display = "none";
     btnUndo.title = "还原成点「AI分段提示词优化」之前的版本（误点可一键回来，不做确认弹窗）";
+    /* 解析引用（与段卡同一个动作、同一套规则）：从别处复制一大段提示词粘进来后，
+     * 点它一次把里面的素材名对应到素材库（别名/标注统一成完整文件名）。
+     * onclick 在 ta 建好后绑定（要用到编辑器实例）。 */
+    const btnResolve = el("button", "h3d-btn", "🔗 解析引用");
+    btnResolve.type = "button";
+    btnResolve.classList.add("h3d-mpboxbtn");
+    btnResolve.title = "把正文里的素材名对应到素材库：别名 / 标注统一写成完整文件名"
+        + "（含后缀），认不出来的名字会点名提示。\n"
+        + "从别处复制来的提示词粘进来后点它一次即可。";
     head.append(el("b", "", "提示词（最终进模型）"),
         el("small", "", "【段N】分段 · 段级标签只有 时长 / 独立镜头 / 参考"),
-        btnOpt, btnUndo);
-    const ta = document.createElement("textarea");
-    ta.className = "h3d-mpbox";
-    ta.spellcheck = false;
-    boxWrap.append(head, ta);
+        btnOpt, btnUndo, btnResolve);
+    /* 素材池（总提示词框用）：与段卡读同一处活状态，别用快照。 */
+    const mpPool = () => {
+        try { return getDs(node).ref_assets || []; } catch (e) { return []; }
+    };
+    /* 提示词框改用**与段卡同一套**编辑器（createPromptEditor）：引用名表、
+     * 绿框渲染、解析逻辑全部共用 —— 以前这里是裸 textarea，那正是
+     * "总提示词框里的素材引用根本认不出来、和分段两回事"的根因。
+     * 两者唯一该有的差异只剩 AI 优化的形式：这里按【段N】分段洗格式
+     * （见 mpRenderState / parseMasterPrompt），不再各有一套引用规则。 */
+    const ta = createPromptEditor({
+        value: "",
+        labels: () => refLabelsOf(mpPool()),
+        assets: () => refInfoMapOf(mpPool()),
+        /* 官方标签 <Picture N> 可视化打开：外部 agent / 官方格式的文本里是这种写法，
+         * 渲染出来才能一眼看出"Picture 几"指向哪张图（顺序挂错立刻可见）。 */
+        tokenMap: () => ({}),
+        dir: () => { try { return getDirValue(node); } catch (e) { return ""; } },
+        autoNormalize: false,
+    });
+    ta.el.classList.add("h3d-mpbox");
+    ta.el.spellcheck = false;
+    boxWrap.append(head, ta.el);
+    btnResolve.onclick = () => {
+        let r = null;
+        try {
+            r = ta.resolveRefs();
+        } catch (e) {
+            setLed("err", `解析失败：${e && e.message ? e.message : e}`);
+            return;
+        }
+        if (!r) { setLed("idle", "解析无结果"); return; }
+        if (r.unknown && r.unknown.length) {
+            setLed("warn", `${r.unknown.length} 个名字在素材库里找不到：`
+                + r.unknown.slice(0, 6).join("、")
+                + (r.unknown.length > 6 ? " …" : ""));
+            alert("这些名字在素材库里对不上（不会挂上素材）：\n- "
+                + r.unknown.join("\n- ")
+                + "\n\n请核对素材名，或先把素材加进项目库。");
+        } else if (r.hits) {
+            setLed("done", `已解析 ${r.hits} 处引用`
+                + (r.changed ? "（名字已统一成完整文件名）" : ""));
+        } else {
+            setLed("idle", "正文里没有 @引用");
+        }
+    };
     stack.append(boxWrap);
 
     const info = el("div", "h3d-mpinfo", "");

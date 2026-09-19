@@ -128,13 +128,14 @@ def validate_anchors(anchors, frame_count, label=""):
 # ---- 源归一化 ----
 
 # 无源可重编时的转档指引（kind -> 该去哪转档）。报错要给出路，不能只说"不行"。
+# P4g：画布「转码为 latent」入口（H3LatentExtract）与 H3LatentUpscale 已下线，
+# 指引不再指向不存在的按钮——latent 只能来自主节点自动存档或 latent_slice 切片。
 _REENCODE_HINT = {
-    "video": "把该视频放进项目 assets/ 后，用面板的「转码为 latent」抽成 latent 文件，"
-             "再改选 latent 库作源",
-    "image": "把该图片放进项目 assets/ 并打上素材标签，或先转成 latent 文件",
+    "video": "请确认该视频已放进项目 assets/ 且文件完好（可直接作源，会走先裁后编）",
+    "image": "请确认该图片已放进项目 assets/ 并打上素材标签（可直接作源，会走先裁后编）",
     "segment": "该段存档 latent 缺失或被删；重新生成该段，或改选别的源",
-    "library": "latent 文件缺失或不是本链分辨率；用 H3LatentUpscale 放大到本链尺寸，"
-               "或改用原始视频素材作源（会走先裁后编）",
+    "library": "latent 文件缺失或不是本链分辨率；请换用与本链同尺寸的 latent，"
+               "或改用原始视频/图片素材作源（会走先裁后编）",
     "prev_tail": "上段尚未生成；先跑完上段，或改用别的源",
 }
 

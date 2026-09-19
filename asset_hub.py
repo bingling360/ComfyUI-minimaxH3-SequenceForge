@@ -1,13 +1,15 @@
-"""H3 资产总闸（AssetHub）：单节点素材分发与早爆校验。
+"""H3 素材清单校验（AssetHub 纯函数层）：早爆校验与标签归一。
 
-M2 新增，与 H3SeamlessChainSampler 配套：
-- 输入：资产包 JSON（导演台资产库 [{label,kind,file}]，总量不限）
-- 输出： validated 规范包 JSON + 人读报告
+P4g：H3AssetHub / H3AssetBundle 两个画布节点均已删除（资产只走导演台状态
+ds.ref_assets，导演台前端 poolFromManifest 自拉 manifest）。本模块只剩纯函数，
+唯一生产调用方是 routes 的 POST /h3chain/asset_check：
+- 输入：素材清单 JSON（[{label,kind,file}]，总量不限）
+- 输出：validated 规范包 JSON + 人读报告
 - 职责：标签归一/去重、防穿越、input 目录存在性预检、单段上限不在此卡
   （执行期按段卡），缺文件/重标签在排队前就报错并点名，不等主节点跑一半才炸。
 
 尽量复用 ComfyUI 原生机制：文件仍走 input 目录 + get_annotated_filepath，
-与 LoadImage/LoadVideo/LoadAudio 同源；Hub 只做分发校验，不自建解码器。
+与 LoadImage/LoadVideo/LoadAudio 同源。
 无 torch 依赖，无 ComfyUI 也可单测纯函数。
 """
 
@@ -21,7 +23,7 @@ _LABEL_MAX = 24
 
 
 def normalize_pack(raw) -> tuple:
-    """资产包 -> (规范列表, warnings)。未知键剔除，label 去重（首个为准）。
+    """素材清单 -> (规范列表, warnings)。未知键剔除，label 去重（首个为准）。
 
     资产库总量不限：只做形态校验与去重，不截断；单段 9/3/3 上限由
     check_segment_refs（执行期按段）与主节点组装期按段卡。
@@ -32,9 +34,9 @@ def normalize_pack(raw) -> tuple:
         try:
             raw = json.loads(raw) if raw.strip() else []
         except ValueError:
-            return [], [{"code": "E_PACK_JSON", "message": "资产包不是合法 JSON"}]
+            return [], [{"code": "E_PACK_JSON", "message": "素材清单不是合法 JSON"}]
     if not isinstance(raw, list):
-        return [], [{"code": "E_PACK_TYPE", "message": "资产包须为数组 [{label,kind,file}]"}]
+        return [], [{"code": "E_PACK_TYPE", "message": "素材清单须为数组 [{label,kind,file}]"}]
     seen = set()
     for entry in raw:
         if not isinstance(entry, dict):
@@ -142,7 +144,7 @@ def check_segment_refs(items: list, refs: list, seg_no: int = 1) -> list:
 
 
 def validate_pack(raw, segments=None, project_root=None) -> dict:
-    """资产包 + 可选分段引用 -> {ok, items, errors, warnings}。"""
+    """素材清单 + 可选分段引用 -> {ok, items, errors, warnings}。"""
     items, warns = normalize_pack(raw)
     errors = check_files(items, project_root)
     if isinstance(segments, list):
@@ -165,6 +167,8 @@ def validate_pack(raw, segments=None, project_root=None) -> dict:
             "warnings": warns, "report": report}
 
 
-# P4d：H3AssetHub 节点类已删除（被 H3AssetBundle 取代；纯函数保留，
-# routes / bundle / 单测仍在用 normalize_pack / check_files / validate_pack）。
+# P4d：H3AssetHub 节点类已删除（被 H3AssetBundle 取代）；
+# P4g：H3AssetBundle 亦已下线（导演台自拉 manifest，画布单线无消费方）。
+# 纯函数保留：routes 的 /h3chain/asset_check 仍在用 validate_pack
+# （内部走 normalize_pack / check_files），单测同样直接调用三者。
 

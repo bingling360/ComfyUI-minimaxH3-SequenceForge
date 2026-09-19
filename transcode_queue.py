@@ -3,10 +3,11 @@
 定位：VAE 编码只能发生在 Comfy 队列执行内（VAE 实例由执行上下文提供），
 本模块不碰 VAE、不加载模型——只做三件事：
 
-1. 任务登记：前端“转 latent”按钮调 /h3chain/transcode_submit 随时提交，
-   不再手写 ds.transcode_jobs、不再教用户连 H3MediaToLatent 线；
-2. 进度/取消：执行侧（主节点 _execute_transcode_only / H3MediaToLatent 垫片）
-   claim -> begin -> progress -> complete/fail 推进；取消是协作式的，
+1. 任务登记：POST /h3chain/transcode_submit 可随时提交（前端目前未接入该入口，
+   转码能力保留在后端），不再手写 ds.transcode_jobs、不再教用户连已删除的
+   H3MediaToLatent 节点；
+2. 进度/取消：执行侧（主节点 _execute_transcode_only）claim -> begin ->
+   progress -> complete/fail 推进；取消是协作式的，
    running 任务置 cancel_requested，执行侧的 _interrupted 回调感知后抛中断；
 3. 证据对账：产物登记仍走 manifest.latents（run_transcode_job 内完成），
    前端凭 latents 证据判定 done，前凭 job 状态显示进度条。

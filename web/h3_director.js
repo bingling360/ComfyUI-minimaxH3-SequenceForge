@@ -6913,49 +6913,6 @@ async function openFramePicker(node, idx, key, name, done) {
 /* 旧三槽位迁移：first/end/last_frame → 入库打标；last_frame 另写各段 tail_src */
 /* 裁剪子面板：探针取帧率/总帧，入帧/出帧数字窗，确认后按帧换算秒执行 */
 /* latent 库：已登记 latent（切片/删除）+ 手工切片表单 */
-/* P4e：latent 行一键放大——驱动画布 H3LatentUpscale（临时模式切换，finally 还原）。
- * 只走神经 enlarge（×2 存回本库）；二次采样等高级参数去画布节点调。
- * 放大模型下拉为空时拒绝（不排队，避免空跑报错）。 */
-async function runUpscaleTool(node, dir, file, say) {
-    const g = app.graph;
-    const up = ((g && g._nodes) || []).find((n) => n.type === "H3LatentUpscale") || null;
-    const main = findNode();
-    if (!up) { say("画布上没有 H3LatentUpscale 节点（请载入配套工作流）"); return; }
-    if (!main) { say("画布上没有主节点"); return; }
-    const W = (name) => (up.widgets || []).find((w) => w.name === name);
-    const setW = (name, value) => {
-        const w = W(name);
-        if (!w) return false;
-        w.value = value;
-        if (typeof w.callback === "function") { try { w.callback(value); } catch (e) { /* 可选 */ } }
-        return true;
-    };
-    const modelW = W("放大模型");
-    if (!modelW || !String(modelW.value || "").trim()) {
-        say("请先在画布 H3LatentUpscale 节点选择放大模型（models/latent_upscale_models/）");
-        return;
-    }
-    const stem = String(file).split("/").pop().replace(/\.pt$/i, "") || "latent";
-    const outName = `${stem}_up2x.pt`;
-    setW("项目名", dir);
-    setW("源文件", file);
-    setW("保存名", outName);
-    const prevUp = up.mode, prevMain = main.mode;
-    try {
-        up.mode = 0;
-        main.mode = 2;
-        await app.queuePrompt();
-        say(`已提交放大（${file} → ${outName}），完成后在 latent 库查看；主节点已恢复。`);
-    } catch (e) {
-        say("提交放大失败：" + (e?.message || e));
-    } finally {
-        try { up.mode = prevUp; } catch (e) { /* 恢复 */ }
-        try { main.mode = prevMain; } catch (e) { /* 恢复 */ }
-        try { if (up.setDirtyCanvas) up.setDirtyCanvas(true, true); } catch (e) {}
-        try { if (main.setDirtyCanvas) main.setDirtyCanvas(true, true); } catch (e) {}
-    }
-}
-
 function mergeProjects(projects, state) {
     const map = new Map();
     for (const p of projects || []) {
@@ -10379,15 +10336,6 @@ function mountFallbackFab() {
 function removeFab() {
     if (fabEl) { fabEl.remove(); fabEl = null; }
 }
-
-/* 供「素材库」浏览器调用：latent 二采要驱动画布节点，逻辑留在导演台里。 */
-window.H3Director = {
-    upscaleLatent(dir, file, say) {
-        const node = findNode();
-        if (!node) return Promise.resolve();
-        return runUpscaleTool(node, dir, file, typeof say === "function" ? say : () => {});
-    },
-};
 
 app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",

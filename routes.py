@@ -334,10 +334,10 @@ def add_routes(routes):
         return web.json_response({"ok": True, "manifest": manifest})
 
     async def asset_check(request):
-        """资产包校验（不落盘）：缺文件/重标签/单段上限早爆，点名标签。
+        """素材清单校验（不落盘）：缺文件/重标签/单段上限早爆，点名标签。
 
         可选传 dir：给了就按项目解析 assets/finals/latent/texts/ 前缀（output 可用）；
-        不给则全部按 input 目录校验（画布 Hub 节点口径）。
+        不给则全部按 input 目录校验。
         """
         try:
             data = await request.json()

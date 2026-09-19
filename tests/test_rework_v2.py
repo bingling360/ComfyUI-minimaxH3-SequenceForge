@@ -232,7 +232,7 @@ def test_save_assets_revision(projects):
 
 def test_nodes_wiring():
     src = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
-    assert "资产包" in src and "总量不限" in src
+    assert "总量不限" in src
     assert "引用了未知素材标签" in src and "加载失败" in src
     # 总量不限：库再大也不逼每段显式勾选（缺省=文本[[标签]]驱动），只卡单段上限
     assert "该段图片没选" not in src and "素材库共" not in src

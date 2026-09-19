@@ -878,10 +878,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                tooltip="基础链（≈一采）分段视频与成片的 mp4 编码质量——二采关闭时直接决定正片清晰度："
                                        "标准=crf20 veryfast（现状兼容）；高清=crf16 medium + 暗部自适应量化 + Bayer 抖动；"
                                        "极致=crf13 slow + 同上（编码明显变慢）。二采开启时其高清产物同名覆盖，此档自动失效"),
-                io.String.Input("资产包", multiline=True, default="", advanced=True,
-                                tooltip="H3AssetBundle「资产包」输出连这里：单线分发，一次连好终身不动。"
-                                        "旧 H3AssetHub「规范包」同样兼容。非空时优先于「导演台状态」内 "
-                                        "ref_assets（总量不限，单段上限执行期按段卡）。空=走导演台状态/画布旧路径。"),
                 io.Image.Input("起始视频", optional=True,
                                tooltip="序章：上传视频（≥5 帧、24fps，超长只取前「每段时长」内）编码为第 1 段存入存档，"
                                        "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图同用"),
@@ -895,8 +891,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "t2v/i2v 用 fl2va、r2v 用 ref2va，别混接。"
                                        "换二采模型不会自动重做已有高清分段——要重做请设「重跑起始段」"),
                 # P4d：画布媒体/提示词入口已删除（首帧/尾帧/尾锚图片、提示词组 autogrow）——
-                # 素材与提示词只走资产包/Bundle/导演台状态。起始视频（序章）是唯一的画布
-                # 媒体入口（无导演台等价字段，保留）。旧工作流残留连线加载时自动忽略。
+                # P4g：连「资产包」输入也一并删除（H3AssetBundle 下线），素材与提示词只走导演台状态。
+                # 起始视频（序章）是唯一的画布媒体入口（无导演台等价字段，保留）。
+                # 旧工作流残留连线加载时自动忽略。
             ],
             outputs=[
                 io.Image.Output("图像"),
@@ -915,7 +912,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
-                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准", 资产包="",
+                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准",
                 二采模型=None):
         # P4d：画布媒体/提示词/参考入口已从 schema 删除，对应形参一并移除；
         # 起始视频（序章）是唯一的画布媒体入口，保留。
@@ -927,17 +924,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             pass
         # ---- 导演台状态驱动：有 JSON 状态时优先于画布接线 ----
         ds = _parse_director_state(导演台状态)
-        # M2：Hub 规范包优先于 ds.ref_assets（单线分发；总量不限）
-        if isinstance(资产包, str) and 资产包.strip():
-            try:
-                from .asset_hub import normalize_pack as _hub_norm
-                _hub_items, _hub_warns = _hub_norm(资产包)
-            except Exception:
-                _hub_items, _hub_warns = [], []
-            if _hub_items:
-                ds = dict(ds)
-                ds["ref_assets"] = [{"label": a["label"], "kind": a["kind"], "file": a["file"]}
-                                    for a in _hub_items]
+        # P4g：画布「资产包」输入已删除（H3AssetBundle 一并下线）——素材唯一来源是
+        # ds.ref_assets（导演台前端 poolFromManifest 写入）。
         ds_used = bool(ds)
         # 实验性功能开关：从 ds.experiments 归一化；全关/FORCE_DISABLED => 空 context，
         # 后续所有实验分支以 exp.has(...) 包裹，关闭时逐字节走现状路径

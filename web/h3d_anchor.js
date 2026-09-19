@@ -337,7 +337,7 @@
       const sol = [];
       if (!nSeg) sol.push("本项目还没有已落盘的段（跑完至少一段才有段源；"
         + "若某段设了「不存 latent」，它也不会出现在段列表里）");
-      if (!nLib) sol.push("项目 latent/ 目录还是空的（可用「转码为 latent」生成，"
+      if (!nLib) sol.push("项目 latent/ 目录还是空的（跑完一段会自动存档 latent，"
         + "或直接把素材库里的图片/视频选作源）");
       empty.textContent = sol.length ? "可选项提示：" + sol.join("；") : "";
       empty.style.display = sol.length ? "" : "none";

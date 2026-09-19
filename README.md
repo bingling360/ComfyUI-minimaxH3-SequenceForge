@@ -184,10 +184,10 @@ ComfyUI-minimaxH3-SequenceForge/
    - **CLIP**：type 必须选 `minimax`（Qwen3-VL）→ 本节点「文本编码器」
    - 视频 VAE（`minimax_h3_video_vae`）→「视频VAE」；音频 VAE（`minimax_h3_audio_vae`）→「音频VAE」
 2. **每段提示词独立输入**：导演台段卡片每段一个文本框（**1–64 段不限**），提示词只走「导演台状态」；画布提示词组入口已删除。
-3. **参考素材（r2v 链，冻结单线）**：配套工作流里 `H3 Asset Bundle` 填项目名，一条线连主节点「资产包」，连一次终身不动——增删素材全在导演台三库面板（瓦片拖放/`@`引用），画布不再拉线。单段上限定额与官方一致：
+3. **参考素材（r2v 链，零画布接线）**：素材**只走导演台三库面板**（瓦片拖放 / `@` 引用），运行时由导演台把素材清单写进链状态（`ds.ref_assets`）——画布上**不需要连任何线**，主节点原先的「资产包」输入与 `H3 Asset Bundle` 节点均已删除。单段上限定额与官方一致：
    - 图片 **9 张**（`<Picture i>`）、视频 **3 个**（`<Video k>`，24fps 2–15 秒）、独立音频 **3 条**（`<Audio j>`，配乐/音效）；参考视频原声自动配对同号 `<Audio j>`
    - 标签编号**按段内引用顺序从 1 数**（官方语义）；接了任一参考素材 → 整条链走 r2v，请换 `ref2va` UNET
-   - 旧链：四组 autogrow 画布输入已从主节点删除（老工作流残留连线加载时自动忽略）；`H3AssetHub` 节点已删除，资产包 JSON 格式仍被「资产包」输入兼容解析
+   - 旧链：四组 autogrow 画布输入、`H3AssetHub` / `H3 Asset Bundle` 节点、主节点「资产包」输入均已删除（老工作流残留连线加载时自动忽略）；素材清单的 JSON 格式校验仍保留在后端（`POST /h3chain/asset_check`）
 4. 输出：成片与分段由主节点「自动保存 / 自动成片」开关一体化落盘（见下节），无需接任何下游节点；若想手动控制编码，也可把「图像」「帧率」「音频」接官方 `Create Video` → `Save Video`。「报告」可右键预览每段执行摘要。
 5. **分段单独保存**：主节点「自动保存=分段」运行时每段自动存 `seg_*.mp4` 到项目文件夹（不重编码），去 `output/h3_projects/<项目名>/` 直接看片。主节点分段列表输出已删除，不再需要下游接线。
 
@@ -537,7 +537,7 @@ output/h3_projects/
 
 ## 示例工作流
 
-- `example_workflows/备用初始化导演台工作流.json`：导演台初始化工作流（模型加载器 ref2va UNET / Qwen3-VL CLIP / 视频+音频 VAE + 主节点导演台模式 + `H3AssetBundle` 单线）——加载后打开导演台即可直接开工，是当前随插件分发的唯一示例。
+- `example_workflows/备用初始化导演台工作流.json`：导演台初始化工作流（模型加载器 ref2va UNET / Qwen3-VL CLIP / 视频+音频 VAE + 主节点导演台模式，共 8 个节点、零画布外联——素材与提示词全走导演台状态）——加载后打开导演台即可直接开工，是当前随插件分发的唯一示例。
 - 旧的 t2v / r2v / 分镜示例工作流（`h3_chain_t2v.json`、`h3_chain_r2v_official_base.json`、`h3_storyboard_base.json`、`h3_chain_storyboard_review.json`）已随分镜模式（`H3StoryboardChain`）与画廊保存节点（`H3ChainSaver`）移除，如需参考可从 git 历史取回。
 
 ## 已知边界（V1）

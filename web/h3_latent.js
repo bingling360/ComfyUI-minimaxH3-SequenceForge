@@ -1,6 +1,6 @@
 /* H3 latent/剪辑前端 helper：切片（含av/video/audio分存） + 删除 + 入出点裁剪
  * + 库间互调 + 音画分离 + 合并 + 生成忙状态。
- * 只挂 window.H3Latent，不注册入口。三源：自动存档 .pt / 段范围切片 / 现抽节点。
+ * 只挂 window.H3Latent，不注册入口。两源：主节点自动存档 .pt / 段范围切片。
  * 生成中后端回 423（BUSY），前端据此置灰剪辑按钮（见 isBusy/busyText）。
  */
 (function () {

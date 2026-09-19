@@ -365,9 +365,6 @@
     if (it.scope === "project" && !it.linked && !isBlocked(it, "global")) {
       mk("存入全局库", false, () => actArchive(it));
     }
-    if (it.scope === "latent" && window.H3Director?.upscaleLatent) {
-      mk("二采", false, () => window.H3Director.upscaleLatent(S.dir, it.file, say));
-    }
     if (it.scope === "project" || it.scope === "global") {
       mk("改名", false, () => actAlias(it));
     }
@@ -574,10 +571,6 @@
       }
     } else if (it.scope === "project" && !many && !it.linked && !isBlocked(it, "global")) {
       m.append(menuItem("⬆ 存入全局库（跨项目可复用）", () => actArchive(it)));
-    }
-    if (it.scope === "latent" && !many && window.H3Director?.upscaleLatent) {
-      m.append(menuItem("🔍 二采放大（驱动画布 H3LatentUpscale）",
-        () => window.H3Director.upscaleLatent(S.dir, it.file, say)));
     }
     m.append(menuItem("📋 复制路径", () => actCopyPath(it)));
     m.append(menuItem("📥 下载文件" + (many ? "（打包）" : ""), () => actDownload(it, ids)));

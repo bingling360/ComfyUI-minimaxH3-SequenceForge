@@ -137,8 +137,8 @@ def test_anchor_js_has_no_cross_module_global_calls():
     2026-09-16 线上故障：h3d_anchor.js 里 `typeof getDirValue !== "function"` 当场抛错，
     整块「⚠ 段落卡片渲染失败 · getDirValue 未加载」。
     根因：`getDirValue` / `setSegmentField` 都是 h3_director.js 的**模块级**函数，
-    并没有挂到 window 上（公开面只有 window.H3Director.upscaleLatent / H3Api /
-    H3Prompts / H3Assets），跨模块按全局名调必然失败。
+    并没有挂到 window 上（公开面只有 H3Api / H3Assets / H3Latent / H3Lib /
+    H3Prompts / H3Anchor），跨模块按全局名调必然失败。
     正确做法：宿主通过 `buildAnchorPanel({ dir, setAnchors, refresh })` 注入访问器。
     """
     code = _js_code(_src("web/h3d_anchor.js"))

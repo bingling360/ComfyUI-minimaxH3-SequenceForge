@@ -418,14 +418,20 @@ def test_director_link_sync():
 
 
 def test_director_legacy_intact():
-    """三库下线后仍要留住的通用件（折叠框 / 预览地址 / 入口 / 画布镜像）。"""
+    """三库下线后仍要留住的通用件（折叠框 / 预览地址 / 入口 / 画布镜像）。
+
+    P4g：window.H3Director 已移除——它只暴露 upscaleLatent（驱动画布
+    H3LatentUpscale 的二采入口），该节点连同驱动逻辑一并下线，见
+    test_workflows_frozen::test_removed_nodes_never_come_back。
+    """
     d = _read("h3_director.js")
     for sym in ["function foldBox(", "function assetPreviewUrl(",
                 "function renderV2Section(", "window.H3Lib.open",
-                "window.H3Director", "syncMirrors"]:
+                "syncMirrors"]:
         assert sym in d, sym
     for gone in ["function openTrimSub", "function renderLibFinals",
-                 "function renderLibLatent", "function renderLibAssets"]:
+                 "function renderLibLatent", "function renderLibAssets",
+                 "window.H3Director", "runUpscaleTool"]:
         assert gone not in d, gone
 
 

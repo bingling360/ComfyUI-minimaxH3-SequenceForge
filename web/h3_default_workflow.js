@@ -2,14 +2,15 @@
  *
  * 由「长视频接续二采导演台工作流.json」导出生成（D:/Downloads）：
  * - 模型加载器（ref2va UNET / Qwen3-VL CLIP / 视频+音频 VAE）+ 主节点（导演台模式）
- * - 提示词与素材全走导演台状态 + H3AssetBundle 单线，画布无任何外联
+ * - 提示词与素材全走导演台状态，画布无任何外联
  *   （提示词 1–64 段不限，全在导演台管理）
  * - 每段视频由主节点「自动保存=分段」存进项目文件夹 output/h3_projects/<项目名>/，
  *   主节点「自动成片=开启」时另编码完整成片（final_*.mp4）落同一文件夹；
  *   不再依赖 H3ChainSaver 节点（成片保存由主节点一体化完成）
- * - 资产走 H3AssetBundle 单线：`H3 Asset Bundle` 节点填项目名，一条线连主节点
- *   「资产包」，连一次终身不动；增删素材全在导演台三库面板，画布不再拉线；
- *   旧 autogrow 拉线与 H3AssetHub 串口仍兼容保留
+ * - P4g：资产只走导演台状态 ds.ref_assets（导演台 poolFromManifest 自拉 manifest）。
+ *   画布上的 H3AssetBundle（资产包）、H3LatentExtract（现抽存档）、
+ *   H3LatentUpscale（库内放大）与现抽输入链（LoadVideo/GetVideoComponents）已整体下线——
+ *   它们均无执行入口（非 OUTPUT_NODE）且全部前端代码零引用，属资产库时代残留。
  * - 注意：本文件由导出 JSON 直接转换，widget 顺序须与 nodes.py define_schema 严格一致
  *   （已校验 29 项）。如需改默认参数，改导出 JSON 后重新生成，勿手工编辑此数组。
  */
@@ -39,8 +40,7 @@ window.H3_DEFAULT_WORKFLOW = {
           "name": "VAE",
           "type": "VAE",
           "links": [
-            3,
-            41
+            3
           ]
         }
       ],
@@ -74,8 +74,7 @@ window.H3_DEFAULT_WORKFLOW = {
           "name": "VAE",
           "type": "VAE",
           "links": [
-            4,
-            42
+            4
           ]
         }
       ],
@@ -108,7 +107,7 @@ window.H3_DEFAULT_WORKFLOW = {
       "title": "导演台使用说明",
       "properties": {},
       "widgets_values": [
-        "# H3 长片导演台 · 配套工作流\n\n- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，提示词只走导演台状态（**1–64 段不限**，画布无任何提示词/素材外联）\n- 资产走 H3AssetBundle 单线：`H3 Asset Bundle` 节点填项目名，一条线连主节点「资产包」，连一次终身不动；增删素材全在导演台三库面板（瓦片拖放/@引用），画布不再拉线；旧 autogrow 拉线与 H3AssetHub 串口仍兼容保留\n- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），导演台段卡片直接预览播放；需要另行导出可手动连「分段图像/分段音频」输出\n- 链路自动推导（无模式选择）：有段引用素材即走 ref conditioning；UNET 请按引用情况接 ref2va（或混用权重），纯文生链用 fl2va 也可\n- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」\n- 工具节点已预连线并旁路休眠（零成本）：latent 库行点「⚡放大」一键放大；「现抽视频源」选视频后取消 H3LatentExtract 旁路即跑现抽。平时不占队列。"
+        "# H3 长片导演台 · 配套工作流\n\n- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，提示词只走导演台状态（画布无任何提示词/素材外联）\n- 资产全在导演台三库面板管理（项目资产 / 全局库 / 成片）：瓦片拖放与正文 @素材名 引用，画布上没有任何资产节点与拉线\n- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），导演台段卡片直接预览播放\n- 链路自动推导（无模式选择）：有段引用素材即走 ref conditioning；UNET 请按引用情况接 ref2va（或混用权重），纯文生链用 fl2va 也可\n- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」"
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -235,11 +234,6 @@ window.H3_DEFAULT_WORKFLOW = {
           "link": null
         },
         {
-          "name": "资产包",
-          "type": "STRING",
-          "link": 37
-        },
-        {
           "name": "二采模型",
           "type": "MODEL",
           "link": null
@@ -336,8 +330,7 @@ window.H3_DEFAULT_WORKFLOW = {
           "name": "CLIP",
           "type": "CLIP",
           "links": [
-            2,
-            44
+            2
           ]
         }
       ],
@@ -372,8 +365,7 @@ window.H3_DEFAULT_WORKFLOW = {
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            34,
-            43
+            34
           ]
         }
       ],
@@ -386,239 +378,6 @@ window.H3_DEFAULT_WORKFLOW = {
         "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         "default"
       ]
-    },
-    {
-      "id": 55,
-      "type": "H3AssetBundle",
-      "title": "H3 Asset Bundle (资产包)",
-      "pos": [
-        380,
-        1660
-      ],
-      "size": [
-        360,
-        150
-      ],
-      "flags": {},
-      "order": 31,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "资产包",
-          "type": "STRING",
-          "links": [
-            37
-          ]
-        },
-        {
-          "name": "报告",
-          "type": "STRING",
-          "links": null
-        }
-      ],
-      "widgets_values": [
-        ""
-      ],
-      "properties": {
-        "Node name for S&R": "H3AssetBundle"
-      }
-    },
-    {
-      "id": 56,
-      "type": "H3LatentExtract",
-      "title": "H3 Latent Extract (现抽存档)",
-      "pos": [
-        880,
-        40
-      ],
-      "size": [
-        360,
-        220
-      ],
-      "flags": {},
-      "order": 32,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "视频帧",
-          "type": "IMAGE",
-          "link": 39
-        },
-        {
-          "name": "视频VAE",
-          "type": "VAE",
-          "link": 41
-        },
-        {
-          "name": "音轨",
-          "type": "AUDIO",
-          "link": 40
-        },
-        {
-          "name": "音频VAE",
-          "type": "VAE",
-          "link": 42
-        }
-      ],
-      "outputs": [
-        {
-          "name": "报告",
-          "type": "STRING",
-          "links": null
-        }
-      ],
-      "widgets_values": [
-        0,
-        0,
-        "",
-        ""
-      ],
-      "properties": {
-        "Node name for S&R": "H3LatentExtract"
-      }
-    },
-    {
-      "id": 57,
-      "type": "H3LatentUpscale",
-      "title": "H3 Latent Upscale (库内放大)",
-      "pos": [
-        880,
-        300
-      ],
-      "size": [
-        360,
-        320
-      ],
-      "flags": {},
-      "order": 33,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "模型",
-          "type": "MODEL",
-          "link": 43
-        },
-        {
-          "name": "文本编码器",
-          "type": "CLIP",
-          "link": 44
-        }
-      ],
-      "outputs": [
-        {
-          "name": "报告",
-          "type": "STRING",
-          "links": null
-        }
-      ],
-      "widgets_values": [
-        "",
-        "",
-        "",
-        "auto",
-        2.0,
-        "fp16",
-        "关闭",
-        "",
-        0,
-        6,
-        0.35,
-        1.0,
-        ""
-      ],
-      "properties": {
-        "Node name for S&R": "H3LatentUpscale"
-      }
-    },
-    {
-      "id": 58,
-      "type": "LoadVideo",
-      "title": "现抽视频源",
-      "pos": [
-        880,
-        660
-      ],
-      "size": [
-        320,
-        120
-      ],
-      "flags": {},
-      "order": 34,
-      "mode": 2,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "VIDEO",
-          "type": "VIDEO",
-          "links": [
-            38
-          ]
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "LoadVideo"
-      },
-      "widgets_values": [
-        "",
-        "image"
-      ]
-    },
-    {
-      "id": 59,
-      "type": "GetVideoComponents",
-      "title": "现抽拆分",
-      "pos": [
-        880,
-        800
-      ],
-      "size": [
-        240,
-        140
-      ],
-      "flags": {},
-      "order": 35,
-      "mode": 2,
-      "inputs": [
-        {
-          "name": "video",
-          "type": "VIDEO",
-          "link": 38
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": [
-            39
-          ]
-        },
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "links": [
-            40
-          ]
-        },
-        {
-          "name": "fps",
-          "type": "FLOAT",
-          "links": null
-        },
-        {
-          "name": "bit_depth",
-          "type": "INT",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "GetVideoComponents"
-      }
     }
   ],
   "links": [
@@ -669,70 +428,6 @@ window.H3_DEFAULT_WORKFLOW = {
       54,
       0,
       "STRING"
-    ],
-    [
-      37,
-      55,
-      0,
-      10,
-      6,
-      "STRING"
-    ],
-    [
-      38,
-      58,
-      0,
-      59,
-      0,
-      "VIDEO"
-    ],
-    [
-      39,
-      59,
-      0,
-      56,
-      0,
-      "IMAGE"
-    ],
-    [
-      40,
-      59,
-      1,
-      56,
-      2,
-      "AUDIO"
-    ],
-    [
-      41,
-      3,
-      0,
-      56,
-      1,
-      "VAE"
-    ],
-    [
-      42,
-      4,
-      0,
-      56,
-      3,
-      "VAE"
-    ],
-    [
-      43,
-      1,
-      0,
-      57,
-      0,
-      "MODEL"
-    ],
-    [
-      44,
-      2,
-      0,
-      57,
-      1,
-      "CLIP"
     ]
   ],
   "groups": [
@@ -758,18 +453,6 @@ window.H3_DEFAULT_WORKFLOW = {
         1100
       ],
       "color": "#88A",
-      "flags": {}
-    },
-    {
-      "id": 3,
-      "title": "素材池与提示词 · 自动管理（导演台控制，勿删；隐藏=未使用）",
-      "bounding": [
-        0,
-        1290,
-        2360,
-        1450
-      ],
-      "color": "#b58b2a",
       "flags": {}
     }
   ],

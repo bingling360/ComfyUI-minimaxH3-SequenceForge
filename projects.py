@@ -420,7 +420,15 @@ def normalize_marks(name: str, save: bool = True):
     if manifest is None:
         return None, False
     _ensure_revision(manifest)
-    changed = _as_mod().assign_marks(_mark_pool(manifest))
+    # assign_marks 返回**新列表**而不是 bool（旧口径返回 bool 的那版已废弃），
+    # 所以 changed 要自己比出来 —— 直接拿返回值当布尔用的话，非空列表恒为真，
+    # 于是每次读项目都判定"有改动"、白白 +1 revision 并重写 manifest。
+    _pool = _mark_pool(manifest)
+    changed = False
+    for _old, _new in zip(_pool, _as_mod().assign_marks(_pool)):
+        if _new.get("mark") and _new.get("mark") != _old.get("mark"):
+            _old["mark"] = _new["mark"]
+            changed = True
     if changed and save:
         manifest["updated_at"] = time.time()
         manifest["revision"] = int(manifest.get("revision") or 1) + 1
@@ -576,8 +584,24 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
     _mk = str(ent.get("mark") or "").strip()
     _mk_explicit = bool(_mk)
     if not _mk:
-        _mk = _mark_of(ent["kind"],
-                       _next_mark_seq(ent["kind"], [x.get("mark") for x in links]))
+        # 同名条目已在池里（旧 assets 或已有 link）：新链接会按 Map.set 语义
+        # **顶替它的位置**，所以要**继承它原来的标注号** ——
+        # 否则"换一张图但名字不变"会把 图片1 变成 图片3，历史提示词里的
+        # `@图片1` 悄悄改指向另一张素材（静默串号）。
+        _prev = next((x for x in pool
+                      if str(x.get("alias") or x.get("label") or "") == ent["alias"]), None)
+        _inherit = str((_prev or {}).get("mark") or "").strip()
+        # 例外：**类型换轨不继承**。`图片1` 指代一个视频等于亲手喂给模型一条错信息，
+        # 这时必须按新类型重发（`图片1` → `视频1`）。同类型才走继承（防串号）。
+        _prev_kind = str((_prev or {}).get("kind") or "image")
+        if _inherit and _prev_kind == ent["kind"]:
+            _mk = _inherit
+        else:
+            # 序号必须按**整个池子**（旧 assets + 已有 links）算，不能只看 links ——
+            # 只看 links 的话，项目里已有 图片1（在 assets 里）时新链进来的素材
+            # 会再拿到 图片1，两个素材撞同一个号。
+            _mk = _mark_of(ent["kind"],
+                           _next_mark_seq(ent["kind"], [x.get("mark") for x in pool]))
     hit = False
     for x in links:
         if x["alias"] == ent["alias"]:
@@ -609,7 +633,12 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
         links.append(ent)
     manifest["asset_links"] = links
     # 标注：按**池序**（旧 assets 先、links 覆盖同名）发号，与前端 poolFromManifest 同口径。
-    AS.assign_marks(_mark_pool(manifest))
+    # 注意 assign_marks 返回**新列表**（不就地改入参），必须把结果写回来才落盘 ——
+    # 直接调用并丢弃返回值的话，缺号的条目永远补不上号（且不报错）。
+    _pool = _mark_pool(manifest)
+    for _old, _new in zip(_pool, AS.assign_marks(_pool)):
+        if _new.get("mark"):
+            _old["mark"] = _new["mark"]
     if want_mark:
         for d in _mark_pool(manifest):
             if str(d.get("asset_id") or "") == ent["asset_id"]:

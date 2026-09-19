@@ -98,9 +98,15 @@ def projects(checkpoint):
 
 
 @pytest.fixture(scope="session")
-def routes(projects):
+def library():
+    return _load_top("library", os.path.join(ROOT, "library.py"))
+
+
+@pytest.fixture(scope="session")
+def routes(projects, library):
     return _load_top("routes", os.path.join(ROOT, "routes.py"),
                      [("from . import projects", "import projects"),
+                      ("from . import library as h3lib", "import library as h3lib"),
                       ("from . import asset_hub", "import asset_hub"),
                       ("from . import prompts as _prompts", "import prompts as _prompts")])
 
@@ -232,8 +238,14 @@ def test_nodes_wiring():
     assert "该段图片没选" not in src and "素材库共" not in src
     assert "总量不限、按段按需" in src
     assert "超过官方单段上限" in src
-    # 段 latent_ref.src 外源桥必须透传进 seg_latent_ref（否则 _inject_guide 外源分支不可达）
-    assert '_ent["src"] = {"file": "/".join(_src_parts)}' in src
+    # 段锚「外源桥」必须透传：旧写法（_ent["src"] = {"file": ...} 从 latent_ref.src 桥进
+    # seg_latent_ref）已随「手动锚定」重构删掉，现在由 anchors 建条目带 src.kind/ref、
+    # nodes._inject_guide 认 src 非 prev_tail 时改取外源 —— 钉住这条新链路，
+    # 否则「设了源却不生效、静默回落上段尾」那类最坏 bug 会悄悄回潮。
+    anc = open(os.path.join(ROOT, "anchors.py"), encoding="utf-8").read()
+    assert '"kind": "prev_tail"' in anc and '"kind": "library"' in anc
+    assert '_a["src"]["kind"] != "prev_tail"' in src
+    assert "_resolve_anchor_latent" in src
 
 
 # ---- M2.5 ----
@@ -379,10 +391,14 @@ def test_v2_section_wired():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     assert "function renderV2Section(sec, data)" in d
     assert "renderV2Section(sec, data);" in d
+    # 端点符号按**名字全域查**，不要按「名字含 latent 就只去 h3_latent.js」猜
+    # —— latent_slice 一直在 h3_api.js，猜错文件就假红（掩盖真回归）。
+    web_all = ""
+    for f in sorted(os.listdir(os.path.join(ROOT, "web"))):
+        if f.endswith(".js"):
+            web_all += open(os.path.join(ROOT, "web", f), encoding="utf-8").read()
     for ep in ["compilePreview", "saveAssets", "assetCheck", "latent_slice", "trim"]:
-        assert ep in d or ep.replace("_", "/") in d or ep in open(
-            os.path.join(ROOT, "web", "h3_latent.js" if "latent" in ep or ep == "trim" else "h3_api.js"),
-            encoding="utf-8").read()
+        assert ep in d or ep.replace("_", "/") in d or ep in web_all
 
 
 def test_transcode_jobs_normalized():

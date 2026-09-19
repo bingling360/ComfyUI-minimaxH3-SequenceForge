@@ -628,11 +628,17 @@ def add_routes(routes):
         if not name:
             return _err("无效的项目目录名", code="BAD_NAME", status=400)
         try:
+            # 必须**关键字传参**：link_asset 的形参在 (roles, mark) 之间插过
+            # ref_name / orig_name 两个新参数，按位置传的话 `mark` 会被
+            # ref_name 吃掉 —— 表现为"手动传了标注却总是被自动发号覆盖"，
+            # 且不报错，是最难查的那类 bug。
             manifest = projects.link_asset(
                 name, data.get("asset_id"), data.get("alias"),
                 data.get("kind") or "image", data.get("base_revision"),
-                data.get("roles") if isinstance(data.get("roles"), list) else None,
-                data.get("mark"))
+                roles=(data.get("roles") if isinstance(data.get("roles"), list) else None),
+                ref_name=data.get("ref_name"),
+                orig_name=data.get("orig_name"),
+                mark=data.get("mark"))
         except ValueError as e:
             msg = str(e)
             if msg.startswith("REVISION_CONFLICT"):

@@ -115,31 +115,41 @@ def test_mark_shaped(store):
     assert store.mark_shaped("阿依") is False
 
 
-def test_next_mark_per_kind(store):
-    items = [{"mark": "图片1", "kind": "image"},
-             {"mark": "图片3", "kind": "image"},
-             {"mark": "视频2", "kind": "video"}]
-    assert store.next_mark(items, "image") == "图片2"     # 最小空闲（补空号，不顶到 4）
-    assert store.next_mark(items, "video") == "视频1"
-    assert store.next_mark(items, "audio") == "音频1"     # 空表从 1 起
-    assert store.next_mark([], "image") == "图片1"
-    # 满号保护（不返回 1000）
-    full = [{"mark": f"图片{i}", "kind": "image"} for i in range(1, store.MARK_MAX + 1)]
-    assert store.next_mark(full, "image") == f"图片{store.MARK_MAX}"
+def test_next_mark_seq_no_recycle(store):
+    """标注编号**不回收**：删掉的号留空，新素材接着最大号往上编。
+
+    合并两条分支时这里改过口径：anchor-studio 取「最小空闲号」（补空号 1、2、3…），
+    理由是不想把自动序列顶高。但标注要落盘、要显示在引用条上、还能手动改 ——
+    一旦回收，旧提示词里的 `@图片2` 会悄悄指向另一张素材（静默串号，
+    比留一个空号危险得多）。所以统一到「不回收」，见 asset_store.assign_marks。
+    """
+    used = ["图片1", "图片3", "视频2"]
+    assert store.next_mark_seq("image", used) == 4      # 最大 +1，不补空缺的 2
+    assert store.next_mark_seq("video", ["视频2"]) == 3
+    assert store.next_mark_seq("audio", []) == 1        # 空表从 1 起
+    assert store.mark_of("image", 4) == "图片4"
+    assert store.mark_of("video", 3) == "视频3"
+    # 脏值不通配 → 不参与取最大（脏值一律由 clean_mark 归空后重发）
+    assert store.next_mark_seq("image", ["图片x", "nonsense"]) == 1
 
 
 def test_assign_marks_pool_order_and_idempotent(store):
+    """缺号的按类型独立递增补上；**已有的不动**（含手动占住的大号）。"""
     items = [{"alias": "a", "kind": "image"},
              {"alias": "b", "kind": "video"},
              {"alias": "c", "kind": "image"},
-             {"alias": "d", "kind": "image", "mark": "图片9", "mark_auto": False}]
-    assert store.assign_marks(items) is True
-    assert [x["mark"] for x in items] == ["图片1", "视频1", "图片2", "图片9"]
-    # 落盘口径：缺省即自动 → 自动条目**不写** mark_auto（只存手动 False）
-    assert "mark_auto" not in items[0]
-    assert items[3]["mark_auto"] is False
-    # 幂等：第二次无改动
-    assert store.assign_marks(items) is False
+             {"alias": "d", "kind": "image", "mark": "图片9"}]
+    out = store.assign_marks(items)
+    # 手动占住的「图片9」把自动序列顶到 10 —— 这正是"编号不回收"：
+    # 宁可号跳着走，也绝不复用任何曾出现过的号（复用会让旧提示词改指向）。
+    assert [x["mark"] for x in out] == ["图片10", "视频1", "图片11", "图片9"]
+    # 手动占住的大号不会被自动序列挤掉，也不会被改小
+    assert out[3]["mark"] == "图片9"
+    # 幂等：再跑一次标注不变（"已有的不动"是新口径的核心不变式）
+    again = store.assign_marks(out)
+    assert [x["mark"] for x in again] == ["图片10", "视频1", "图片11", "图片9"]
+    # 返回**新列表**而非就地改（调用方要拿入参做 diff）
+    assert items[0].get("mark") is None
 
 
 def test_mark_taken_dedupe(store):
@@ -181,14 +191,20 @@ def test_link_asset_assigns_mark_by_pool_order(projects):
     assert [x["mark"] for x in m["asset_links"]] == ["图片1", "视频1", "图片2"]
 
 
-def test_manual_mark_does_not_inflate_auto_numbering(projects):
-    """手动标成「图片9」不该把自动序列顶到 10 —— 新素材照样拿空缺的 2。"""
+def test_manual_mark_is_not_recycled(projects):
+    """手动占住「图片9」后，自动序列**从 10 续**，绝不复用出现过的小号。
+
+    这里与早期设计相反（曾是"手动占 9、新素材补空缺的 2"）。反转的原因：
+    标注要落盘、要在引用条上显示、还能手动改 —— 一旦复用曾出现过的号，
+    旧提示词里的 `@图片2` 会悄悄指向另一张素材（串号且无提示）。
+    宁可号跳着走，也不能串号。见 asset_store.assign_marks。
+    """
     projects.create_project("t_mark1b")
     _link(projects, "t_mark1b", "a_111111111111", "甲", "image")
     _link(projects, "t_mark1b", "a_222222222222", "乙", "image", mark="图片9")
     m = _link(projects, "t_mark1b", "a_333333333333", "丙", "image")
     assert {x["alias"]: x["mark"] for x in m["asset_links"]} == {
-        "甲": "图片1", "乙": "图片9", "丙": "图片2"}
+        "甲": "图片1", "乙": "图片9", "丙": "图片10"}
 
 
 def test_link_asset_keeps_mark_on_repoint_and_rename(projects):
@@ -223,8 +239,9 @@ def test_normalize_marks_legacy_first_and_idempotent(projects):
         {"label": "旧图A", "kind": "image", "file": "assets/a.png"},
         {"label": "旧图B", "kind": "image", "file": "assets/b.png"},
     ])
-    mf, changed = projects.normalize_marks("t_mark4")
-    assert changed is True
+    # save_assets 入库时已按池序补过号，所以这里**通常**无改动；
+    # 本用例真正要钉的是池序（旧 assets 先、数组序发号）与**幂等**。
+    mf, _changed = projects.normalize_marks("t_mark4")
     assert [x["mark"] for x in mf["assets"]] == ["图片1", "图片2"]
     # 第二次：无改动（幂等，不涨 revision）
     mf2, changed2 = projects.normalize_marks("t_mark4")

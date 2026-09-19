@@ -69,6 +69,7 @@ ROUTES = [
     ("GET", "/h3chain/library_file"),
     ("GET", "/h3chain/asset_links"),
     ("POST", "/h3chain/asset_link"),
+    ("POST", "/h3chain/asset_mark"),
     ("POST", "/h3chain/asset_unlink"),
     ("POST", "/h3chain/asset_mirror"),
     ("POST", "/h3chain/delete_project"),
@@ -541,7 +542,9 @@ def add_routes(routes):
     async def asset_links(request):
         """项目链接表（?dir=）：asset_links + 全局库回填 file/bytes，直供前端池子合并。
 
-        只读，不受生成锁影响；全局库不可用时 file 缺省（执行期按旧路径）。
+        只读语义；全局库不可用时 file 缺省（执行期按旧路径）。
+        副手：老项目首次读到时按池序补发**标注**（mark）并落盘，之后号固定不变 ——
+        补号幂等，只在确有缺失时才写。
         """
         q = request.query if hasattr(request, "query") else {}
         name = projects.safe_name(str((q.get("dir") if hasattr(q, "get") else None) or ""))
@@ -550,6 +553,9 @@ def add_routes(routes):
         manifest = projects.read_project(name)
         if manifest is None:
             return _err("项目不存在", code="NOT_FOUND", status=404)
+        migrated, changed = projects.normalize_marks(name)
+        if changed and migrated is not None:
+            manifest = migrated
         try:
             from . import asset_store
         except ImportError:
@@ -567,6 +573,11 @@ def add_routes(routes):
                 continue
             ent = {"asset_id": x["asset_id"], "alias": x.get("alias") or "",
                    "kind": x.get("kind") or "image"}
+            mk = asset_store.clean_mark(x.get("mark"))
+            if mk:
+                ent["mark"] = mk
+                # 缺省即自动（只在手动改过时才存 False，这里回显成确定布尔值）
+                ent["mark_auto"] = x.get("mark_auto") is not False
             if isinstance(x.get("roles"), list):
                 ent["roles"] = [str(r) for r in x["roles"]
                                 if str(r) in ("首帧图", "尾帧图")][:2]
@@ -577,11 +588,37 @@ def add_routes(routes):
             out.append(ent)
         return web.json_response({"ok": True, "links": out})
 
-    async def asset_link(request):
-        """写链接：{dir, asset_id, alias, kind?, roles?, base_revision?} -> manifest。
+    async def asset_mark(request):
+        """手动改标注：{dir, mark, asset_id?|alias?, base_revision?} -> manifest。
 
-        改名/改标即重调本接口（同 alias 重指向；roles 显式传列表覆盖，缺省不动）。
-        revision 冲突回 409。
+        mark 传空串 = 清除该素材的标注（下次自动补号）。标注项目内唯一，
+        与别的素材重复回 400。改过的条目 mark_auto=False，不再被自动发号覆盖。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        name = projects.safe_name(str(data.get("dir") or ""))
+        if not name:
+            return _err("无效的项目目录名", code="BAD_NAME", status=400)
+        try:
+            manifest = projects.set_asset_mark(
+                name, data.get("mark"), data.get("asset_id"), data.get("alias"),
+                data.get("base_revision"))
+        except ValueError as e:
+            msg = str(e)
+            if msg.startswith("REVISION_CONFLICT"):
+                return _rev_conflict(name, msg)
+            return _err(msg, code="BAD_REQUEST", status=400)
+        if manifest is None:
+            return _err("项目不存在", code="NOT_FOUND", status=404)
+        return web.json_response({"ok": True, "manifest": manifest})
+
+    async def asset_link(request):
+        """写链接：{dir, asset_id, alias, kind?, roles?, mark?, base_revision?} -> manifest。
+
+        改名/改标即重调本接口（同 alias 重指向；roles 显式传列表覆盖，缺省不动；
+        mark 缺省按池序自动发号，显式传则手动覆盖并锁定）。revision 冲突回 409。
         """
         try:
             data = await request.json()
@@ -594,7 +631,8 @@ def add_routes(routes):
             manifest = projects.link_asset(
                 name, data.get("asset_id"), data.get("alias"),
                 data.get("kind") or "image", data.get("base_revision"),
-                data.get("roles") if isinstance(data.get("roles"), list) else None)
+                data.get("roles") if isinstance(data.get("roles"), list) else None,
+                data.get("mark"))
         except ValueError as e:
             msg = str(e)
             if msg.startswith("REVISION_CONFLICT"):
@@ -603,6 +641,7 @@ def add_routes(routes):
         if manifest is None:
             return _err("项目不存在或链接非法", code="NOT_FOUND", status=404)
         return web.json_response({"ok": True, "manifest": manifest})
+
 
     async def asset_unlink(request):
         """解链：{dir, asset_id?, alias?, base_revision?} -> manifest（幂等）。"""
@@ -2379,6 +2418,7 @@ def add_routes(routes):
         ("GET", "/h3chain/library_file", library_file),
         ("GET", "/h3chain/asset_links", asset_links),
         ("POST", "/h3chain/asset_link", asset_link),
+        ("POST", "/h3chain/asset_mark", asset_mark),
         ("POST", "/h3chain/asset_unlink", asset_unlink),
         ("POST", "/h3chain/asset_mirror", asset_mirror),
         ("POST", "/h3chain/delete_project", delete_project),

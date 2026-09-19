@@ -86,6 +86,8 @@
     compileRefs: (payload) => _json("POST", "/h3chain/compile_refs", payload),
     assetLinks: (dir) => _call("/h3chain/asset_links?dir=" + encodeURIComponent(dir || "")),
     assetLink: (payload) => _json("POST", "/h3chain/asset_link", payload),
+    /* 手动改素材标注（发给 LLM 的稳定短编号 图片1/视频1/音频1）；mark 传空串=清除 */
+    assetMark: (payload) => _json("POST", "/h3chain/asset_mark", payload),
     assetUnlink: (payload) => _json("POST", "/h3chain/asset_unlink", payload),
     assetMirror: (payload) => _json("POST", "/h3chain/asset_mirror", payload),
     vaeFiles: () => _call("/h3chain/vae_files"),

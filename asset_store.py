@@ -78,7 +78,13 @@ def clean_alias(alias) -> str:
         s = stem
     s = _ALIAS_BAD.sub("_", s)
     s = re.sub(r"[_\-]{2,}", "_", s).strip("_-")
-    return s[:ALIAS_MAX].strip("_-")
+    s = s[:ALIAS_MAX].strip("_-")
+    # 别名不能长成「标注」形态（图片1 / 视频2 / 音频3）：标注是发给 LLM 的稳定编号，
+    # 与别名同形时，`@图片1` 到底指别名还是标注无法判定 —— 编码/解码会串号。
+    # 统一加一个尾下划线错开（`图片1` -> `图片1_`），语义不变、可见、可改名。
+    if s and _MARK_RE.match(s):
+        s = (s + "_")[:ALIAS_MAX]
+    return s
 
 
 def alias_of(*cands) -> str:
@@ -130,6 +136,54 @@ def ref_name_of(*cands) -> str:
         if r:
             return r
     return ""
+
+
+# ---- 素材标注（mark）----
+#
+# 标注 ≠ 别名。别名（alias）是 `@别名` 引用语法的载体，用户可见可编辑；标注是
+# **发给 LLM 用的稳定短编号**（图片1 / 视频2 / 音频1），只在「提示词 ⇄ LLM」这一跳
+# 上代替原文名出现：长文件名进 LLM 既费 token 又容易被抄错。
+#
+# 与官方 <Picture N> **不是一回事**（那是执行期按"本段挂载顺序"重算的 token，
+# 见 compile_refs）—— 某段只引用「图片3」时它仍须编译成 <Picture 1>。
+# 两层编号必须分离，把标注当 token 用会导致挂载数与编号对不上（模型收不到图）。
+
+MARK_MAX = 999
+MARK_KINDS = ("image", "video", "audio")
+_MARK_RE = re.compile(r"^(图片|视频|音频)(\d{1,3})$")
+
+
+def mark_shaped(text) -> bool:
+    """字符串是否是标注形态（图片1 / 视频12 / 音频3）。"""
+    return bool(_MARK_RE.match(str(text or "").strip()))
+
+
+def clean_mark(mark) -> str:
+    """标注归一：只认「图片N / 视频N / 音频N」，非法一律返回 ""（由调用方发新号）。"""
+    m = _MARK_RE.match(str(mark or "").strip())
+    if not m:
+        return ""
+    n = int(m.group(2))
+    if n < 1 or n > MARK_MAX:
+        return ""
+    return f"{m.group(1)}{n}"
+
+
+def mark_taken(items, mark, exclude_id=None, exclude_label=None) -> bool:
+    """标注是否已被别的条目占用（手动改标注时查重）。"""
+    want = clean_mark(mark)
+    if not want:
+        return False
+    for x in (items or []):
+        if not isinstance(x, dict):
+            continue
+        if exclude_id and str(x.get("asset_id") or "") == str(exclude_id):
+            continue
+        if exclude_label and str(x.get("alias") or x.get("label") or "") == str(exclude_label):
+            continue
+        if clean_mark(x.get("mark")) == want:
+            return True
+    return False
 
 
 def asset_id_for_content(sha_hex: str) -> str:

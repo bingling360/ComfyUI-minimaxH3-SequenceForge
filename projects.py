@@ -177,6 +177,12 @@ def _clean_asset(raw) -> dict | None:
         kept = [str(r).strip() for r in rl if str(r).strip() in ("首帧图", "尾帧图")]
         if kept:
             ent["roles"] = kept[:2]
+    # 标注透存（发给 LLM 的稳定短编号：图片1 / 视频2 / 音频1，见 asset_store.assign_marks）
+    mk = _mark_clean(raw)
+    if mk:
+        ent["mark"] = mk
+        if raw.get("mark_auto") is False:
+            ent["mark_auto"] = False
     return ent
 
 
@@ -242,6 +248,28 @@ def _ref_name_of(*cands) -> str:
     return asset_store.ref_name_of(*cands)
 
 
+def _as_mod():
+    """asset_store 延迟导入（本模块可能被按顶层模块加载，不能顶层 import）。"""
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    return asset_store
+
+
+def _mark_clean(raw) -> str:
+    """标注归一（规则唯一在 asset_store.clean_mark）。非法/缺省返回 ""。
+
+    与 `_mark_of(kind, seq)` 的分工：这个是**读已有值并清洗**（入参是条目 dict），
+    那个是**按类型和序号生成新标注文本**。合并两条分支时它们曾同名 `_mark_of`，
+    语义却完全不同 —— 传错类型会静默返回 ""（清洗版对非 dict 的处理），
+    所以改名拆开，别再合回去。
+    """
+    if not isinstance(raw, dict):
+        return ""
+    return _as_mod().clean_mark(raw.get("mark"))
+
+
 def _mark_of(kind, seq) -> str:
     """标注文本（图片1 / 视频1 / 音频1）；规则唯一在 asset_store.mark_of。"""
     try:
@@ -267,7 +295,6 @@ def _next_mark_seq(kind, used) -> int:
     except ImportError:
         import asset_store
     return asset_store.next_mark_seq(kind, used)
-
 
 def _unique_filename(directory, want, sep="_"):
     """directory 里找一个不冲突文件名（同名加 _2），**保证能停**。"""
@@ -313,7 +340,7 @@ def save_assets(name: str, assets, base_revision=None):
 
 
 def _clean_asset_link(raw) -> dict | None:
-    """项目资产链接白名单清洗：{asset_id, alias, kind?, roles?}；非法丢弃。"""
+    """项目资产链接白名单清洗：{asset_id, alias, kind?, roles?, mark?}；非法丢弃。"""
     import re as _re
     if not isinstance(raw, dict):
         return None
@@ -345,7 +372,118 @@ def _clean_asset_link(raw) -> dict | None:
         kept = [str(r).strip() for r in rl if str(r).strip() in ("首帧图", "尾帧图")]
         if kept:
             ent["roles"] = kept[:2]
+    # 标注透存（发给 LLM 的稳定短编号，与旧 assets 同口径）
+    mk = _mark_clean(raw)
+    if mk:
+        ent["mark"] = mk
+        if raw.get("mark_auto") is False:
+            ent["mark_auto"] = False
     return ent
+
+
+def _mark_pool(manifest: dict) -> list:
+    """按「池序」返回素材条目（同一批 dict 引用，就地改即落盘）。
+
+    池序 = 前端 `poolFromManifest` 的顺序：旧 `assets` 先按数组序，
+    同名（label==alias）时 **asset_links 胜出并顶替原位置**（Map.set 语义）。
+    只有与前端同口径，标注号才两边一致 —— 否则界面显示"图片3"、后端存的是"图片4"。
+    """
+    out, idx = [], {}
+    for a in (manifest.get("assets") or []):
+        if not isinstance(a, dict) or not a.get("label"):
+            continue
+        idx[str(a["label"])] = len(out)
+        out.append(a)
+    for L in (manifest.get("asset_links") or []):
+        if not isinstance(L, dict) or not L.get("alias"):
+            continue
+        k = str(L["alias"])
+        if k in idx:
+            out[idx[k]] = L
+        else:
+            idx[k] = len(out)
+            out.append(L)
+    return out
+
+
+def normalize_marks(name: str, save: bool = True):
+    """给项目里还没标注的素材按池序补发标注（幂等）。
+
+    返回 `(manifest, changed)`；目录/manifest 不存在返回 `(None, False)`。
+    老项目首次读到时补号并落盘，之后号就固定了（删素材留空号、不重排）。
+    """
+    name = safe_name(name)
+    if not name:
+        return None, False
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None, False
+    _ensure_revision(manifest)
+    changed = _as_mod().assign_marks(_mark_pool(manifest))
+    if changed and save:
+        manifest["updated_at"] = time.time()
+        manifest["revision"] = int(manifest.get("revision") or 1) + 1
+        manifest["manifest_schema"] = MANIFEST_SCHEMA
+        checkpoint.save_manifest(root, manifest)
+    return manifest, changed
+
+
+def set_asset_mark(name: str, mark, asset_id=None, alias=None, base_revision=None):
+    """手动改标注：查重后写入，并置 `mark_auto=False`（不再被自动发号覆盖）。
+
+    mark 传空串 = 清除标注（下次 normalize_marks 会按池序重新发号）。
+    找不到目标素材抛 ValueError；标注被别的素材占用抛 ValueError。
+    """
+    name = safe_name(name)
+    if not name:
+        return None
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        return None
+    _ensure_revision(manifest)
+    if base_revision is not None:
+        try:
+            br = int(base_revision)
+        except (TypeError, ValueError):
+            raise ValueError("无效的 base_revision（须为整数）")
+        if int(manifest.get("revision") or 1) != br:
+            raise ValueError(
+                f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    AS = _as_mod()
+    pool = _mark_pool(manifest)
+    want = AS.clean_mark(mark)
+    raw_mark = str(mark or "").strip()
+    if raw_mark and not want:
+        raise ValueError(f"标注须是「图片N / 视频N / 音频N」形态，收到「{raw_mark}」")
+    target = None
+    aid = str(asset_id or "").strip()
+    lab = str(alias or "").strip()
+    for d in pool:
+        if aid and str(d.get("asset_id") or "") == aid:
+            target = d
+            break
+        if lab and str(d.get("alias") or d.get("label") or "") == lab:
+            target = d
+            break
+    if target is None:
+        raise ValueError("素材不在项目库中")
+    tgt_id = str(target.get("asset_id") or "") or None
+    tgt_lab = str(target.get("alias") or target.get("label") or "") or None
+    if want and AS.mark_taken(pool, want, exclude_id=tgt_id, exclude_label=tgt_lab):
+        raise ValueError(f"标注「{want}」已被其它素材占用，请换一个")
+    if want:
+        target["mark"], target["mark_auto"] = want, False
+    else:
+        target.pop("mark", None)
+        target.pop("mark_auto", None)
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return manifest
+
 
 
 def _purge_alias_refs(manifest: dict, aliases) -> bool:
@@ -395,6 +533,7 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
     就是它；缺省时由 orig_name / 落盘文件名 / alias 兜底推导。
     同 alias 已存在则重指向新 asset_id；同 asset_id 已存在则只改 alias。
     roles：None=不动旧标注；列表（含空）=覆盖（含取消标注）。
+    mark：None=按池序自动发号（既有号不动）；非空=手动覆盖并锁定（mark_auto=False）。
     目录或 manifest 不存在返回 None；base_revision 不一致抛
     ValueError(REVISION_CONFLICT)。旧 manifest["assets"] 不动（转译层照读）。
     """
@@ -422,6 +561,14 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
         if int(manifest.get("revision") or 1) != br:
             raise ValueError(
                 f"REVISION_CONFLICT: server={int(manifest.get('revision') or 1)} client={br}")
+    AS = _as_mod()
+    pool = _mark_pool(manifest)
+    want_mark = AS.clean_mark(mark)
+    if str(mark or "").strip() and not want_mark:
+        raise ValueError(f"标注须是「图片N / 视频N / 音频N」形态，收到「{mark}」")
+    if want_mark and AS.mark_taken(pool, want_mark, exclude_id=ent["asset_id"],
+                                   exclude_label=ent["alias"]):
+        raise ValueError(f"标注「{want_mark}」已被其它素材占用，请换一个")
     links = [x for x in (manifest.get("asset_links") or []) if isinstance(x, dict)]
     links = [x for x in (_clean_asset_link(x) for x in links) if x is not None]
     # 标注：显式给了就用它（改标注），没给就按"已有最大序号 +1"自动分配
@@ -461,11 +608,18 @@ def link_asset(name: str, asset_id: str, alias: str, kind="image", base_revision
         ent["mark"] = _mk
         links.append(ent)
     manifest["asset_links"] = links
+    # 标注：按**池序**（旧 assets 先、links 覆盖同名）发号，与前端 poolFromManifest 同口径。
+    AS.assign_marks(_mark_pool(manifest))
+    if want_mark:
+        for d in _mark_pool(manifest):
+            if str(d.get("asset_id") or "") == ent["asset_id"]:
+                d["mark"], d["mark_auto"] = want_mark, False
     manifest["updated_at"] = time.time()
     manifest["revision"] = int(manifest.get("revision") or 1) + 1
     manifest["manifest_schema"] = MANIFEST_SCHEMA
     checkpoint.save_manifest(root, manifest)
     return manifest
+
 
 
 def unlink_asset(name: str, asset_id=None, alias=None, base_revision=None):
@@ -731,10 +885,10 @@ def projects_linking(asset_ids, exclude=None) -> dict:
     return out
 
 
-# intent_zh 是段级中文意图：主框上半区输入，不进模型，只给人和 AI 扩写看。
-# 结果稿仍是 prompts[idx]，后端取值链路不变。
-_SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music",
-                   "intent_zh", "script")
+# 段级字符串字段白名单。B02 三框合一后只剩传统的场景/角色/环境音/配乐四项：
+# 提示词正文（含意图与剧本的最终产物）统一在 prompts[idx]，不再有 intent_zh / script
+# 这两个中间字段 —— 前端老项目的文字靠 migrateLegacySegText 在主框为空时回填。
+_SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music")
 
 
 def _clean_seg_field(raw) -> dict | None:

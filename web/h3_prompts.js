@@ -98,7 +98,111 @@
     return out;
   }
 
-  /* 预留：外部 agent / 本地模型的自动解析分配接口（总提示词框式）。
+  /* ---- 素材标注编解码（B03）----
+   * 发给 LLM 的一跳用**标注**（`@图片1`）；磁盘上永远存**素材名**（`@阿依.png`）。
+   *
+   * 为什么：长文件名进 LLM 既费 token 又容易被抄错，抄错 = 静默丢图（模型收不到那张参考图，
+   * 而正文看着完全正常）。短编号还能让"引用的是哪一张"在人机对话里可核对。
+   *
+   * 为什么标注不能落盘：执行期 nodes._find_refs 只认池里的**别名**，标注不是别名 ——
+   * 一旦写进 prompts，编译时找不到标签，那张图就再也不进 conditioning。
+   * 所以这两个函数**只允许**出现在请求/回填这一跳上。
+   *
+   * 与官方 `<Picture N>` 分层：那个是执行期按"本段挂载顺序"每段重算的 token
+   * （asset_store.compile_refs）。某段只引用「图片3」时仍须编译成 `<Picture 1>`。
+   */
+  const MARK_RE = /^(图片|视频|音频)(\d{1,3})$/;
+  const MARK_OPEN = "【[（(「";
+  const MARK_CLOSE = { "【": "】", "[": "]", "（": "）", "(": ")", "「": "」" };
+  /* `@别名` 语法的前导判据：**必须与后端 nodes._REF_AT 的负向后顾逐字一致**
+   * （只挡 ASCII 字母数字下划线）—— 写成含 CJK 的"更严"版本会让
+   * `@阿依@回廊` 这种连写漏掉后一个，与 refsFromText / 后端编译结果不一致。 */
+  const _AT_PREV_BAD = (c) => /[0-9A-Za-z_]/.test(c || "");
+  /* 裸形态（LLM 漏了 @）的前导判据：连汉字也挡，避免把散文里的「大图片1」当引用 */
+  const _BARE_PREV_BAD = (c) => /[0-9A-Za-z_\u4e00-\u9fff]/.test(c || "");
+
+  /** 池 → 可用的 (素材名, 标注) 对（标注形态非法/缺失的条目直接跳过） */
+  function markPairs(pool) {
+    const out = [];
+    for (const a of (pool || [])) {
+      const label = String((a && a.label) || "").trim();
+      const mark = String((a && a.mark) || "").trim();
+      if (label && MARK_RE.test(mark)) out.push({ label, mark });
+    }
+    return out;
+  }
+
+  /** 出（给 LLM）：`@素材名` → `@标注`。最长素材名优先，与 refsFromText / 后端 _find_refs 同口径。 */
+  function marksToText(text, pool) {
+    const s = String(text == null ? "" : text);
+    const pairs = markPairs(pool).sort((a, b) => b.label.length - a.label.length);
+    if (!pairs.length) return s;
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+      if (s[i] === "@" && !_AT_PREV_BAD(s[i - 1])) {
+        const hit = pairs.find((p) => s.startsWith(p.label, i + 1));
+        if (hit) { out += "@" + hit.mark; i += hit.label.length + 1; continue; }
+      }
+      out += s[i];
+      i += 1;
+    }
+    return out;
+  }
+
+  /** 回（LLM 产出）：`@标注` → `@素材名`。
+   *
+   * 容错按"宁可多认不可漏认"：LLM 可能写成 `图片1`（漏 @）、`@图片 1`（中间多个空格）、
+   * `【图片1】`/`(图片1)`（加括号强调）。**故意接受裸形态** —— 漏认的后果是引用静默丢失
+   * （图片不进模型，正文却看着正常），而多认的后果只是个明显的绿色引用框，用户一眼能删。
+   */
+  function textToMarks(text, pool) {
+    const s = String(text == null ? "" : text);
+    const pairs = markPairs(pool);
+    if (!pairs.length) return s;
+    const table = new Map();                       // 前缀 -> [{digits, label}]
+    for (const p of pairs) {
+      const m = MARK_RE.exec(p.mark);
+      if (!m) continue;
+      const arr = table.get(m[1]) || [];
+      arr.push({ digits: m[2], label: p.label });
+      table.set(m[1], arr);
+    }
+    const prefixes = [...table.keys()].sort((a, b) => b.length - a.length);
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+      /* 显式 @ 形态不查前导字符（@ 本身就是标记，且 @ 后面紧跟 CJK 不可能是邮箱）；
+       * 裸形态才查，且连汉字一起挡（散文里的「大图片1」不能被认成引用）。 */
+      const prevOk = s[i] === "@" ? true : !_BARE_PREV_BAD(s[i - 1]);
+      if (prevOk) {
+        let j = s[i] === "@" ? i + 1 : i;
+        let open = "";
+        if (MARK_OPEN.includes(s[j])) { open = s[j]; j += 1; }
+        const pf = prefixes.find((p) => s.startsWith(p, j));
+        if (pf) {
+          let k = j + pf.length;
+          while (k < s.length && /\s/.test(s[k])) k += 1;      // 允许「图片 1」中间的空格
+          const hit = (table.get(pf) || [])
+            .filter((x) => s.startsWith(x.digits, k) && !/[0-9]/.test(s[k + x.digits.length] || ""))
+            .sort((a, b) => b.digits.length - a.digits.length)[0];
+          const end = k + (hit ? hit.digits.length : 0);
+          if (!hit || (open && s[end] !== MARK_CLOSE[open])) {
+            /* 有前缀没编号 / 括号不闭合：当普通文字，不动 */
+          } else {
+            out += "@" + hit.label;
+            i = end + (open ? 1 : 0);
+            continue;
+          }
+        }
+      }
+      out += s[i];
+      i += 1;
+    }
+    return out;
+  }
+
+  /** 预留：外部 agent / 本地模型的自动解析分配接口（总提示词框式）。
    *  后续实现：把一段自然语言/官方文本解析成 prompt_v2 各字段并写回 ds.segments。
    *  当前为占位，调用方应捕获其抛出的未实现错误。 */
   function assignV2FromText() {
@@ -122,6 +226,8 @@
       defaultShot, defaultPromptV2, migrateLegacySeg, compilePayload,
       defaultLatentSave, cleanLatentSave, ensurePromptV2, hasPromptV2,
       detectMode, assignV2FromText,
+      /* 素材标注编解码（B03）：只用于「提示词 ⇄ LLM」这一跳，绝不落盘 */
+      markPairs, marksToText, textToMarks,
       CAMERA_MOVES, CAMERA_AMPS, CAMERA_SPEEDS, RETENTION_MARKERS,
     };
   }

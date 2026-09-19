@@ -352,7 +352,8 @@ def test_link_entries_listed_and_resolved(proj, tmp_path, monkeypatch):
     aid = "a_0123456789ab"
     root = tmp_path / "h3_projects" / "demo"
     (root / "manifest.json").write_text(json.dumps({
-        "assets": [], "asset_links": [{"asset_id": aid, "alias": "女主", "kind": "image"}],
+        "assets": [], "asset_links": [{"asset_id": aid, "alias": "女主", "kind": "image",
+                                       "mark": "图片1"}],
     }, ensure_ascii=False), encoding="utf-8")
     lib = tmp_path / "lib"
     (lib / "images").mkdir(parents=True)
@@ -362,6 +363,11 @@ def test_link_entries_listed_and_resolved(proj, tmp_path, monkeypatch):
     fake.load_library = lambda root_: {"assets": [{
         "asset_id": aid, "kind": "image", "file": "images/x.png",
         "orig_name": "girl.png", "bytes": 3}]}
+    # clean_mark 是 library._link_entries 用来透出「标注」的（镜像真实实现；替身不碰磁盘）
+    import re as _re
+    fake.clean_mark = lambda m: (
+        _re.fullmatch(r"(图片|视频|音频)[1-9]\d{0,2}", str(m or "").strip()).group(0)
+        if _re.fullmatch(r"(图片|视频|音频)[1-9]\d{0,2}", str(m or "").strip()) else "")
     monkeypatch.setitem(sys.modules, "asset_store", fake)
     monkeypatch.setattr(L, "_library_root", lambda: str(lib))
     L.invalidate()
@@ -373,6 +379,8 @@ def test_link_entries_listed_and_resolved(proj, tmp_path, monkeypatch):
     assert e["asset_id"] == aid and e["name"] == "女主"
     assert e["file"] == "images/x.png"          # 全局库相对路径
     assert e["origin"].endswith("链接全局库")
+    # 标注透到条目（素材库瓦片/引用条要显示「图片1」）
+    assert e["mark"] == "图片1" and e["mark_auto"] is True
     # 绝对路径按全局库解析（否则缩略图/预览全 404）
     assert L.resolve_item_path(e, proj).endswith("x.png")
     assert L.resolve_item_path(e, proj).startswith(str(lib))

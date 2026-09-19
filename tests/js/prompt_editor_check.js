@@ -74,6 +74,12 @@ const code = [
     extractFn("assetPreviewUrl"),
     extractFn("buildAssetThumb"),
     extractFn("thumbSig"),
+    /* 素材标注层：makeTag 的 title / @标注 提示都要用 cleanMark */
+    extractConstLine("MARK_RE"),
+    extractConstLine("MARK_MAX"),
+    extractFn("cleanMark"),
+    extractFn("markShaped"),
+    extractFn("nextMark"),
     extractFn("refsFromText"),
     extractFn("createPromptEditor"),
     extractFn("syncRefsFromText"),

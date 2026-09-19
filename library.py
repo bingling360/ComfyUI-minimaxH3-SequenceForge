@@ -470,11 +470,23 @@ def _link_entries(project, root) -> list:
                       if str(r) in ("首帧图", "尾帧图")]
         # 引用名（含后缀全名）：提示词里 @ 后面写的就是它。缺省由原始文件名推导，
         # 再不行退回显示名（无后缀，但至少能被解析到）。
+        # 为什么必须带后缀：识别表按「全名 + 别名」两份最长优先匹配（见
+        # asset_store.clean_ref_name），没有全名的话用户从外面贴进来的
+        # `@猫.png` 只能匹配到 `猫`，`.png` 会当普通文本留在正文里（后缀溢出）。
         _rn = L.get("ref_name") or g.get("orig_name") or f.split("/")[-1] \
             or str(L.get("alias") or "")
         e["ref_name"] = _rn
-        # 标注（图片1 / 视频1 / 音频1）：给 LLM 看的短名，链接条目自己带着
-        e["mark"] = str(L.get("mark") or "")
+        # 标注（图片1 / 视频1 / 音频1）：给 LLM 看的短名，链接条目自己带着。
+        # 走 clean_mark 归一 —— 非法/手滑写的值一律变空，由 assign_marks 补发，
+        # 免得脏值一路传到 LLM 那边变成"抄错名字"。
+        try:
+            from . import asset_store as _as
+        except ImportError:
+            import asset_store as _as
+        mk = _as.clean_mark(L.get("mark"))
+        if mk:
+            e["mark"] = mk
+            e["mark_auto"] = L.get("mark_auto") is not False
         out.append(e)
     return out
 

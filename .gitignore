@@ -6,6 +6,10 @@
 .workbuddy/
 .workbuddy-ai/
 
+# 本地私有默认值：内含 API Key / 默认服务商，**绝不入库**
+optimizer.local.json
+optimizer.local.json.bak-*
+
 # 前端测试依赖（jsdom 等，npm install 生成；package.json/lock 已入库）
 node_modules/
 

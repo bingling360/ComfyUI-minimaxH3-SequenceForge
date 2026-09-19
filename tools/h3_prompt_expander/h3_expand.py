@@ -343,7 +343,8 @@ def main(argv=None):
                     help="优化设置 JSON（服务商/协议/API Key/模型/本地模型，见 optimizer.DEFAULT_CONFIG）")
     ap.add_argument("--duration", type=float, default=5, help="目标秒数 4-15（默认 5）")
     ap.add_argument("--mode", default="T2VA", choices=["T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA"])
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="覆盖配置里的模型名")
+    ap.add_argument("--model", default=None,
+                    help="覆盖配置里的模型名（不填则用 --config 里的 model，最后才回落到内置默认）")
     ap.add_argument("--temperature", type=float, default=None, help="不填则按 --style 取默认")
     ap.add_argument("--style", default="balanced", choices=["strict", "balanced", "creative"],
                     help="strict只收敛 / balanced默认 / creative允许补1个视觉细节")

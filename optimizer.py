@@ -19,22 +19,59 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
+# 本地私有默认值：optimizer.local.json（已 gitignore）—— 放 API Key 这类**不该进仓库**
+# 的东西。有它就开箱即用（前端 Key 留空也照样能调），没有就回落内置默认值。
+# 坏 JSON / 无权限一律静默忽略：这只是一层便利，不是必需品，绝不能因此让插件起不来。
+LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "optimizer.local.json")
+
+
+def _load_local_defaults() -> dict:
+    try:
+        with open(LOCAL_CONFIG_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+LOCAL_DEFAULTS = _load_local_defaults()
+
 DEFAULT_CONFIG = {
     "mode": "api",
-    "provider": "runninghub",
-    "api_url": "https://www.runninghub.cn/openapi/v2",
+    # 默认走智谱 GLM（国产、直连快、支持多图视觉理解）。
+    # 注意 protocol 是 openai（v4 是 OpenAI 兼容接口），不是 runninghub。
+    "provider": "glm",
+    "api_url": "https://open.bigmodel.cn/api/paas/v4",
     "api_key": "",
-    "model": "openai/gpt-5.6-sol",
-    "protocol": "runninghub",
+    # glm-5.3-flashx：实测 18.8s 出 1330 字六字段（比 4.6v 快一档），
+    # 代价是「始终思考」型号 —— 见 thinking 默认值的说明。
+    "model": "glm-5.3-flashx",
+    "protocol": "openai",
     "read_media": True,
     "output_language": "中文",
     "local_model": "",
     "local_mmproj": "",
     "local_device": "cuda",
-    "max_tokens": 4096,
+    "max_tokens": 8192,
+    # 单次 HTTP 读写超时（秒）。旧值 120 是"读操作超时"报错的直接原因：
+    # 带图 + 长规则 + 六字段长输出的改写，GLM 开思考时轻易超过 120s。
+    "timeout": 300,
+    # GLM 系深度思考：auto=不干预（服务商默认）/ enabled / disabled。
+    # 默认 disabled —— 意图是"别想太久、快点出结果"。
+    # ⚠ 默认型号 glm-5.3-flashx 是「始终思考」型号，传 disabled 会 400，
+    #   见 _glm_thinking_fields() 的自动降级：它会翻译成最低强度 low，
+    #   而不是什么都不发（什么都不发 = 服务商默认，通常是 max，最慢的）。
+    "thinking": "disabled",
+    # 思考强度（仅智谱 GLM-5 系支持）：""=不指定（服务商用默认，通常 max）
+    # / low / high / max。5.3 系只认这三档，别的值会报错。
+    "reasoning_effort": "",
     "rule_file": "auto",
     # 「AI 扩写优化设置」：单框提示词主按钮「AI 扩写 + 优化」的参数。
     # sec_min/sec_max = 0 表示"跟随本段时长 ±2 秒"（前端 optExpandSettings 负责换算）。
@@ -42,6 +79,7 @@ DEFAULT_CONFIG = {
 }
 
 PROVIDERS = {
+    "glm": ("https://open.bigmodel.cn/api/paas/v4", "glm-5.3-flashx", "openai"),
     "openai": ("https://api.openai.com/v1", "gpt-4.1-mini", "openai"),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", "gemini"),
     "openrouter": ("https://openrouter.ai/api/v1", "google/gemini-2.5-flash", "openai"),
@@ -51,6 +89,92 @@ PROVIDERS = {
     "runninghub_overseas": ("https://www.runninghub.ai/openapi/v2", "openai/gpt-5.6-sol", "openai"),
     "custom": ("", "", "openai"),
 }
+
+# 会走 bigmodel（智谱）私有 `thinking` 字段的端点特征。别的端点塞这个字段只会换来 400。
+_GLM_HOSTS = ("bigmodel.cn", "bigmodel")
+
+# ---- 智谱思考能力表（2026-09-19 实测 + 官方《深度思考》文档）----
+# 「始终思考」型号：传 `thinking.type=disabled` 会被直接拒绝，实测报
+#   HTTP 400 / code 1210「该模型始终思考，不支持关闭思考；请使用 low、high 或 max。」
+# 复现：glm-5.3 / glm-5.3-flash / glm-5.3-flashx 全拒；glm-5.2 与 glm-4.6v 可关。
+GLM_FORCE_THINKING = ("glm-5.3", "glm-4.7", "glm-4.5v")
+# 支持 `reasoning_effort` 的型号（官方："仅 GLM-5.2 及以上支持"）。
+# 取保守前缀：只有 glm-5 系确定支持，4.7/4.5v 不冒险下发（下发不被识别会报错）。
+GLM_EFFORT_PREFIXES = ("glm-5",)
+# 可选的思考强度。5.3 系只认这三档，多传别的值直接报错，所以这里就是白名单。
+GLM_EFFORT_VALUES = ("low", "high", "max")
+
+
+def _is_forced_thinking(model: str) -> bool:
+    """该模型是否「始终思考」（不能关）。"""
+    return str(model or "").lower().startswith(GLM_FORCE_THINKING)
+
+
+def _supports_effort(model: str) -> bool:
+    return str(model or "").lower().startswith(GLM_EFFORT_PREFIXES)
+
+
+def _glm_thinking_fields(cfg: dict) -> dict:
+    """智谱系专有的 `thinking` / `reasoning_effort` 字段。非智谱端点返回 {}。
+
+    四条规则，都是被实测打出来的：
+    1. `thinking` 是智谱私有字段，塞进 OpenAI/百炼的请求体直接 400 → 非智谱不下发。
+    2. **「始终思考」型号不能收 `disabled`**（实测 400 / code 1210：
+       「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」）。
+       用户选了「关闭」时，把它**翻译成最低强度 `low`** —— 用户的意图是"别想太久、
+       快点出结果"，`low` 才是这个意图在强制思考模型上的对应物。
+       什么都不发是不行的：那等于让服务商用默认值（通常是 `max`，最慢）。
+    3. `reasoning_effort` 只在 thinking 没被真正关掉时有意义。
+    4. 模型不支持 effort 时不发 —— 换个不认识这字段的型号整个请求就废了。
+    """
+    url = str(cfg.get("api_url") or "").lower()
+    if not any(h in url for h in _GLM_HOSTS):
+        return {}
+    model = str(cfg.get("model") or "")
+    mode = str(cfg.get("thinking") or "auto").lower()
+    effort = str(cfg.get("reasoning_effort") or "").lower()
+    forced = _is_forced_thinking(model)
+    supports = _supports_effort(model)
+    out: dict = {}
+    if mode == "disabled":
+        if not forced:
+            out["thinking"] = {"type": "disabled"}
+        elif supports:
+            out["reasoning_effort"] = "low"
+    elif mode == "enabled":
+        out["thinking"] = {"type": "enabled"}
+    # auto（或强制思考型号被降级）→ 不下发 thinking，交给服务商默认
+    # 显式指定的强度永远优先于上面的翻译
+    if effort in GLM_EFFORT_VALUES and supports \
+            and out.get("thinking", {}).get("type") != "disabled":
+        out["reasoning_effort"] = effort
+    return out
+
+
+def _glm_caps(model: str) -> dict:
+    """给前端的能力提示：这个型号能不能关思考、能不能调强度、关闭会被翻译成什么。"""
+    forced = _is_forced_thinking(model)
+    supports = _supports_effort(model)
+    return {"forced_thinking": forced,
+            "supports_effort": supports,
+            "effort_values": list(GLM_EFFORT_VALUES),
+            # 前端拿它渲染「关闭思考」的说明文案
+            "disabled_effect": ("low" if (forced and supports)
+                                else ("disabled" if not forced else ""))}
+
+
+def default_config() -> dict:
+    """内置默认值 + 本地私有覆盖（optimizer.local.json）。"""
+    cur = dict(DEFAULT_CONFIG)
+    cur["expand"] = dict(DEFAULT_CONFIG["expand"])
+    for k, v in (LOCAL_DEFAULTS or {}).items():
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        if k == "expand" and isinstance(v, dict):
+            cur["expand"].update(v)
+        elif k in cur:
+            cur[k] = v
+    return cur
 
 RULE_OPTIONS = (
     "auto",
@@ -118,20 +242,44 @@ def pick_rule_text(settings: dict | None, files: dict | None, task: str | None =
 
 
 def normalize_config(raw: dict | None) -> dict:
-    cur = DEFAULT_CONFIG
+    cur = default_config()
     raw = raw if isinstance(raw, dict) else {}
     provider = str(raw.get("provider") or cur["provider"]).lower()
     preset = PROVIDERS.get(provider)
     api_keys = raw.get("api_keys") if isinstance(raw.get("api_keys"), dict) else {}
     pk = api_keys.get(provider)
-    api_key = pk if pk is not None else raw.get("api_key", cur["api_key"])
+    # 注意 `""` 与"缺失"必须同等对待：前端设置面板点一次「保存」就会把
+    # `api_keys[provider] = ""` 写进来（Key 框留空时），若把空串当"用户显式置空"，
+    # 内置 Key 的兜底会被自己顶掉，用户点完保存反而调不通。
+    if pk is not None and str(pk).strip():
+        api_key = pk
+    else:
+        api_key = raw.get("api_key")
+        if api_key is None or not str(api_key).strip():
+            # 前端留空（或压根没下发 Key）时回落到本地私有默认 Key。
+            # **只在服务商正好等于本地默认服务商时回落** —— 否则会把 GLM 的 Key
+            # 发给 OpenAI，换回来一个 401，比"没填 Key"更难排查。
+            api_key = cur.get("api_key") if provider == str(cur.get("provider") or "").lower() else ""
     provider_models = raw.get("provider_models") if isinstance(raw.get("provider_models"), dict) else {}
     pm = provider_models.get(provider)
     try:
         max_tokens = int(raw.get("max_tokens", cur["max_tokens"]))
     except (TypeError, ValueError):
-        max_tokens = 4096
-    max_tokens = max(512, min(8192, max_tokens))
+        max_tokens = int(cur["max_tokens"])
+    # 上限从 8192 提到 32768：思考模型的 reasoning token **计入** completion_tokens，
+    # 上限太小时推理会把预算吃光、正文一个字都留不下（前端看到的就是"LLM 返回空文本"）。
+    max_tokens = max(512, min(32768, max_tokens))
+    try:
+        timeout = int(float(raw.get("timeout", cur.get("timeout", 300))))
+    except (TypeError, ValueError):
+        timeout = 300
+    timeout = max(30, min(1800, timeout))
+    thinking = str(raw.get("thinking") or cur.get("thinking") or "auto").lower()
+    if thinking not in ("auto", "enabled", "disabled"):
+        thinking = "auto"
+    effort = str(raw.get("reasoning_effort") or cur.get("reasoning_effort") or "").lower()
+    if effort not in GLM_EFFORT_VALUES:
+        effort = ""
     lang_raw = str(raw.get("output_language") or cur["output_language"])
     lang = "中文" if lang_raw.lower() in {"中文", "chinese", "zh"} else "English"
     return {
@@ -149,6 +297,9 @@ def normalize_config(raw: dict | None) -> dict:
         "local_mmproj": str(raw.get("local_mmproj") or cur["local_mmproj"] or "").strip(),
         "local_device": str(raw.get("local_device") or cur["local_device"] or "cuda").lower(),
         "max_tokens": max_tokens,
+        "timeout": timeout,
+        "thinking": thinking,
+        "reasoning_effort": effort,
         "rule_file": str(raw.get("rule_file") or cur["rule_file"]),
         "expand": _clean_expand(raw.get("expand"), cur.get("expand")),
     }
@@ -186,6 +337,17 @@ def public_config(cfg: dict) -> dict:
     out = dict(cfg)
     out["api_key"] = ""
     out["has_api_key"] = bool(cfg.get("api_key"))
+    # 前端据此判断"Key 留空也能跑"（服务端有本地私有 Key 兜底），
+    # 从而不再因为输入框为空就把用户拦到设置面板里。
+    out["has_default_key"] = bool(str(LOCAL_DEFAULTS.get("api_key") or "").strip())
+    out["providers"] = {k: {"url": v[0], "model": v[1], "protocol": v[2]}
+                        for k, v in PROVIDERS.items()}
+    # 思考能力表下发（**单一真相源**）：前端据此把「关闭思考」置灰、显示强度下拉。
+    # 型号名单只写在后端一处，前端不重复一份 —— 两边各写一份必然漂移。
+    out["glm_force_thinking"] = list(GLM_FORCE_THINKING)
+    out["glm_effort_prefixes"] = list(GLM_EFFORT_PREFIXES)
+    out["glm_effort_values"] = list(GLM_EFFORT_VALUES)
+    out["model_caps"] = _glm_caps(cfg.get("model") or "")
     try:
         out["models"] = scan_visual_models()
     except Exception:
@@ -315,22 +477,74 @@ def build_system_prompt(task: str, duration: float, labels: list,
     )
 
 
-def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 120) -> dict:
+# 值得重试的瞬时故障状态码：限流与对端 5xx/网关抖动。
+# 4xx 一律不重试 —— Key 错、参数错、余额不足，重试多少次结果都一样，只会白等。
+_RETRY_STATUS = (408, 425, 429, 500, 502, 503, 504)
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """识别超时：urlopen 直抛 TimeoutError/socket.timeout，连接阶段则包在 URLError.reason 里。
+    Windows 上读超时的文案是 "The read operation timed out"，不认类型也得认文案。"""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 300,
+                    retries: int = 2) -> dict:
+    """POST JSON 并解析响应。
+
+    超时语义（旧实现直接 `urlopen(timeout=120)` 且不重试）：
+    - timeout 是**读+写**的单次上限，由调用方按服务商配置下发；
+    - 超时只重试 1 次（一次已经等了 timeout 秒，再等一轮对用户是双重折磨），
+      连接类/5xx/429 才重试 retries 次；
+    - 超时的报错必须**可行动**：直接告诉用户去哪儿调大、或关掉深度思考，
+      而不是把 socket 的英文原文丢给前端。
+    """
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={
-        "Content-Type": "application/json", **(headers or {})}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            status = getattr(resp, "status", 200)
-    except Exception as e:
-        raise RuntimeError(f"LLM 请求失败：{e}")
-    if status >= 400:
-        raise RuntimeError(f"LLM 返回 HTTP {status}：{body[:1000]}")
-    try:
-        return json.loads(body)
-    except ValueError:
-        raise RuntimeError("LLM 返回了无效 JSON")
+    last = "LLM 请求失败"
+    timeout_retried = False
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, headers={
+            "Content-Type": "application/json", **(headers or {})}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                status = getattr(resp, "status", 200)
+            if status >= 400:
+                raise RuntimeError(f"LLM 返回 HTTP {status}：{body[:1000]}")
+            try:
+                return json.loads(body)
+            except ValueError:
+                raise RuntimeError("LLM 返回了无效 JSON")
+        except RuntimeError:
+            raise
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:800]
+            except Exception:
+                pass
+            last = f"LLM 返回 HTTP {e.code}：{detail}"
+            if e.code not in _RETRY_STATUS or attempt >= retries:
+                raise RuntimeError(last)
+        except Exception as e:
+            if _is_timeout(e):
+                last = (f"LLM 请求超时（{timeout} 秒内未返回）：服务商没有在超时时间内响应。"
+                        f"请到「AI 优化设置 → 请求超时」调大（如 600），"
+                        f"或关闭「深度思考」；也可以先关掉「读取视觉参考」再试。")
+                if timeout_retried or attempt >= retries:
+                    raise RuntimeError(last)
+                timeout_retried = True
+            else:
+                last = f"LLM 请求失败（{type(e).__name__}）：{e}"
+                if attempt >= retries:
+                    raise RuntimeError(last)
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(last)
 
 
 def _endpoint_for(cfg: dict) -> str:
@@ -347,6 +561,34 @@ def _endpoint_for(cfg: dict) -> str:
     return f"{base}/chat/completions"
 
 
+def _empty_text_error(choice: dict, usage: dict | None) -> RuntimeError:
+    """正文为空时的可行动诊断。
+
+    两种成因长得一样（content 都是空串），但处理方式完全不同：
+    - **思考吃光预算**：reasoning_content 有内容、finish_reason=length
+      → 调大「最大输出 token」或把思考强度降到 low。
+    - **服务商就是没给正文**：连 reasoning 都没有
+      → 换模型或看 finish_reason。
+    统一报"LLM 返回空文本"等于什么都没说，用户只能反复重试。
+    """
+    reason = str((choice or {}).get("finish_reason") or "?")
+    msg = (choice or {}).get("message") or {}
+    reasoning = str(msg.get("reasoning_content") or "")
+    u = usage or {}
+    rt = (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    head = f"LLM 没有产出正文（finish_reason={reason}"
+    head += f"，推理 {len(reasoning)} 字" if reasoning else ""
+    head += f"，completion_tokens={u.get('completion_tokens')}" if u.get("completion_tokens") else ""
+    head += f"，reasoning_tokens={rt}" if rt else ""
+    head += "）。"
+    if reasoning or (reason == "length"):
+        return RuntimeError(
+            head + "推理过程很可能吃光了「最大输出 token」—— 思考产生的 token 是计入"
+                   "输出上限的。请到「AI 优化设置 → 最大输出 token」调大（如 16384），"
+                   "或把「思考强度」降到 low。")
+    return RuntimeError(head + "请换一个模型，或检查服务商返回。")
+
+
 def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tokens: int,
                   temperature: float = 0.2) -> str:
     if not cfg.get("api_key"):
@@ -354,6 +596,7 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
     if not cfg.get("api_url") or not cfg.get("model"):
         raise ValueError("API 地址或模型为空")
     proto = str(cfg.get("protocol") or "openai").lower()
+    timeout = int(cfg.get("timeout") or 300)
     # 图片只取前 8 张（与测试分支一致，防包过大）
     images: list = []
     for item in media or []:
@@ -375,7 +618,8 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
             parts.append({"inline_data": {"mime_type": mime, "data": b64}})
         res = _http_post_json(
             _endpoint_for(cfg) + f"?key={urllib.parse.quote(str(cfg['api_key']))}",
-            {"contents": [{"parts": parts}], "generationConfig": {"maxOutputTokens": max_tokens}})
+            {"contents": [{"parts": parts}], "generationConfig": {"maxOutputTokens": max_tokens}},
+            timeout=timeout)
         try:
             return str(res["candidates"][0]["content"]["parts"][0]["text"]).strip()
         except (KeyError, IndexError, TypeError):
@@ -387,7 +631,7 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
         res = _http_post_json(_endpoint_for(cfg), {
             "model": cfg["model"], "input": [{"role": "user", "content": content}],
             "max_output_tokens": max_tokens},
-            headers={"Authorization": f"Bearer {cfg['api_key']}"})
+            headers={"Authorization": f"Bearer {cfg['api_key']}"}, timeout=timeout)
         try:
             for item in res.get("output", []):
                 for c in item.get("content", []):
@@ -396,22 +640,135 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
         except AttributeError:
             pass
         raise RuntimeError("Responses 返回结构异常")
-    # 默认 OpenAI 兼容（含 RunningHub/百炼/SiliconFlow/OpenRouter）
+    # 默认 OpenAI 兼容（含 GLM/百炼/SiliconFlow/OpenRouter/RunningHub）
     content2: list = [{"type": "text", "text": user_prompt}]
     for u in images:
         content2.append({"type": "image_url", "image_url": {"url": u}})
-    res = _http_post_json(_endpoint_for(cfg), {
+    payload = {
         "model": cfg["model"],
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": content2}],
-        "max_tokens": max_tokens, "temperature": _temp(temperature)},
-        headers={"Authorization": f"Bearer {cfg['api_key']}"})
+        "max_tokens": max_tokens, "temperature": _temp(temperature),
+    }
+    payload.update(_glm_thinking_fields(cfg))
+    res = _http_post_json(_endpoint_for(cfg), payload,
+                          headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                          timeout=timeout)
     try:
-        text = str(res["choices"][0]["message"]["content"] or "").strip()
+        choice = res["choices"][0]
+        text = str(choice["message"]["content"] or "").strip()
     except (KeyError, IndexError, TypeError):
         raise RuntimeError("LLM 返回结构异常")
     if not text:
-        raise RuntimeError("LLM 返回空文本")
+        raise _empty_text_error(choice, res.get("usage"))
+    return text
+
+
+def _api_generate_stream(cfg: dict, system: str, user_prompt: str, media: list, max_tokens: int,
+                         temperature: float = 0.2, on_progress=None) -> str:
+    """OpenAI 兼容 + `stream=true`：边收边报进度，返回完整正文。
+
+    只走 openai 兼容协议（GLM / OpenAI / 百炼 / SiliconFlow / OpenRouter 都支持）；
+    gemini 与 responses 两条通道没有流式，调用方要先探测再决定走不走这里。
+
+    为什么单独写一条而不是复用 `_api_generate`：
+    1. **真实进度** —— 思考模型的 reasoning 阶段可能几十秒一个字正文都没有，
+       没有进度用户只会以为卡死（"缺个进度条"的根因）。
+    2. **超时语义更正确** —— urllib 的 timeout 是**单次 socket 操作**上限，
+       只要还在持续收数据就不会触发；非流式则是"整包读完"才算一次操作，
+       长生成照样会被判超时。
+    3. 能拿到 `usage.completion_tokens`（流式最后一帧带），于是进度可以按
+       **已用 token / max_tokens** 算真实比例，而不是拍脑袋估时间。
+    """
+    if not cfg.get("api_key"):
+        raise ValueError("未配置 API Key（请在优化设置里填写，或改用本地模型）")
+    if not cfg.get("api_url") or not cfg.get("model"):
+        raise ValueError("API 地址或模型为空")
+    timeout = int(cfg.get("timeout") or 300)
+    content2: list = [{"type": "text", "text": user_prompt}]
+    for u in _media_images(media):
+        content2.append({"type": "image_url", "image_url": {"url": u}})
+    payload = {
+        "model": cfg["model"],
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": content2}],
+        "max_tokens": max_tokens, "temperature": _temp(temperature),
+        "stream": True,
+    }
+    payload.update(_glm_thinking_fields(cfg))
+    req = urllib.request.Request(
+        _endpoint_for(cfg), data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Accept": "text/event-stream",
+                 "Authorization": f"Bearer {cfg['api_key']}"}, method="POST")
+
+    parts: list = []
+    reasons: list = []
+    usage: dict = {}
+    finish = ""
+    t0 = time.monotonic()
+    last_emit = 0.0
+    emit = on_progress or (lambda ev: None)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:800]
+        except Exception:
+            pass
+        raise RuntimeError(f"LLM 返回 HTTP {e.code}：{detail}")
+    except Exception as e:
+        if _is_timeout(e):
+            raise RuntimeError(
+                f"LLM 请求超时（{timeout} 秒内没收到任何数据）：请到「AI 优化设置 → "
+                f"请求超时」调大，或降低「思考强度」。")
+        raise RuntimeError(f"LLM 请求失败（{type(e).__name__}）：{e}")
+
+    with resp:
+        while True:
+            raw = resp.readline()          # 逐行读：SSE 每帧一行，读完即到，不缓冲整包
+            if not raw:
+                break
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            chunk = line[5:].strip()
+            if chunk == "[DONE]":
+                break
+            try:
+                obj = json.loads(chunk)
+            except ValueError:
+                continue
+            if isinstance(obj.get("usage"), dict) and obj["usage"]:
+                usage = obj["usage"]
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            rc = delta.get("reasoning_content")
+            if rc:
+                reasons.append(str(rc))
+            c = delta.get("content")
+            if c:
+                parts.append(str(c))
+            if choices[0].get("finish_reason"):
+                finish = str(choices[0]["finish_reason"])
+            now = time.monotonic()
+            if now - last_emit >= 0.2:      # 节流：SSE 一帧报一次会把前端刷爆
+                last_emit = now
+                emit({"phase": "thinking" if (reasons and not parts) else "writing",
+                      "reasoning_chars": sum(len(x) for x in reasons),
+                      "content_chars": sum(len(x) for x in parts),
+                      "tokens": usage.get("completion_tokens") or 0,
+                      "max_tokens": max_tokens,
+                      "elapsed": round(now - t0, 1)})
+
+    text = "".join(parts).strip()
+    if not text:
+        raise _empty_text_error(
+            {"finish_reason": finish or "empty",
+             "message": {"reasoning_content": "".join(reasons)}}, usage)
     return text
 
 
@@ -526,7 +883,7 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
 
 def generate_text(config_in: dict | None, system: str, user_prompt: str,
                   media: list | None = None, max_tokens: int | None = None,
-                  temperature: float | None = None) -> str:
+                  temperature: float | None = None, on_progress=None) -> str:
     """通用文本生成入口：复用本模块的三协议云通道 + 本地通道。
 
     供 h3_prompt_expander 等上层工具调用，避免各自维护一套 HTTP 客户端。
@@ -534,6 +891,9 @@ def generate_text(config_in: dict | None, system: str, user_prompt: str,
 
     - 云通道：_api_generate（自动按 protocol 走 openai 兼容 / gemini / responses）
     - 本地通道：_local_generate（Transformers / GGUF）
+
+    on_progress：给了就走**流式**（只有 openai 兼容协议有），边收边回调，
+    上层据此画进度条（扩写阶段也要进度，否则那 20~40 秒是黑箱）。
     """
     cfg = normalize_config(config_in)
     system = str(system or "")
@@ -542,14 +902,20 @@ def generate_text(config_in: dict | None, system: str, user_prompt: str,
         raise ValueError("待生成内容为空")
     if max_tokens is not None:
         try:
-            cfg["max_tokens"] = max(512, min(8192, int(max_tokens)))
+            # 上限必须与 normalize_config 一致（32768）。这里写 8192 是个陷阱：
+            # 调用方传 16384 会被静默砍半，思考模型的推理就够吃光。
+            cfg["max_tokens"] = max(512, min(32768, int(max_tokens)))
         except (TypeError, ValueError):
             pass
     media = media if isinstance(media, list) else []
     temp = _temp(temperature)
     if cfg.get("mode") == "local":
         return _local_generate(cfg, system, user_prompt, media, temp)
-    return _api_generate(cfg, system, user_prompt, media, int(cfg.get("max_tokens") or 4096), temp)
+    budget = int(cfg.get("max_tokens") or 8192)
+    if on_progress and str(cfg.get("protocol") or "openai") == "openai":
+        return _api_generate_stream(cfg, system, user_prompt, media, budget, temp,
+                                    on_progress=on_progress)
+    return _api_generate(cfg, system, user_prompt, media, budget, temp)
 
 
 def generate_json(config_in: dict | None, system: str, user_prompt: str,
@@ -572,8 +938,15 @@ def generate_json(config_in: dict | None, system: str, user_prompt: str,
     raise RuntimeError(f"LLM 未返回合法 JSON：{text[:300]}")
 
 
-def optimize_once(config_in: dict | None, payload: dict | None) -> str:
-    """单次优化入口（同步，调用方放线程池）。返回优化后文本。"""
+def optimize_once(config_in: dict | None, payload: dict | None, on_progress=None) -> str:
+    """单次优化入口（同步，调用方放线程池）。返回优化后文本。
+
+    on_progress(ev)：可选进度回调，**只有在 openai 兼容协议 + 云通道**下才生效
+    （走流式）。ev 形如
+        {"phase": "thinking"|"writing", "reasoning_chars": n, "content_chars": m,
+         "tokens": k, "max_tokens": N, "elapsed": 秒}
+    其它协议（gemini/responses）与本地模型没有流式，静默退化成"无进度"，
+    调用方要自己显示不确定态进度条。"""
     cfg = normalize_config(config_in)
     payload = payload if isinstance(payload, dict) else {}
     user_prompt = str(payload.get("prompt") or "").strip()
@@ -597,8 +970,13 @@ def optimize_once(config_in: dict | None, payload: dict | None) -> str:
     if cfg.get("mode") == "local":
         return _local_generate(cfg, system, user_prompt, media,
                                _temp(payload.get("temperature")))
-    return _api_generate(cfg, system, user_prompt, media, int(cfg.get("max_tokens") or 4096),
-                         _temp(payload.get("temperature")))
+    max_tokens = int(cfg.get("max_tokens") or 4096)
+    temp = _temp(payload.get("temperature"))
+    # 要进度就走流式。只有 openai 兼容协议有 SSE；gemini/responses 退回整包模式，
+    # 前端拿不到进度事件就会显示不确定态进度条（不会卡住，只是没有百分比）。
+    if on_progress and str(cfg.get("protocol") or "openai").lower() == "openai":
+        return _api_generate_stream(cfg, system, user_prompt, media, max_tokens, temp, on_progress)
+    return _api_generate(cfg, system, user_prompt, media, max_tokens, temp)
 
 
 def _validate_optimized(text: str, mode: str, seconds: float) -> dict:

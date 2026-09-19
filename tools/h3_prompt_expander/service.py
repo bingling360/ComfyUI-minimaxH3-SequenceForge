@@ -99,7 +99,7 @@ def expand_via_config(config_in, payload):
     }
 
 
-def expand_optimize_via_config(config_in, payload):
+def expand_optimize_via_config(config_in, payload, on_progress=None):
     """**一步到位**：中文意图 -> 剧本（扩写）-> H3 官方格式（优化）-> 最终文本。
 
     三框合一之后段卡只有一个框，不再有"① 意图 / ② 剧本"两个中间稿可点，
@@ -110,12 +110,22 @@ def expand_optimize_via_config(config_in, payload):
       prompt / style / style_note / segment_count / seconds_min、max / media
       task / duration / context（优化阶段用）
     返回 {ok, prompt（最终结果）, script（中间剧本，仅回看用）, seconds, meta}
+
+    on_progress：两个阶段的事件都带上 `stage` 字段（"expand" / "optimize"），
+    前端据此把进度条画成两段（扩写 0→45%，优化 45→99%）。两次调用都是
+    20~40 秒级，不给进度就是"点下去没反应"。
     """
     cfg = _opt_backend.normalize_config(config_in)
     payload = payload if isinstance(payload, dict) else {}
 
+    def _stage(name):
+        def _emit(ev):
+            if on_progress:
+                on_progress(dict(ev, stage=name))
+        return _emit
+
     # ① 扩写：出剧本（中文自由格式，内容发散）
-    sp = screenplay_via_config(cfg, payload)
+    sp = screenplay_via_config(cfg, payload, on_progress=_stage("expand"))
     segs = [s for s in (sp.get("segments") or []) if isinstance(s, dict)]
     script = str((segs[0] if segs else {}).get("script") or "").strip()
     if not script:
@@ -129,7 +139,7 @@ def expand_optimize_via_config(config_in, payload):
         "duration": seconds,
         "media": payload.get("media") if isinstance(payload.get("media"), list) else [],
         "context": payload.get("context") if isinstance(payload.get("context"), dict) else {},
-    })
+    }, on_progress=_stage("optimize"))
     return {
         "ok": bool(str(prompt or "").strip()),
         "prompt": str(prompt or "").strip(),
@@ -146,7 +156,7 @@ def validate_only(payload):
     return {"ok": bool(verdict.get("ok")), "validation": verdict}
 
 
-def screenplay_via_config(config_in, payload):
+def screenplay_via_config(config_in, payload, on_progress=None):
     """剧本扩写入口：总意图 -> N 段中文剧本（内容发散，不带官方格式）。
 
     与 expand_via_config 的分工：这里只管**内容**，格式交给提示词优化。
@@ -158,6 +168,9 @@ def screenplay_via_config(config_in, payload):
       style_note      风格/案例参考
       media           参考素材 [{label, images:[dataURL]}]
       one_shot        是否一次出全部（缺省：段数 <= 3 时自动启用）
+    on_progress     给了就透传给 LLM 通道（流式），上层据此画进度条。
+                     只覆盖**单段**路径；多段走 outline + 逐段，调用点多且节奏
+                     不同，暂不透传（前端多段入口也没有进度条）。
     """
     cfg = _opt_backend.normalize_config(config_in)
     payload = payload if isinstance(payload, dict) else {}
@@ -181,7 +194,8 @@ def screenplay_via_config(config_in, payload):
         res = screenplay.screenplay_once(raw, sec_range, model, cfg, media=media,
                                          style=style,
                                          style_note=str(payload.get("style_note") or ""),
-                                         temperature=temperature)
+                                         temperature=temperature,
+                                         on_progress=on_progress)
         return {
             "ok": bool(str(res.get("script") or "").strip()),
             "segments": [{"index": 0, "seconds": res.get("seconds"),

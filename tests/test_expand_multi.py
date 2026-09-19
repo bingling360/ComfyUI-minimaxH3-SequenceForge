@@ -70,7 +70,8 @@ def test_parse_script_seconds():
 def test_screenplay_once_returns_plain_script(monkeypatch):
     captured = {}
 
-    def fake_text(cfg, system, user, media=None, max_tokens=None, temperature=None):
+    def fake_text(cfg, system, user, media=None, max_tokens=None, temperature=None,
+                  on_progress=None):
         captured.update({"system": system, "user": user, "temperature": temperature})
         return "时长：10 秒\n\n镜头一（0–3 秒）：她停下回头。\n镜头二（3–10 秒）：她喊了一声。"
 
@@ -115,7 +116,8 @@ def test_screenplay_multi_outline_then_scripts(monkeypatch):
                         _json_once(OUTLINE)[0])
     scripts = []
 
-    def fake_text(cfg, system, user, media=None, max_tokens=None, temperature=None):
+    def fake_text(cfg, system, user, media=None, max_tokens=None, temperature=None,
+                  on_progress=None):
         scripts.append(user)
         return "时长：9 秒\n\n镜头一：她回头。"
 
@@ -241,3 +243,18 @@ def test_chat_passes_temperature():
     src = open(os.path.join(TOOLS, "h3_expand.py"), encoding="utf-8").read()
     assert "def chat(model, messages, cfg, media=None, temperature=None)" in src
     assert "temperature=temperature" in src
+
+
+def test_cli_model_flag_does_not_shadow_config():
+    """`--model` 的 argparse 默认值曾经是 DEFAULT_MODEL（恒真的非空串），于是
+    `args.model or cfg.get("model") or DEFAULT_MODEL` 里的 **cfg 永远轮不到** ——
+    用户传了 --config 也没用，实际一直在调内置的 glm-4-flash。
+
+    2026-09-19 换默认服务商到 GLM-4.6V 时发现：配置里写 glm-4.6v，跑出来却是
+    glm-4-flash。默认必须是 None，优先级才是「显式 --model > --config 里的 model
+    > 内置默认」。
+    """
+    src = open(os.path.join(TOOLS, "h3_expand.py"), encoding="utf-8").read()
+    assert 'ap.add_argument("--model", default=None' in src, \
+        "--model 的默认值不能是恒真值，否则会压住 --config 里的 model"
+    assert 'model = args.model or cfg.get("model") or DEFAULT_MODEL' in src

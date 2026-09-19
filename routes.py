@@ -48,6 +48,8 @@ ROUTES = [
     ("GET", "/h3chain/prompt-rules"),
     ("GET", "/h3chain/optimizer-config"),
     ("POST", "/h3chain/optimize"),
+    ("POST", "/h3chain/optimize_stream"),
+    ("POST", "/h3chain/expand_optimize_stream"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
     ("POST", "/h3chain/compile"),
@@ -1089,6 +1091,126 @@ def add_routes(routes):
         except Exception as e:
             return _err(f"优化失败：{e}", code="OPTIMIZE_FAILED", status=500)
         return web.json_response({"ok": True, "prompt": text})
+
+    async def _sse_stream(request, work, error_code="STREAM_FAILED"):
+        """把一段**同步长耗时工作**包成 SSE：worker 线程里跑，事件实时推给前端。
+
+        `work(data, emit)` 在**线程池**里执行（同步阻塞代码，不能占事件循环），
+        用 `emit(kind, payload)` 推帧；返回值合并进收尾帧 `{"ok": true, **结果}`。
+
+        帧格式（前端 `_postStream` 按此解析）：
+            event: progress  data: {...}          # 0..N 帧，随时可到
+            event: done      data: {ok: true, ...}
+            event: error     data: {ok: false, code, message}
+
+        进度事件由工作线程经 `loop.call_soon_threadsafe` 塞进 asyncio 队列，
+        所以 worker 里不需要任何 asyncio 知识；客户端中途断开时
+        `call_soon_threadsafe` 会抛 RuntimeError，吞掉即可（结果没人要了）。
+
+        为什么抽成公共函数：优化和「扩写+优化」是同一套需求（都是 30~90 秒的
+        黑箱 + 都要进度条 + 都要能取消），各写一遍必然只修好一条。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _push(kind, payload):
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
+            except RuntimeError:
+                pass
+
+        resp = web.StreamResponse(status=200, headers={
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        })
+        await resp.prepare(request)
+
+        async def _write(kind, payload):
+            body = "event: %s\ndata: %s\n\n" % (
+                kind, json.dumps(payload, ensure_ascii=False))
+            await resp.write(body.encode("utf-8"))
+
+        async def _flush():
+            while not queue.empty():
+                kind, payload = queue.get_nowait()
+                await _write(kind, payload)
+
+        fut = loop.run_in_executor(None, lambda: work(data, _push))
+        try:
+            while True:
+                done, _ = await asyncio.wait({fut}, timeout=0.25)
+                await _flush()
+                if done:
+                    break
+            await _flush()
+            try:
+                result = fut.result()
+                payload = {"ok": True}
+                payload.update(result if isinstance(result, dict) else {"result": result})
+                await _write("done", payload)
+            except ValueError as e:
+                await _write("error", {"ok": False, "code": "BAD_REQUEST",
+                                       "message": str(e)})
+            except Exception as e:
+                await _write("error", {"ok": False, "code": error_code,
+                                       "message": str(e)})
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass          # 客户端关了页面/取消：不用报错，让它安静地结束
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+        return resp
+
+    async def optimize_stream(request):
+        """提示词优化 + **实时进度**（SSE）。
+
+        与 /h3chain/optimize 的区别：那条是"发完等一整包"，而思考模型一次改写
+        动辄 30~90 秒，期间前端只能干等（用户体感就是"卡死了"）。这条边跑边推。
+
+        进度帧字段：{phase, content_chars, reasoning_chars, tokens, max_tokens,
+        elapsed}（详见 optimizer._api_generate_stream）。
+        """
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+
+        def _work(data, emit):
+            return {"prompt": _opt.optimize_once(
+                data.get("config"), data, lambda ev: emit("progress", ev))}
+
+        return await _sse_stream(request, _work, error_code="OPTIMIZE_FAILED")
+
+    async def expand_optimize_stream(request):
+        """扩写 + 优化一步到位 + **实时进度**（SSE）。
+
+        与 /h3chain/expand_optimize 同一条链，只是把两次 LLM 调用（扩写、优化）
+        的进度都推出来。两次调用各 20~40 秒，串起来最长能到一分半 —— 不给进度
+        的话，用户点完按钮除了"扩写中…"三个字什么都看不到。
+
+        进度帧多一个 `stage` 字段："expand"（第①步）/ "optimize"（第②步），
+        前端据此把进度条画成两段。
+        """
+        try:
+            svc = _load_expander()
+        except Exception as e:
+            return _err(f"扩写模块未就绪：{e}", code="EXPAND_UNAVAILABLE", status=500)
+
+        def _work(data, emit):
+            return svc.expand_optimize_via_config(
+                data.get("config"), data,
+                on_progress=lambda ev: emit("progress", ev))
+
+        return await _sse_stream(request, _work, error_code="EXPAND_FAILED")
 
     def _load_expander():
         """加载 tools/h3_prompt_expander/service.py（非包目录，走 sys.path 注入）。"""
@@ -2398,9 +2520,11 @@ def add_routes(routes):
         ("GET", "/h3chain/prompt-rules", prompt_rules),
         ("GET", "/h3chain/optimizer-config", optimizer_config),
         ("POST", "/h3chain/optimize", optimize),
+        ("POST", "/h3chain/optimize_stream", optimize_stream),
         ("POST", "/h3chain/expand", expand),
         ("POST", "/h3chain/expand_multi", expand_multi),
         ("POST", "/h3chain/expand_optimize", expand_optimize),
+        ("POST", "/h3chain/expand_optimize_stream", expand_optimize_stream),
         ("POST", "/h3chain/optimize_multi", optimize_multi),
         ("POST", "/h3chain/expand_validate", expand_validate),
         ("POST", "/h3chain/create_project", create_project),

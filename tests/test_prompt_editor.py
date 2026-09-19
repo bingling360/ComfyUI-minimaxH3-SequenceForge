@@ -240,10 +240,11 @@ def test_single_pane_refbar():
 
 
 def test_expand_optimize_pipeline_wired():
-    """「AI 扩写 + 优化」流水线（源码点）：不弹小框、不显示进度、失败硬报错。
+    """「AI 扩写 + 优化」流水线（源码点）：不弹小框、走 SSE 阶段进度、失败硬报错。
 
-    设计约束（用户拍板）：点击后**不弹框**，也不显示"1/2 2/2"这类进度，
-    只在按钮上禁用 + LED 写一句状态。中间产物（剧本）不回框、不落盘。
+    设计约束：点击后**不弹框**（阻塞式对话框一律不许），也**不用"1/2 2/2"
+    这种自造的步数计数器** —— 改走统一的两段式进度条（① 扩写剧本 → ② 优化格式），
+    进度值来自真实的 SSE 帧。中间产物（剧本）不回框、不落盘。
 
     三框合一后没有"剧本框"这个中间层，所以扩写与优化在**后端串成一次请求**
     （/h3chain/expand_optimize），中间剧本只在响应里带回一份便于排查 ——
@@ -258,10 +259,17 @@ def test_expand_optimize_pipeline_wired():
     i = d.index("async function runExpandOptimizeForSegment(")
     block = d[i:i + 3200]
     assert "window.prompt" not in block and "confirm(" not in block
-    # 不显示进度百分比
+    # 旧式自造步数计数器（"扩写中 1/2"）不许回归
     assert "扩写中 1/2" not in block and "优化中 2/2" not in block
-    # 一步到底：走 /h3chain/expand_optimize（前端不再串两步）
-    assert "H3Api.expandOptimize" in block
+    # 一步到底：走 /h3chain/expand_optimize_stream（SSE 阶段进度），
+    # 老后端没有该路由时静默退回整包 /h3chain/expand_optimize
+    assert "optCallStream(" in block
+    assert 'stream: "expandOptimizeStream"' in block
+    assert 'fallback: "expandOptimize"' in block
+    # 两个阶段的按钮文案：扩写阶段 → 优化阶段
+    assert 'busy: { expand: "扩写中…", thinking: "优化中…", writing: "优化中…" }' in block
+    # 用户主动取消不算失败（不弹错）
+    assert "r.body?.cancelled" in block
     # 与单步优化共用落盘路径（对齐指令必须补回，否则模型丢首尾帧锚）
     assert "resyncAlignmentLines(node, idx)" in block
     # 误点保护：写入前把当前正文存为原稿，工具条「原稿」可一键还原

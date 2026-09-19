@@ -570,7 +570,10 @@ def test_optimizer_backend():
 def test_optimizer_routes_mount(routes):
     r = _Router()
     routes.add_routes(r)
-    for p in ["/h3chain/prompt-rules", "/h3chain/optimizer-config", "/h3chain/optimize"]:
+    for p in ["/h3chain/prompt-rules", "/h3chain/optimizer-config", "/h3chain/optimize",
+              # 流式那两条（进度条用）：必须**两份都挂**，新版前端 api.fetchApi()
+              # 会给所有不以 /api 开头的路径强制加前缀，只挂根路径会 404。
+              "/h3chain/optimize_stream", "/h3chain/expand_optimize_stream"]:
         assert ("GET", p) in r.paths or ("POST", p) in r.paths
         assert ("GET", "/api" + p) in r.paths or ("POST", "/api" + p) in r.paths
 
@@ -599,3 +602,11 @@ def test_segment_tabs_and_optimizer_ui():
                 "optimizer-config", "/h3chain/optimize"]:
         assert sym in d or sym in a, sym
     assert "optimize:" in a and "getOptimizerConfig" in a and "getPromptRules" in a
+    # 进度条 + 思考强度（2026-09-19）：两条都必须真的接上，不能只留后端接口。
+    # 前端少了 optimizeStream 就退回整包（没有进度）；少了 rebuildThinking
+    # 「思考强度」就退化成只能开/关（用户报的"强度不能选"会复现）。
+    assert "optimizeStream" in a and "/h3chain/optimize_stream" in a
+    assert "expandOptimizeStream" in a and "/h3chain/expand_optimize_stream" in a
+    for sym in ["optProgressStart", "optCallStream", "rebuildThinking",
+                "optModelCaps", "optCapsLoad", "思考强度", "h3d-opt-prog"]:
+        assert sym in d, sym

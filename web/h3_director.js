@@ -3270,22 +3270,105 @@ function optGetExpandSettings(node) {
     return Object.assign(optDefaultExpandSettings(), saved || {});
 }
 
+/* 配置版本。v2 = 默认服务商由 RunningHub 换成智谱 GLM（模型 GLM-4.6V）。
+ * v3 = 默认模型 GLM-4.6V -> GLM-5.3-FlashX。
+ * 老工作流里存的仍是旧默认值，而那套默认值开箱就是坏的（没有 Key、模型是
+ * 预设占位名，请求只能超时）—— 所以老配置必须迁移，否则"改了默认值"对
+ * 已经存过档的用户毫无作用。迁移只在**确认用户没动过**时执行。 */
+const OPT_CFG_VER = 3;
+const OPT_LEGACY_DEFAULT = { providers: ["runninghub", "runninghub_overseas"], model: "openai/gpt-5.6-sol" };
+/* v2 的默认模型：cfg_ver==2 且服务商还是 glm、模型还是它 → 说明用户没挑过型号，
+ * 可以安全地升到 v3 的默认。挑过别的型号（或换了服务商）就不动。 */
+const OPT_V2_DEFAULT_MODEL = "glm-4.6v";
+
 function optDefaultSettings() {
     return {
-        mode: "api", provider: "runninghub",
-        api_url: "https://www.runninghub.cn/openapi/v2", api_key: "", api_keys: {},
-        model: "openai/gpt-5.6-sol", provider_models: {}, protocol: "openai",
+        mode: "api", provider: "glm",
+        api_url: "https://open.bigmodel.cn/api/paas/v4", api_key: "", api_keys: {},
+        model: "glm-5.3-flashx", provider_models: {}, protocol: "openai",
         read_media: true, output_language: "中文",
         local_model: "", local_mmproj: "", local_device: "cuda",
-        max_tokens: 4096, rule_file: "auto",          // 开关删留见 openOptSettings 注释
+        max_tokens: 8192, timeout: 300, thinking: "disabled", reasoning_effort: "",
+        rule_file: "auto",          // 开关删留见 openOptSettings 注释
+        cfg_ver: OPT_CFG_VER,
         expand: optDefaultExpandSettings(),
     };
+}
+
+function optMigrateSettings(saved) {
+    if (!saved || typeof saved !== "object") return null;
+    const ver = Number(saved.cfg_ver) || 0;
+    if (ver >= OPT_CFG_VER) return saved;
+    const out = Object.assign({}, saved);
+    if (ver < 2) {
+        const keys = (out.api_keys && typeof out.api_keys === "object") ? out.api_keys : {};
+        /* "没动过" = 还是那两个旧预设之一 + 模型还是旧预设占位名 + 该服务商下没填过 Key。
+         * 三条同时成立才迁移 —— 用户自己填过任何一项，都说明他在用别的服务商，
+         * 这时候改他的 provider 等于把他配置弄丢。 */
+        const untouched = OPT_LEGACY_DEFAULT.providers.includes(String(out.provider || ""))
+            && String(out.model || "") === OPT_LEGACY_DEFAULT.model
+            && !String(keys[out.provider] || out.api_key || "").trim();
+        if (untouched) {
+            const p = OPT_PROVIDERS.glm;
+            out.provider = "glm";
+            out.api_url = p.url;
+            out.model = p.model;
+            out.protocol = p.protocol;
+        }
+    }
+    /* v2 -> v3：只认"服务商还是 glm 且型号还是 v2 的默认"这一种组合。
+     * 这里**不看 Key**（与 v2 那段不同）：填过 GLM 的 Key 只说明他认了这个服务商，
+     * 型号仍是插件给的默认，跟着升到新默认是符合预期的；而 v1 那段是在
+     * 跨服务商搬（RunningHub -> GLM），搬错代价高，才要额外确认没填过 Key。 */
+    if (String(out.provider || "") === "glm"
+        && String(out.model || "") === OPT_V2_DEFAULT_MODEL) {
+        const p = OPT_PROVIDERS.glm;
+        out.model = p.model;
+        out.api_url = p.url;
+        out.protocol = p.protocol;
+    }
+    out.cfg_ver = OPT_CFG_VER;
+    return out;
 }
 
 function optGetSettings(node) {
     const ds = getDs(node);
     const saved = ds && ds.optimizer && typeof ds.optimizer === "object" ? ds.optimizer : null;
-    return Object.assign(optDefaultSettings(), saved || {});
+    return Object.assign(optDefaultSettings(), optMigrateSettings(saved) || {});
+}
+
+/* 服务端是否内置了 Key（optimizer.local.json）。前端 Key 框为空**不等于**不能用：
+ * 服务端会在服务商与默认服务商一致时用自己的 Key 兜底。所以判"能不能跑"
+ * 必须问一次服务端，只看输入框会把开箱可用的用户拦回设置面板。 */
+const _optBackend = { loaded: false, hasKey: false, providers: null };
+
+async function optBackendProbe() {
+    if (_optBackend.loaded) return _optBackend;
+    try {
+        if (window.H3Api?.getOptimizerConfig) {
+            const r = await window.H3Api.getOptimizerConfig();
+            if (r.body?.ok) {
+                _optBackend.hasKey = r.body.has_default_key === true;
+                _optBackend.providers = r.body.providers || null;
+                optCapsLoad(r.body);
+            }
+        }
+    } catch (e) { /* 探不到就当作没有，退回原来的"拦人填 Key"行为 */ }
+    _optBackend.loaded = true;
+    return _optBackend;
+}
+
+/** 该不该把用户拦到设置面板：本地缺模型 / 云通道既没填 Key 服务端也没有兜底 Key。 */
+async function optNeedsSetup(node, st) {
+    if (st.mode === "local") {
+        if (st.local_model) return false;
+    } else if (String(st.api_key || "").trim()) {
+        return false;
+    } else if ((await optBackendProbe()).hasKey) {
+        return false;
+    }
+    openOptSettings(node);
+    return true;
 }
 
 function optSaveSettings(node, settings) {
@@ -3405,6 +3488,181 @@ function optRestoreMaps(node, ds) {
     } catch (e) { /* 忽略 */ }
 }
 
+/* ---- 优化进度条（SSE 实时进度）-------------------------------------------
+ * 思考模型一次改写 30~90 秒，前几十秒正文一个字都没有 —— 没有进度条，用户看到
+ * 的就是"点下去就卡死"。所以优化改走 /h3chain/optimize_stream（SSE），这里把
+ * 事件画成一条**阶段进度**。
+ *
+ * 为什么不按 token 画真实比例：实测（tools/_probe_stream_usage.py：glm-4.6v /
+ * glm-5.3-flash，带不带 stream_options 都一样）**usage 只在最后一帧出现**，
+ * 中途 completion_tokens 恒为 0。按 token 画 = 全程停在 0%，比没有还糟。
+ * 所以改成三段式：
+ *   连接 0→8% / 思考 8→60% / 撰写 60→99%，段内按已生成字数渐近推进。
+ *
+ * 「扩写+优化」是**两次** LLM 调用（扩写 → 优化），进度帧多带一个 `stage`，
+ * 于是画成两格：① 扩写 4→45%，② 优化 45→99%。两次都是 20~40 秒级，
+ * 只报一格的话"扩写"那半程看起来就是原地不动。 */
+const _optProg = { box: null, timer: null };
+
+function optProgressClose() {
+    if (_optProg.timer) { clearInterval(_optProg.timer); _optProg.timer = null; }
+    if (_optProg.box) { _optProg.box.remove(); _optProg.box = null; }
+}
+
+/** 开一条进度条。返回的句柄：update(事件) / done() / fail() / close() /
+ *  cancelled() / onCancel(fn) / onPhase(fn)。 */
+function optProgressStart(title) {
+    optProgressClose();
+    const box = el("div", "h3d-opt-prog");
+    const head = el("div", "h3d-opt-prog-head");
+    head.append(el("span", "h3d-opt-prog-name", escapeHtml(title || "提示词优化")));
+    const cancelBtn = el("button", "h3d-opt-prog-cancel", "取消");
+    cancelBtn.type = "button";
+    head.append(cancelBtn);
+    const track = el("div", "h3d-opt-prog-track");
+    const fill = el("div", "h3d-opt-prog-fill");
+    track.append(fill);
+    const meta = el("div", "h3d-opt-prog-meta", "正在连接模型…");
+    box.append(head, track, meta);
+    document.body.append(box);
+    _optProg.box = box;
+
+    const st = { pct: 4, phase: "connect", rchars: 0, cchars: 0, tokens: 0, maxTokens: 0,
+                 stage: "", two: false, t0: Date.now() };
+    let cancelled = false;
+    let onPhase = null;
+    /* 渐近推进：字数越接近"典型量"越慢，永不越过阶段上界。
+     * 900 / 2200 是**实测手感值**（tools/_probe_progress_timeline.py）：
+     *   glm-4.6v 关思考     → 只有撰写，正文 399 字 / 5.8s
+     *   glm-5.3-flash 关闭  → 思考 70 字 → 撰写 642 字 / 4.7s
+     *   glm-5.3-flash max   → 思考 13255 字 → 撰写 908 字 / 43.6s
+     * 思考段跨度太大（70 ~ 13000 字），半衰值取 2500 折中：短思考几乎立刻
+     * 进撰写段，长思考也能一路爬到 60% 而不是早早顶住不动。不是精确模型 ——
+     * 只求"一直在动、不倒退、不虚报完成"。 */
+    const creep = (chars, half) => 1 - Math.exp(-Math.max(0, chars) / half);
+
+    const render = () => {
+        let pct = st.pct;
+        let phaseText = "正在连接模型…";
+        if (st.two && st.stage === "expand") {
+            /* 第①格：扩写。它内部也有 thinking/writing 之分，但对用户是**一个**
+             * 步骤（"先把意图写开"），所以两段合起来占 4→45%。
+             * 字数取 cchars || rchars：思考阶段只有推理字数，撰写阶段才有正文。 */
+            const chars = st.cchars || st.rchars;
+            pct = 4 + 41 * creep(chars, 1200);
+            phaseText = (st.phase === "thinking" ? "① 扩写剧本 · 思考中" : "① 扩写剧本 · 撰写中")
+                + ` · 已生成 ${chars} 字`;
+        } else if (st.phase === "thinking") {
+            pct = (st.two ? 45 : 8) + (st.two ? 15 : 52) * creep(st.rchars, 2500);
+            phaseText = (st.two ? "② 优化格式 · 思考中" : "思考中") + ` · 推理 ${st.rchars} 字`;
+        } else if (st.phase === "writing") {
+            /* 没经过思考阶段（关掉思考的型号）就别从 60% 起跳 —— 那一段
+             * 对用户根本没发生过，凭空跳一格只会让人以为漏了什么。
+             * 两段式里第①格已经垫到 45%，所以第②格恒定从 60% 起。 */
+            const base = st.two ? 60 : (st.rchars > 0 ? 60 : 10);
+            const span = st.two ? 39 : (st.rchars > 0 ? 39 : 89);
+            pct = base + span * creep(st.cchars, 1600);
+            phaseText = (st.two ? "② 优化格式 · 撰写中" : "撰写中") + ` · 正文 ${st.cchars} 字`;
+        }
+        if (st.tokens && st.maxTokens) {
+            pct = Math.max(pct, Math.min(99, 100 * st.tokens / st.maxTokens));
+        }
+        st.pct = Math.max(st.pct, pct);
+        fill.style.width = `${Math.min(99, st.pct).toFixed(1)}%`;
+        const secs = ((Date.now() - st.t0) / 1000).toFixed(1);
+        meta.textContent = `${phaseText} · 已用 ${secs} 秒`
+            + (st.tokens && st.maxTokens ? ` · ${st.tokens}/${st.maxTokens} token` : "");
+        /* 往外报的"阶段"用**用户视角**的粒度：两段式里第①格的 thinking/writing
+         * 都属于「扩写」，报给按钮文案时应该还是"扩写中…"，而不是细化成
+         * "思考中…"（用户关心的是"现在在扩写还是在优化"）。 */
+        if (onPhase) {
+            const report = (st.two && st.stage === "expand") ? "expand" : st.phase;
+            try { onPhase(report); } catch (e) { /* 忽略 */ }
+        }
+    };
+    render();
+    /* 本地 250ms 心跳：事件是被节流过的（服务端 0.2s 一帧，且连上之前一帧都没有），
+     * 没有它，慢的首帧会让秒数冻在 0.0 上，看着还是像卡死。 */
+    _optProg.timer = setInterval(render, 250);
+
+    return {
+        cancelled: () => cancelled,
+        onCancel(fn) {
+            cancelBtn.onclick = () => {
+                cancelled = true;
+                cancelBtn.disabled = true;
+                cancelBtn.textContent = "取消中…";
+                try { fn && fn(); } catch (e) { /* 忽略 */ }
+            };
+        },
+        onPhase(fn) { onPhase = fn; },
+        update(evt) {
+            if (!evt || evt.type !== "progress") return;
+            /* `stage` 是「扩写+优化」才有的字段（expand / optimize）；单段优化
+             * 的帧里没有 → 保持一格进度。 */
+            if (evt.stage) { st.stage = String(evt.stage); st.two = true; }
+            if (evt.phase) st.phase = String(evt.phase);
+            st.rchars = Number(evt.reasoning_chars) || 0;
+            st.cchars = Number(evt.content_chars) || 0;
+            st.tokens = Number(evt.tokens) || 0;
+            st.maxTokens = Number(evt.max_tokens) || 0;
+            render();
+        },
+        done() {
+            if (_optProg.timer) { clearInterval(_optProg.timer); _optProg.timer = null; }
+            fill.style.width = "100%";
+            box.classList.add("h3d-done");
+            meta.textContent = `完成 · 用时 ${((Date.now() - st.t0) / 1000).toFixed(1)} 秒`;
+            cancelBtn.remove();
+            setTimeout(optProgressClose, 1400);
+        },
+        /* 失败/取消一律**立刻撤掉**：错误信息由调用方的 alert 负责说清楚，
+         * 面板再挂一条只会和弹窗重复，还挡住下面的卡片。 */
+        close: optProgressClose,
+    };
+}
+
+/** 走 SSE 流式调用并驱动进度条。返回与整包版同形的 {status, body}。
+ *
+ *  opts.stream   = 流式方法名（默认 optimizeStream）
+ *  opts.fallback = 降级用的整包方法名（默认 optimize）
+ *  opts.busy     = 阶段 → 按钮文案，例如 {thinking: "思考中…", writing: "撰写中…"}
+ *
+ *  降级路径：老后端没有这条流式接口 / 环境不支持 ReadableStream 时，
+ *  **静默退回整包**（没有进度，但功能不丢）—— 不能让"多了一条进度条"变成
+ *  "老版本直接不能用了"。 */
+async function optCallStream(body, title, ui, opts) {
+    opts = opts || {};
+    const streamFn = opts.stream || "optimizeStream";
+    const fallbackFn = opts.fallback || "optimize";
+    const busyText = opts.busy || { thinking: "思考中…", writing: "撰写中…", expand: "扩写中…" };
+    const prog = optProgressStart(title);
+    const ac = new AbortController();
+    prog.onCancel(() => ac.abort());
+    if (ui && ui.btn) {
+        prog.onPhase((p) => {
+            if (ui.btn && ui.btn.disabled && busyText[p]) ui.btn.textContent = busyText[p];
+        });
+    }
+    try {
+        if (typeof window.H3Api?.[streamFn] !== "function") throw new Error("__no_stream__");
+        const r = await window.H3Api[streamFn](body, (evt) => prog.update(evt), { signal: ac.signal });
+        if (r.body?.ok) { prog.done(); return r; }
+        prog.close();
+        return r;
+    } catch (e) {
+        prog.close();
+        if (prog.cancelled() || (e && e.name === "AbortError")) {
+            return { status: 200, body: { ok: false, cancelled: true, message: "已取消" } };
+        }
+        const msg = String((e && e.message) || e);
+        if (msg === "__no_stream__" || /不支持流式|ReadableStream/.test(msg)) {
+            return await window.H3Api[fallbackFn](body);
+        }
+        throw e;
+    }
+}
+
 async function runOptForSegment(node, idx, ta, ui, srcTa) {
     if (_optBusy && _optBusy.node === node && _optBusy.idx === idx) return;
     /* srcTa = 优化源（外部给的待优化文本）；缺省即用 ta（段卡提示词框自身）。
@@ -3415,8 +3673,7 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
     let settings;
     try { settings = optGetSettings(node); }
     catch (e) { alert(`加载优化配置失败：${e.message}`); return; }
-    if (settings.mode === "local" && !settings.local_model) { openOptSettings(node); return; }
-    if (settings.mode !== "local" && !settings.api_key) { openOptSettings(node); return; }
+    if (await optNeedsSetup(node, settings)) return;
     _optBusy = { node, idx };
     if (ui.btn) { ui.btn.textContent = "优化中…"; ui.btn.disabled = true; }
     const clearBusy = () => {
@@ -3442,7 +3699,9 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
             media: mm.media, context: { main_mode: optTaskForMode(ds, idx) }, config: settings,
         };
         if (!window.H3Api?.optimize) throw new Error("h3_api.js 未更新（缺 optimize）");
-        const r = await window.H3Api.optimize(body);
+        /* 走 SSE 流式（有进度条 + 可取消）。老后端/老浏览器自动退回整包。 */
+        const r = await optCallStream(body, `第 ${idx + 1} 段 · 提示词优化`, ui);
+        if (r.body?.cancelled) return;      // 用户主动取消：不弹错，静默收场
         if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "优化失败"));
         /* LLM 返回的是 `@图片1` —— 译回 `@女主.png` 再落库（译不出的原样保留，
          * 正文里会显示成红框，不静默丢）。 */
@@ -3507,8 +3766,7 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
     let settings;
     try { settings = optGetSettings(node); }
     catch (e) { alert(`加载优化配置失败：${e.message}`); return; }
-    if (settings.mode === "local" && !settings.local_model) { openOptSettings(node); return; }
-    if (settings.mode !== "local" && !settings.api_key) { openOptSettings(node); return; }
+    if (await optNeedsSetup(node, settings)) return;
     const ex = optGetExpandSettings(node);
     _optBusy = { node, idx };
     if (ui.btn) { ui.btn.textContent = "扩写中…"; ui.btn.disabled = true; }
@@ -3523,9 +3781,10 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
             ? await collectSegMedia(node, ds, idx) : { media: [], note: "", markMap: {} };
         await optFetchRuleFiles();
         const outText = toLLMText(before, ds.ref_assets || []);
-        if (ui.btn) ui.btn.textContent = "优化中…";
         if (!window.H3Api?.expandOptimize) throw new Error("h3_api.js 未更新（缺 expandOptimize）");
-        const r = await window.H3Api.expandOptimize({
+        /* 走 SSE 流式（两次 LLM 调用各 20~40 秒，没有进度就是"点完没反应"）。
+         * 老后端自动退回整包。 */
+        const r = await optCallStream({
             config: settings,
             prompt: mm.note ? `${mm.note}\n${outText}` : outText,
             style: ex.style,
@@ -3537,7 +3796,11 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
             task: optTaskForMode(ds, idx),
             duration: Number(seg.seconds) || 5,
             context: { main_mode: optTaskForMode(ds, idx) },
+        }, `第 ${idx + 1} 段 · 扩写 + 优化`, ui, {
+            stream: "expandOptimizeStream", fallback: "expandOptimize",
+            busy: { expand: "扩写中…", thinking: "优化中…", writing: "优化中…" },
         });
+        if (r.body?.cancelled) return;      // 用户主动取消：不弹错
         if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "扩写失败"));
         const result = fromLLMText(String(r.body.prompt || "").trim() || before,
             ds.ref_assets || []);
@@ -3580,9 +3843,53 @@ function optToggle(node, idx, ta, ui) {
     }
 }
 
-/* 服务商预设（与后端 optimizer.py PROVIDERS 对齐：url/model/protocol） */
+/* ---- 思考强度：能力表 ----------------------------------------------------
+ * **单一真相源在后端**（optimizer.py 的 GLM_FORCE_THINKING / GLM_EFFORT_PREFIXES），
+ * 前端只做前缀匹配，不另写一份名单 —— 两边各写一份，改一处忘一处必然漂移，
+ * 症状是"界面说能关、请求却被服务商 400 拒绝"。
+ * 拿不到就退化成空表：界面只给「关闭 / 开启」，不猜、不假装支持强度分级。 */
+const _optCapsTbl = { force: [], effortPrefixes: [], effortValues: ["low", "high", "max"] };
+
+function optCapsLoad(body) {
+    if (!body || typeof body !== "object") return;
+    if (Array.isArray(body.glm_force_thinking)) {
+        _optCapsTbl.force = body.glm_force_thinking.map((s) => String(s).toLowerCase());
+    }
+    if (Array.isArray(body.glm_effort_prefixes)) {
+        _optCapsTbl.effortPrefixes = body.glm_effort_prefixes.map((s) => String(s).toLowerCase());
+    }
+    if (Array.isArray(body.glm_effort_values) && body.glm_effort_values.length) {
+        _optCapsTbl.effortValues = body.glm_effort_values.map((s) => String(s).toLowerCase());
+    }
+}
+
+/** `thinking` / `reasoning_effort` 是智谱私有字段，别家端点收到只会 400。 */
+function optIsGlm(url) {
+    return String(url || "").toLowerCase().indexOf("bigmodel") >= 0;
+}
+
+/** 该型号的思考能力：能不能关、能不能调强度、选「关闭」实际会被翻译成什么。 */
+function optModelCaps(model) {
+    const m = String(model || "").toLowerCase();
+    const forced = _optCapsTbl.force.some((p) => m.startsWith(p));
+    const supports = _optCapsTbl.effortPrefixes.some((p) => m.startsWith(p));
+    return {
+        forced,
+        supports,
+        values: supports ? _optCapsTbl.effortValues.slice() : [],
+        /* 与后端 _glm_caps().disabled_effect 同口径：强制思考且支持强度 → low；
+         * 能真正关掉 → disabled；强制思考又不支持强度 → 空（后端什么都不发）。 */
+        disabledEffect: forced ? (supports ? "low" : "") : "disabled",
+    };
+}
+
+const OPT_EFFORT_LABEL = { low: "低强度（快）", high: "高强度", max: "最高强度（最慢）" };
+
+/* 服务商预设（与后端 optimizer.py PROVIDERS 对齐：url/model/protocol）
+ * 顺序 = 下拉顺序，glm 排第一因为它是默认值。 */
 const OPT_PROVIDERS = {
-    runninghub: { label: "RunningHub 国内版（推荐）", url: "https://www.runninghub.cn/openapi/v2", model: "openai/gpt-5.6-sol", protocol: "openai" },
+    glm: { label: "智谱 GLM（BigModel，默认）", url: "https://open.bigmodel.cn/api/paas/v4", model: "glm-5.3-flashx", protocol: "openai" },
+    runninghub: { label: "RunningHub 国内版", url: "https://www.runninghub.cn/openapi/v2", model: "openai/gpt-5.6-sol", protocol: "openai" },
     runninghub_overseas: { label: "RunningHub 海外版", url: "https://www.runninghub.ai/openapi/v2", model: "openai/gpt-5.6-sol", protocol: "openai" },
     openai: { label: "OpenAI", url: "https://api.openai.com/v1", model: "gpt-4.1-mini", protocol: "openai" },
     gemini: { label: "Google Gemini", url: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-2.5-flash", protocol: "gemini" },
@@ -3598,6 +3905,7 @@ async function openOptSettings(node, onSaved) {
     let current;
     try { current = optGetSettings(node); }
     catch (e) { current = optDefaultSettings(); }
+    let hasDefaultKey = false;
     try {
         if (window.H3Api?.getOptimizerConfig) {
             const r = await window.H3Api.getOptimizerConfig();
@@ -3605,6 +3913,12 @@ async function openOptSettings(node, onSaved) {
                 current = Object.assign({}, current);
                 if (Array.isArray(r.body.models)) current._models = r.body.models;
                 if (Array.isArray(r.body.mmproj_models)) current._mmproj = r.body.mmproj_models;
+                hasDefaultKey = r.body.has_default_key === true;
+                _optBackend.loaded = true;
+                _optBackend.hasKey = hasDefaultKey;
+                _optBackend.providers = r.body.providers || null;
+                /* 思考能力表（型号名单）由后端下发，前端只做前缀匹配 */
+                optCapsLoad(r.body);
             }
         }
     } catch (e) { /* 用本地值 */ }
@@ -3635,19 +3949,25 @@ async function openOptSettings(node, onSaved) {
 
     const provider = el("select", "");
     for (const [value, preset] of Object.entries(OPT_PROVIDERS)) provider.append(new Option(preset.label, value));
-    provider.value = OPT_PROVIDERS[current.provider] ? current.provider : "runninghub";
+    provider.value = OPT_PROVIDERS[current.provider] ? current.provider : "glm";
 
     /* 分服务商记忆 Key 与模型（切换服务商不丢已填值，随 ds.optimizer 持久化） */
     const apiKeys = { ...(current.api_keys || {}) };
-    if (current.api_key && !apiKeys[current.provider || "runninghub"]) apiKeys[current.provider || "runninghub"] = current.api_key;
+    if (current.api_key && !apiKeys[current.provider || "glm"]) apiKeys[current.provider || "glm"] = current.api_key;
     const providerModels = { ...(current.provider_models || {}) };
-    if (current.model && !providerModels[current.provider || "runninghub"]) providerModels[current.provider || "runninghub"] = current.model;
+    if (current.model && !providerModels[current.provider || "glm"]) providerModels[current.provider || "glm"] = current.model;
 
     const key = el("input", ""); key.type = "password"; key.value = apiKeys[provider.value] || "";
-    key.placeholder = "sk-…";
+    /* 服务端内置了 Key 且当前就是默认服务商时，留空 = 用内置 Key。说清楚，
+     * 否则用户会以为"必须填"而反复去找自己的 Key。 */
+    const keyHint = () => {
+        key.placeholder = (hasDefaultKey && provider.value === "glm")
+            ? "已内置 Key，留空即用（也可在此覆盖）" : "sk-…";
+    };
+    keyHint();
     const url = el("input", ""); url.type = "text";
     const model = el("input", ""); model.type = "text";
-    model.placeholder = "如 openai/gpt-5.6-sol";
+    model.placeholder = "如 glm-5.3-flashx";
     const protocol = el("select", "");
     protocol.append(new Option("OpenAI 兼容", "openai"), new Option("OpenAI Responses", "responses"), new Option("Gemini", "gemini"));
 
@@ -3656,9 +3976,30 @@ async function openOptSettings(node, onSaved) {
     const device = el("select", "");
     device.append(new Option("Auto", "auto"), new Option("GPU", "cuda"), new Option("CPU", "cpu"));
     device.value = current.local_device || "cuda";
+    /* 上限 32768（旧值 8192 太紧）：**推理 token 也算在 max_tokens 里**，
+     * 思考模型动辄先烧掉几千个推理 token，正文还没开始就被 finish_reason=length
+     * 截断 → 用户看到的是"LLM 返回空文本"。上限卡在 8192 等于把这条路堵死。
+     * 默认 8192（后端同值），够六字段长输出 + 一轮中等推理。 */
     const maxTokens = el("input", ""); maxTokens.type = "number";
-    maxTokens.min = "512"; maxTokens.max = "8192"; maxTokens.step = "512";
-    maxTokens.value = String(Math.max(512, Math.min(8192, Number(current.max_tokens) || 4096)));
+    maxTokens.min = "512"; maxTokens.max = "32768"; maxTokens.step = "512";
+    maxTokens.value = String(Math.max(512, Math.min(32768, Number(current.max_tokens) || 8192)));
+    /* 单次 HTTP 读写超时。默认 300：带图 + 长规则 + 六字段长输出的改写，
+     * 旧的 120 秒必然"读操作超时"。 */
+    const timeout = el("input", ""); timeout.type = "number";
+    timeout.min = "30"; timeout.max = "1800"; timeout.step = "30";
+    timeout.value = String(Math.max(30, Math.min(1800, Number(current.timeout) || 300)));
+    /* 思考强度：**一个下拉管两个后端字段**（thinking + reasoning_effort）。
+     * 以前只有一个「深度思考」勾选框 —— 用户选了 glm-5.3-flash 这类分档模型
+     * 却只能开/关，低/高/最高三档根本选不到（用户报的就是这个）。
+     * 默认关：同一份改写从分钟级降到二三十秒，结构化改写并不需要长思考。
+     * 选项**按型号能力重建**（见 rebuildThinking），非智谱服务商整行隐藏 ——
+     * 后端对它们根本不下发这两个字段，摆着只会让人以为调了有用。 */
+    const thinking = el("select", "");
+    /* 当前档位：强度档 > 开启 > 关闭。历史值 `auto`（= 服务商默认）按「开启」显示 ——
+     * GLM 系默认就是开思考，显示成「关闭」才是骗人。 */
+    const _lv0 = String(current.reasoning_effort || "").toLowerCase();
+    let level = ["low", "high", "max"].includes(_lv0) ? _lv0
+        : (String(current.thinking || "disabled") === "disabled" ? "disabled" : "enabled");
 
     const language = el("div", "h3d-opt-language");
     for (const value of ["中文", "English"]) {
@@ -3689,11 +4030,58 @@ async function openOptSettings(node, onSaved) {
     const rowMmproj = row("视觉投影 mmproj", mmproj);
     const rowDevice = row("本地设备", device);
     row("最大输出 token", maxTokens);
+    const rowTimeout = row("请求超时（秒）", timeout);
+    const rowThinking = row("思考强度", thinking);
+    const thinkingHint = el("div", "h3d-opt-hint");
+    dialog.append(thinkingHint);
+    /* 选项按**当前框里的型号**重建。三档形态：
+     *   支持强度（glm-5.x）  → 关闭 / 低 / 高 / 最高
+     *   不支持强度（glm-4.6v）→ 关闭 / 开启
+     *   非智谱端点           → 整行隐藏（后端不下发这两个字段）
+     * 强制思考型号（glm-5.3 / 4.7 / 4.5v）选「关闭」会被后端翻译成 low，
+     * 界面上**直接说明**，否则用户以为自己关成功了、实际还在思考。 */
+    const rebuildThinking = () => {
+        const glm = optIsGlm(url.value);
+        rowThinking.classList.toggle("h3d-opt-hidden", !glm);
+        thinkingHint.classList.toggle("h3d-opt-hidden", !glm);
+        if (!glm) return;
+        const caps = optModelCaps(model.value);
+        const opts = [["disabled", "关闭思考（最快）"]];
+        if (caps.supports) for (const v of caps.values) opts.push([v, OPT_EFFORT_LABEL[v] || v]);
+        else opts.push(["enabled", "开启思考"]);
+        thinking.replaceChildren();
+        for (const [v, l] of opts) thinking.append(new Option(l, v));
+        const has = (v) => opts.some(([x]) => x === v);
+        /* 档位在当前型号上不存在（如从 glm-5.3 的最高档切到 glm-4.6v）时，
+         * 退到「开启」但**不覆盖 level** —— 切回去还能还原用户选的档。 */
+        thinking.value = has(level) ? level : (has("enabled") ? "enabled" : "disabled");
+        const name = model.value.trim() || "该型号";
+        const warns = [];
+        if (caps.forced && caps.supports) {
+            warns.push(`「${name}」始终思考，服务商不允许关闭；选「关闭思考」将按最低强度 low 执行。`);
+        } else if (caps.forced) {
+            warns.push(`「${name}」始终思考，且不支持强度分级；选「关闭思考」将按服务商默认强度执行。`);
+        } else if (!caps.supports) {
+            warns.push("该型号无强度分级，只能开或关（要分档请换 glm-5 系型号）。");
+        }
+        /* 推理 token 与正文**共用** max_tokens 配额：实测 effort=max 单是推理就
+         * 产出 13255 字（≈上万 token），8192 的额度会被推理吃光，正文一个字都
+         * 出不来 —— 用户看到的「LLM 返回空文本」就是这么来的。额度不够就直接
+         * 在这里点出来，别等他跑完再报错。 */
+        if (caps.supports && ["high", "max"].includes(thinking.value)
+            && Number(maxTokens.value) < 16384) {
+            warns.push("高强度思考的推理过程也占「最大输出 token」配额，建议调到 16384 以上。");
+        }
+        thinkingHint.textContent = warns.join(" ");
+        thinkingHint.classList.toggle("h3d-opt-hidden", !warns.length);
+    };
     const langRow = el("label", "h3d-opt-row"); langRow.append(el("span", "", "输出语言"), language); dialog.append(langRow);
     const ruleRow = el("label", "h3d-opt-row"); ruleRow.append(el("span", "", "提示词规则"), ruleSel); dialog.append(ruleRow);
     const checks = el("div", "h3d-opt-checks");
     const chk = (t, c) => { const lb = el("label", ""); lb.append(c, el("span", "", t)); checks.append(lb); };
     chk("读取视觉参考（图片转 dataURL，最多 8 张）", readMedia);
+    /* 「深度思考」勾选框已升级成上面的「思考强度」下拉：勾选框只能表达开/关，
+     * 而 glm-5.3 这类型号真正的控制维度是 low/high/max 三档。 */
     dialog.append(checks);
     /* ---- AI 扩写优化设置（段卡「✨ AI扩写+优化」按钮的参数）----
      * 扩写弹窗取消后，这些参数没有地方填了 —— 住进设置里，点按钮就直接用，
@@ -3760,35 +4148,59 @@ async function openOptSettings(node, onSaved) {
 
     const sync = () => {
         const local = mode.value === "local";
-        const custom = provider.value === "custom";
+        /* URL / 模型 / 协议三行对**所有**服务商可见（以前只给"自定义"看）。
+         * 隐藏它们时用户看不到自己实际在调什么模型 —— 默认模型换成 GLM-4.6V
+         * 之后这一点尤其要紧：看不见就没法确认改没改到。 */
         rowKey.classList.toggle("h3d-opt-hidden", local);
-        rowUrl.classList.toggle("h3d-opt-hidden", local || !custom);
-        rowModel.classList.toggle("h3d-opt-hidden", local || !custom);
-        rowProto.classList.toggle("h3d-opt-hidden", local || !custom);
+        rowUrl.classList.toggle("h3d-opt-hidden", local);
+        rowModel.classList.toggle("h3d-opt-hidden", local);
+        rowProto.classList.toggle("h3d-opt-hidden", local);
+        rowTimeout.classList.toggle("h3d-opt-hidden", local);
         rowLocal.classList.toggle("h3d-opt-hidden", !local);
         refreshRow.classList.toggle("h3d-opt-hidden", !local);
         rowDevice.classList.toggle("h3d-opt-hidden", !local);
+        /* 思考强度跟 URL/型号走，所以每次重绘都重建一遍（本地模式整行藏起来 ——
+         * 本地模型不走这两个字段）。 */
+        if (local) {
+            rowThinking.classList.add("h3d-opt-hidden");
+            thinkingHint.classList.add("h3d-opt-hidden");
+        } else {
+            rebuildThinking();
+        }
         const sel = models.find((m) => m.relative_path === localModel.value);
         rowMmproj.classList.toggle("h3d-opt-hidden", !local || !(sel && sel.format === "gguf"));
-        const preset = OPT_PROVIDERS[provider.value];
-        if (!custom && preset) { url.value = preset.url; model.value = preset.model; protocol.value = preset.protocol; }
         void rowMode; void rowProv;
+    };
+    /* 预设只在**切换服务商时**落地一次。放进 sync() 会在任何一次重绘
+     * （切模式、选本地模型…）把用户手改过的 URL / 模型冲回预设值。 */
+    const applyPreset = (value) => {
+        const preset = OPT_PROVIDERS[value];
+        if (!preset || value === "custom") return;
+        url.value = preset.url;
+        protocol.value = preset.protocol;
+        model.value = providerModels[value] || preset.model;
     };
     if (!url.value) url.value = current.api_url || "";
     if (!model.value) model.value = current.model || "";
     protocol.value = ["openai", "responses", "gemini"].includes(current.protocol) ? current.protocol : "openai";
     provider.addEventListener("change", () => {
-        const prev = provider.dataset.prev || current.provider || "runninghub";
+        const prev = provider.dataset.prev || current.provider || "glm";
         apiKeys[prev] = key.value;
         providerModels[prev] = model.value;
         key.value = apiKeys[provider.value] || "";
+        applyPreset(provider.value);
+        keyHint();
         sync();
-        /* 非自定义服务商切回预设模型（用户改过则保留记忆值） */
-        if (provider.value !== "custom") {
-            model.value = providerModels[provider.value] || OPT_PROVIDERS[provider.value]?.model || "";
-        }
     });
-    mode.addEventListener("change", sync);
+    mode.addEventListener("change", () => { sync(); keyHint(); });
+    /* 改型号 / 改地址都可能改变思考能力（glm-4.6v ↔ glm-5.3-flash 就是两种形态），
+     * 所以两行都要重算。用 input 事件（不是 change）—— 边打字边更新，选完就看到
+     * 「该型号不支持关闭」这类说明，不用等失焦。 */
+    model.addEventListener("input", rebuildThinking);
+    url.addEventListener("input", rebuildThinking);
+    /* max_tokens 也参与提示：高强度思考 + 额度不够要当场提醒（见 rebuildThinking） */
+    maxTokens.addEventListener("input", rebuildThinking);
+    thinking.addEventListener("change", () => { level = thinking.value; rebuildThinking(); });
     localModel.addEventListener("change", () => { fillLocal(); sync(); guide.style.display = localModel.value ? "none" : ""; });
     refreshModels.onclick = async () => {
         refreshModels.disabled = true;
@@ -3817,18 +4229,28 @@ async function openOptSettings(node, onSaved) {
         const preset = OPT_PROVIDERS[provider.value];
         apiKeys[provider.value] = key.value;
         providerModels[provider.value] = model.value;
-        const mt = Math.max(512, Math.min(8192, Number(maxTokens.value) || 4096));
+        const mt = Math.max(512, Math.min(32768, Number(maxTokens.value) || 8192));
+        const to = Math.max(30, Math.min(1800, Number(timeout.value) || 300));
+        /* 思考强度档 → 两个后端字段：强度档本身就是"开思考 + 指定强度"，
+         * 「关闭」「开启」两个档不带强度。 */
+        const lv = thinking.value;
+        const isEffort = ["low", "high", "max"].includes(lv);
         const body = {
             mode: mode.value, provider: provider.value,
-            api_url: provider.value === "custom" ? url.value.trim() : (preset?.url || url.value.trim()),
+            /* 三行现在对所有服务商可见，就以**框里的值**为准（预设只在切服务商时
+             * 落一次）。以前预设值直接覆盖用户输入，等于这三行对预设服务商不可改。 */
+            api_url: url.value.trim() || preset?.url || "",
             api_key: key.value.trim(), api_keys: { ...apiKeys },
-            model: provider.value === "custom" ? model.value.trim() : (model.value.trim() || preset?.model || ""),
+            model: model.value.trim() || preset?.model || "",
             provider_models: { ...providerModels },
-            protocol: provider.value === "custom" ? protocol.value : (preset?.protocol || protocol.value),
+            protocol: protocol.value || preset?.protocol || "openai",
             read_media: readMedia.checked, output_language: outLang,
             local_model: localModel.value, local_mmproj: mmproj.value, local_device: device.value,
             rule_file: ruleSel.value,
-            max_tokens: mt,
+            max_tokens: mt, timeout: to,
+            thinking: isEffort ? "enabled" : lv,
+            reasoning_effort: isEffort ? lv : "",
+            cfg_ver: OPT_CFG_VER,
             /* AI 扩写优化设置（段卡「AI扩写+优化」按钮的参数） */
             expand: {
                 style: exStyle.value,
@@ -3843,7 +4265,12 @@ async function openOptSettings(node, onSaved) {
             body.expand.seconds_max = t;
         }
         if (body.mode === "local" && !body.local_model) { alert("请先选择一个本地视觉模型"); return; }
-        if (body.mode === "api" && (!body.api_key || !body.model)) { alert("请填写 API Key 与模型名"); return; }
+        /* Key 留空**不算错**：服务端可能内置了 Key（hasDefaultKey），此时留空
+         * 就是"用内置的"。只有既没填、服务端也没有，才拦。 */
+        if (body.mode === "api" && !body.model) { alert("请填写模型名"); return; }
+        if (body.mode === "api" && !body.api_key && !hasDefaultKey) {
+            alert("请填写 API Key（或改用本地模型）"); return;
+        }
         optSaveSettings(node, body);
         close();
         if (onSaved) onSaved(body);
@@ -5066,6 +5493,25 @@ function injectStyles() {
     .h3d-opt-hidden{display:none!important}
     .h3d-opt-refresh{flex:none;width:auto!important;padding:4px 9px;display:inline-flex;align-items:center}
     .h3d-opt-save{border:0;background:linear-gradient(135deg,#f0c274,#e6b566 55%,#d99e4a);color:#1a1408;font-weight:700}
+    /* 设置面板里的行内说明（思考强度的能力提示等）：小一号、弱化色，
+       它解释的是"为什么这个选项长这样"，不是必读项。 */
+    .h3d-opt-hint{color:var(--h3d-muted);font-size:11px;line-height:1.6;margin:-2px 0 8px}
+
+    /* ---- 优化进度条（SSE）----
+       思考阶段几十秒没有正文，没有它用户只会以为点下去卡死了。
+       固定贴在视口底部中间：段卡可能在滚动区任意位置，跟着卡片走会跑出视野。 */
+    .h3d-opt-prog{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:1000004;width:min(420px,calc(100vw - 32px));border:1px solid #464033;border-radius:11px;background:linear-gradient(160deg,#242019,#191712 62%);box-shadow:0 16px 44px #000c;padding:11px 13px;color:var(--h3d-bone);font:12px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif;box-sizing:border-box}
+    .h3d-opt-prog *{box-sizing:border-box}
+    .h3d-opt-prog-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px}
+    .h3d-opt-prog-name{font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .h3d-opt-prog-cancel{flex:none;border:1px solid #4a4436;border-radius:6px;background:#211f1a;color:#c8c2b4;font:11px/1.4 inherit;padding:2px 9px;cursor:pointer}
+    .h3d-opt-prog-cancel:hover{border-color:#8a5a42;color:#e0a892}
+    .h3d-opt-prog-cancel:disabled{opacity:.5;cursor:default}
+    .h3d-opt-prog-track{height:6px;border-radius:4px;background:#211f1a;border:1px solid #37332b;overflow:hidden}
+    .h3d-opt-prog-fill{height:100%;width:4%;border-radius:3px;background:linear-gradient(90deg,#7fc79f,#f0c274);transition:width .35s ease-out}
+    .h3d-opt-prog-meta{margin-top:6px;color:var(--h3d-muted);font:10.5px ui-monospace,Consolas;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .h3d-opt-prog.h3d-done .h3d-opt-prog-fill{background:linear-gradient(90deg,#7fc79f,#a8d8bd)}
+    .h3d-opt-prog.h3d-done .h3d-opt-prog-meta{color:#8fc9a5}
 
     /* ---- 分段处理中心面板 ---- */
     .h3d-seg-panel{margin-top:6px;border:1px solid #37332b;border-radius:7px;background:#181712;overflow:hidden}
@@ -9475,12 +9921,11 @@ function openMasterPromptModal() {
     };
     if (((getDs(node).prompts || []).some((x) => String(x ?? "").trim()))) loadFromChain();
 
-    const ensureSettings = () => {
+    const ensureSettings = async () => {
         let st;
         try { st = optGetSettings(node); }
         catch (e) { err.textContent = `加载优化配置失败：${e.message}`; return null; }
-        if (st.mode === "local" && !st.local_model) { openOptSettings(node); return null; }
-        if (st.mode !== "local" && !st.api_key) { openOptSettings(node); return null; }
+        if (await optNeedsSetup(node, st)) return null;
         return st;
     };
 
@@ -9507,7 +9952,7 @@ function openMasterPromptModal() {
      * 直接把 `@完整文件名.png` 发给 LLM，长名容易被抄错（抄错 = 静默丢图），
      * 回写时也不会翻回真名，于是"总提示词框引用不对"就成了常态。 */
     btnOpt.onclick = async () => {
-        const st = ensureSettings();
+        const st = await ensureSettings();
         if (!st) return;
         const p = parseMasterPrompt(String(ta.value ?? ""));
         if (!p.segs.length) { err.textContent = "框里没有任何段落内容"; return; }

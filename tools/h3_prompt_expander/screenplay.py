@@ -83,9 +83,11 @@ def _strip_fence(text: str) -> str:
     return m.group(1).strip() if m else str(text or "").strip()
 
 
-def _gen(cfg, system, user, media=None, max_tokens=None, temperature=None):
+def _gen(cfg, system, user, media=None, max_tokens=None, temperature=None,
+         on_progress=None):
     return _opt_backend.generate_text(cfg, system, user, media=media,
-                                      max_tokens=max_tokens, temperature=temperature)
+                                      max_tokens=max_tokens, temperature=temperature,
+                                      on_progress=on_progress)
 
 
 def _gen_json(cfg, system, user, media=None, max_tokens=None, temperature=None):
@@ -217,14 +219,14 @@ def compose_script_messages(logline_zh, sec_range, ctx=None, style="balanced", s
 
 
 def script_once(logline_zh, sec_range, model, cfg, media=None, ctx=None,
-                style="balanced", style_note="", temperature=None):
+                style="balanced", style_note="", temperature=None, on_progress=None):
     """一段 logline -> 一大段中文剧本（纯文本，非官方格式）。"""
     sec_range = clamp_seconds_range(*sec_range)
     msg = compose_script_messages(logline_zh, sec_range, ctx, style, style_note)
     if temperature is None:
         temperature = style_cfg(style)["temperature"]
     text = _strip_fence(_gen(cfg, msg["system"], msg["user"], media=media,
-                             temperature=temperature))
+                             temperature=temperature, on_progress=on_progress))
     return text, msg
 
 
@@ -340,11 +342,13 @@ def _pack(outline, segs, model, cfg, style, sec_range, one_shot):
 
 
 def screenplay_once(raw_zh, sec_range, model, cfg, media=None, ctx=None,
-                    style="balanced", style_note="", temperature=None):
+                    style="balanced", style_note="", temperature=None,
+                    on_progress=None):
     """单段扩写（段卡里的「AI扩写 → 剧本」用）：一句话 -> 一大段剧本。"""
     sec_range = clamp_seconds_range(*sec_range)
     text, _msg = script_once(raw_zh, sec_range, model, cfg, media=media, ctx=ctx,
-                             style=style, style_note=style_note, temperature=temperature)
+                             style=style, style_note=style_note,
+                             temperature=temperature, on_progress=on_progress)
     return {"script": text,
             "seconds": parse_script_seconds(text, sec_range[0]),
             "meta": {"seconds_range": list(sec_range), "style": style, "model": model}}

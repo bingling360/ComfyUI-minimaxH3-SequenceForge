@@ -63,7 +63,11 @@ const code = [
     extractConst("REF_NAME_MAX"),
     extractFn("cleanRefName"),
     extractConst("refKeyOf"),
-    extractConst("markOf"),
+    /* assignMarks 依赖：标注重发要走 cleanMark（非法形态不能留着占位），
+     * 抽函数时漏了它会在补号那一步 ReferenceError。 */
+    extractFn("markTextOf"),
+    extractConst("_HP"),
+    extractFn("cleanMark"),
     extractFn("assignMarks"),
     extractFn("poolFromManifest"),
 ].join("\n");

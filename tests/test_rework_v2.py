@@ -439,14 +439,18 @@ def test_v2_group_form_wired():
     assert "JSON.stringify(s.prompt_v2)" in d
     assert "function renderPromptV2Panel(body, node, data, segIdx)" in d or \
         "function renderPromptV2Panel(" in d
-    assert "renderPromptV2Panel(paneV2, node, data, it.idx)" in d or \
-        "renderPromptV2Panel(body, node, data, it.idx)" in d
+    # 结构化**只**在弹窗里渲染（页内不再预渲染一份 —— 同一份 prompt_v2 渲染两处，
+    # 改哪边都容易让人以为另一边才是真相）
+    assert "renderPromptV2Panel(bodyBox, node, data, idx)" in d
+    assert "paneV2" not in d, "页内 paneV2 应已随「结构化」迁进弹窗一起删掉"
     assert "function setPromptV2Field(node, idx, mutate" in d
     assert "function debouncePromptV2Write" in d
     assert "function getSegPromptV2" in d
-    # 四组中文标题齐全（官方字段名口径）；源码覆盖已迁出到主框结果区
-    # （参考组标题已从中英混排改为全中文，断言跟着改，别再拿旧字符串钉）
-    for g in ["画面 · 风格/构图/环境/光照/角色/道具", "镜头 ×", "声音 · overall_soundscape",
+    # 三组中文标题齐全（**官方字段名**口径）：
+    # 画面设定与分镜合进「整体描述」一组 —— 它们编译出去是同一个官方字段，
+    # 分成两组看着像官方有两个字段（这正是"结构化对不上官方格式"的来源）。
+    # 源码覆盖已迁出到主框结果区。
+    for g in ["整体描述 ×", "声音 · overall_soundscape",
               "参考 · 主体定义 / 总结 / 保留分析"]:
         assert g in d, g
     assert "高级 · 源码覆盖" not in d, "源码覆盖应已移除"
@@ -470,9 +474,11 @@ def test_v2_group_form_wired():
     assert "const _v2Open = new Map();" in d, "缺 details 开合记忆"
     assert 'function v2Details(key, cls, summaryHtml, defOpen)' in d, "缺 v2Details 工厂"
     assert '_v2Open.set(key, g.open)' in d, "toggle 未记录开合"
-    for k in ["v2${segIdx}", "pic${segIdx}", "shot${segIdx}", "snd${segIdx}", "ref${segIdx}",
+    # 「画面」不再单独成组（pic${segIdx}）：已并进「整体描述」组，见上面标题断言
+    for k in ["v2${segIdx}", "shot${segIdx}", "snd${segIdx}", "ref${segIdx}",
               "more${segIdx}_${si}"]:
         assert k in d, k
+    assert "pic${segIdx}" not in d, "画面组应已并入整体描述组"
     # 重建只在会丢东西时才问（否则 confirm 抢焦点导致输入框卡住）
     assert "hasNote" in d and "按当前素材调度重建引用列表" in d, "重建应改为条件确认"
     # 模式必须按本段数据自动判定，不能写死
@@ -564,8 +570,9 @@ def test_optimizer_routes_mount(routes):
 def test_segment_tabs_and_optimizer_ui():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     a = open(os.path.join(ROOT, "web", "h3_api.js"), encoding="utf-8").read()
-    # 切换式三页
-    assert "h3d-tabs" in d and "paneMain" in d and "paneV2" in d and "paneSet" in d
+    # 切换式两页（「具象化/结构化」那一页已迁成工具条弹窗，不再占一个 pane）
+    assert "h3d-tabs" in d and "paneMain" in d and "paneSet" in d
+    assert "paneV2" not in d
     assert "_segTab" in d
     # 旧四框 UI 已删（后端仍兼容旧键，仅前端不编辑）
     assert "场景提示词" not in d and "角色提示词" not in d
@@ -573,8 +580,9 @@ def test_segment_tabs_and_optimizer_ui():
     assert "segMediaInfo" in d and "openSegViewer" in d and "h3d-viewer" in d
     assert "▶ 预览" in d
     assert "grid-template-columns:minmax(0,1fr)" in d
-    # 具象化已降级为「结构化 ⇄ 文本」页内切换（不再是独立 tab、不再双向同步按钮）
-    assert "结构化 ⇄ 文本" in d and "_segStructView" in d
+    # 结构化已收进工具条弹窗（不再是独立 tab、也不再是页内切换）
+    assert "⇄ 结构化提示词" in d and "function openStructuredModal(" in d
+    assert "_segStructView" not in d, "页内切换的视图记忆应随弹窗化一起删掉"
     assert "从具象化同步" not in d and "同步到具象化" not in d, "旧的双向同步按钮应已下线"
     assert "function applyAiToV2(" not in d, "旧 applyAiToV2（整段塞进 shots[0]）应已删除"
     assert "function applyH3TextToSeg(" in d and "function splitH3Sections(" in d

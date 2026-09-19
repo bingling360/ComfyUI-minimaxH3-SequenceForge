@@ -21,16 +21,20 @@ try {
 }
 
 const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");
+/* 标注规则的**唯一真相**在 h3_prompts.js（与后端 asset_store 同口径），
+ * director 只做转发 + 缺模块兜底。要锁规则就从 h3_prompts 抽，别抽转发的壳。 */
+const psrc = fs.readFileSync(path.join(ROOT, "web", "h3_prompts.js"), "utf8");
 
-function extractFn(name) {
+function extractFn(name, from) {
+    const text = from || src;
     const re = new RegExp("^\\s*function " + name + "\\(", "m");
-    const m = re.exec(src);
+    const m = re.exec(text);
     if (!m) throw new Error("未找到函数 " + name);
-    const i = src.indexOf("{", m.index);
+    const i = text.indexOf("{", m.index);
     let depth = 0;
-    for (let j = i; j < src.length; j++) {
-        if (src[j] === "{") depth++;
-        else if (src[j] === "}") { depth--; if (!depth) return src.slice(m.index, j + 1); }
+    for (let j = i; j < text.length; j++) {
+        if (text[j] === "{") depth++;
+        else if (text[j] === "}") { depth--; if (!depth) return text.slice(m.index, j + 1); }
     }
     throw new Error("大括号不配平 " + name);
 }
@@ -49,9 +53,9 @@ function extractDecl(name, open, close) {
 }
 
 /** 抓单行 const（正则常量等）——从源码原样取，避免测试与实现脱节。 */
-function extractConstLine(name) {
-    const re = new RegExp("^const " + name + " = .*$", "m");
-    const m = re.exec(src);
+function extractConstLine(name, from) {
+    const re = new RegExp("^\\s*const " + name + " = .*$", "m");
+    const m = re.exec(from || src);
     if (!m) throw new Error("未找到常量 " + name);
     return m[0];
 }
@@ -74,12 +78,12 @@ const code = [
     extractFn("assetPreviewUrl"),
     extractFn("buildAssetThumb"),
     extractFn("thumbSig"),
-    /* 素材标注层：makeTag 的 title / @标注 提示都要用 cleanMark */
-    extractConstLine("MARK_RE"),
-    extractConstLine("MARK_MAX"),
-    extractFn("cleanMark"),
-    extractFn("markShaped"),
-    extractFn("nextMark"),
+    /* 素材标注层（规则唯一在 h3_prompts.js，见文件头说明） */
+    extractConstLine("MARK_RE", psrc),
+    extractConstLine("MARK_MAX", psrc),
+    extractFn("cleanMark", psrc),
+    extractFn("markShaped", psrc),
+    extractFn("nextMarkSeq", psrc),
     extractFn("refsFromText"),
     extractFn("createPromptEditor"),
     extractFn("syncRefsFromText"),

@@ -240,33 +240,39 @@ def test_single_pane_refbar():
 
 
 def test_expand_optimize_pipeline_wired():
-    """「AI 扩写 + 优化」两步流水线（源码点）：不弹小框、不显示进度、失败硬报错。
+    """「AI 扩写 + 优化」流水线（源码点）：不弹小框、不显示进度、失败硬报错。
 
     设计约束（用户拍板）：点击后**不弹框**，也不显示"1/2 2/2"这类进度，
     只在按钮上禁用 + LED 写一句状态。中间产物（剧本）不回框、不落盘。
+
+    三框合一后没有"剧本框"这个中间层，所以扩写与优化在**后端串成一次请求**
+    （/h3chain/expand_optimize），中间剧本只在响应里带回一份便于排查 ——
+    前端不再是"先 expandMulti 再 optimize"两步。
     """
     d = _src()
-    assert "async function runExpandOptimize(node, idx, ta, ui)" in d
-    assert "runExpandOptimize(node, it.idx, ta, { btn: bExpandOpt })" in d
+    assert "async function runExpandOptimizeForSegment(node, idx, ta, ui)" in d
+    assert "runExpandOptimizeForSegment(node, it.idx, ta, { btn: bExpandOpt })" in d
     # 小框（openExpandModal）彻底删除
     assert "function openExpandModal" not in d
     # 不弹框：流水线内不出现 confirm/prompt 之类阻塞对话框
-    i = d.index("async function runExpandOptimize(")
+    i = d.index("async function runExpandOptimizeForSegment(")
     block = d[i:i + 3200]
     assert "window.prompt" not in block and "confirm(" not in block
-    # 不显示进度百分比：按钮文案只在 finally 复原，跑的过程中不改
-    assert "btnLabel0" in block
+    # 不显示进度百分比
     assert "扩写中 1/2" not in block and "优化中 2/2" not in block
-    # 两步串行：先 expandMulti 再 optimize
-    assert "H3Api.expandMulti" in block and "H3Api.optimize" in block
-    assert block.index("expandMulti") < block.index("H3Api.optimize")
+    # 一步到底：走 /h3chain/expand_optimize（前端不再串两步）
+    assert "H3Api.expandOptimize" in block
     # 与单步优化共用落盘路径（对齐指令必须补回，否则模型丢首尾帧锚）
     assert "resyncAlignmentLines(node, idx)" in block
-    # 扩写设置（时长范围/风格/是否续跑）在设置页，不在小框里
-    assert "function optExpandSettings(settings, seg)" in d
+    # 误点保护：写入前把当前正文存为原稿，工具条「原稿」可一键还原
+    assert "_optBefore.set(key, before)" in block
+    # 出/回码走标注编解码（与总提示词框同一条规则）
+    assert "toLLMText(before, ds.ref_assets" in block
+    assert "fromLLMText(" in block
+    # 扩写设置（时长范围/风格）在设置页，不在小框里
+    assert "function optGetExpandSettings(node)" in d
     assert "AI 扩写优化设置" in d
-    assert "const EX_STYLES = " in d
-    # 悬空设置 auto_optimize 已删
+    # 悬空设置 auto_optimize 已删（勾了没人消费 = 不能兑现的承诺）
     assert "auto_optimize" not in d and "autoOptimize" not in d
 
 
@@ -297,27 +303,29 @@ def test_master_prompt_single_box_modal():
     block = _fn_block(d, "function openMasterPromptModal()")
     # 单框：只有一个 textarea，三框时代的箱体/句柄全删
     assert "h3d-mpboxwrap-main" in block
-    assert "MP_PH_MASTER" in block
+    # 占位示例按模式给两份（base 三字段 / Ref2VA 六字段），比一份"通用示例"更贴题
+    assert "MP_PH_MAIN_BASE" in block and "MP_PH_MAIN_REF2VA" in block
     for dead in ["mkBox", "boxI", "boxS", "boxR",
                  "h3d-mpboxwrap-1", "h3d-mpboxwrap-2", "h3d-mpboxwrap-3",
                  "const MP_PH_INTENT =", "const MP_PH_SCRIPT =",
-                 "const MP_ALIGN_LINE =", "const MP_PH_MAIN_REF2VA =",
                  "function mpComposeBoxes(", "function mpSplitBox("]:
         assert dead not in d, f"三框时代的 {dead} 应已删除"
     # 没有「AI 多段扩写」：弹窗里不出现 expandMulti
     assert "expandMulti" not in block, "总提示词框不该再有 AI 多段扩写"
     assert "AI扩写" not in block and "AI 扩写" not in block
-    # 有「AI 分段优化」且走 optimizeMulti（一次请求吃 N 段 = 整篇一次跑）
-    assert "✨ AI 分段优化" in block
+    # 有「AI 分段优化」（整篇一次跑，不是逐段各跑一次）
+    assert "✨ AI分段提示词优化" in block
     assert "optimizeMulti" in block
     # 写回仍是「解析并分配」那一条链路
-    assert "applyMasterPrompt(node, raw)" in block
+    assert "applyMasterPrompt(node, text)" in block
     assert "解析并分配" in block
     # 出/回码要走标注编解码（与段卡同一条规则，不另写一套）
     assert "toLLMText(t.src, pool)" in block and "fromLLMText(" in block
-    # 单框渲染器：有值就写回旧四标签，不写「意图/剧本」
+    # 单框渲染器：只写 时长 / 独立镜头 / 参考 / 提示词
+    # （旧四框的 场景/角色/环境音/配乐 已下线，解析仍兼容旧文本但不再写出）
     assert "function mpRenderState(state)" in d
-    assert "[['场景', 'scene']" not in d and '["场景", "scene"]' in d
+    assert "旧四框已下线" in d
+    assert "【段${i + 1}】" in d
 
 
 def test_structured_modal_replaces_v2_tab():
@@ -334,7 +342,9 @@ def test_structured_modal_replaces_v2_tab():
     i = d.index("function openStructuredModal(")
     block = d[i:i + 2600]
     assert "renderPromptV2Panel(bodyBox, node, data, idx)" in block
-    assert "applyAiToV2(node, idx, text)" in block
+    # 文本→结构走 applyH3TextToSeg（按官方字段切块 + 按 [Shot N] 切镜）。
+    # 旧的 applyAiToV2 把整段塞进 shots[0].description，多镜段一切就只剩第一镜。
+    assert "applyH3TextToSeg(node, idx, text)" in block
 
 
 def test_director_js_module_syntax():

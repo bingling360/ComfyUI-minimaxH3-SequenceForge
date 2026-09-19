@@ -128,6 +128,14 @@ def _frontend_fn(name):
     return m.group(0)
 
 
+def _frontend_const(name):
+    """抓 `const name = …;`（箭头函数 / 常量都行），到第一个行尾分号为止。"""
+    src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    m = re.search(rf"^const {re.escape(name)} = .*?;$", src, re.M | re.S)
+    assert m, f"未找到前端常量 {name}"
+    return m.group(0)
+
+
 @pytest.mark.skipif(NODE is None, reason="需要 node 执行前端纯函数")
 def test_frontend_replace_at_tokens_matches_backend(AS):
     fn = _frontend_fn("replaceAtTokens")
@@ -155,13 +163,18 @@ def test_frontend_replace_at_tokens_matches_backend(AS):
 @pytest.mark.skipif(NODE is None, reason="需要 node 执行前端纯函数")
 def test_frontend_assign_marks_matches_backend(AS):
     """前端兜底补号与后端规则一致：按类型独立、已有不动、不回收。"""
-    fn = _frontend_fn("assignMarks")
     items = [{"kind": "image", "mark": "图片5"}, {"kind": "image", "mark": ""},
              {"kind": "video", "mark": ""}, {"kind": "image", "mark": "图片2"},
              {"kind": "audio", "mark": ""}]
+    # assignMarks 的依赖链一并抽真源码（markTextOf / cleanMark），不要就地造桩 ——
+    # 造桩就测不到"非法标注要重发"这条口径。_HP 只是取 window.H3Prompts，
+    # node 里没有 window → 走兜底实现。
     code = (
         "const KIND_NAME = { image: '图片', video: '视频', audio: '音频' };\n"
-        "const markOf = (a) => String((a && a.mark) || '').trim();\n" + fn + "\n"
+        + _frontend_fn("markTextOf") + "\n"
+        + _frontend_const("_HP") + "\n"
+        + _frontend_fn("cleanMark") + "\n"
+        + _frontend_fn("assignMarks") + "\n"
         + "console.log(JSON.stringify(assignMarks("
         + json.dumps(items, ensure_ascii=False) + ").map((x) => x.mark)));"
     )

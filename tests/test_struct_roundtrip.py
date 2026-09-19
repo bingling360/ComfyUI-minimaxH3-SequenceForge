@@ -170,10 +170,12 @@ def test_struct_text_roundtrip_is_idempotent(PR, descs, secs):
 def test_apply_ai_to_v2_removed():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     assert "function applyAiToV2(" not in d, "旧的 applyAiToV2 应已删除"
-    assert "同步到具象化 →" not in d, "旧的双向同步按钮应已换成「结构化 ⇄ 文本」"
-    assert "结构化 ⇄ 文本" in d, "缺「结构化 ⇄ 文本」切换按钮"
+    assert "同步到具象化 →" not in d, "旧的双向同步按钮应已换成「⇄ 结构化提示词」弹窗"
+    assert "⇄ 结构化提示词" in d, "缺「⇄ 结构化提示词」弹窗入口"
+    assert "function openStructuredModal(node, data, idx, ta)" in d
     # 具象化不再是独立 tab
     assert '["main", "提示词"]' in d and '["set", "锚定设置"]' in d, "段卡 tab 应为 提示词 / 锚定设置"
-    # paneV2 的显隐不能再由 paintTabs 统一管（切一次 tab 就把结构化视图关掉）
+    # 结构化不再有页内 pane（paneV2 已随弹窗化删掉）
+    assert "paneV2" not in d, "页内 paneV2 应已删除"
     m = re.search(r"const panes = \{([^}]*)\};", d)
-    assert m and "v2:" not in m.group(1), "paneV2 不应再挂在 panes 里（显隐由切换按钮管）"
+    assert m and "v2:" not in m.group(1), "panes 里不应再有 v2"

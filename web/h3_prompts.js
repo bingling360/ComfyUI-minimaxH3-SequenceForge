@@ -112,6 +112,7 @@
    * （asset_store.compile_refs）。某段只引用「图片3」时仍须编译成 `<Picture 1>`。
    */
   const MARK_RE = /^(图片|视频|音频)(\d{1,3})$/;
+  const MARK_MAX = 999;   // 与后端 asset_store.MARK_MAX 一致
   const MARK_OPEN = "【[（(「";
   const MARK_CLOSE = { "【": "】", "[": "]", "（": "）", "(": ")", "「": "」" };
   /* `@别名` 语法的前导判据：**必须与后端 nodes._REF_AT 的负向后顾逐字一致**
@@ -121,15 +122,62 @@
   /* 裸形态（LLM 漏了 @）的前导判据：连汉字也挡，避免把散文里的「大图片1」当引用 */
   const _BARE_PREV_BAD = (c) => /[0-9A-Za-z_\u4e00-\u9fff]/.test(c || "");
 
-  /** 池 → 可用的 (素材名, 标注) 对（标注形态非法/缺失的条目直接跳过） */
+  /** 池 → 可用的 (素材名, 标注) 对（标注形态非法/缺失的条目直接跳过）。
+   *
+   * **全名（ref_name）与别名都要建映射**：正文里 `@猫.png` 和 `@猫` 两种写法都在，
+   * 只映射别名的话，`@猫.png` 会被只吃掉 `猫`、把 `.png` 留在正文 ——
+   * 和提示词框那个"后缀溢出"是同一个坑（匹配表不全）。
+   * 全名先入，于是"标注 → 名字"回写时优先还原成全名。 */
   function markPairs(pool) {
     const out = [];
     for (const a of (pool || [])) {
-      const label = String((a && a.label) || "").trim();
       const mark = String((a && a.mark) || "").trim();
-      if (label && MARK_RE.test(mark)) out.push({ label, mark });
+      if (!MARK_RE.test(mark)) continue;
+      const names = [String((a && a.ref_name) || "").trim(),
+        String((a && (a.label || a.alias)) || "").trim()];
+      for (const n of names) {
+        if (n && !out.some((p) => p.label === n)) out.push({ label: n, mark });
+      }
     }
     return out;
+  }
+
+  /** 按素材名（全名或别名皆可）查标注；查不到返回 ""。
+   *  给 LLM 的素材名单用它取显示名 —— 名单写短编号，模型才不容易抄错。 */
+  function markOf(pool, nm) {
+    const want = String(nm || "").trim();
+    if (!want) return "";
+    const p = markPairs(pool).find((x) => x.label === want);
+    return p ? p.mark : "";
+  }
+
+  /** 标注归一：形态合法就返回去空白后的文本，否则 ""（与后端 clean_mark 逐字同规则）。
+   *  校验必须和后端用同一条尺子 —— 前端松一点，老存档里的垃圾标注（"图1"/"图片0"/
+   *  "图片1000"）就会被当成有效号占位，后端却判非法重新发号，两边显示的号对不上。 */
+  function cleanMark(s) {
+    const t = String(s == null ? "" : s).trim();
+    const m = MARK_RE.exec(t);
+    /* 光形状对不够，还得看号在 1..999：**图片0 是非法号**（后端 clean_mark 同判据） */
+    if (!m) return "";
+    const n = Number(m[2]);
+    return n >= 1 && n <= MARK_MAX ? `${m[1]}${n}` : "";
+  }
+
+  /** 形态是否合法（只看形状，不查重） */
+  function markShaped(s) { return MARK_RE.test(String(s == null ? "" : s).trim()); }
+
+  /** 下一个可用号 = 当前最大号 +1（**编号不回收**）。
+   *  为什么不用"最小空闲号"：删掉 2 号后补成 2 的话，旧的提示词/LLM 对话里
+   *  写的「图片2」会突然指向另一张素材（串号），而且完全静默。留空更安全。 */
+  function nextMarkSeq(kind, marks) {
+    const k = String(kind || "image");
+    const want = k === "video" ? "视频" : k === "audio" ? "音频" : "图片";
+    let mx = 0;
+    for (const m of marks || []) {
+      const g = /^(图片|视频|音频)(\d{1,3})$/.exec(String(m || "").trim());
+      if (g && g[1] === want) mx = Math.max(mx, Number(g[2]));
+    }
+    return mx + 1;
   }
 
   /** 出（给 LLM）：`@素材名` → `@标注`。最长素材名优先，与 refsFromText / 后端 _find_refs 同口径。 */
@@ -227,7 +275,8 @@
       defaultLatentSave, cleanLatentSave, ensurePromptV2, hasPromptV2,
       detectMode, assignV2FromText,
       /* 素材标注编解码（B03）：只用于「提示词 ⇄ LLM」这一跳，绝不落盘 */
-      markPairs, marksToText, textToMarks,
+      markPairs, markOf, marksToText, textToMarks,
+      cleanMark, markShaped, nextMarkSeq,
       CAMERA_MOVES, CAMERA_AMPS, CAMERA_SPEEDS, RETENTION_MARKERS,
     };
   }

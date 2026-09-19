@@ -83,12 +83,18 @@ def test_subject_tag_still_documented():
 # 运行期真跑见 tests/js/mark_codec_check.js）。
 
 def test_collect_seg_media_uses_mark_not_raw_name():
-    """media.label 必须是**标注** —— 后端 build_system_prompt 直接用它拼名单。"""
+    """media.label 必须是**标注** —— 后端 build_system_prompt 直接用它拼名单。
+
+    钉的是"标注优先、回落引用名"这个意图，不是变量名（合并两条分支时
+    变量叫过 mk / nm，钉变量名会在改名时假红、却挡不住真的回退）。
+    """
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     i = src.index("async function collectSegMedia")
     block = src[i:i + 2600]
-    assert "label: mk" in block, "media.label 应取标注（mark）"
-    assert "markOf(pool, nm)" in block, "标注从池子里按素材名查"
+    assert "asset.mark || asset.label" in block, \
+        "media.label 应**优先**取标注（mark），只在没有标注时才回落引用名"
+    assert re.search(r"mark:\s*[A-Za-z_$][\w$]*\(\s*hit\s*\)", block), \
+        "标注从素材条目上取（不是现场拼 <Picture N>）"
     assert "`<Picture ${media.length + 1}>`" not in block, \
         "不应再用 <Picture N> 当 media.label"
 
@@ -97,9 +103,9 @@ def test_collect_seg_media_note_mentions_marks():
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     i = src.index("async function collectSegMedia")
     block = src[i:i + 2800]
-    assert "`@${mk}`" in block, "note 里应给出 @标注"
+    assert "notes.push(`@${nm}`)" in block, "note 里应给出 @标注"
     assert "不要写 <Picture N>" in block
-    assert "@图片N" in block, "note 要说明标注形态（@图片N）"
+    assert "@图片N" in block or "图片1" in block, "note 要说明标注形态（@图片N）"
 
 
 def test_llm_roundtrip_uses_mark_codec():
@@ -107,7 +113,9 @@ def test_llm_roundtrip_uses_mark_codec():
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     assert "function toLLMText(text, pool)" in src
     assert "function fromLLMText(text, pool)" in src
-    for fn in ("async function runOptForSegment(", "async function runExpandOptimize("):
+    for fn in ("async function runOptForSegment(",
+               "async function runExpandOptimizeForSegment("):
+        assert fn in src, f"找不到 {fn}（改名了就同步这里）"
         i = src.index(fn)
         block = src[i:i + 4200]
         assert "toLLMText(" in block, f"{fn} 出参未换码"

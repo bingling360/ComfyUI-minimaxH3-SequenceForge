@@ -270,8 +270,10 @@ def test_expand_optimize_pipeline_wired():
     assert 'busy: { expand: "扩写中…", thinking: "优化中…", writing: "优化中…" }' in block
     # 用户主动取消不算失败（不弹错）
     assert "r.body?.cancelled" in block
-    # 与单步优化共用落盘路径（对齐指令必须补回，否则模型丢首尾帧锚）
-    assert "resyncAlignmentLines(node, idx)" in block
+    # 与单步优化共用落盘路径（对齐指令必须**剥掉**：它是编译产物，由锚定栏展示 +
+    # 实跑注入；留在正文里会跟注入的那句重复，锚一变还变成指向不存在图的陈旧指令）
+    assert "stripAlignmentLines(node, idx)" in block
+    assert "resyncAlignmentLines" not in block
     # 误点保护：写入前把当前正文存为原稿，工具条「原稿」可一键还原
     assert "_optBefore.set(key, before)" in block
     # 出/回码走标注编解码（与总提示词框同一条规则）
@@ -303,34 +305,42 @@ def _fn_block(d, sig):
 
 
 def test_master_prompt_single_box_modal():
-    """总提示词框 = 单框分段工具（B04，源码点）。
+    """总提示词框 = **纯分段流水线**（源码点）。
 
-    需求：去掉 AI 多段扩写、退回单框；只留「AI 分段优化」（整篇一次跑）+「解析并分配」。
+    三条边界：① 不做 AI（分段优化 / 扩写 / 优化设置 / 原稿 全撤）；
+    ② 不与段卡提示词同步（打开不自动载入，只有手动「从当前链载入」）；
+    ③ 资产引用与段卡同一套语义（正文 @素材名 → syncRefsFromText 派生 seg.refs，
+       不再有「参考：」那条第二通道）。
     """
     d = _src()
     block = _fn_block(d, "function openMasterPromptModal()")
-    # 单框：只有一个 textarea，三框时代的箱体/句柄全删
+    # 单框：三框时代的箱体/句柄全删
     assert "h3d-mpboxwrap-main" in block
-    # 占位示例按模式给两份（base 三字段 / Ref2VA 六字段），比一份"通用示例"更贴题
-    assert "MP_PH_MAIN_BASE" in block and "MP_PH_MAIN_REF2VA" in block
     for dead in ["mkBox", "boxI", "boxS", "boxR",
                  "h3d-mpboxwrap-1", "h3d-mpboxwrap-2", "h3d-mpboxwrap-3",
                  "const MP_PH_INTENT =", "const MP_PH_SCRIPT =",
                  "function mpComposeBoxes(", "function mpSplitBox("]:
         assert dead not in d, f"三框时代的 {dead} 应已删除"
-    # 没有「AI 多段扩写」：弹窗里不出现 expandMulti
-    assert "expandMulti" not in block, "总提示词框不该再有 AI 多段扩写"
-    assert "AI扩写" not in block and "AI 扩写" not in block
-    # 有「AI 分段优化」（整篇一次跑，不是逐段各跑一次）
-    assert "✨ AI分段提示词优化" in block
-    assert "optimizeMulti" in block
+    # ① 不做 AI：弹窗里一个 AI **入口**都不许剩（格式清洗在段卡上做）。
+    # 文案里提到「去段卡上的 ✨ AI扩写+优化」是**指路**，不是入口，别被它骗过去。
+    for dead in ["optimizeMulti", "expandMulti", "optCallStream", "openOptSettings(",
+                 "✨ AI分段提示词优化", "↩ 原稿", "⚙ AI 优化设置",
+                 "MP_MODE_HINT", "MP_ALIGN_LINE", "collectMasterMedia",
+                 "h3d-mpset", "h3d-mprefs", "toLLMText(", "fromLLMText("]:
+        assert dead not in block, f"总提示词框不该再有 {dead}"
+    assert "段卡上的「✨ AI扩写+优化" in block, "不做 AI 也要把人指到段卡去"
+    # ② 不与段卡同步：没有"打开即载入"，载入只在按钮的 onclick 里
+    assert "if (((getDs(node).prompts" not in d, "打开时不应自动载入链上提示词"
+    assert "bLoad.onclick = () => loadFromChain();" in block
+    # ③ 资产引用与段卡同一套：分配时由正文 @序列 派生 seg.refs
+    alloc = _fn_block(d, "function applyMasterPrompt(node, text)")
+    assert "syncRefsFromText(ds, i," in alloc, "seg.refs 必须由正文派生，不能另写一套"
+    assert "s.refs !== undefined" not in alloc, "「参考：」标签应已停用"
+    assert "base.scene_prompt" not in alloc, "旧四框字段不该再写回"
     # 写回仍是「解析并分配」那一条链路
     assert "applyMasterPrompt(node, text)" in block
     assert "解析并分配" in block
-    # 出/回码要走标注编解码（与段卡同一条规则，不另写一套）
-    assert "toLLMText(t.src, pool)" in block and "fromLLMText(" in block
-    # 单框渲染器：只写 时长 / 独立镜头 / 参考 / 提示词
-    # （旧四框的 场景/角色/环境音/配乐 已下线，解析仍兼容旧文本但不再写出）
+    # 单框渲染器：只写 时长 / 独立镜头 / 提示词
     assert "function mpRenderState(state)" in d
     assert "旧四框已下线" in d
     assert "【段${i + 1}】" in d

@@ -1,12 +1,16 @@
-/* 总提示词分段格式：提示词单主体 + 三个段级标签 + 旧标签兼容 + 导出回环。
+/* 总提示词分段格式：提示词单主体 + 两个段级标签 + 旧标签只读丢弃 + 导出回环。
  *
- * 背景：工作台从三框（① 意图 / ② 剧本 / ③ 结果）退化为**单框**——框里就是直接
- * 进模型的提示词。文本交换格式相应收敛为：
- *   【段N】 + 段级标签（时长 / 独立镜头 / 参考）+ 提示词正文（可带 `提示词：` 标签，
+ * 背景：工作台退化成**纯分段流水线**——只给每段三样东西：提示词 / 时长 / 独立镜头。
+ * 文本交换格式相应收敛为：
+ *   【段N】 + 段级标签（时长 / 独立镜头）+ 提示词正文（可带 `提示词：` 标签，
  *   不带也行，段头后的裸正文一律归提示词）。
- * 「意图 / 剧本」两个标签**降级为只读兼容**：外部 skill 的产出、旧导出文本里还在写，
- * 解析必须整块跳过并提示"已忽略"，绝不能当作正文吞掉（那是把"不进模型"的内容
- * 悄悄送进模型），也不能静默丢弃（用户会以为内容还在）。导出侧不再写这两个标签。
+ *
+ * 上一代的分层全部**只读丢弃**（认出来 → 整块丢掉 → 进 notes 点名）：
+ *   参考 / 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本
+ * 为什么不是"看不懂就当正文"：这些块的内容**不该进模型**，悄悄并进提示词等于
+ * 把"不进模型"的内容送进模型；也不能静默丢弃，用户会以为内容还在。
+ * 其中「参考」尤其要点名：它曾是资产引用的第二条通道，现在只有正文里的
+ * `@素材名` 算数（与段卡同一套），不提示的话用户会以为自己挂上了素材。
  *
  * jsdom 真跑：从 h3_director.js 抽出 MP_* 常量与 mpReflow / newMasterSeg /
  * parseMasterPrompt / mpRenderState，不依赖 DOM。
@@ -68,13 +72,17 @@ const check = (name, cond, extra) => {
     if (extra !== undefined) console.log("       " + extra);
 };
 
-/* ---------- 1. 段级标签 + 提示词正文；意图 / 剧本 只读跳过 ---------- */
+/* ---------- 1. 段级标签只有 时长 / 独立镜头；旧标签只读丢弃 ---------- */
 {
     const text = [
         "【段1】",
         "时长：9",
         "独立镜头：否",
         "参考：角色1，图片2",
+        "场景：黄昏教室",
+        "角色：短发少女",
+        "环境音：翻书声",
+        "配乐：钢琴独奏",
         "意图：雨夜霓虹市场，女孩回头笑说跟上我",
         "剧本：",
         "时长：9 秒",
@@ -93,41 +101,36 @@ const check = (name, cond, extra) => {
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
     check("识别 1 段", p.segs.length === 1, "实际 " + p.segs.length);
     const s = p.segs[0];
-    check("意图不再解析成字段", s.intent === undefined, JSON.stringify(s.intent));
-    check("剧本不再解析成字段", s.script === undefined, JSON.stringify(s.script));
-    check("剧本正文**没被当提示词吞掉**",
-        String(s.main || "").indexOf("镜头一") < 0 && String(s.main || "").indexOf("时长：9 秒") < 0,
+    check("时长：9", Number(s.seconds) === 9, String(s.seconds));
+    check("独立镜头：否 → false", s.unlink === false, String(s.unlink));
+    /* 上一代的七个标签全部不再产出字段 */
+    for (const k of ["refs", "scene", "character", "soundscape", "music", "intent", "script"]) {
+        check(`「${k}」不再解析成字段`, s[k] === undefined, JSON.stringify(s[k]));
+    }
+    check("剧本/场景正文**没被当提示词吞掉**",
+        String(s.main || "").indexOf("镜头一") < 0
+        && String(s.main || "").indexOf("时长：9 秒") < 0
+        && String(s.main || "").indexOf("黄昏教室") < 0
+        && String(s.main || "").indexOf("参考：角色1") < 0,
         JSON.stringify(s.main));
     check("提示词 → main（含空行）",
         s.main && s.main.indexOf("integrated_multimodal_description") === 0
         && s.main.indexOf("overall_soundscape") > 0 && s.main.indexOf("\n\n") > 0,
         JSON.stringify(s.main));
-    check("时长：9", Number(s.seconds) === 9, String(s.seconds));
-    check("参考：切成两个标签",
-        JSON.stringify(s.refs) === JSON.stringify(["角色1", "图片2"]), JSON.stringify(s.refs));
-    check("独立镜头：否 → false", s.unlink === false, String(s.unlink));
-    check("已忽略要**提示**出来（不能静默）",
+    check("丢弃要说出来（进 notes）",
         p.notes.some((n) => n.indexOf("已忽略") >= 0), JSON.stringify(p.notes));
+    check("「参考」单独点名（否则用户以为挂上素材了）",
+        p.notes.some((n) => n.indexOf("参考") >= 0), JSON.stringify(p.notes));
 }
 
-/* ---------- 2. 旧八标签仍认（旧项目文本可粘回） ---------- */
+/* ---------- 2. 资产引用只认正文里的 @素材名（不再有「参考：」通道） ---------- */
 {
-    const text = [
-        "【段1】",
-        "场景：黄昏教室",
-        "角色：短发少女",
-        "环境音：翻书声",
-        "配乐：钢琴独奏",
-        "提示词：她抬起头。",
-    ].join("\n");
+    const text = "【段1】\n提示词：integrated_multimodal_description: [Shot 1] "
+        + "<Picture 1> 的雨夜市场，@女主.png 站在巷口。";
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
-    const s = p.segs[0];
-    check("旧标签 场景/角色/环境音/配乐 仍解析",
-        s.scene === "黄昏教室" && s.character === "短发少女"
-        && s.soundscape === "翻书声" && s.music === "钢琴独奏",
-        JSON.stringify(s));
-    check("旧文本没写意图/剧本 → undefined（不覆盖）",
-        s.intent === undefined && s.script === undefined);
+    check("引用原样留在正文里（不被任何标签吃掉）",
+        String(p.segs[0].main).indexOf("@女主.png") > 0, JSON.stringify(p.segs[0].main));
+    check("没有「参考：」时不再产生任何 note", p.notes.length === 0, JSON.stringify(p.notes));
 }
 
 /* ---------- 3. 软换行丢失容错（从 markdown 界面复制） ---------- */
@@ -149,19 +152,22 @@ const check = (name, cond, extra) => {
 /* ---------- 5. 导出回环：mpRenderState -> parseMasterPrompt ---------- */
 {
     const state = [
-        /* intent / script 故意带上：导出必须**不写**它们，否则下次贴回就触发已忽略 */
-        { intent: "雨夜市场，她喊跟上我", script: "镜头一：她回头\n\n镜头二：她跑", main: "integrated_multimodal_description: [Shot 1] …", seconds: 9, unlink: false, refs: ["角色1"] },
+        /* 故意带上上一代的字段：导出必须**一个都不写**，否则下次贴回就触发已忽略 */
+        { intent: "雨夜市场，她喊跟上我", script: "镜头一：她回头\n\n镜头二：她跑",
+            main: "integrated_multimodal_description: [Shot 1] …", seconds: 9,
+            unlink: false, refs: ["角色1"], scene: "雨夜", character: "她",
+            soundscape: "雨声", music: "N/A" },
         { intent: "天台看烟花", script: "镜头一：跑到天台", main: "", seconds: 12, unlink: true, refs: [] },
     ];
     const text = run("mpRenderState(" + JSON.stringify(state) + ")");
-    check("导出不再写 意图 / 剧本",
-        text.indexOf("意图：") < 0 && text.indexOf("剧本：") < 0, JSON.stringify(text));
+    for (const dead of ["意图：", "剧本：", "参考：", "场景：", "角色：", "环境音：", "配乐："]) {
+        check(`导出不再写「${dead.replace("：", "")}」`, text.indexOf(dead) < 0, JSON.stringify(text));
+    }
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
     check("回环段数一致", p.segs.length === 2, "实际 " + p.segs.length);
     const a = p.segs[0] || {};
     check("回环 提示词 一致", a.main === state[0].main, JSON.stringify(a.main));
     check("回环 时长 一致", Number(a.seconds) === 9, String(a.seconds));
-    check("回环 参考 一致", JSON.stringify(a.refs) === JSON.stringify(["角色1"]), JSON.stringify(a.refs));
     const b = p.segs[1] || {};
     check("回环 独立镜头 是 → true", b.unlink === true, String(b.unlink));
     check("回环 空提示词 → 空串不是 undefined", b.main === "", JSON.stringify(b.main));

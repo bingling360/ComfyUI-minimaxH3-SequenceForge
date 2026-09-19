@@ -199,8 +199,33 @@ def migrate_legacy_seg(seg):
     return p
 
 
+FRAME_FPS = 24.0
+
+
+def frames_to_seconds(frames):
+    """段长**帧数** -> 对齐指令里用的秒（两位小数，官方 S.SS）。
+
+    段长的真实单位是吸附到 17k+5 网格的帧数（nodes._snap_seconds），而官方
+    FL2VA/L2VA 对齐句的 S.SS 是秒 —— 5 秒段实际是 124 帧 = 5.17s。前端锚定栏
+    预览与后端实跑注入必须共用这一个换算，否则同一段两边写出不同的 S.SS
+    （曾经就是前端 5.00、后端 5.17）。
+    """
+    try:
+        f = int(frames)
+    except (TypeError, ValueError):
+        return 5.0
+    if f <= 0:
+        return 5.0
+    return round(f / FRAME_FPS, 2)
+
+
 def detect_mode(prompt, *, has_start=False, has_end=False):
-    """模式自动判定：有普通参考/主体/中间引用即 Ref2VA，否则按首尾帧。"""
+    """模式自动判定：有普通参考/主体/中间引用即 Ref2VA，否则按首尾帧。
+
+    混合模式：首尾帧锚 + 参考素材同时存在时**仍判 Ref2VA** —— 官方六段式能
+    同时承载"关键帧锚点"与"参考素材"（帧锚作为 <Picture 1>/<Picture 2> 进
+    subject_definitions），比把两种语义塞进 base 三字段更贴近官方格式。
+    """
     refs = prompt.get("references") or []
     subs = prompt.get("subjects") or []
     if refs or subs:
@@ -212,6 +237,27 @@ def detect_mode(prompt, *, has_start=False, has_end=False):
     if has_end:
         return "L2VA"
     return "T2VA"
+
+
+def alignment_lines(mode, seconds, has_start, has_end, n_shots=1):
+    """本段的官方对齐指令行（纯函数，无状态）—— 后端实跑与前端预览同口径。
+
+    mode=Ref2VA/T2VA 返回 []：**混合模式（帧锚 + 参考素材）不生成对齐句**，
+    帧锚改由 subject_definitions / retention_analysis 里的 <Picture k> 承载
+    （官方 Ref2VA 六段式本来就不带对齐指令）。
+    其余逐字照抄 tools/h3_prompt_expander/references/h3-dialect.md §1.2。
+    """
+    dur = float(seconds or 5.0)
+    n = max(1, int(n_shots or 1))
+    if mode in ("T2VA", "Ref2VA"):
+        return []
+    if mode == "FL2VA" and has_start and has_end:
+        return [FL2VA_HEAD.format(first_shot=1, last_shot=n, t=dur)]
+    if mode in ("L2VA", "FL2VA") and has_end:
+        return [L2VA_HEAD.format(shot=n, t=dur)]
+    if mode in ("I2VA", "FL2VA") and has_start:
+        return [keyframe_line(0.0, "<Picture 1>", 1)]
+    return []
 
 
 def keyframe_line(t, label, shot=1):
@@ -344,23 +390,40 @@ def _norm_label(label):
     return s
 
 
-def compose_reference(prompt, *, duration=5.0):
+def compose_reference(prompt, *, duration=5.0, frame_anchors=()):
+    """Ref2VA 六段式。**混合模式**下 frame_anchors 是首尾帧锚（已编号的官方标签）。
+
+    frame_anchors: [(token, note)]，如 `[("<Picture 1>", "首帧锚点，0.00s 起手帧")]`。
+    帧锚排在 subject_definitions 最前 —— 它就是本段最先要交代的两张图（模型按
+    <Picture k> 编号认图，帧锚占 1/2，参考素材顺延）。retention 一律
+    `fully_preserved`：帧锚是硬钉在 0.00s / 末帧的，不是"参考一下"。
+    """
     refs = prompt.get("references") or []
     subs = prompt.get("subjects") or []
-    subj_lines = [f"<Subject {i + 1}>: {_s(s.get('definition'))}" for i, s in enumerate(subs)]
+    subj_lines = []
+    for tok, note in (frame_anchors or ()):
+        subj_lines.append(f"{tok}: {_s(note) or 'keyframe anchor'}")
+    subj_lines += [f"<Subject {i + 1}>: {_s(s.get('definition'))}" for i, s in enumerate(subs)]
     for r in refs:
         subj_lines.append(f"{_norm_label(r.get('label'))}: {_s(r.get('note')) or 'reference asset'}")
     tasks = [_s(t) for t in (prompt.get("task_types") or []) if _s(t)]
+    if frame_anchors and "keyframe completion" not in tasks:
+        # 混合模式：任务前缀必须同时声明两种职责，模型才知道"这两张是锚、其余是参考"
+        tasks = ["keyframe completion"] + (tasks or ["reference generation"])
     prefix = "[" + " + ".join(tasks or ["reference generation"]) + "]"
     summary = _s(prompt.get("summary_override"))
     if not summary:
         bits = [f"{prefix} A {max(1, int(round(float(duration or 5.0))))}-second clip"]
+        if frame_anchors:
+            bits.append("anchored on " + " and ".join(tok for tok, _ in frame_anchors))
         if subs:
             bits.append("of " + " and ".join(f"<Subject {i + 1}>" for i in range(len(subs))))
         if refs:
             bits.append("based on " + " and ".join(_norm_label(r.get("label")) for r in refs))
         summary = " ".join(bits) + "."
     ret_lines = []
+    for tok, _note in (frame_anchors or ()):
+        ret_lines.append(f"{tok}: fully_preserved, keyframe anchor pinned at its timestamp")
     for r in prompt.get("retention") or []:
         lbl = _norm_label(r.get("label"))
         if lbl:
@@ -381,10 +444,17 @@ def compose_reference(prompt, *, duration=5.0):
     return fields
 
 
-def compile_segment(prompt_raw, *, seconds=5.0, has_start=False, has_end=False, mode=None):
+def compile_segment(prompt_raw, *, seconds=5.0, frames=None, has_start=False,
+                    has_end=False, mode=None, frame_anchors=()):
     """结构化 prompt -> {mode, fields, prompt_text, warnings, diagnostics}。
+
     mode：None/非法=自动判定；合法五模式之一=手动覆写（字段集与校验按该模式，
-    对齐指令行仍按 has_start/has_end 实际生成）。"""
+    对齐指令行仍按 has_start/has_end 实际生成）。
+
+    frames：本段长的**帧数**（17k+5 网格）。给了就由它换算对齐句的 S.SS
+    （frames_to_seconds），与实跑的采样长度严格一致；不给才回落到 seconds。
+    frame_anchors：混合模式下首尾帧锚已占用的官方标签（见 compose_reference）。
+    """
     prompt = clean_prompt(prompt_raw)
     auto = detect_mode(prompt, has_start=has_start, has_end=has_end)
     mode = mode if mode in VALID_MODES else auto
@@ -392,20 +462,11 @@ def compile_segment(prompt_raw, *, seconds=5.0, has_start=False, has_end=False, 
     if mode != auto:
         warnings.append({"code": "W_MODE_OVERRIDE",
                          "message": f"手动模式 {mode}（自动判定为 {auto}）"})
-    kf_lines = []
+    dur = frames_to_seconds(frames) if frames else float(seconds or 5.0)
     n_shots = len(prompt.get("shots") or [])
-    if mode in ("I2VA", "L2VA", "FL2VA"):
-        dur = float(seconds or 5.0)
-        n = max(1, n_shots)
-        if mode == "FL2VA" and has_start and has_end:
-            # 官方 FL2VA：一条对齐句说完首尾两锚，尾帧锚是本段的 S.SS（不是全片总时长）
-            kf_lines.append(FL2VA_HEAD.format(first_shot=1, last_shot=n, t=dur))
-        elif mode in ("L2VA", "FL2VA") and has_end:
-            kf_lines.append(L2VA_HEAD.format(shot=n, t=dur))
-        elif mode in ("I2VA", "FL2VA") and has_start:
-            kf_lines.append(keyframe_line(0.0, "<Picture 1>", 1))
+    kf_lines = alignment_lines(mode, dur, has_start, has_end, n_shots)
     if mode == "Ref2VA":
-        fields = compose_reference(prompt, duration=seconds)
+        fields = compose_reference(prompt, duration=dur, frame_anchors=frame_anchors)
     else:
         fields = compose_base(prompt, keyframe_lines=kf_lines)
     override = prompt.get("override_text")

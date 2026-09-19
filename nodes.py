@@ -43,6 +43,8 @@ from comfy_api.latest import io
 
 from . import anchors
 from . import checkpoint
+from . import prompts as _P
+from .prompts import L2VA_HEAD, FL2VA_HEAD
 from . import metrics
 from . import experiments
 from . import transition
@@ -1132,6 +1134,28 @@ class H3SeamlessChainSampler(io.ComfyNode):
         seg_dialogues = 0
         seg_label_orders = [[] for _ in seg_prompts]   # 每段 [(kind, 标签)]，按勾选顺序
         composed_prompts = []
+        # 首尾帧锚**复用素材池编号**：帧图被选为锚时前端已给它分配 图N 标注，
+        # 所以它和普通参考素材共用一套 <Picture k> 编号，只是固定排在最前
+        # （帧锚=1/2，参考素材顺延）。以前帧锚完全不进编号池 → 正文里手写的
+        # <Picture 1> 与帧锚撞号，前端还把对齐句的 <Picture 1> 标成"悬空"红框。
+        # 文件 -> 池标签反查（frame_img 存的是项目内相对路径）。
+        _file_to_label = {}
+        for _lbl, _fn in (pool_file_of or {}).items():
+            if _fn:
+                _file_to_label[str(_fn).replace("\\", "/").lstrip("./")] = _lbl
+        _frame_imgs_early = _parse_frame_imgs(segments, len(seg_prompts))
+
+        def _anchors_of(pi):
+            """第 pi 段的首尾帧锚在素材池里的标签（按 首帧→尾帧 顺序，去重）。"""
+            _fi = _frame_imgs_early[pi] if 0 <= pi < len(_frame_imgs_early) else ("", "")
+            _out = []
+            for _ff in (_fi[0], _fi[1]):
+                if not _ff:
+                    continue
+                _l = _file_to_label.get(str(_ff).replace("\\", "/").lstrip("./"))
+                if _l and _l not in _out:
+                    _out.append(_l)
+            return _out
         for i, prompt in enumerate(seg_prompts):
             seg = segments[i] if i < len(segments) and isinstance(segments[i], dict) else {}
             scene = str(seg.get("scene_prompt", "")).strip()
@@ -1208,6 +1232,24 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if len(_picked) > _cap:
                             raise ValueError(f"段{i + 1} 引用{_KIND_NAME[_k]}素材 {len(_picked)} 个，"
                                              f"超过官方单段上限 {_cap} 个（{_picked}）：请在段卡片少勾几个")
+                # 帧锚编号前置：帧图占本段最前的 <Picture k>（首帧=1，再尾帧=2），
+                # 参考素材顺延。同一张图既是帧锚又被 @引用时只占一个号。
+                _anchors = _anchors_of(i)
+                if _anchors:
+                    # 去重按**文件**而不只是标签字符串：正文里写 @别名、池里存
+                    # 全名（或反过来）时两边的字符串不相等，只比字符串会让同一张
+                    # 图既当帧锚又当参考素材、占掉两个 <Picture k> 号。
+                    def _norm_file(lbl):
+                        return str(pool_file_of.get(lbl, "") or "").replace("\\", "/").lstrip("./")
+                    _an_files = {_norm_file(l) for l in _anchors if _norm_file(l)}
+                    _rest = [(k, l) for k, l in order
+                             if l not in _anchors and _norm_file(l) not in _an_files]
+                    order = [("image", l) for l in _anchors] + _rest
+                    _np = len([1 for k, _ in order if k == "image"])
+                    if _np > REF_CAPS["image"]:
+                        raise ValueError(
+                            f"段{i + 1} 首尾帧锚 + 参考素材共 {_np} 张图，超过官方单段"
+                            f"上限 {REF_CAPS['image']} 张（帧锚 {_anchors}）：请少勾几个素材")
                 seg_label_orders[i] = order
                 if order:
                     # 显性语义：tag 必须落进最终文本模型才用素材；正文已写 tag 则直通，
@@ -1334,6 +1376,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 段级（新入口）优先于库内旧标注：用户既然在段卡里显式选了图，就以它为准
         _head_seg = _fi_first if (首帧图片 is None and _fi_first) else None
         _tail_seg = _fi_end if (尾帧图片 is None and _fi_end) else None
+        # 库级 roles 标的首尾帧图，若与段级锚指向**同一文件** → 库级那张失效。
+        # 否则同一张图会被同时挂到链级首帧 + 链级尾帧，AI 看到 subject_definitions
+        # 里 <Picture 1> 和 <Picture 2> 都指向它，于是产出"以 X 为首帧与结尾定格"
+        # ——用户只想要尾帧时这就是 bug。roles 是用户之前手动打的标，跨场景
+        # 复用同一张图很常见（库内标过"首帧图"的图以后用作尾帧图也合理），库级
+        # 不能强压段级意图。
+        def _norm(s):
+            return str(s or "").replace("\\", "/").lstrip("./")
+        if _tail_seg and _head_lib \
+                and _norm(_tail_seg) == _norm(pool_file_of.get(_head_lib)):
+            _head_lib = None
+        if _head_seg and _tail_lib \
+                and _norm(_head_seg) == _norm(pool_file_of.get(_tail_lib)):
+            _tail_lib = None
         has_first_eff = 首帧图片 is not None or _head_lib is not None or _head_seg is not None
         has_end_eff = 尾帧图片 is not None or _tail_lib is not None or _tail_seg is not None
 
@@ -1365,7 +1421,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 纯 i2v 起手（首段无素材引用，引用集合已最终确定）才写指令行；
         # 首段同时有引用时走 r2v + 头锚 keyframe（_apply_guide 叠加），
         # 此处不写指令行避免编号错位。
-        _seg0_has_refs = bool(seg_label_orders[0]) if seg_label_orders else False
+        # 帧锚**不算**"参考素材"：判定首段是不是混合模式（帧锚+素材）时要把帧锚
+        # 排除掉，否则帧锚一进池就把本段判成 Ref2VA、永远不生成对齐句。
+        _anchors0 = set(_anchors_of(0)) if seg_label_orders else set()
+        _seg0_has_refs = bool([1 for k, l in (seg_label_orders[0] if seg_label_orders else [])
+                               if l not in _anchors0])
         if has_first_eff and seg_first_on[0] and not _seg0_has_refs and seg_prompts \
                 and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
             seg_prompts[0] = ("For the target video, at 0.00 seconds into the target video, "
@@ -1384,16 +1444,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
         width, height, seed = int(宽度), int(高度), int(种子)
         length = _snap_seconds(每段时长)
         seg_lengths = [length if s is None else s for s in seg_secs]
-        # FL2VA 末段官方指令行（镜像 I2VA 首段行的官方句式：声明末帧 = <Picture k> 锚，
-        # 时间点=末段时长；首尾都接时尾帧是 <Picture 2>，只接尾帧时为 <Picture 1>）；
-        # 已是官方格式的段不注入。段级勾选关掉末段尾帧图时不注入；
-        # 首段关掉首帧图时 <Picture> 编号前移
+        # 末段尾帧锚：官方 L2VA 句式（逐字照抄 h3-dialect.md §1.2）。
+        # **时间点由段长帧数换算**（frames_to_seconds），与前端锚定栏预览同口径 ——
+        # 以前这里写 `seg_lengths[-1] / 24.0`、前端写 `seg.seconds`，同一个锚两边
+        # 算出 5.17 与 5.00 两个值。Shot N 取本段最后一镜（官方要求），不是硬编码 1。
         if has_end_eff and seg_end_on[-1] and seg_prompts \
                 and not _OFFICIAL_FIELD_RE.search(seg_prompts[-1]):
-            _pic = 2 if (has_first_eff and seg_first_on[0]) else 1
-            _end_s = seg_lengths[-1] / 24.0
-            seg_prompts[-1] = (f"For the target video, at {_end_s:.2f} seconds into the target video, "
-                               f"<Picture {_pic}> (from [Shot 1]) is fully referenced.\n" + seg_prompts[-1])
+            _end_s = _P.frames_to_seconds(seg_lengths[-1])
+            _last_shot = len(re.findall(r"\[Shot\s+\d+\]", seg_prompts[-1])) or 1
+            seg_prompts[-1] = (L2VA_HEAD.format(shot=_last_shot, t=_end_s) + "\n"
+                               + seg_prompts[-1])
         ctx = int(引导帧数)
         gate_limit = max(0, int(回退上限) // 17 * 17)
         full_bridge0 = full_bridge_supported()
@@ -2200,10 +2260,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"尾帧图片：FL2VA 剧情终点 → 段{'、'.join(_end_segs)} 末帧 keyframe"
                           + ("（这些段不叠加段尾锚）" if tail_anchor_latent is not None else ""))
 
-        # 首帧图片（中段段级引用）：任一中段勾了首帧图时编码为头锚 latent——
-        # 注入段头 keyframe 作为身份锚（同 E2 记忆锚段首注入模式），抑制长链漂移
-        if 首帧图片 is not None and any(seg_first_on[i] and i > 0
-                                        for i in range(len(seg_prompts))):
+        # 首帧图片（段级引用）：任一勾了首帧图的段都编码为头锚 latent —— 注入段头
+        # keyframe 作为身份锚（同 E2 记忆锚段首注入模式），抑制长链漂移。
+        # 段 0 也一样要编：它走 Ref2VA（段里有素材引用）时官方入口**没有
+        # first_frame 参数**，不补这个 keyframe 首帧图就彻底失效（老 bug）。
+        if 首帧图片 is not None and any(seg_first_on):
             head_frame_latent = video_vae.encode(_center_cover(首帧图片[:1], width, height))
 
         if any(seg_fr_explicit):
@@ -2725,7 +2786,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 段级首帧参考图优先（本段自己指定的图），否则回落到链级首帧图头锚
             _head_kf = (seg_head_img_latent[i] if i < len(seg_head_img_latent) else None) \
                 or (head_frame_latent
-                    if (i > 0 and seg_first_on[i] and head_frame_latent is not None) else None)
+                    if (seg_first_on[i] and head_frame_latent is not None
+                        # 段 0 无素材引用时走官方 first_frame= 参数（I2VA 语义最正），
+                        # 别再叠一个帧 0 keyframe；有素材（Ref2VA）才补 keyframe，
+                        # 否则首帧图在混合模式里根本不生效。
+                        and (i > 0 or _seg0_has_refs)) else None)
             _seg_t.update(cond=0.0, sample=0.0, decode=0.0)
             _soft_note = ""   # 软桥报告后缀（只有采样段装配成功才非空；回放段为空）
             if replay:

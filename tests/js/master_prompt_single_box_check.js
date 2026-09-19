@@ -84,6 +84,8 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
 
 /* ---------- 2. 多段：段级标签 + 正文按【段N】同序 ---------- */
 {
+    /* 「参考：」是上一代的资产引用通道，已停用：认出来 → 丢弃 → 进 notes。
+     * 关键是它**不能并进正文**（否则把不该进模型的清单送进模型），也不能静默消失。 */
     const text = "【段1】\n时长：9\n参考：角色1\n\n" + OFFICIAL
         + "\n\n【段2】\n时长：12\n独立镜头：是\n参考：角色1\n\n"
         + "integrated_multimodal_description: [Shot 1] 乙";
@@ -92,8 +94,11 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
     const a = p.segs[0] || {}, b = p.segs[1] || {};
     check("段1 时长=9", Number(a.seconds) === 9, String(a.seconds));
     check("段2 时长=12", Number(b.seconds) === 12, String(b.seconds));
-    check("段1 参考还原", JSON.stringify(a.refs) === JSON.stringify(["角色1"]),
-        JSON.stringify(a.refs));
+    check("参考不再产出 refs 字段", a.refs === undefined && b.refs === undefined,
+        JSON.stringify([a.refs, b.refs]));
+    check("参考没被并进正文", String(a.main || "").indexOf("角色1") < 0,
+        JSON.stringify(a.main));
+    check("参考被点名提示", p.notes.some((n) => n.indexOf("参考") >= 0), JSON.stringify(p.notes));
     check("段2 独立镜头=是", b.unlink === true, String(b.unlink));
     check("段1 官方三字段原样", a.main === OFFICIAL, JSON.stringify(a.main));
     check("段2 正文含官方字段头", String(b.main || "").indexOf("integrated_multimodal_description") === 0,
@@ -106,7 +111,7 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
     check("空段头 → main 未定义（分配时按空串 = 清空）",
         p.segs[0] && p.segs[0].main === undefined,
         JSON.stringify(p.segs[0] && p.segs[0].main));
-    const t = render([{ seconds: null, unlink: false, refs: [] }]);
+    const t = render([{ seconds: null, unlink: false }]);
     check("渲染空段会写出「提示词：」标签", t.indexOf("提示词：") >= 0, JSON.stringify(t));
     check("渲染→回读 = 显式空串（不是 undefined）", parse(t).segs[0].main === "",
         JSON.stringify(parse(t).segs[0].main));
@@ -145,13 +150,14 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
     check("往返无告警", p2.notes.length === 0, JSON.stringify(p2.notes));
 }
 
-/* ---------- 6. 意图 / 剧本 不再是单框格式的一部分 ---------- */
+/* ---------- 6. 意图 / 剧本 / 参考 不再是单框格式的一部分 ---------- */
 {
-    const segs = [{ main: OFFICIAL, seconds: 9, unlink: false, refs: [],
-        intent: "雨夜市场", script: "镜头一：她回头" }];
+    const segs = [{ main: OFFICIAL, seconds: 9, unlink: false,
+        intent: "雨夜市场", script: "镜头一：她回头", refs: ["角色1"] }];
     const t = render(segs);
-    check("渲染不再写 意图 / 剧本",
-        t.indexOf("意图：") < 0 && t.indexOf("剧本：") < 0, JSON.stringify(t));
+    check("渲染不再写 意图 / 剧本 / 参考",
+        t.indexOf("意图：") < 0 && t.indexOf("剧本：") < 0 && t.indexOf("参考：") < 0,
+        JSON.stringify(t));
     const p = parse("【段1】\n意图：雨夜市场\n剧本：镜头一\n提示词：" + OFFICIAL);
     check("解析丢弃 意图", p.segs[0] && p.segs[0].intent === undefined,
         JSON.stringify(p.segs[0] && p.segs[0].intent));
@@ -163,12 +169,18 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
         JSON.stringify(p.notes));
 }
 
-/* ---------- 7. 三框合成已下线（防止有人把旧实现加回来） ---------- */
+/* ---------- 7. 三框合成 / AI 工作台已下线（防止有人把旧实现加回来） ---------- */
 {
     check("mpSplitBox 已删除", !/function mpSplitBox\s*\(/.test(src));
     check("mpComposeBoxes 已删除", !/function mpComposeBoxes\s*\(/.test(src));
     check("三框工厂 mkBox 已删除", !/const mkBox = /.test(src));
     check("多段扩写入口已下线", src.indexOf("✨ AI扩写 → 剧本") < 0);
+    /* 总提示词框不做 AI：分段优化 / 模式下拉 / 参考图勾选 全部撤下 */
+    check("AI 分段提示词优化已下线", src.indexOf("✨ AI分段提示词优化") < 0);
+    check("模式下拉（MP_MODE_HINT）已下线", !/const MP_MODE_HINT/.test(src));
+    check("参考素材 chips（collectMasterMedia）已下线",
+        !/function collectMasterMedia\s*\(/.test(src));
+    check("打开即自动载入已下线", !/if \(\(\(getDs\(node\)\.prompts/.test(src));
 }
 
 console.log(bad ? `\n${bad} 个用例不符` : "\n全部通过");

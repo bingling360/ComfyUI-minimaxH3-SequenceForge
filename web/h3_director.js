@@ -102,22 +102,6 @@ const REF_TPL_DEFAULT = 0;
 let _cardPainters = [];
 function registerCardPainter(fn) { if (typeof fn === "function") _cardPainters.push(fn); }
 
-/* 打开中的浮层里的「活」渲染器（总提示词框等）：每次 refresh 一并推进。
- * 为什么必须有：素材库弹窗（.h3l-overlay）与总提示词框（.h3d-overlay）**可以同时开着**，
- * 在素材库里删/改名/上传后，总提示词框的「参考素材（AI 可见）」chips 却停在旧池上
- * —— 那一栏没少、点上去还报错。段卡的引用条有 _cardPainters，浮层这边此前没有对应物。
- * 注册者自己负责摘除（DOM 断开即 unregister），不留悬挂引用。 */
-let _livePainters = [];
-function registerLivePainter(fn) { if (typeof fn === "function") _livePainters.push(fn); }
-function unregisterLivePainter(fn) {
-    const i = _livePainters.indexOf(fn);
-    if (i >= 0) _livePainters.splice(i, 1);
-}
-function runLivePainters() {
-    for (const fn of [..._livePainters]) {
-        try { fn(); } catch (e) { /* 单个浮层失败不影响别的 */ }
-    }
-}
 const MODES = [
     ["文生视频", "文生", "纯文本，fl2va UNET，不接图片"],
     ["首帧视频", "首帧", "首帧起手（可选尾帧图片=FL2VA 首尾帧），fl2va UNET"],
@@ -316,8 +300,14 @@ function resolveCanvas(ar, mp) {
 }
 
 function snapFrames(seconds) {
-    const f = Math.max(5, Math.round(Number(seconds) * 24));
-    const k = Math.max(0, Math.round((f - 5) / 17));
+    /* 必须用 pyRound（Python round 的 banker's 语义）而不是 Math.round：
+     * 后端 nodes._snap_seconds 是 Python，`.5` 的取舍规则和 JS 不一样
+     * （round(6.5)=6 而 Math.round(6.5)=7）。段长一旦差 1 帧，对齐指令的
+     * S.SS 就跟着差 0.04s，前端显示和实跑注入又对不上。 */
+    const s = Number(seconds);
+    if (!isFinite(s) || s <= 0) return 124;      // 与后端默认 5s 一致
+    const f = Math.max(5, pyRound(s * 24));
+    const k = Math.max(0, pyRound((f - 5) / 17));
     return 17 * k + 5;
 }
 
@@ -327,11 +317,21 @@ function snapFrames(seconds) {
  *  段卡标题那个「≈N帧」和锚定面板的目标轨刻度都取这一个函数——这两处曾经各算一遍，
  *  结果一边向上对齐一边就近，用户看到目标轨的总帧数跟分段时长对不上。
  *  改公式只许改这里（连线另一头是 nodes._snap_seconds，两边必须同时改）。 */
-function segmentFrames(node, seg) {
+/** 本段时长（**秒**）：段级 seconds 优先，没填 → 跟随节点「每段时长」默认。
+ *
+ *  AI 扩写/优化、对齐指令的 S.SS、段卡「≈N帧」全走这一个函数。以前这些地方
+ *  各自写 `seg.seconds || 5` —— 段级留空（语义就是"跟随节点默认"）时一律拿 5，
+ *  用户把节点「每段时长」改成 8s 就会出现"界面显示 8s、AI 按 5s 写、对齐句
+ *  S.SS 也对不上"三处错位。段级留空 ≠ 5 秒，是"用节点那个值"。 */
+function segmentSeconds(node, seg) {
+    const s = Number(seg && seg.seconds);
+    if (Number.isFinite(s) && s > 0) return s;
     const defRaw = Number(getWidgetValue(node, W_DUR));
-    const defSec = isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
-    const secs = Number(seg && seg.seconds);
-    return snapFrames((isFinite(secs) && secs > 0) ? secs : defSec);
+    return Number.isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
+}
+
+function segmentFrames(node, seg) {
+    return snapFrames(segmentSeconds(node, seg));
 }
 
 /** 宽高比+百万像素 -> 显示徽章文案；自定义/非法返回 null */
@@ -2376,21 +2376,27 @@ function renameAssetLabel(node, idx, text) {
     return asset.label;
 }
 
-/* ---- 总提示词（多段一次性导入 / 导出）----
+/* ---- 总提示词（多段一次性分配）----
+ * 定位：**纯粹的分段流水线**，不是结果框、不做 AI、不与段卡提示词双向同步。
+ * 把外部（AI / 另一个项目 / 手写）的一大段多段文本粘进来 → 「解析并分配」写回段落。
+ * 只给每段三样东西：**提示词、时长、独立镜头**（是否跳过引用上段尾帧）。
+ *
  * 格式（提示词正文按 H3 官方格式，见 tools/h3_prompt_expander/references/h3-dialect.md）：
  *   【段1】          ← 段头：【段1】/【第1段】/【段落1】等价；序号可省略，按出现顺序排段
- *   时长：5         → seg.seconds（官方字段；缺省=沿用全局「每段时长」）
+ *   时长：5         → seg.seconds（官方字段；不写=不动该段时长）
  *   独立镜头：是    → seg.unlink（是/否；是=断链不锚定上段尾帧，跳转/闪回/蒙太奇用）
- *   参考：角色1，图片2 → seg.refs（逗号/顿号分隔的素材标签；不存在的标签分配时剔除并提示）
- *   意图：…         → **只读兼容**：整块跳过并提示"已忽略"（三框合一后已无 UI 承载）
- *   剧本：…         → **只读兼容**：同上，不再写回 seg.script
  *   提示词：…       → 段主体（ds.prompts[i]，即段卡那个框），可多行（续行不写标签）。
  *                     正文按 H3 官方格式写：三字段 integrated_multimodal_description /
  *                     overall_soundscape / non_diegetic_music（字段间空行），Ref2VA 六段式；
  *                     I2VA/FL2VA/L2VA 的关键帧对齐指令写在正文最前、空一行再接三字段。
+ *                     **资产引用就写在正文里：@素材名**，与段卡提示词框同一套语义。
  *   【完】          ← 结束标记（可选）：其后的所有内容（如 AI 的参考素材建议）不参与解析
- * 兼容：旧「场景/角色/环境音/配乐」四标签解析仍认（落到 seg.scene_prompt 等旧字段），
- *       但导出不再写——这两组旧字段已被具象化（prompt_v2）取代，仅保旧项目文本可粘回。
+ *
+ * 只读兼容（认出来 → 整块丢弃 → 提示「已忽略」，绝不悄悄并进正文）：
+ *   参考 / 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本
+ * ——这些都是**上一代**的分层：场景/角色/环境音/配乐被官方三字段吸收（写进正文），
+ *   意图/剧本不再进模型，参考则已统一成正文里的 @素材名。留着它们只是为了旧文本
+ *   与外部 skill 的产出**不把不该进模型的内容静默塞进提示词**，所以认出即丢并点名。
  * 规则：段头后未带标签的正文行视为提示词内容；只认上述行首标签，其余文本原样进主体
  * （官方字段标签 integrated_multimodal_description: 等不受影响）；某标签「写了即生效
  * （含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。
@@ -2518,20 +2524,28 @@ function parseMasterPrompt(text) {
         if (!cur) { stray.push(line); continue; }       // 段头前的普通正文
         pushBody(field || "main", line);
     }
-    /* 意图 / 剧本：**只读兼容**——外部 skill 的产出、旧导出文本里还在写这两个标签。
+    /* 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本 / 参考：**只读兼容**（见文件头注释）。
      * 解析时照旧收进 cur（为了保住上面的 inBody 保护），收完立刻丢弃并提示：
      * ① 不当作正文吞掉 = 不能把「不进模型」的内容悄悄送进模型；
-     * ② 也不静默保留 = 用户会以为内容还在。汇总成一条 note，不逐段刷屏。 */
-    let _nIgn = 0;
+     * ② 也不静默保留 = 用户会以为内容还在。汇总成一条 note，不逐段刷屏。
+     * 「参考」单独点名：它曾经是资产引用的**第二条通道**，现在只有正文里的
+     * @素材名 算数，不提示的话用户会以为自己挂上了素材（实际没有）。 */
+    let _nIgn = 0, _nRef = 0;
     for (const s of out.segs) {
-        for (const k of ["intent", "script"]) {
+        for (const k of ["scene", "character", "soundscape", "music", "intent", "script"]) {
             if (String(s[k] ?? "").trim()) _nIgn += 1;
             s[k] = undefined;
         }
+        if (Array.isArray(s.refs) ? s.refs.length : String(s.refs ?? "").trim()) _nRef += 1;
+        s.refs = undefined;
     }
     if (_nIgn) {
-        out.notes.push(`已忽略 ${_nIgn} 处「意图 / 剧本」`
-            + "（三框合一后只有提示词进模型，这两层已不再使用）");
+        out.notes.push(`已忽略 ${_nIgn} 处「场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本」`
+            + "（只有提示词进模型：场景/角色/环境音/配乐写进正文的官方三字段）");
+    }
+    if (_nRef) {
+        out.notes.push(`已忽略 ${_nRef} 处「参考」标签：资产引用只认正文里的 @素材名`
+            + "（与段卡提示词框同一套，由正文 @序列 派生 seg.refs）");
     }
     if (!out.segs.length && stray.length) {             // 无段头=单段（正文原样作主体）
         while (stray.length && !String(stray[0]).trim()) stray.shift();       // 去首尾空行
@@ -2544,9 +2558,12 @@ function parseMasterPrompt(text) {
     return out;
 }
 
-/** 工作台状态 -> 分段文本（【段N】+ 时长/独立镜头/参考/提示词）。
- *  注意：**不再导出 意图 / 剧本**——三框合一后这两层已经没有 UI 承载，写进导出
- *  文本只会在下次贴回时触发"已忽略"提示。解析侧仍认它们（只读兼容）。 */
+/** 工作台状态 -> 分段文本（【段N】+ 时长/独立镜头/提示词）。
+ *  段级标签只有这三个：**资产引用不在这里**——它就写在提示词正文里的 @素材名，
+ *  与段卡提示词框同一套语义（导出正文 = 导出引用，不需要第二份清单）。
+ *  注意：**不再写 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本 / 参考**——这些层
+ *  已经没有 UI 承载，写进文本只会在下次贴回时触发"已忽略"提示。解析侧仍认
+ *  它们（只读兼容，见 parseMasterPrompt）。 */
 function mpRenderState(state) {
     const blocks = [];
     for (let i = 0; i < state.length; i++) {
@@ -2555,7 +2572,6 @@ function mpRenderState(state) {
         /* 旧四框已下线：导出不再写场景/角色/环境音/配乐（解析仍兼容旧文本，见 parseMasterPrompt） */
         if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`时长：${seg.seconds}`);
         if (seg.unlink) rows.push("独立镜头：是");
-        if (Array.isArray(seg.refs) && seg.refs.length) rows.push(`参考：${seg.refs.join("，")}`);
         /* 提示词正文按 H3 官方格式（三字段 / Ref2VA 六段），自身含空行——
            标签独占一行、正文从下一行开始，贴回时按续行原样归入 main。 */
         const main = String(seg.main || "").trim();
@@ -2565,67 +2581,58 @@ function mpRenderState(state) {
     return blocks.join("\n\n") + "\n\n【完】";
 }
 
-/** 把当前链的提示词导出为总提示词文本（只写非空字段，可回贴/喂给 AI 续改）。 */
+/** 把当前链的提示词导出为总提示词文本（只写非空字段，可回贴/喂给外部改）。
+ *  只用于「从当前链载入」这一个手动动作——工作台**打开时不再自动载入**：
+ *  它不是一个跟着段卡提示词走的结果框，只是个分配框。 */
 function exportMasterPrompt(node) {
     const ds = getDs(node);
     const prompts = ds.prompts || [];
     const segs = ds.segments || [];
-    const blocks = [];
-    for (let i = 0; i < prompts.length; i++) {
+    return mpRenderState(prompts.map((main, i) => {
         const seg = (i < segs.length && segs[i] && typeof segs[i] === "object") ? segs[i] : {};
-        const rows = [`【段${i + 1}】`];
-        /* 旧四框已下线：导出不再写场景/角色/环境音/配乐（解析仍兼容旧文本，见 parseMasterPrompt） */
-        if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`时长：${seg.seconds}`);
-        if (!segAutoRef(seg)) rows.push("独立镜头：是");
-        if (Array.isArray(seg.refs) && seg.refs.length) rows.push(`参考：${seg.refs.join("，")}`);
-        /* 意图 / 剧本不再导出（见 mpRenderState 的说明）。 */
-        /* 提示词正文按 H3 官方格式（三字段 / Ref2VA 六段），自身含空行——
-           标签独占一行、正文从下一行开始，贴回时按续行原样归入 main。 */
-        const main = String(prompts[i] ?? "").trim();
-        rows.push(main ? `提示词：\n${main}` : "提示词：");
-        blocks.push(rows.join("\n"));
-    }
-    return blocks.join("\n\n") + "\n\n【完】";
+        const sec = Number(seg.seconds);
+        return {
+            main: String(main ?? ""),
+            seconds: Number.isFinite(sec) && sec > 0 ? sec : undefined,
+            unlink: segAutoRef(seg) ? false : true,
+        };
+    }));
 }
 
-/** 解析并分配到当前链：prompts 重排为 N 段，segments 同步伸缩（既有段保留 refs/unlink
- *  等未提及字段），插入视频段（inserts）不动；参考标签按「素材与参考」已有标签过滤
- *  （未知标签剔除并进 notes，防止运行期「引用未知素材标签」报错）。返回解析结果供界面提示。 */
+/** 解析并分配到当前链：prompts 重排为 N 段，segments 同步伸缩（既有段保留未提及字段），
+ *  插入视频段（inserts）不动。**只赋三样**：提示词 / 时长 / 独立镜头。
+ *  资产引用不在这里赋值——它跟段卡是同一套口径：**正文是唯一真相**，
+ *  seg.refs 由正文里的 @素材名 序列派生（syncRefsFromText），没有第二份清单。
+ *  返回解析结果供界面提示。 */
 function applyMasterPrompt(node, text) {
     const p = parseMasterPrompt(text);
     if (!p.segs.length) return p;
     const ds = getDs(node);
     const old = Array.isArray(ds.segments) ? ds.segments : [];
-    /* P3：粘贴的参考标签同时接受 alias 与 asset_id（与 getDs 白名单同口径） */
-    const poolList0 = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
-    const labels = new Set(poolList0.map((a) => a && (a.label || a.asset_id)).filter(Boolean));
     ds.prompts = p.segs.map((s) => (s.main === undefined ? "" : s.main));
     ds.segments = p.segs.map((s, i) => {
         const base = (i < old.length && old[i] && typeof old[i] === "object") ? { ...old[i] } : defaultSegment();
-        if (s.scene !== undefined) base.scene_prompt = s.scene;
-        if (s.character !== undefined) base.character_prompt = s.character;
-        if (s.soundscape !== undefined) base.soundscape = s.soundscape;
-        if (s.music !== undefined) base.music = s.music;
-        /* intent / script 不再写回：parseMasterPrompt 已把这两块标记为只读并跳过，
-         * 这里留着赋值只会让"已忽略"变成"忽略了一半"（提示有了、字段也写了）。 */
+        /* 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本 / 参考 一律不写回：
+         * parseMasterPrompt 已把它们标记为只读并丢弃，这里再赋值只会让
+         * "已忽略"变成"忽略了一半"（提示有了、字段也写了）。 */
         if (s.seconds !== undefined) base.seconds = s.seconds;
         if (s.unlink !== undefined) {
             base.unlink = s.unlink;
             base.auto_ref = s.unlink ? false : true;
         }
-        if (s.refs !== undefined) {
-            const valid = s.refs.filter((r) => labels.has(r));
-            const dropped = s.refs.filter((r) => !labels.has(r));
-            if (dropped.length) p.notes.push(`段${i + 1} 参考标签不存在已剔除：${dropped.join("、")}（先在「素材与参考」上传素材获得标签）`);
-            base.refs = valid;
-        }
         return base;
     });
+    /* 引用派生必须在 ds.prompts / ds.segments 都就位之后：refsFromText 按"本段正文
+     * 里的 @素材名 出现序列"出结果，与段卡提示词框**逐字同一条函数** —— 这里若另写
+     * 一套（旧版的「参考：」标签），就会出现"总提示词框挂上的素材和段卡不是一回事"。 */
+    for (let i = 0; i < ds.prompts.length; i++) {
+        syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
+    }
     setDs(node, ds);
     /* 提示词是整段替换进来的（AI 优化产物只有官方三/六字段），对齐指令不会跟着来：
      * 按每段的首尾帧锚补回去，否则贴一次总提示词就把全链的首尾帧锚冲掉。
      * 没有锚的段 resync 内部直接返回，不会打扰手写文本。 */
-    for (let i = 0; i < ds.prompts.length; i++) resyncAlignmentLines(node, i);
+    for (let i = 0; i < ds.prompts.length; i++) stripAlignmentLines(node, i);
     return p;
 }
 
@@ -3083,7 +3090,25 @@ function v2RefsFromSchedule(ds, segIdx) {
     const pool = (ds && ds.ref_assets) || [];
     const cnt = { image: 0, video: 0, audio: 0 };
     const out = [];
+    /* 首尾帧锚**先**占位：它复用素材池编号（选为锚时已发 图片N），固定排在本段
+     * <Picture k> 最前（首帧=1，再尾帧=2），参考素材顺延 —— 与后端
+     * nodes._anchors_of + _kind_tokens 完全同口径。
+     * 以前帧锚根本不进编号池，于是：① 对齐指令里的 <Picture 1> 在映射表查不到
+     * 素材，被富文本框标成"悬空"红框（其实它就指向这张帧图）② 帧锚和第一个
+     * 参考素材撞号，正文里手写的 <Picture 1> 和帧锚指向两张不同的图。 */
+    const fi = (seg.frame_img && typeof seg.frame_img === "object") ? seg.frame_img : {};
+    for (const fkey of ["first", "end"]) {
+        const f = String(fi[fkey] || "").trim();
+        if (!f) continue;
+        const hit = pool.find((x) => x && String(x.file || "") === f);
+        if (!hit) continue;
+        const lbl = refKeyOf(hit);
+        if (!lbl || out.some((r) => r.src === lbl)) continue;   // 同一张图只占一个号
+        cnt.image = (cnt.image || 0) + 1;
+        out.push({ label: `<Picture ${cnt.image}>`, src: lbl, anchor: fkey });
+    }
     for (const label of (seg.refs || [])) {
+        if (out.some((r) => r.src === label)) continue;         // 帧锚已占号
         const a = pool.find((x) => x && (x.label === label || x.asset_id === label));
         const kind = (a && KIND_LIST.includes(a.kind)) ? a.kind : "image";
         cnt[kind] = (cnt[kind] || 0) + 1;
@@ -3208,10 +3233,46 @@ function setV2Mode(node, idx, mode) {
     scheduleRefresh(80);
 }
 
+/** Python round() = 四舍六入五取偶（banker's）；JS Math.round 是四舍五入。
+ *  段长吸附要和后端 nodes._snap_seconds **逐帧一致**，否则同一段前端算 124 帧、
+ *  后端算 122 帧，对齐指令的 S.SS 又对不上（这就是时间同步要修的根）。 */
+function pyRound(x) {
+    const f = Math.floor(x);
+    const d = x - f;
+    if (d > 0.5) return f + 1;
+    if (d < 0.5) return f;
+    return (f % 2 === 0) ? f : f + 1;
+}
+
+/** 段长秒 -> 帧数：**唯一入口就是 snapFrames**，这里只是别名 —— 同一个数只许有
+ *  一个算法（段卡「≈N帧」、锚定面板刻度、对齐指令的 S.SS 全走它）。 */
+function snapSecondsToFrames(sec) {
+    return snapFrames(sec);
+}
+
+/** 帧数 -> 对齐指令用的秒（两位小数），与后端 prompts.frames_to_seconds 同式。
+ *  段长的真实单位是帧数，5 秒段实际是 124 帧 = 5.17s；直接用原始秒会写出 5.00，
+ *  和后端实跑注入的 5.17 差 0.17 秒（锚点位置也跟着偏）。 */
+function framesToSeconds(frames) {
+    const f = Number(frames);
+    if (!Number.isFinite(f) || f <= 0) return 5.0;
+    return Math.round((f / 24) * 100) / 100;
+}
+
+/** 本段对齐指令里那个 S.SS：先吸附成帧数再反算秒 —— 显示、预览、后端注入
+ *  三处必须都走这一步，看到的 S.SS 就是模型收到的 S.SS。 */
+function segAlignSeconds(seg) {
+    /* 兼容两种入参：段对象 `{seconds: 8}` 或直接的秒数 `8`。
+     * **调用方必须先把段级留空解析成节点默认**（segmentSeconds）—— 本函数没有
+     * node，拿不到「每段时长」，直接吃 `seg.seconds` 会把"跟随默认"当成 5 秒。 */
+    const s = (seg && typeof seg === "object") ? seg.seconds : seg;
+    return framesToSeconds(snapSecondsToFrames(s));
+}
+
 /** 官方对齐指令行（与后端 prompts.py 同口径：FL2VA 单句双锚、L2VA 末帧句、
  *  I2VA keyframe_line；时长一律取本段 seconds）。无锚时返回空数组。 */
 function v2InstrLines(mode, seconds, hasStart, hasEnd, nShots) {
-    const dur = (Number(seconds) || 5.0).toFixed(2);
+    const dur = segAlignSeconds({ seconds }).toFixed(2);
     const n = Math.max(1, Number(nShots) || 1);
     if (mode === "T2VA" || mode === "Ref2VA") return [];
     if (mode === "FL2VA" && hasStart && hasEnd) {
@@ -3414,13 +3475,36 @@ async function collectSegMedia(node, ds, idx) {
         || (idx === 0 ? String(ds.first_frame || "").trim() : "");
     const endFile = String(fi.end || "").trim()
         || (idx === nP - 1 ? String(ds.end_frame || "").trim() : "");
-    const picks = [];
-    if (firstFile) picks.push({ file: firstFile, asset_id: "", role: "本段首帧（0.00s 起点锚）" });
-    if (endFile) picks.push({ file: endFile, asset_id: "", role: "本段尾帧（终点锚）" });
     const pool = ds.ref_assets || [];
+    const infoOfFile = (f) => pool.find((a) => a && String(a.file || "") === f) || {};
+    const picks = [];
+    const anchorNotes = [];
+    /* 同一张图只挂一次：它可能**同时**是帧锚和被 @引用的素材（用户就是想让画面
+     * 从这张图开始、并且长得像它）。按 file 去重 —— 不拦的话 media 里会出现两张
+     * 一模一样的图、两个同名的 @图片1，LLM 收到编号 1 和 2 却长得一样，
+     * 会以为自己看错而把描述写歪；还白占一个官方 9 图的名额。 */
+    const pickedFiles = new Set();
+    /* 帧锚**复用素材池编号**（选为锚时已领 图片N），所以它有 mark / label，
+     * 和参考素材一起进 media —— 模型按 <Picture k> 认图，帧锚排在最前。
+     * 以前帧图没 mark → media 第一项 label 是空字符串，LLM 收到一张"无名图"，
+     * 既不知道它是锚，也没法在正文里引用它。 */
+    const addAnchor = (file, role) => {
+        if (!file || pickedFiles.has(file)) return;
+        pickedFiles.add(file);
+        const info = infoOfFile(file);
+        const lbl = String(refKeyOf(info) || frameNameOf(file) || "").trim();
+        const mk = String(markTextOf(info) || "").trim();
+        picks.push({ file, asset_id: String(info.asset_id || ""), mark: mk,
+            label: lbl, role });
+        if (mk) anchorNotes.push(`@${mk}`);
+    };
+    if (firstFile) addAnchor(firstFile, "首帧锚点：画面必须从这张图开始（0.00s 硬钉）");
+    if (endFile) addAnchor(endFile, "尾帧锚点：画面必须在这一帧结束（末帧硬钉）");
     for (const key of ((Array.isArray(seg.refs) ? seg.refs : []).slice(0, 8))) {
         const hit = pool.find((a) => a && (refKeyOf(a) === key || a.asset_id === key));
         if (!hit || hit.kind !== "image") continue;
+        if (pickedFiles.has(hit.file)) continue;      // 已是帧锚 → 不重复挂
+        pickedFiles.add(hit.file);
         picks.push({ file: hit.file, asset_id: hit.asset_id || "",
             label: refKeyOf(hit), mark: markTextOf(hit),
             role: `参考素材「${refKeyOf(hit)}」` });
@@ -3443,10 +3527,33 @@ async function collectSegMedia(node, ds, idx) {
         media.push({ kind: "image", label: nm, images: [dataUrl] });
         if (nm) notes.push(`@${nm}`);
     }
-    return { media, markMap, note: notes.length
+    const base = notes.length
         ? `随图说明：可用素材 ${notes.join("、")}`
           + "（正文里直接写 @名字 引用，不要写 <Picture N>）。"
-        : "" };
+        : "";
+    /* 混合模式的关键一句：模型必须分清"哪几张是硬钉的锚、哪些只是参考"。
+     * 不点名的话 LLM 会把首帧图当成普通素材去"描述外观"，甚至把它写进
+     * subject_definitions 当参考项 —— 锚点语义就丢了，出片也不从它开始。
+     *
+     * 措辞按**实际角色**区分：只有首帧 / 只有尾帧 / 两者都有 —— 不能含糊地
+     * 写"画面必须从它开始 / 必须在它结束"，否则用户只设了尾帧图时模型会以为
+     * 这张图也是首帧（"以 X 为首帧与结尾定格"就是由此而来）。 */
+    const anchorNote = anchorNotes.length
+        ? (() => {
+            const isFirst = !!firstFile;
+            const isEnd = !!endFile;
+            const role = isFirst && isEnd
+                ? "**首尾帧锚点**（画面必须从它开始、也必须在它结束，是硬钉的关键帧）"
+                : isFirst
+                    ? "**首帧锚点**（画面必须从它开始，0.00s 硬钉，**不是**尾帧）"
+                    : "**尾帧锚点**（画面必须在这一帧结束，末帧硬钉，**不是**首帧）";
+            return `\n其中 ${anchorNotes.join("、")} 是${role}（不是普通参考素材）。`
+                + "不要把它当素材去描述外观，也不要改写它的编号；"
+                + "其余素材才是“参考一下”的角色。"
+                + "写 subject_definitions 时锚点标 fully_preserved，参考素材标 partially_preserved。";
+        })()
+        : "";
+    return { media, markMap, note: base + anchorNote };
 }
 
 async function optFetchRuleFiles() {
@@ -3712,7 +3819,8 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
     try {
         const ds = getDs(node);
         const seg = (ds.segments || [])[idx] || {};
-        const secs = seg.seconds || 5;
+        /* 段级留空 = 跟随节点「每段时长」，不是 5 秒（见 segmentSeconds） */
+        const secs = segmentSeconds(node, seg);
         /* 图 = 首尾帧锚 + 本段参考素材（collectSegMedia 统一编号并给出角色说明） */
         const mm = settings.read_media !== false
             ? await collectSegMedia(node, ds, idx) : { media: [], note: "", markMap: {} };
@@ -3724,7 +3832,7 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
             /* 角色说明只进请求、不落库：优化器会像规则文件一样把它消费掉，
              * 原稿（before）与写回的 prompt 都不受影响。 */
             prompt: mm.note ? `${mm.note}\n${outText}` : outText,
-            task: optTaskForMode(ds, idx), duration: Number(secs) || 5,
+            task: optTaskForMode(ds, idx), duration: secs,
             media: mm.media, context: { main_mode: optTaskForMode(ds, idx) }, config: settings,
         };
         if (!window.H3Api?.optimize) throw new Error("h3_api.js 未更新（缺 optimize）");
@@ -3744,15 +3852,14 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
          * 按 [Shot N] 切镜。旧的 applyAiToV2 把整段塞进 shots[0].description，
          * 多镜段一同步就只剩第一镜）。 */
         applyH3TextToSeg(node, idx, result);
-        /* 优化器只产出官方三/六字段，**不含**关键帧对齐指令（那是编译产物，
-         * 由 resyncAlignmentLines 按本段首尾帧锚现算）。直接整段写回就把
-         * "Picture 1 aligns with the 0.00-second mark…" 冲掉了——模型于是失去
-         * 首尾帧锚。写完立刻按当前锚点补回，再把屏幕上的编辑器同步到最终文本。 */
-        resyncAlignmentLines(node, idx);
+        /* 对齐指令**不写进正文**：它是编译产物（锚定栏展示 + 实跑时由后端注入）。
+         * LLM 有时会自己抄一句 "Picture 1 aligns with…" 进产出，这里必须剥掉 ——
+         * 留着会跟实跑注入的那句重复，锚一变还变成指向不存在图片的陈旧指令。
+         * 剥完再同步屏幕上的编辑器，否则用户一动键盘旧文本又回写。 */
+        stripAlignmentLines(node, idx);
         const finalText = String((getDs(node).prompts || [])[idx] ?? result);
         if (ta) ta.value = finalText;
-        /* 原稿/优化稿切换存的是**最终文本**（含补回的对齐指令），
-         * 否则切回"优化稿"又把对齐行弄丢一次。 */
+        /* 原稿/优化稿切换存的是**最终文本**（已剥掉对齐指令的干净正文）。 */
         _optAfter.set(key, finalText);
         optPersist(node, idx, "after");
         if (ui.reset) { ui.reset.style.display = ""; ui.reset.textContent = "原稿"; }
@@ -3806,6 +3913,8 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
     try {
         const ds = getDs(node);
         const seg = (ds.segments || [])[idx] || {};
+        /* 段级留空 = 跟随节点「每段时长」（见 segmentSeconds） */
+        const secs = segmentSeconds(node, seg);
         const mm = settings.read_media !== false
             ? await collectSegMedia(node, ds, idx) : { media: [], note: "", markMap: {} };
         await optFetchRuleFiles();
@@ -3817,13 +3926,17 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
             config: settings,
             prompt: mm.note ? `${mm.note}\n${outText}` : outText,
             style: ex.style,
-            seconds_min: Number(ex.seconds_min) || 4,
-            seconds_max: Number(ex.seconds_max) || 15,
+            /* 单段扩写（segment_count:1）：时长**锁死**为段时长，不留给模型自选。
+             * 给 4–15 的范围它会写出 12s 的分镜，而本段实际只生成 5s —— Shot 时间戳
+             * 直接超界（validate E_SHOT_OVERFLOW），出片被截断，还会让模型以为
+             * 时长没定、于是"自由发挥"。duration 与范围必须是同一个数。 */
+            seconds_min: secs,
+            seconds_max: secs,
             segment_count: 1,
             media: mm.media,
             style_note: mm.note || "",
             task: optTaskForMode(ds, idx),
-            duration: Number(seg.seconds) || 5,
+            duration: secs,
             context: { main_mode: optTaskForMode(ds, idx) },
         }, `第 ${idx + 1} 段 · 扩写 + 优化`, ui, {
             stream: "expandOptimizeStream", fallback: "expandOptimize",
@@ -3837,7 +3950,7 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
         _optBefore.set(key, before);          // 原稿：误点了可以原样还原
         _optShown.set(key, "after");
         setPromptText(node, idx, result);
-        resyncAlignmentLines(node, idx);
+        stripAlignmentLines(node, idx);       // 同上：对齐指令不进正文
         const finalText = String((getDs(node).prompts || [])[idx] ?? result);
         if (ta) ta.value = finalText;
         _optAfter.set(key, finalText);
@@ -4376,7 +4489,7 @@ function openStructuredModal(node, data, idx, ta) {
             if (!pv) { alert("本段没有可编译的内容"); return; }
             const fr = segHasFrames(ds2, idx);
             const r = await window.H3Api.compilePreview({
-                prompt: pv, seconds: Number(fseg.seconds) || 5.0,
+                prompt: pv, seconds: segmentSeconds(node, fseg),
                 has_start: fr.has_start, has_end: fr.has_end,
                 mode: effV2Mode(ds2, idx),
             });
@@ -5614,6 +5727,11 @@ function injectStyles() {
     .h3d-frm.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
     .h3d-frm{display:inline-flex;align-items:center;gap:5px}
     .h3d-frmthumb{width:18px;height:18px;object-fit:cover;border-radius:3px;flex:0 0 auto;background:#0f1316}
+    .h3d-alignprev{display:flex;gap:6px;align-items:flex-start;flex-wrap:wrap;flex:1 1 100%;margin-top:3px;padding:5px 7px;border:1px dashed #3a352c;border-radius:6px;background:#14130f}
+    .h3d-alignprev>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
+    .h3d-alignline{display:block;flex:1 1 100%;font-family:var(--h3d-mono,ui-monospace,Menlo,Consolas,monospace);font-size:10.5px;line-height:1.5;color:#9ecbff;word-break:break-word;white-space:pre-wrap}
+    .h3d-alignnone{font-size:10.5px;color:#8a8478}
+    .h3d-alignhint{flex:1 1 100%;font-size:10px;color:#6f6a60}
     .h3d-frmpic{font-size:9px;padding:0 4px;border-radius:7px;background:rgba(49,109,202,.28);
         border:1px solid #316dca;color:#bcd9ff;line-height:14px}
     .h3d-frmmap{display:flex;flex-direction:column;gap:2px;margin:2px 0}
@@ -5765,10 +5883,9 @@ function injectStyles() {
     .h3d-mpinfo{color:var(--h3d-muted);font-size:12px;min-height:18px;margin-bottom:4px}
     .h3d-mpbtn{display:block;margin:8px 0 0}
 
-    /* ---- 总提示词工作台入口（单框分段工具，见 openMasterPromptModal） ----
-     * 三个框各自可拖右下角伸缩（resize 挂在 wrapper 上，wrapper 内部 textarea
-     * flex 撑满，这样拖动的是整块而不是只有编辑区）；内容超出即框内滚轮滚动；
-     * 三块加起来超过可视高度时，外层 stack 自己滚。 */
+    /* ---- 总提示词工作台入口（纯分段流水线，见 openMasterPromptModal） ----
+     * 单框可拖右下角伸缩（resize 挂在 wrapper 上，wrapper 内部编辑器
+     * flex 撑满，这样拖动的是整块而不是只有编辑区）；内容超出即框内滚轮滚动。 */
     .h3d-overlay-full{padding:0;place-items:stretch}
     .h3d-dialog-full{width:100vw;height:100vh;max-width:none;border:0;border-radius:0;display:flex;flex-direction:column;padding:14px 18px 12px;gap:8px}
     .h3d-dialog-full h3{margin:0}
@@ -5787,18 +5904,11 @@ function injectStyles() {
     .h3d-mplabel small{color:var(--h3d-muted);font-size:10.5px;line-height:1.4;flex:1;min-width:0}
     .h3d-mpboxbtn{padding:2px 9px;font-size:11px;flex:none;align-self:center}
     .h3d-mpboxwrap textarea{flex:1;min-height:0;width:100%;resize:none;border:0;background:transparent;color:var(--h3d-bone);padding:0;font:12.5px/1.7 ui-monospace,Consolas,monospace;outline:none}
-    .h3d-mpmode{color:var(--h3d-muted);font-size:10.5px;line-height:1.4;flex:1 1 100%;min-width:0}
-    .h3d-mprefs{gap:8px}
-    .h3d-mprefs-chips{display:flex;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
-    .h3d-mprefs-btn{padding:2px 8px;font-size:11px}
-    /* 段卡：AI 优化设置条（三页之外的公共区，区别于「锚定设置」页的本段设置） */
+    /* 段卡：AI 优化设置条（三页之外的公共区，区别于「锚定设置」页的本段设置）
+     * 注：总提示词框曾经的「模式 / 缺省时长」行与「参考素材（AI 可见）」chips 的
+     * 样式已随那一跳一起删掉——工作台不做 AI，就没有它们的服务对象。 */
     .h3d-optsetbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:2px 0 4px;
         padding:5px 8px;border:1px dashed #2a3438;border-radius:7px;background:#0f1418}
-    .h3d-mpset{display:flex;gap:8px;flex-wrap:wrap;align-items:center;border:1px solid #2a3438;border-radius:7px;background:#10161a;padding:8px 10px;margin-bottom:8px}
-    .h3d-mpset label{display:inline-flex;gap:4px;align-items:center;font-size:11.5px;color:var(--h3d-muted);white-space:nowrap}
-    .h3d-mpset input[type=number]{width:56px;border:1px solid #2a3438;border-radius:5px;background:#1b2126;color:var(--h3d-bone);padding:3px 6px;font-size:12px;outline:none;font-family:inherit}
-    .h3d-mpset input[type=number]:focus{border-color:#6cb6ff}
-    .h3d-mpset select{border:1px solid #2a3438;border-radius:5px;background:#1b2126;color:var(--h3d-bone);padding:3px 6px;font-size:12px;outline:none;font-family:inherit}
 
     .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #46604f;background:#1f2a23;color:#c2e0cd;cursor:pointer;font-size:17px}
     .h3d-fab:hover{filter:brightness(1.2)}
@@ -6383,21 +6493,47 @@ function frameNameOf(file) {
     return String(file || "").split("/").pop() || "";
 }
 
+/** 帧图进素材池并领一个「图片N」标注 —— 只在**被选为锚的这一刻**发，不是上传时。
+ *
+ * 为什么不在上传时发：帧图是从项目素材库里挑的、随时可换，"这张图叫什么"和
+ * "它现在是不是锚"是两回事。跟着上传发会让池里堆满从没当过锚的号，而真正被
+ * 选中的那张（老档 / 从项目 manifest 直选的）反而可能没号。
+ *
+ * 拿到标注后帧图就能：① 进本段 <Picture k> 编号（帧锚排在最前，素材顺延）
+ * ② 在正文里被 @名字 引用 ③ 对齐指令里的 <Picture 1> 不再是"查无此图"的红框
+ * （以前帧锚完全不进编号池，正文手写的 <Picture 1> 会和帧锚撞号）。 */
+function ensureFrameAssetMark(node, file) {
+    const f = String(file || "").trim();
+    if (!f) return "";
+    const ds = getDs(node);
+    ds.ref_assets = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    const inPool = ds.ref_assets.some((a) => a && String(a.file || "") === f);
+    if (!inPool) {
+        pushPoolAsset(node, f, frameNameOf(f));      // 内部已 assignMarks 发号
+    } else if (!ds.ref_assets.every((a) => cleanMark(markTextOf(a)))) {
+        ds.ref_assets = assignMarks(ds.ref_assets);  // 在池但没号：补发（合法的不动）
+        setDs(node, ds);
+    }
+    const hit = getDs(node).ref_assets.find((a) => a && String(a.file || "") === f);
+    return hit ? markTextOf(hit) : "";
+}
+
 function setSegmentFrameImg(node, idx, key, file) {
     const ds = getDs(node);
     if (idx < 0 || idx >= (ds.segments || []).length) return false;
     const seg = ds.segments[idx];
     const cur = (seg.frame_img && typeof seg.frame_img === "object") ? { ...seg.frame_img } : {};
-    if (file) cur[key] = String(file);
-    else delete cur[key];
+    if (file) {
+        cur[key] = String(file);
+        /* 选为锚 = 进池领号（见 ensureFrameAssetMark）。
+         * 这里**不**把图加进本段 refs —— 锚点不是"被正文引用的素材"，
+         * 但它**占**一个 <Picture k> 编号（由 v2RefsFromSchedule 前置）。 */
+        ensureFrameAssetMark(node, String(file));
+    } else delete cur[key];
     seg.frame_img = (cur.first || cur.end) ? cur : null;
-    /* 注意：这里**不**把图加进本段 refs —— 首/尾帧图是"锚点"不是"素材引用"。
-     * 加进 refs 会让首段走 Ref2V（多参）分支，反而丢掉 i2v 起手帧语义。 */
     setDs(node, ds);
-    /* 锚点变了，结果框里那句对齐指令必须跟着变：清了锚还留着
-     * "Picture 1 aligns with the 0.00-second mark"，等于告诉模型去参考一张
-     * 已经不存在的图。对齐行是编译产物不是手写的，可以放心重写。 */
-    resyncAlignmentLines(node, idx);
+    /* 对齐指令**不写进正文**：它是编译产物，由锚定栏展示、实跑时由后端注入
+     * （见 stripAlignmentLines / mkAlignPreview）。正文保持"用户视角的纯文本"。 */
     return true;
 }
 
@@ -6432,10 +6568,15 @@ function syncPromptEditor(node, idx, text) {
     } catch (e) { return false; }
 }
 
-/** 按当前锚点重写结果框里的对齐指令行：清了锚就摘掉，还有锚就按新锚重写。
- *  只动 integrated_multimodal_description 开头那几句，正文一个字不碰。
- *  原本没有对齐行、现在也不需要 → 直接返回，不打扰手写的文本。 */
-function resyncAlignmentLines(node, idx) {
+/** 把正文里的对齐指令行**剥掉** —— 正文只存"用户视角的纯文本"。
+ *
+ * 对齐指令是**编译产物**：由锚定栏按当前锚实时展示（mkAlignPreview）、实跑时由
+ * 后端注入正文前（nodes.py L2VA_HEAD / keyframe_line）。它一旦落进 ds.prompts 就会：
+ * ① 跟实跑注入的那句重复；② 锚一变就成了指向不存在图片的陈旧指令；
+ * ③ AI 扩写/优化把它当正文改写或抄走；④ 飘在字段前缀之前的那些根本清不掉
+ * （老逻辑只处理 `integrated_...:` 之后的行，前缀之前的永远留着）。
+ * 所以这里只做减法：认出官方对齐句整行（KF_ALIGN_RE）就删，其余一字不动。 */
+function stripAlignmentLines(node, idx) {
     try {
         const ds = getDs(node);
         const text = String((ds.prompts || [])[idx] || "");
@@ -6448,7 +6589,12 @@ function resyncAlignmentLines(node, idx) {
                 /* 六段式（Ref2VA）主体字段叫 detailed_description：也要认，
                  * 否则切到 Ref2VA 后残留在正文里的对齐行永远摘不掉。 */
                 const m = /^((?:integrated_multimodal_description|detailed_description):)(.*)$/.exec(l);
-                if (!m) { before.push(l); continue; }
+                if (!m) {
+                    /* 字段前缀**之前**的裸对齐行（粘贴/AI 带进来的）同样要摘 */
+                    if (KF_ALIGN_RE.test(l.trim())) { sawAlign = true; continue; }
+                    before.push(l);
+                    continue;
+                }
                 prefix = m[1];
                 const tail = m[2].trim();
                 if (KF_ALIGN_RE.test(tail)) sawAlign = true;
@@ -6458,30 +6604,22 @@ function resyncAlignmentLines(node, idx) {
             if (KF_ALIGN_RE.test(l.trim())) { sawAlign = true; continue; }
             body.push(l);
         }
-        if (prefix === null) return;                  // 不是官方字段结构 → 不碰
-        const seg = (ds.segments || [])[idx] || {};
-        const fr = segHasFrames(ds, idx);
-        const mode = effV2Mode(ds, idx);
-        const pv = window.H3Prompts?.ensurePromptV2
-            ? window.H3Prompts.ensurePromptV2(seg) : null;
-        const nShots = pv ? ((pv.shots || []).length || 1) : 1;
-        const want = v2InstrLines(mode, Number(seg.seconds) || 5.0,
-            fr.has_start, fr.has_end, nShots);
-        if (!sawAlign && !want.length) return;        // 原本没有、现在也不要 → 不动
-        const parts = want.slice();
+        if (!sawAlign) return;                        // 本来就没有 → 不动
+        const parts = [];
         if (inline) parts.push(inline);
         parts.push(...body);
-        const head = prefix + (parts.length ? " " + parts.join("\n") : "");
-        const newText = before.concat(head).join("\n");
+        const head = prefix === null ? null
+            : prefix + (parts.length ? " " + parts.join("\n") : "");
+        const newText = (head === null ? before : before.concat(head)).join("\n")
+            .replace(/^\n+/, "");
         if (newText !== text) {
             setPromptText(node, idx, newText);
             /* 写完状态还要把屏幕上的编辑器一起改掉：否则编辑器里仍是旧文本，
-             * 用户一动键盘就把旧文本回写，刚补的对齐行立刻消失
-             * （"对齐指令似乎输不进去"的真正成因，不是输入被拦）。 */
+             * 用户一动键盘就把旧文本回写，刚摘掉的对齐行又冒出来。 */
             syncPromptEditor(node, idx, newText);
             scheduleRefresh(150);
         }
-    } catch (e) { console.warn("[h3-director] resyncAlignmentLines failed:", e); }
+    } catch (e) { console.warn("[h3-director] stripAlignmentLines failed:", e); }
 }
 
 /** 段级首帧图 / 尾帧图按钮组：点开选图（项目内图片或现传），已选可换可清。
@@ -6528,6 +6666,42 @@ function mkFrameBtns(node, segIdx, onChange) {
             });
             box.append(b);
         }
+    };
+    paint();
+    return box;
+}
+
+/** 首尾帧锚定栏里的「对齐指令预览」—— **正文里不存这一句**，这里只回答
+ *  "提交时会自动往正文前拼什么"。
+ *
+ *  与后端实跑注入同句式（prompts.L2VA_HEAD / FL2VA_HEAD / keyframe_line）、
+ *  同时间口径（S.SS 由段长帧数反算，见 segAlignSeconds），所以这里看到的
+ *  就是模型收到的那句。混合模式（有参考素材）下官方六段式不带对齐句，
+ *  帧锚改由 <Picture 1>/<Picture 2> 在 subject_definitions 里声明。 */
+function mkAlignPreview(node, idx) {
+    const box = el("div", "h3d-alignprev");
+    const paint = () => {
+        box.replaceChildren();
+        const ds = getDs(node);
+        const seg = (ds.segments || [])[idx] || {};
+        const fr = segHasFrames(ds, idx);
+        const mode = effV2Mode(ds, idx);
+        const pv = window.H3Prompts?.ensurePromptV2
+            ? window.H3Prompts.ensurePromptV2(seg) : null;
+        const nShots = pv ? ((pv.shots || []).length || 1) : 1;
+        const secs = segmentSeconds(node, seg);      // 段级留空 → 跟随节点默认
+        const lines = v2InstrLines(mode, secs, fr.has_start, fr.has_end, nShots);
+        box.append(el("label", "", "对齐指令"));
+        if (!lines.length) {
+            box.append(el("span", "h3d-alignnone", mode === "Ref2VA"
+                ? "混合模式：不生成对齐句，首尾帧锚作为 <Picture 1>/<Picture 2> 写进 subject_definitions"
+                : "无首尾帧锚 → 不注入对齐指令"));
+            return;
+        }
+        for (const l of lines) box.append(el("code", "h3d-alignline", l));
+        box.append(el("span", "h3d-alignhint",
+            `（提交时自动拼到正文最前；S.SS=${segAlignSeconds({ seconds: secs }).toFixed(2)}s`
+            + ` = ${snapSecondsToFrames(secs)} 帧 @24fps）`));
     };
     paint();
     return box;
@@ -7003,7 +7177,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     + "详细描述 → 环境音 → 背景配乐";
             } else {
                 prev.textContent = v2InstrPreview(effMode,
-                    Number(seg.seconds) || 5.0, hasStart, hasEnd,
+                    segmentSeconds(node, seg), hasStart, hasEnd,
                     (pv0.shots || []).length);
             }
             vbody.append(prev);
@@ -7591,8 +7765,8 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 const fseg = (fresh.segments || [])[segIdx] || {};
                 const payload = HP.compilePayload
                     ? HP.compilePayload(Object.assign({}, fseg, { prompt: (fresh.prompts || [])[segIdx] || "" }),
-                        { seconds: Number(fseg.seconds) || 5.0, has_start: hasStart, has_end: hasEnd, mode: effV2Mode(fresh, segIdx) })
-                    : { prompt: fseg.prompt_v2 || {}, seconds: 5.0, mode: effV2Mode(fresh, segIdx) };
+                        { seconds: segmentSeconds(node, fseg), has_start: hasStart, has_end: hasEnd, mode: effV2Mode(fresh, segIdx) })
+                    : { prompt: fseg.prompt_v2 || {}, seconds: segmentSeconds(node, fseg), mode: effV2Mode(fresh, segIdx) };
                 say("编译中…", "");
                 const r = await window.H3Api.compilePreview(payload);
                 const errs = r.body?.errors || [];
@@ -7632,7 +7806,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 if (!pv) { say("本段尚未启用 v2", "err"); return; }
                 say("编译同步中…", "");
                 const r = await window.H3Api.compilePreview({
-                    prompt: pv, seconds: Number(fseg.seconds) || 5.0,
+                    prompt: pv, seconds: segmentSeconds(node, fseg),
                     has_start: hasStart, has_end: hasEnd,
                     mode: effV2Mode(fresh, segIdx),
                 });
@@ -7865,7 +8039,12 @@ function buildCards(data) {
             anchorBar.append(el("label", "", "首尾帧锚定"));
             anchorBar.append(mkFrameBtns(node, it.idx, () => scheduleRefresh(240)));
             anchorBar.append(el("span", "h3d-secs-hint",
-                "本段的起手帧 / 终点锚（段级，三栏共用）；清锚会同步摘掉结果框里的对齐指令"));
+                "本段的起手帧 / 终点锚（段级，三栏共用）；选为锚即领一个「图片N」编号，"
+                + "占本段 <Picture k> 最前，参考素材顺延"));
+            /* 对齐指令在这里**展示**，不进提示词框正文（提交时由后端注入）。
+             * 以前它写在正文里：AI 产出会抄走它、清了锚还留着指向不存在的图、
+             * 飘在字段前缀之前的那些永远摘不掉。 */
+            anchorBar.append(mkAlignPreview(node, it.idx));
             body.append(anchorBar);
         }
 
@@ -9623,89 +9802,55 @@ function openNewProjectModal() {
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
 }
 
-/* ---- 总提示词工作台：单框分段工具 ----
- * 两代历史形态：① 一个巨大文本框里用「意图：/剧本：/提示词：」行内标签混写；
- * ② 拆成三框（意图 / 剧本 / 结果）。三框的问题：三个框都在说"提示词"，
- * **只有结果进模型**，而剧本只在 AI 扩写时才有意义——日常用起来是在三个框之间
- * 翻找，却只有一个真正有用。
- * 现在退回**单框**：框里就是段卡那个框的内容（直接进模型的提示词），
- * 用 `【段N】` 分段；段内可写三个段级标签 `时长：` / `独立镜头：` / `参考：`，
- * 其余一律是正文。**意图 / 剧本两个标签降级为只读兼容**：解析时跳过并提示已忽略
- * （旧文本、外部 skill 的产出里还写着它们，不能因为看不懂就把正文吞掉），
- * 但不再导出、不再写回段落。
- * 定位也就清楚了：这是一个**分段工具**——把外部生成的一大段多段文本粘进来，
- * 「✨ AI分段提示词优化」洗成官方格式，「解析并分配」写回段落。
- * 扩写不再从这里发起（段卡的「✨ AI扩写+优化」一次到位，不用在框之间倒文本）。 */
+/* ---- 总提示词工作台：纯分段流水线 ----
+ *
+ * **它不是一个结果框，也不做 AI。** 打开就是空框，只干一件事：把外部（AI /
+ * 另一个工程 / 手写）的一大段多段文本粘进来，「解析并分配」写回段落。
+ * 给每段的东西只有三样：
+ *   · 提示词 —— ds.prompts[i]，就是段卡那个框，直接进模型；
+ *   · 时长   —— `时长：9`；
+ *   · 独立镜头 —— `独立镜头：是` = 本段不自动引用上段尾帧（跳转 / 闪回 / 蒙太奇）。
+ * 段级标签只有这三个，其余一律是正文。
+ *
+ * **资产引用与段卡同一套语义**：就写在提示词正文里的 `@素材名`（绿框），
+ * 分配时由正文的 @序列 派生 seg.refs（syncRefsFromText）。不再有「参考：」那条
+ * 第二通道——两条通道必然对不上，那正是"总提示词框引用不对"的来源。
+ *
+ * **不做 AI**：格式清洗交给段卡上的「✨ AI扩写+优化 / ✨ 提示词优化」（一次一段、
+ * 就地写回，不用在两个框之间倒文本）。所以这里没有模式下拉、没有参考图勾选、
+ * 没有原稿回退——那三个控件只是 AI 那一跳的参数。
+ *
+ * **也不与段卡同步**：打开时不自动载入。「从当前链载入」是个手动按钮，只服务于
+ * 「导出 → 外部改 → 贴回」的往返，不是常驻镜像。 */
 
-/* 范例（严格按 tools/h3_prompt_expander/references/h3-dialect.md：
+/* 空框占位（严格按 tools/h3_prompt_expander/references/h3-dialect.md：
  * 英文骨架逐字不改，主体中文；[Shot 1] 无时间戳且先声明风格，后续 [Shot N] At MM:SS.mmm；
  * 运镜写成句内自然动作（类型+幅度+速度）；(S1) 说话人 + <d>[Chinese] 原文</d>；
- * 环境音进 overall_soundscape，配乐无则 N/A）。 */
-/* 三字段骨架（base：T2VA / I2VA / FL2VA / L2VA）——空框时的占位提示 */
-const MP_PH_MAIN_BASE = `integrated_multimodal_description: [Shot 1] 实拍、电影感，手持轻微晃动，中景框住雨夜市场的窄巷，霓虹招牌在积水里拉出红蓝长影，雨丝斜穿过画面。
+ * 环境音进 overall_soundscape，配乐无则 N/A）。
+ * 只示范「段头 + 时长 / 独立镜头 + 提示词」这一种写法——模式、对齐指令那些是
+ * 段卡上「AI 优化」按锚点产出的，这里不做 AI，就不在占位里假装有。 */
+const MP_PH_MAIN = `【段1】
+时长：8
 
-[Shot 2] At 00:03.200，镜头以小幅慢速推近她的侧脸，她停下脚步回头看向镜头，湿掉的刘海贴在额角，嘴角翘起。
+提示词：
+integrated_multimodal_description: [Shot 1] 实拍、电影感，手持轻微晃动，中景框住雨夜市场的窄巷，霓虹招牌在积水里拉出红蓝长影。
 
-[Shot 3] At 00:07.100，(S1) 用清亮的少女嗓音、语速偏快地说道：<d>[Chinese] 跟上我。</d> 说完转身挤进人流，镜头以小幅中速跟拍，霓虹在前景不断被路人肩头切断。
-
-overall_soundscape: 雨声持续，落在铁棚顶上的密集雨点，远处摊贩的叫卖声，电动车驶过水洼的溅水声。
-
-non_diegetic_music: N/A`;
-
-/* 六段式骨架（Ref2VA 全参考） */
-const MP_PH_MAIN_REF2VA = `subject_definitions: <Subject 1> 撑伞的女孩：二十岁上下，黑色湿发贴额，白色雨衣；<Picture 1> 雨夜市场窄巷的实景参考图
-
-summary:
-[reference generation] 雨夜市场，女孩回头喊话后带路走进人流
-
-retention_analysis:
-<Subject 1>: fully_preserved - 人物身份与服装在全程保持一致
-<Picture 1>: fully_copy - 场景光照与色彩关系沿用参考图
-
-detailed_description: [Shot 1] 实拍、电影感，<Picture 1> 的雨夜市场作为起点，<Subject 1> 撑伞站在巷口，霓虹在积水里拉出红蓝长影。
-
-[Shot 2] At 00:03.200，镜头以小幅慢速推近 <Subject 1> 的侧脸，她回头看向镜头，嘴角翘起。
+[Shot 2] At 00:03.200，镜头以小幅慢速推近她的侧脸，她停下脚步回头看向镜头，嘴角翘起。
 
 overall_soundscape: 雨声持续，落在铁棚顶上的密集雨点，远处摊贩的叫卖声。
 
+non_diegetic_music: N/A
+
+【段2】
+时长：8
+独立镜头：是
+
+提示词：
+integrated_multimodal_description: [Shot 1] 实拍，她转身挤进人流，镜头以小幅中速跟拍。
+
+overall_soundscape: 叫卖声渐远，脚步声明显。
+
 non_diegetic_music: N/A`;
-
-/* 关键帧对齐指令（官方整句，只替换 N 与 S.SS）——必须是结果正文的第一行，
- * 其后空一行再接三字段；T2VA 没有这一行。 */
-const MP_ALIGN_LINE = {
-    I2VA: "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.",
-    FL2VA: "How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.",
-    L2VA: "How the reference pictures align with the target video — <Picture 1> (from [Shot N]) aligns with the S.SS-second mark of the target video.",
-};
-
-/* 模式下拉的实时说明：模式**确实**改变产出格式——后端 optimizer.build_system_prompt
- * 按 task 给出不同的节数与标签纪律，pick_rule_text 还会据此切换规则文件
- * （base 三字段 vs Ref2VA 六字段）。这里把差异说在界面上，别让人以为是个摆设。 */
-const MP_MODE_HINT = {
-    T2VA: "三字段，无关键帧对齐指令",
-    I2VA: "三字段 + 首帧对齐指令（Picture 1 在 0.00s 被完整参考）",
-    FL2VA: "三字段 + 首尾帧对齐指令（Picture 1 @0.00s、Picture 2 @结尾）",
-    L2VA: "三字段 + 尾帧对齐指令（Picture 1 落在结尾）",
-    Ref2VA: "六段式：subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music",
-};
-
-/** 总提示词工作台选中的素材 -> AI 可读的 media（后端只吃 data:image，故只收图片，
- *  上限 8 张，与 optimizer._media_images 同口径）。带角色说明，模型才知道谁是谁。 */
-async function collectMasterMedia(node, assets) {
-    const media = [];
-    const notes = [];
-    for (const a of (assets || [])) {
-        if (media.length >= 8) break;
-        if (!a || (a.kind || "image") !== "image") continue;
-        const dataUrl = await optImageToDataUrl(
-            assetPreviewUrl(getDirValue(node), a.file, a.asset_id));
-        if (!dataUrl) continue;
-        const tag = `<Picture ${media.length + 1}>`;
-        media.push({ kind: "image", label: tag, images: [dataUrl] });
-        notes.push(`${tag} = 参考素材「${a.label || a.file || "未命名"}」`);
-    }
-    return { media, note: notes.length ? `随图说明：${notes.join("；")}。` : "" };
-}
 
 function openMasterPromptModal() {
     const node = findNode();
@@ -9715,71 +9860,20 @@ function openMasterPromptModal() {
     const overlay = el("div", "h3d-overlay h3d-overlay-full");
     const dialog = el("div", "h3d-dialog h3d-dialog-full");
     dialog.innerHTML = `
-        <h3>📋 总提示词 · 多段工作台</h3>
-        <p class="h3d-lead">一个框管全片：框里就是<b>直接进模型的提示词</b>，用
-        <code>【段N】</code> 分段（不写段头 = 单段）。段内可写三个段级标签
-        <b>时长 / 独立镜头 / 参考</b>，其余一律是正文。
-        典型用法：把外部生成的一大段多段文本粘进来 →
-        <b>「✨ AI分段提示词优化」</b>洗成 H3 官方格式 → <b>「解析并分配」</b>写回段落。
-        「参考素材（AI 可见）」里<b>勾上要给的图</b>，优化才会把它们一起送去给模型看。
-        <b>改满意了再点「解析并分配」</b>——只有这一步才会写回你的段落。</p>`;
-
-    /* ---- 第一行：模式 + 缺省时长 + AI 优化设置 ----
-     * 「段数 / 风格 / 时长范围」已随多段扩写一起撤下：扩写在段卡上做（一次一段），
-     * 这里只负责"洗格式 + 分配"，摆一排用不上的参数只会让人以为它们还管用。 */
-    const top = el("div", "h3d-mpset");
-    const numBox = (v, lo, hi) => {
-        const i = document.createElement("input");
-        i.type = "number"; i.min = String(lo); i.max = String(hi); i.step = "1";
-        i.value = String(v);
-        return i;
-    };
-    const lab = (text, ctrl) => {
-        const w = el("label", "");
-        w.append(el("span", "", text), ctrl);
-        return w;
-    };
-    const secDef = numBox(8, 4, 15);
-    secDef.title = "段里没写「时长：」时用它当该段时长（只影响优化时的时长口径，不写回段落）";
-    const modeSel = document.createElement("select");
-    for (const [v, l] of [["T2VA", "T2VA 文生视频"], ["I2VA", "I2VA 首帧"],
-        ["FL2VA", "FL2VA 首尾帧"], ["L2VA", "L2VA 尾帧"], ["Ref2VA", "Ref2VA 多参"]]) {
-        modeSel.append(new Option(l, v));
-    }
-    const btnSet = el("button", "h3d-btn", "⚙ AI 优化设置");
-    btnSet.title = "AI 提示词优化设置（服务商 / 模型 / 输出语言 / 规则文件）—— 全链共用";
-    const modeHint = el("small", "h3d-mpmode", "");
-    top.append(lab("模式", modeSel), lab("缺省时长", secDef), el("span", "", "秒"),
-        btnSet, modeHint);
-
-    /* ---- 第二行：参考素材（AI 可见）—— 勾选的图随请求送去给模型 ---- */
-    const refRow = el("div", "h3d-refrow h3d-mprefs");
-    refRow.append(el("label", "", "参考素材（AI 可见）"));
-    const refCount = el("span", "h3d-secs-hint", "");
-    refRow.append(refCount);
-    const chipBox = el("div", "h3d-mprefs-chips");
-    refRow.append(chipBox);
-    const bRefAll = el("button", "h3d-btn h3d-mprefs-btn", "全选");
-    const bRefNone = el("button", "h3d-btn h3d-mprefs-btn", "清空");
-    const bRefReload = el("button", "h3d-btn h3d-mprefs-btn", "⟳");
-    bRefReload.title = "立即重读素材池（正常情况下素材库增删改后会自动跟上；"
-        + "点它用于手动催一次）";
-    refRow.append(bRefAll, bRefNone, bRefReload);
+        <h3>📋 总提示词 · 多段分配</h3>
+        <p class="h3d-lead">把外部（AI / 另一个工程 / 手写）的一大段多段文本粘进来，
+        <b>「解析并分配」</b>一次写回所有段落。用 <code>【段N】</code> 分段
+        （不写段头 = 单段）；段内只有三个段级标签
+        <b>时长 / 独立镜头 / 提示词</b>，其余一律是正文。
+        <b>资产引用就写在提示词正文里的 <code>@素材名</code></b>——与段卡提示词框同一套，
+        粘完点「🔗 解析引用」可把别名 / 标注统一成素材全名。
+        这里<b>不做 AI</b>：要洗格式请去段卡上的「✨ AI扩写+优化 / ✨ 提示词优化」。
+        <b>只有「解析并分配」会写回你的段落。</b></p>`;
 
     /* ---- 单框：全片分段提示词 ---- */
     const stack = el("div", "h3d-mpstack");
     const boxWrap = el("div", "h3d-mpboxwrap h3d-mpboxwrap-main");
     const head = el("div", "h3d-mplabel");
-    const btnOpt = el("button", "h3d-btn h3d-btn-cyan", "✨ AI分段提示词优化");
-    btnOpt.type = "button";
-    btnOpt.classList.add("h3d-mpboxbtn");
-    btnOpt.title = "把每段正文按 H3 官方格式规范化（不改你的意思，只洗格式），"
-        + "结果写回本框——点「↩ 原稿」可还原。会带上勾选的参考图；输出格式由「模式」决定。";
-    const btnUndo = el("button", "h3d-btn", "↩ 原稿");
-    btnUndo.type = "button";
-    btnUndo.classList.add("h3d-mpboxbtn");
-    btnUndo.style.display = "none";
-    btnUndo.title = "还原成点「AI分段提示词优化」之前的版本（误点可一键回来，不做确认弹窗）";
     /* 解析引用（与段卡同一个动作、同一套规则）：从别处复制一大段提示词粘进来后，
      * 点它一次把里面的素材名对应到素材库（别名/标注统一成完整文件名）。
      * onclick 在 ta 建好后绑定（要用到编辑器实例）。 */
@@ -9790,17 +9884,17 @@ function openMasterPromptModal() {
         + "（含后缀），认不出来的名字会点名提示。\n"
         + "从别处复制来的提示词粘进来后点它一次即可。";
     head.append(el("b", "", "提示词（最终进模型）"),
-        el("small", "", "【段N】分段 · 段级标签只有 时长 / 独立镜头 / 参考"),
-        btnOpt, btnUndo, btnResolve);
+        el("small", "", "【段N】分段 · 段级标签只有 时长 / 独立镜头 / 提示词"
+            + " · 资产引用写正文 @素材名"),
+        btnResolve);
     /* 素材池（总提示词框用）：与段卡读同一处活状态，别用快照。 */
     const mpPool = () => {
         try { return getDs(node).ref_assets || []; } catch (e) { return []; }
     };
-    /* 提示词框改用**与段卡同一套**编辑器（createPromptEditor）：引用名表、
-     * 绿框渲染、解析逻辑全部共用 —— 以前这里是裸 textarea，那正是
-     * "总提示词框里的素材引用根本认不出来、和分段两回事"的根因。
-     * 两者唯一该有的差异只剩 AI 优化的形式：这里按【段N】分段洗格式
-     * （见 mpRenderState / parseMasterPrompt），不再各有一套引用规则。 */
+    /* 提示词框与段卡**同一套**编辑器（createPromptEditor）：引用名表、绿框渲染、
+     * 解析逻辑、以及分配时的 refs 派生（syncRefsFromText）全部共用 —— 以前这里是
+     * 裸 textarea 加一个「参考：」标签，那正是"总提示词框的素材引用和分段两回事"
+     * 的根因。现在两者没有任何语义差异，只有"一段 vs 全篇"这个粒度差别。 */
     const ta = createPromptEditor({
         value: "",
         labels: () => refLabelsOf(mpPool()),
@@ -9813,6 +9907,7 @@ function openMasterPromptModal() {
     });
     ta.el.classList.add("h3d-mpbox");
     ta.el.spellcheck = false;
+    ta.placeholder = MP_PH_MAIN;
     boxWrap.append(head, ta.el);
     btnResolve.onclick = () => {
         let r = null;
@@ -9847,75 +9942,12 @@ function openMasterPromptModal() {
     const cancel = el("button", "h3d-btn", "取消");
     const ok = el("button", "h3d-btn h3d-btn-cta", "解析并分配");
     row.append(bLoad, bClear, cancel, ok);
-    dialog.append(top, refRow, stack, info, err, row);
+    dialog.append(stack, info, err, row);
     overlay.append(dialog);
     overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
     overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
     document.body.append(overlay);
     ta.focus();
-
-    /* ---- 模式：实时说明 + 占位骨架跟着换（让人看见模式真的在起作用）---- */
-    const syncMode = () => {
-        const m = modeSel.value;
-        modeHint.textContent = `→ ${MP_MODE_HINT[m] || ""}`;
-        const align = MP_ALIGN_LINE[m] ? MP_ALIGN_LINE[m] + "\n\n" : "";
-        ta.placeholder = "【段1】\n时长：9 秒\n\n"
-            + align + (m === "Ref2VA" ? MP_PH_MAIN_REF2VA : MP_PH_MAIN_BASE);
-    };
-    modeSel.addEventListener("change", syncMode);
-    syncMode();
-
-    /* ---- 参考素材 chips ---- */
-    const selKey = new Set();
-    const assetKey = (a) => String(a.asset_id || a.label || a.file || "");
-    let imgPool = [];
-    const renderRefs = () => {
-        let pool = [];
-        try { pool = getDs(node).ref_assets || []; } catch (e) { pool = []; }
-        imgPool = pool.filter((a) => a && String(a.kind || "image") === "image");
-        /* 池里已经没有的素材要从勾选集合里剔掉：否则删完素材，
-         * 计数还写着「已选 3/2」，而且请求里还惦记着一条不存在的图。 */
-        for (const k of [...selKey]) {
-            if (!imgPool.some((a) => assetKey(a) === k)) selKey.delete(k);
-        }
-        chipBox.innerHTML = "";
-        if (!imgPool.length) {
-            chipBox.append(el("span", "h3d-secs-hint",
-                "（还没有图片素材：去左侧「素材与参考」上传。AI 只能读图片，视频/音频发不出去）"));
-        }
-        for (const a of imgPool) {
-            const key = assetKey(a);
-            const c = el("button", "h3d-refchip" + (selKey.has(key) ? " on" : ""));
-            c.type = "button";
-            c.append(buildAssetThumb(getDirValue(node), a));
-            c.append(el("span", "", String(a.label || a.file || "素材")));
-            c.title = `${a.label || a.file}｜点一下 = 让 AI 看这张图（再点取消）`;
-            c.onclick = () => {
-                if (selKey.has(key)) selKey.delete(key); else selKey.add(key);
-                renderRefs();
-            };
-            chipBox.append(c);
-        }
-        refCount.textContent = imgPool.length
-            ? `已选 ${selKey.size}/${imgPool.length}${selKey.size ? "（随请求发给 AI）" : ""}`
-            : "";
-    };
-    bRefAll.onclick = () => { for (const a of imgPool) selKey.add(assetKey(a)); renderRefs(); };
-    bRefNone.onclick = () => { selKey.clear(); renderRefs(); };
-    bRefReload.onclick = () => renderRefs();
-    renderRefs();
-    /* 素材库删/改名/上传后 chips 自动跟上（DOM 断开即自摘，不必在各处 close 里挂钩子） */
-    const paintLive = () => {
-        if (!chipBox.isConnected) { unregisterLivePainter(paintLive); return; }
-        renderRefs();
-    };
-    registerLivePainter(paintLive);
-
-    const pickedAssets = () => imgPool.filter((a) => selKey.has(assetKey(a)));
-
-    /* 段时长：只在「从链载入」给出确切值时才写回，避免冲掉链上时长 */
-    let segSecs = [];
-    const defSec = () => Math.max(4, Math.min(15, Number(secDef.value) || 8));
 
     const paint = () => {
         const text = String(ta.value ?? "");
@@ -9924,145 +9956,34 @@ function openMasterPromptModal() {
         const cntMain = p.segs.filter((s) => String(s.main ?? "").trim()).length;
         const total = p.segs.reduce((a, s) => a + (Number(s.seconds) || 0), 0);
         const nUnlink = p.segs.filter((s) => s.unlink === true).length;
+        /* 引用计数直接调 refsFromText（**段卡用的同一个函数**）：这里显示几处，
+         * 分配后 seg.refs 就是几个，不会出现"框里看着引用了、段落却没挂上"。 */
+        const pool = mpPool();
+        const nRef = p.segs.reduce((a, s) => a + refsFromText(String(s.main ?? ""), pool).length, 0);
         info.innerHTML = `识别 <b>${p.segs.length}</b> 段 · 总时长 <b>${Math.round(total)}s</b>`
             + ` · 有正文 <b>${cntMain}</b> 段`
-            + (nUnlink ? ` · 独立镜头 <b>${nUnlink}</b>` : "");
+            + (nUnlink ? ` · 独立镜头 <b>${nUnlink}</b>` : "")
+            + (nRef ? ` · 素材引用 <b>${nRef}</b> 处` : "");
         const allNotes = (p.notes || []).filter(Boolean);
         err.textContent = allNotes.length ? "⚠ " + allNotes.join("；") : "";
         return p;
     };
     ta.addEventListener("input", paint);
 
-    /* 打开即载入当前链（有内容才载），进来就是可改的现成内容 */
+    /* 「从当前链载入」：**只在手动点的时候**发生。
+     * 打开时不再自动载入 —— 这个框不是段卡提示词的镜像/结果框。自动载入会让人
+     * 以为两边是双向同步的（改段卡这边跟着变、改这边段卡也跟着变），而实际上
+     * 只有「解析并分配」是单向写入。想拿现成内容去外面改，就手动点一下。 */
     const loadFromChain = () => {
-        const ds = getDs(node);
-        const prompts = ds.prompts || [];
-        const segs = ds.segments || [];
-        segSecs = [];
-        if (!prompts.length) { ta.value = ""; paint(); return; }
-        for (let i = 0; i < prompts.length; i++) {
-            const sec = Number((segs[i] || {}).seconds);
-            segSecs.push(Number.isFinite(sec) && sec > 0 ? sec : null);
-        }
-        /* 单框格式与段卡正文同源：直接复用导出（它现在只写 时长/独立镜头/参考/提示词） */
         ta.value = exportMasterPrompt(node);
         paint();
-    };
-    if (((getDs(node).prompts || []).some((x) => String(x ?? "").trim()))) loadFromChain();
-
-    const ensureSettings = async () => {
-        let st;
-        try { st = optGetSettings(node); }
-        catch (e) { err.textContent = `加载优化配置失败：${e.message}`; return null; }
-        if (await optNeedsSetup(node, st)) return null;
-        return st;
+        info.textContent = "已载入当前链（改完点「解析并分配」写回段落）";
     };
 
-    /* 误点保护（不做确认弹窗）：写入前把当前文本存为「原稿」，按钮旁常驻 ↩。 */
-    let draft = null;
-    const saveDraft = () => {
-        draft = String(ta.value ?? "");
-        btnUndo.style.display = "";
-    };
-    btnUndo.onclick = () => {
-        if (draft === null) return;
-        ta.value = draft;
-        draft = null;
-        btnUndo.style.display = "none";
-        paint();
-        info.textContent = "已还原到优化前的原稿";
-    };
-
-    /* AI 分段提示词优化：每段正文 -> 官方格式，写回本框（不改段数、不动段级标签）。
-     *
-     * 出/回码走**与段卡同一套**标注编解码（toLLMText / fromLLMText）：
-     * 总提示词框与分段的资产引用规则必须完全一致 —— 唯一该有的差异只是
-     * "AI 优化的形式"（这里是按【段N】分段洗格式，段卡是整段）。以前这里
-     * 直接把 `@完整文件名.png` 发给 LLM，长名容易被抄错（抄错 = 静默丢图），
-     * 回写时也不会翻回真名，于是"总提示词框引用不对"就成了常态。 */
-    btnOpt.onclick = async () => {
-        const st = await ensureSettings();
-        if (!st) return;
-        const p = parseMasterPrompt(String(ta.value ?? ""));
-        if (!p.segs.length) { err.textContent = "框里没有任何段落内容"; return; }
-        const targets = [];
-        p.segs.forEach((s, i) => {
-            const src = String(s.main ?? "").trim();
-            if (src) {
-                targets.push({
-                    index: i, src,
-                    seconds: Number((segSecs || [])[i]) || Number(s.seconds) || defSec(),
-                });
-            }
-        });
-        if (!targets.length) { err.textContent = "没有任何段有正文可优化"; return; }
-        err.textContent = "";
-        btnOpt.disabled = true;
-        const oldTxt = btnOpt.textContent;
-        btnOpt.textContent = "优化中…";
-        info.textContent = `正在优化 ${targets.length} 段…`;
-        try {
-            const assets = pickedAssets();
-            const mm = (st.read_media !== false && assets.length)
-                ? await collectMasterMedia(node, assets)
-                : { media: [], note: "" };
-            /* 换码表覆盖**整个素材池**（不是只"勾选的参考图"）：正文里写了但没勾
-             * 的素材也要换，否则模型看见一半 @猫.png 一半 @图片1，两边对不上。 */
-            const pool = mpPool();
-            const task = modeSel.value;
-            /* 走 SSE 流式：N 段是**串行**跑的，段数一多就是"点完盯着不动好几分钟"。
-             * 老后端没有 optimize_multi_stream 时静默退回整包（功能不丢，只是没进度）。 */
-            const res = await optCallStream({
-                config: st,
-                media: mm.media,
-                task,
-                segments: targets.map((t) => ({
-                    prompt: (mm.note ? `${mm.note}\n` : "") + toLLMText(t.src, pool),
-                    seconds: t.seconds,
-                    task,
-                })),
-            }, `总提示词框 · 优化 ${targets.length} 段`, { btn: btnOpt }, {
-                stream: "optimizeMultiStream", fallback: "optimizeMulti",
-                busy: { thinking: "优化中…", writing: "优化中…" },
-            });
-            if (res.body?.cancelled) return;      // 用户主动取消：不弹错
-            if (res.status >= 400 || res.body?.error) {
-                err.textContent = window.H3Api.errText(res, "多段优化失败");
-                return;
-            }
-            const arr = res.body.segments || [];
-            let bad = 0;
-            arr.forEach((r, k) => {
-                const idx = (targets[k] || {}).index;
-                if (idx === undefined || idx >= p.segs.length || !r.result) return;
-                /* 回码：@图片1 → @完整文件名（盘上永远存真名） */
-                p.segs[idx].main = fromLLMText(String(r.result).trim(), pool);
-                bad += (r.errors || []).length;
-            });
-            saveDraft();
-            /* 用渲染器重排：段级标签（时长/独立镜头/参考）原样保留，只换正文。 */
-            ta.value = mpRenderState(p.segs);
-            paint();
-            info.textContent = `已优化 ${arr.length} 段（${MP_MODE_HINT[task] || task}）`
-                + (mm.media.length ? `，已带 ${mm.media.length} 张参考图` : "")
-                + (bad ? `，仍有 ${bad} 项官方格式问题（在框里手改或换个模型重跑）`
-                    : "，全部通过官方格式校验");
-        } catch (e) {
-            err.textContent = `多段优化失败：${e?.message || e}`;
-        } finally {
-            btnOpt.textContent = oldTxt;
-            btnOpt.disabled = false;
-        }
-    };
-
-    btnSet.onclick = () => openOptSettings(node);
     bLoad.onclick = () => loadFromChain();
     bClear.onclick = () => {
         if (String(ta.value || "").trim() && !confirm("清空整个框？（链上数据不动）")) return;
         ta.value = "";
-        segSecs = [];
-        draft = null;
-        btnUndo.style.display = "none";
         paint();
     };
     cancel.onclick = () => overlay.remove();
@@ -10388,7 +10309,6 @@ async function refresh() {
         const data = await collectData();
         renderMini(data);
         if (desk) updateDesk(data);
-        runLivePainters();            // 打开中的浮层（总提示词框的参考素材 chips 等）
     } catch (e) {
         console.warn("[h3-director] refresh failed:", e);
         renderMiniFallback(e);   // 出错也保住入口按钮，不留空白标签

@@ -83,8 +83,14 @@ function env() {
     ok(seg.frame_img && seg.frame_img.first === "assets/A.png",
         `贴总提示词不得冲掉 frame_img，实际 ${JSON.stringify(seg.frame_img)}`);
     const txt = w.eval("getDs")(node).prompts[0];
-    ok(txt.indexOf("0.00-second mark") > 0,
-        `双锚段贴完总提示词应自动补回 FL2VA 对齐行，实际：${txt}`);
+    /* 对齐指令**不进正文**：它是编译产物，由锚定栏展示、实跑时由后端注入。
+     * 正文必须保持"用户视角的纯文本"，否则 AI 产出会抄走它、清了锚还留着
+     * 指向不存在图片的陈旧指令、飘在字段前缀之前的那些永远摘不掉。 */
+    ok(txt.indexOf("0.00-second mark") < 0 && txt.indexOf("is fully referenced") < 0,
+        `贴完总提示词正文里不应有对齐指令（锚定栏展示 + 实跑注入），实际：${txt}`);
+    /* 锚本身当然要活着 */
+    ok(!!w.eval("segHasFrames")(node && w.eval("getDs")(node), 0).has_start,
+        "贴完总提示词后首尾帧锚仍在（对齐指令没了 ≠ 锚没了）");
 }
 
 console.log(fails ? `\n${fails} 个断言失败` : "\nframe_anchor_persist_check 全部通过");

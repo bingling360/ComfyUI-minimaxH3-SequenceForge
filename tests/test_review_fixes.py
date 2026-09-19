@@ -194,7 +194,11 @@ def test_mirrors_skip_global():
 
 def test_paste_and_optimizer_id_aware():
     d = _director_src()
-    assert "(a.label || a.asset_id)" in d
+    # 段引用白名单：引用键（含后缀）/ 旧别名 / asset_id 三种写法都算合法。
+    # 总提示词框的「参考：」标签停用后，这是**唯一**的白名单——分配时由正文 @序列
+    # 派生 seg.refs（syncRefsFromText），派生结果同样要过它，认不出的名字不落盘。
+    assert "validIds = new Set(refAssets.map((a) => a.asset_id)" in d
+    assert "validLabels.has(l) || validIds.has(l)" in d
     # 引用键换轨后按 refKeyOf（引用名，含后缀）匹配，asset_id 仍可命中
     assert "refKeyOf(a) === key || a.asset_id === key" in d
     assert "assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id)" in d

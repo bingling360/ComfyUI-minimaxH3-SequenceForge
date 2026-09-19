@@ -34,6 +34,28 @@ retention 标记（`fully_preserved` 等）、任务类型前缀（`[reference g
 8. **自检再输出**：风格在首句；Shot 时间递增且 ≤ duration；`<d>` 内只有语言+原文；双引号只包屏显；
    无裸抽象词；无否定堆叠；单镜 ≤3 节拍且 ≤1 运镜；台词后无冲突口部动作。
 
+## 混合模式（首尾帧锚 + 参考素材同时存在）
+
+user 消息的「随图说明」里会**点名哪几张是锚点**（写明"首尾帧锚点""硬钉"），其余才是
+"参考一下"的素材。**必须先分清这两类，再动笔** —— 它们是两种不同的约束：
+
+| 类别 | 约束性质 | retention 标记 | 正文怎么写 |
+| --- | --- | --- | --- |
+| 首尾帧锚 | **硬钉**：画面必须从它开始 / 必须在它结束 | `fully_preserved` | 用自然措辞锚死：`the shot begins from <Picture 1>` / `the shot ends on <Picture 2>` |
+| 参考素材 | 软参考：提取外观/风格/身份 | `partially_preserved` 等 | 描述它提供什么、跟随哪些特征 |
+
+判据：有参考素材时一律走**六段式**（下面的 Ref2VA 结构），锚点作为 `<Picture 1>` /
+`<Picture 2>` 排进 `subject_definitions` **最前**（它俩占编号 1、2，参考素材顺延）。
+`summary` 的任务前缀写 `[keyframe completion + reference generation]` —— 少了
+`keyframe completion` 模型就不知道有硬钉的帧，会把它当普通参考图自由发挥。
+
+**不要做的事**：
+
+* 不要把锚点当素材去描述外观（"这是一张…风格的图"）—— 它是起点/终点，不是灵感来源。
+* 不要改写锚点编号（模型按 `<Picture k>` 认图，改了就指错图）。
+* 不要在六段式之外再补关键帧对齐句 —— 混合模式**不生成对齐指令**，对齐关系
+  由 `subject_definitions` + `retention_analysis` 承载。
+
 ## Ref2VA（有参考素材时）
 
 六段顺序固定：`subject_definitions` / `summary` / `retention_analysis` /

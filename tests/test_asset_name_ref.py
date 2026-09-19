@@ -82,6 +82,16 @@ def test_subject_tag_still_documented():
 # 换码规则唯一在 web/h3_prompts.js（marksToText / textToMarks，
 # 运行期真跑见 tests/js/mark_codec_check.js）。
 
+def _fn_block(src, header):
+    """按**函数边界**取源码片段（不用固定长度 —— 加注释让函数变长就截断、假红）。
+
+    依据是顶层收尾：函数体结束那行的 `}` 顶格（函数内的 `}` 都有缩进）。
+    """
+    i = src.index(header)
+    j = src.index("\n}\n", i)
+    return src[i:j + 3]
+
+
 def test_collect_seg_media_uses_mark_not_raw_name():
     """media.label 必须是**标注** —— 后端 build_system_prompt 直接用它拼名单。
 
@@ -89,8 +99,7 @@ def test_collect_seg_media_uses_mark_not_raw_name():
     变量叫过 mk / nm，钉变量名会在改名时假红、却挡不住真的回退）。
     """
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
-    i = src.index("async function collectSegMedia")
-    block = src[i:i + 2600]
+    block = _fn_block(src, "async function collectSegMedia")
     assert "asset.mark || asset.label" in block, \
         "media.label 应**优先**取标注（mark），只在没有标注时才回落引用名"
     assert re.search(r"mark:\s*[A-Za-z_$][\w$]*\(\s*hit\s*\)", block), \
@@ -101,8 +110,7 @@ def test_collect_seg_media_uses_mark_not_raw_name():
 
 def test_collect_seg_media_note_mentions_marks():
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
-    i = src.index("async function collectSegMedia")
-    block = src[i:i + 2800]
+    block = _fn_block(src, "async function collectSegMedia")
     assert "notes.push(`@${nm}`)" in block, "note 里应给出 @标注"
     assert "不要写 <Picture N>" in block
     assert "@图片N" in block or "图片1" in block, "note 要说明标注形态（@图片N）"

@@ -356,13 +356,15 @@ def test_library_frontend_surfaces_notes():
     assert 'x.scope === "global"' in d, "确认框没区分全局库条目"
 
 
-def test_director_repaints_open_overlays_on_refresh():
-    """总提示词框的「参考素材」chips 要跟着素材池变。
+def test_director_has_no_overlay_chips_to_repaint():
+    """总提示词框不再有「参考素材（AI 可见）」chips，活渲染通道随之删除。
 
-    素材库（.h3l-overlay）与总提示词框（.h3d-overlay）可以同时开着，
-    没有这条活渲染通道，删完素材那一栏就不减 —— 正是用户报的第二个症状。
+    那条通道是专为 chips 建的（删完素材那一栏要跟着减）。总提示词框退化成纯
+    分段流水线后不再有 chips，留着 registerLivePainter 就是没人注册的死代码 ——
+    段卡那边的同类需求走 _cardPainters。
     """
     d = _src("h3_director.js")
-    assert "function registerLivePainter(" in d
-    assert "runLivePainters();" in d, "refresh 里没推进打开中的浮层"
-    assert "registerLivePainter(paintLive);" in d, "参考素材 chips 没注册活渲染"
+    for dead in ["function registerLivePainter(", "function runLivePainters(",
+                 "registerLivePainter(paintLive);", "h3d-mprefs"]:
+        assert dead not in d, f"{dead} 应随 chips 一起删除"
+    assert "function registerCardPainter(" in d, "段卡的卡片级活渲染仍要在"

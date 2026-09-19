@@ -609,10 +609,14 @@ def test_segment_tabs_and_optimizer_ui():
     assert "optimizeStream" in a and "/h3chain/optimize_stream" in a
     assert "expandOptimizeStream" in a and "/h3chain/expand_optimize_stream" in a
     assert "optimizeMultiStream" in a and "/h3chain/optimize_multi_stream" in a
-    # 多段那条也得真的接上流式（总提示词框的「AI 分段优化」）：
-    # 少了 stream 名就退回整包，N 段串行跑起来就是"点完盯着不动好几分钟"。
-    assert 'stream: "optimizeMultiStream"' in d
-    assert 'fallback: "optimizeMulti"' in d
+    # 多段（optimize_multi*）**后端与 api 都还在**，但前端**没有入口了**：
+    # 总提示词框的「AI 分段优化」已随工作台退化成纯分配框一起撤下，段卡上只有单段
+    # 优化/扩写。别把这个断言改回"UI 必须接上多段流式"——那等于把入口加回来。
+    assert 'stream: "optimizeMultiStream"' not in d
+    assert 'fallback: "optimizeMulti"' not in d
+    # 单段优化不传 opts：靠 optCallStream 的默认值走流式（否则没有进度条）
+    assert 'const streamFn = opts.stream || "optimizeStream";' in d
+    assert 'stream: "expandOptimizeStream"' in d, "扩写+优化必须走流式（两段式进度）"
     for sym in ["optProgressStart", "optCallStream", "rebuildThinking",
                 "optModelCaps", "optCapsLoad", "思考强度", "h3d-opt-prog"]:
         assert sym in d, sym

@@ -46,9 +46,6 @@ from . import checkpoint
 from . import prompts as _P
 from .prompts import L2VA_HEAD, FL2VA_HEAD
 from . import metrics
-from . import experiments
-from . import transition
-from . import bridge
 from . import guides
 from . import grid
 from . import perf
@@ -886,7 +883,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Model.Input("二采模型", optional=True,
                                tooltip="高清精化二采专用 UNET（神经放大 → 高清 latent 低强度重采样）。"
                                        "不接=沿用一采「模型」（旧行为）。只作用于高清精化二采；"
-                                       "一采、E4 缝区过渡重采样、接缝重摇仍用一采模型。"
+                                       "一采与接缝重摇仍用一采模型。"
                                        "可接不同量化 + 不同 LoRA 的独立链（UNETLoader → LoraLoader → 本槽）；"
                                        "t2v/i2v 用 fl2va、r2v 用 ref2va，别混接。"
                                        "换二采模型不会自动重做已有高清分段——要重做请设「重跑起始段」"),
@@ -894,6 +891,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # P4g：连「资产包」输入也一并删除（H3AssetBundle 下线），素材与提示词只走导演台状态。
                 # 起始视频（序章）是唯一的画布媒体入口（无导演台等价字段，保留）。
                 # 旧工作流残留连线加载时自动忽略。
+                # —— 新控件一律加在**本列表末尾**（= widgets_values 末尾）：旧工作流值不足时
+                #    按默认值补齐；插进中间会顶掉它之后所有控件的既有取值。
+                io.Combo.Input("参考图像尺寸", options=["match", "max"], default="match",
+                               tooltip="参考图缩放口径（官方 Reference to Video 同款）："
+                                       "match=每张参考图按本次生成画幅的像素面积等比缩小（只缩不放，省显存与时间）；"
+                                       "max=走参考管线的 2048 短边，身份保真最好，"
+                                       "但参考 token 每步采样都参与，可能慢数倍。"),
+                io.Float.Input("响度对齐强度", default=1.0, min=0.0, max=1.0, step=0.1,
+                               tooltip="段首响度对齐强度：把本段开头的增益去匹配上一段尾的 RMS"
+                                       "（±6dB 钳制 + 1s 渐出；增益不沿链累积，不会越对越响）。"
+                                       "1.0=全量对齐（默认）；0=完全不对齐（保留内容本身的响度差）；"
+                                       "0.2-0.4 常用于只兜内容本身的残留响度差。"
+                                       "段间隔链（勾了「跳过自动引用上段」）本就不做对齐。"),
             ],
             outputs=[
                 io.Image.Output("图像"),
@@ -913,7 +923,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
                 递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准",
-                二采模型=None):
+                二采模型=None, 参考图像尺寸="match", 响度对齐强度=1.0):
         # P4d：画布媒体/提示词/参考入口已从 schema 删除，对应形参一并移除；
         # 起始视频（序章）是唯一的画布媒体入口，保留。
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
@@ -927,9 +937,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # P4g：画布「资产包」输入已删除（H3AssetBundle 一并下线）——素材唯一来源是
         # ds.ref_assets（导演台前端 poolFromManifest 写入）。
         ds_used = bool(ds)
-        # 实验性功能开关：从 ds.experiments 归一化；全关/FORCE_DISABLED => 空 context，
-        # 后续所有实验分支以 exp.has(...) 包裹，关闭时逐字节走现状路径
-        exp = experiments.resolve(ds if isinstance(ds, dict) else None)
         # ---- 内联转码任务（资产库"转latent"）：ds.transcode_jobs 非空则只跑转码，
         # 不跑链、不耗种子。任务由资产库面板写入 ds，提交即自动排队执行；
         # 队列中断在任务间隙生效（见 run_transcode_job 的 _interrupted）。
@@ -1727,7 +1734,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         else:
             chain = "t2v（fl2va UNET）"
 
-        # cond 文本编码缓存代理：一采/二采/重摇/E4 全链共用同一实例——TE 的
+        # cond 文本编码缓存代理：一采/二采/重摇全链共用同一实例——TE 的
         # tokenize+encode 只依赖提示词文本，同一段提示词（含二采高清条件重建、
         # negative 空串）只前向一次；参考图/视频的 VAE 编码与画布其他节点不受影响
         from .cond_cache import CachedClipProxy
@@ -1768,10 +1775,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     + (f"({_a['src']['ref']})" if _a["src"]["ref"] else "")
                     + f" {_a['window']} 帧窗 → 本段{_am}，{_ANCHOR_AV_CN[_a['branches']['av']]}"
                     + ("" if _a["on"] else "（已关闭，不注入）"))
-        if experiments.FORCE_DISABLED:
-            report.append("实验性功能：后端已强制关闭（H3_EXPERIMENTS=0）")
-        elif exp.enabled:
-            report.append(exp.describe())
         # 二采模型来源与结构签名（一次算好，逐段复用）：未接「二采模型」槽时沿用
         # 一采模型——此时签名即一采模型的签名。签名只用于报告标注与 manifest 留痕，
         # 不进 params_hash：换二采模型不会自动重做已有高清分段。
@@ -1809,15 +1812,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"二采模型：{_up_src}" + (f"（{_up_tag}）" if _up_tag else "")
                           + ("；与一采非同源，每段二采前先卸一采（换页次数不变，"
                              "只把空闲显存并成整块）" if _up_swap else ""))
-        # 软桥能力探测：只在开关打开时探测并报告（全关时报告与旧版逐行一致）。
-        # 等级 0 = 本机 ComfyUI 不支持逐 token 掩码 -> 整链自动回退现状路径。
-        _sb_level, _sb_reason = 0, "未启用"
-        if exp.has("soft_bridge"):
-            _sb_level, _sb_reason = bridge.probe_soft_bridge()
-            report.append("软桥：" + ("开" if _sb_level else "关") + " · "
-                          + bridge.level_text(_sb_level, _sb_reason))
-            if _sb_level == bridge.LEVEL_OFF:
-                report.append("软桥不可用，本次按现状「钉桥 + 裁头」生成（行为与关闭开关时一致）")
         _unlink_pos = [str(item_i + 1) for item_i, it in enumerate(exec_items)
                        if it[0] == "prompt" and seg_unlink[it[1]]]
         if _unlink_pos:
@@ -1953,10 +1947,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "fade_ratio": fade_ratio,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
-        # 实验性功能：仅在开启时并入指纹——切换实验组合即判参数不一致触发整链重做，
-        # 杜绝不同实验复用同一缓存污染结果；全关时不加该键，旧档续跑行为与现状一致。
-        if exp.enabled:
-            ckpt_params["experiments"] = exp.fingerprint()
         # 衔接诊断参数（下阶段基建：重摇/锚定）只记录不进指纹（改值不触发重跑；报告回看用）
         seam_refine = {"reroll": 接缝重摇, "reroll_th": float(重摇阈值),
                        "reroll_max": int(重摇上限), "anchor_aug": aug}
@@ -2584,10 +2574,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
         guide = None
         # 段间衔接的三件「上段尾」快照 + 成片音轨累积：`cc93c7d` 把这几行**一起删过**
         # （于是只剩序章分支里赋值）→ 没接起始视频时第 1 段一读就崩：
-        # 3045 读 prev_tail_frame、3187 读自身累积的 all_wav、E3 开着时 3095 读
-        # prev_tail_clip。语义与 guide 一样：链首本来就"没有上段"。
+        # 段循环里两处读它：prev_tail_frame（接缝帧差/响度）与 prev_tail_clip
+        # （接缝五维 z 观测）。语义与 guide 一样：链首本来就"没有上段"。
         prev_tail_frame = None   # 上段末帧（成片顺序）
-        prev_tail_clip = None    # 上段末 24 帧（E3 运动 z 用）
+        prev_tail_clip = None    # 上段末 24 帧（接缝五维 z 用）
         prev_tail_wav = None     # 上段末 0.25s 音频（接缝测量/响度对齐用）
         all_wav = None           # 成片音轨累积（首段直接取本段）
 
@@ -2625,7 +2615,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "seeds": [0], "trims": [0], "prompt_hashes": [prologue_hash],
                         "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
-                        "seam_metrics": [None], "seam_refine": seam_refine, "experiments": exp.describe(),
+                        "seam_metrics": [None], "seam_refine": seam_refine,
                         "upscale": proj_upscale,
                         "redo_queue": list(redo_queue),
                         "assets": list(_carry.get("assets") or []),
@@ -2792,24 +2782,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             replay = (use_ckpt and g < done and _redo_mode is None
                       and os.path.exists(checkpoint.seg_path(root, g)))
             next_wants_bridge = _next_wants_bridge(item_i)
-            # 桥区软着陆（实验）预检：段首钉住上段尾，只烧「钉住帧数」而不是整段 ctx 帧。
-            # 预检必须放在 cond 构造之前——seg_len 一旦按某档定死就不能中途改，
-            # 否则 cond 的帧数与裁剪量对不上。任一条件不满足即整段走现状路径。
             # 本段是否接收上段桥：事实首段没有上源；_eff_inject 已内含 unlink（返回 0）。
             _eff_fr, _has_v, _has_a = _eff_inject(i)
             _has_src = not _is_fact_first(item_i) and _eff_fr > 0 and (_has_v or _has_a)
-            _soft_hold = 0
-            if (exp.has("soft_bridge") and _sb_level > 0 and _has_src
-                    and guide is not None
-                    and _redo_mode not in ("仅锚下段", "无锚")):
-                _hf, _ht, _ha = bridge.plan_for_guide(
-                    guide, int(exp.param("soft_bridge", "钉住帧数", 9)))
-                if _ht > 0:
-                    _soft_hold = _hf
-            # skip_f 与采样额外帧数一次定死：回放分支与生成分支共用同一个值。
-            # 软桥段存下的是「段长+hold」帧的 latent，回放时若按 ctx 裁会多裁帧。
+            # skip_f 与采样额外帧数一次定死：回放分支与生成分支共用同一个值
+            # （有源 = 整段 ctx 帧烧进引导桥、可见帧从第 ctx 帧起算；无源 = 两者皆为 0）。
             # 分段优先：本段注入帧数（latent_ref.frames 覆盖全局 ctx）。
-            skip_f, _seg_extra = bridge.resolve_crop(_soft_hold, _eff_fr, _has_src)
+            skip_f = _seg_extra = int(_eff_fr) if _has_src else 0
             # 首帧图段级引用（中段）：头锚 latent——生成段注入 cond，回放段二采补渲染同用
             #（定义在 replay 分支之前：两路都消费；独立镜头段照常注入，本段主动锚）
             # 段级首帧参考图优先（本段自己指定的图），否则回落到链级首帧图头锚
@@ -2821,7 +2800,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         # 否则首帧图在混合模式里根本不生效。
                         and (i > 0 or _seg0_has_refs)) else None)
             _seg_t.update(cond=0.0, sample=0.0, decode=0.0)
-            _soft_note = ""   # 软桥报告后缀（只有采样段装配成功才非空；回放段为空）
             if replay:
                 video_t, audio_t = checkpoint.load_segment(root, g)
                 video_t = video_t.to(video_vae.device)
@@ -2844,7 +2822,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     cur_seed = (seeds[-1] + g - len(seeds) + 1) % 0xffffffffffffffff
                 else:
                     cur_seed = (seed + i) % 0xffffffffffffffff
-                # 软桥：只补「钉住帧数」；现状路径仍补整段 ctx 帧（钉桥 + 裁头）
+                # 本段采样长度 = 可见段长 + 引导桥额外帧数（无源时 _seg_extra=0）
                 seg_len = seg_lengths[i] + _seg_extra
                 if has_refs:
                     # 段级注入：只把本段勾选的素材压实进 conditioning（未勾选的根本不进本段），
@@ -2868,7 +2846,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     out = MiniMaxH3ReferenceToVideo.execute(
                         clip=clip, vae=video_vae, audio_vae=audio_vae,
                         prompt=prompt, width=width, height=height, length=seg_len,
-                        ref_image_size="match", **seg_refs)
+                        ref_image_size=参考图像尺寸, **seg_refs)
                 else:
                     _t = time.perf_counter()
                     out = MiniMaxH3ImageToVideo.execute(
@@ -2969,28 +2947,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if aug > 0.0:
                             cond = _apply_anchor_noise(cond, aug)
 
-                # 桥区软着陆装配：初始 latent 头部写入上段尾 + 逐 token 掩码（video/audio 各一份）。
-                # 装配失败不重来——仍按钉住帧数裁头（形状一致），只是没有钉住效果。
+                # 初始 latent 直用官方空 latent（段首内容由引导桥 cond 承载）。
                 _sampling_latent = latent
-                _soft_note = ""
-                if _soft_hold:
-                    _sb_curve = str(exp.param("soft_bridge", "释放曲线", "hold"))
-                    if _sb_curve not in bridge.CURVES:
-                        _sb_curve = "hold"
-                    try:
-                        _sampling_latent, _sb_mask, _soft_info = bridge.apply_soft_bridge(
-                            latent, eff_guide, _soft_hold, _sb_curve)
-                        skip_f = int(_soft_info["hold_frames"])
-                        _soft_note = (f" · 软桥钉住上段尾 {_soft_info['hold_frames']}帧"
-                                      f"/{_soft_info['hold_tokens']}token"
-                                      f"（音频 {_soft_info['hold_audio_tokens']}token"
-                                      f" · {_sb_curve}）")
-                    except Exception as e:
-                        if "out of memory" in str(e).lower():
-                            raise   # 显存致命：不静默降级，交上层终止并报告
-                        _sampling_latent = latent
-                        skip_f = _soft_hold
-                        _soft_note = f" · 软桥装配失败（{e}），按 {_soft_hold} 帧裁头"
 
                 # 接缝自动重摇：本段生成后若缝差超阈值，换种子重采本段（上限内），
                 # 排除抽卡坏段（同参数下缝差 0.02-0.17 波动大）。cond/latent 与种子
@@ -3000,24 +2958,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 attempt = 0
                 d_raw = None
                 best = None   # (缝差, 结果快照)
-                # 实验 E3：运动感知闭环门控——首采后算一次 flow_z/cam_z，
-                # 若超阈值则触发一次额外重采（动作=重摇/重锚）。全关时 motion_extra
-                # = 0，重摇上限与现状完全一致（零影响）。
-                motion_extra = 0    # 额外触发次数（0 或 1）
-                motion_action = "重摇"
-                e3_z_row = None     # 首采后填入，避免重复计算
-                if exp.has("e3_motion_gate"):
-                    motion_action = str(exp.param("e3_motion_gate", "触发动作", "重摇"))
-                    if motion_action not in ("重摇", "重锚"):
-                        motion_action = "重摇"
                 while True:
-                    # 实验 E3：触发动作=重锚时，第二次采样（attempt==1，首次额外重采）
-                    # 用更硬的锚定（aug 减半），等价于"把段首桥换成更密的受控锚再采"。
-                    # 全关 / 动作非重锚 / attempt==0 时不改动 cond。
-                    if (exp.has("e3_motion_gate") and motion_action == "重锚"
-                            and attempt == 1 and aug > 0.0 and (eff_guide is not None
-                                                               or tail_anchor_latent is not None)):
-                        cond = _apply_anchor_noise(cond, max(0.0, aug * 0.5))
                     # 共存 H3 插件可能丢 keyframe/refs 音频导致 cond_audio 行数错位，
                     # 采样期挂模型层兜底（见 cond_audio_rows_guard），完成后恢复
                     restore_audio_rows = cond_audio_rows_guard(模型.model.diffusion_model)
@@ -3034,8 +2975,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             模型.model.diffusion_model, aug_start, 0.0, fade_ratio)
                     try:
                         t0 = time.perf_counter()
-                        # 软桥开启时传的是装好钉住内容与 noise_mask 的 latent；
-                        # 未开启就是官方空 latent（与现状逐字节一致）
+                        # 初始 latent 是官方空 latent（段首内容由引导桥 cond 承载），
+                        # 与旧版逐字节一致
                         sampled = nodes.common_ksampler(
                             模型, cur_seed, 步数, CFG,
                             采样器, 调度器, cond, negative, _sampling_latent, denoise=1.0)[0]
@@ -3056,71 +2997,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         best = (d_raw, (frames.cpu(), wav.cpu(), sample_rate,
                                         video_t, audio_t, end_t, vis_len,
                                         seg_bridge_score, list(gate_lines), cur_seed))
-                    # 实验 E4：双向过渡重生成——首次采样后（attempt==0）若缝差超阈值，
-                    # 对缝区做 past|transition|future 三窗双锚 + 缝区独占噪声的定向重采样。
-                    # 只改 transition 窗，前后帧不动；E4 优先于整段重摇，E4 后仍不合格再回退。
-                    # 全关 / 独立镜头 / 无缝 / 过渡窗过小 → 跳过（零影响）。
-                    # 软桥段跳过 E4：E4 用「缝区独占纯噪声」重采过渡窗，会把刚钉住的
-                    # 上段尾衔接一并冲掉，与软桥目标相反；软桥缝差本就更小，E4 触发
-                    # 概率也低。两者不叠加，E4 仍是现状路径（无软桥）的兜底。
-                    if (attempt == 0 and exp.has("e4_transition_res")
-                            and not _soft_hold
-                            and prev_tail_frame is not None and not seg_unlink[i]
-                            and d_raw is not None and d_raw > float(重摇阈值)):
-                        _e4_tf = int(exp.param("e4_transition_res", "过渡窗帧数", 17))
-                        _e4_steps = int(exp.param("e4_transition_res", "重生成步数", 20))
-                        _e4_strength = float(exp.param("e4_transition_res", "双锚强度", 1.0))
-                        _e4_result = cls._e4_transition_resample(
-                            模型, clip, cond, negative, latent, video_t, audio_t,
-                            采样器, 调度器, 步数, CFG, cur_seed,
-                            i, skip_f, g, next_wants_bridge,
-                            _decode_crop, prev_tail_frame, qc,
-                            transition_frames=_e4_tf,
-                            resample_steps=_e4_steps,
-                            dual_anchor_strength=_e4_strength,
-                            video_vae=video_vae, audio_vae=audio_vae,
-                            aug=aug, fade_ratio=fade_ratio,
-                            eff_guide=eff_guide, tail_anchor_latent=tail_anchor_latent,
-                            cond_audio_rows_guard=cond_audio_rows_guard,
-                            cond_video_rows_guard=cond_video_rows_guard,
-                            step_cond_noise_guard=step_cond_noise_guard,
-                            _apply_anchor_noise=_apply_anchor_noise,
-                            latent_t_to_frames=latent_t_to_frames,
-                            frames_to_latent_t=frames_to_latent_t,
-                        )
-                        if _e4_result is not None:
-                            frames, wav, sample_rate, video_t, audio_t, end_t, vis_len, \
-                                seg_bridge_score, gate_lines, _e4_d, _e4_lines = _e4_result
-                            d_raw = _e4_d
-                            report.extend(_e4_lines)
-                            report.append(
-                                f"段{g + 1} 过渡重生成：缝差 {d_raw:.3f}（重生成{_e4_steps}步，"
-                                f"过渡窗{_e4_tf}帧，双锚强度{_e4_strength:g}）")
-                    # 实验 E3：首采后算一次运动 z（仅 attempt==0，避免重复开销）。
-                    # 帧差本身未超阈值但 flow_z/cam_z 异常 → 额外触发 1 次重采（动作由参数决定）。
-                    # 全关时 motion_extra 恒为 0，不进入此分支。
-                    if (attempt == 0 and exp.has("e3_motion_gate")
-                            and prev_tail_clip is not None and not seg_unlink[i]):
-                        try:
-                            e3_z_row = metrics.evaluate_local(prev_tail_clip, frames[:48].cpu())
-                        except Exception:
-                            e3_z_row = None
-                        _mz_th = float(exp.param("e3_motion_gate", "运动z阈值", 2.0))
-                        _mtrig, _maction = experiments.e3_motion_trigger(
-                            e3_z_row, _mz_th, motion_action)
-                        if _mtrig and d_raw is not None and d_raw <= float(重摇阈值):
-                            motion_extra = 1
-                            motion_action = _maction
-                            report.append(
-                                f"段{g + 1} 运动门控：{metrics.fmt_seam_z(e3_z_row) or '指标缺失'} "
-                                f"（|z|>{_mz_th:g}σ）→ 触发一次{_maction}")
-                    # 重摇退出条件：帧差达标 且 运动门控无需额外次数（motion_extra 耗尽）
-                    _effective_max = reroll_max + motion_extra
-                    if d_raw is None or (d_raw <= float(重摇阈值) and motion_extra <= 0) \
-                            or attempt >= _effective_max:
+                    # 重摇退出条件：帧差达标，或已用满重摇上限。
+                    if d_raw is None or d_raw <= float(重摇阈值) or attempt >= reroll_max:
                         break
-                    if motion_extra > 0:
-                        motion_extra -= 1
                     attempt += 1
                     cur_seed = (cur_seed + 7919) % 0xffffffffffffffff
                     report.append(f"段{g + 1} 接缝 {d_raw:.3f} > {重摇阈值:g}，自动换种子重摇（{attempt}/{reroll_max}）")
@@ -3149,13 +3028,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 增益不沿链累积；归一化已排除锚定区，此处兜住内容本身的响度差。
             # 独立镜头段跳过（独立镜头常配独立声音设计）
             if (item_i > 0 or off) and prev_tail_wav is not None and not seg_unlink[i]:
-                # 软桥下音频头部与上段尾同帧钉住，接缝已逐帧连续：默认不再叠增益
-                # （强度 0 = 不干预），残留响度差由「音频接缝软过渡」开关按需要回加。
-                _la_strength = 1.0
-                if exp.has("audio_seam"):
-                    _la_strength = float(exp.param("audio_seam", "响度对齐强度", 0.0))
+                # 段首响度对齐：增益去匹配上段尾 RMS（±6dB 钳制 + 1s 渐出），
+                # 不沿链累积；归一化已排除锚定区，此处兜住内容本身的响度差。
+                # 强度由控件的「响度对齐强度」给（1.0=全量，0=完全不对齐）。
+                # 独立镜头/间隔链的段进不来（seg_unlink 已挡）。
                 wav, gain_db = qc.loudness_align_head(wav, prev_tail_wav, rate=sample_rate,
-                                                      strength=_la_strength)
+                                                      strength=float(响度对齐强度))
                 if gain_db is not None:
                     report.append(f"段{g + 1} 响度对齐：段首 {gain_db:+.1f} dB（1s 渐出）")
 
@@ -3258,8 +3136,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           f" · 种子 {seed_txt}" + ("" if replay else f" · 采样 {_seg_t['sample']:.0f}s") + f" | {note}"
                           + (" · 关闭自动引用上段（断链）" if seg_unlink[i] else "")
                           + (" · 首帧图头锚" if _head_kf is not None else "")
-                          + (" · 尾帧图尾锚" if (seg_end_on[i] and end_frame_latent is not None) else "")
-                          + _soft_note)
+                          + (" · 尾帧图尾锚" if (seg_end_on[i] and end_frame_latent is not None) else ""))
             report.append(f"⏱ 段{g + 1}：条件 {_seg_t['cond']:.0f}s · 一采 {_seg_t['sample']:.0f}s"
                           f" · 基础解码 {_seg_t['decode']:.0f}s"
                           + (f" · TE缓存 命中{clip.hits}/未中{clip.misses}" if clip.hits or clip.misses else ""))
@@ -3292,7 +3169,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "prompt_hashes": full_hashes[:done],
                     "total": total,
                     "prompts": prompt_list[:done],
-                    "params": ckpt_params, "seam_refine": seam_refine, "experiments": exp.describe(),
+                    "params": ckpt_params, "seam_refine": seam_refine,
                     "title": proj_title, "created_at": proj_created,
                     "updated_at": time.time(), "finals": list(proj_finals),
                     "upscale": proj_upscale,
@@ -3337,7 +3214,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "prompt_hashes": full_hashes[:done],
                 "total": total,
                 "prompts": prompt_list[:done],
-                "params": ckpt_params, "seam_refine": seam_refine, "experiments": exp.describe(),
+                "params": ckpt_params, "seam_refine": seam_refine,
                 "title": proj_title, "created_at": proj_created,
                 "updated_at": time.time(), "finals": list(proj_finals),
                 "upscale": proj_upscale,
@@ -3692,132 +3569,3 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "minimax_keyframes": merged,
             "minimax_frame_count": sampled_fc,
         })
-
-    @staticmethod
-    def _e4_transition_resample(模型, clip, cond, negative, base_latent, video_t, audio_t,
-                                 采样器, 调度器, total_steps, CFG, seed,
-                                 seg_idx, skip_f, gi, next_wants_bridge,
-                                 _decode_crop, prev_tail_frame, qc,
-                                 transition_frames=17, resample_steps=20,
-                                 dual_anchor_strength=1.0,
-                                 video_vae=None, audio_vae=None,
-                                 aug=0.0, fade_ratio=0.0,
-                                 eff_guide=None, tail_anchor_latent=None,
-                                 cond_audio_rows_guard=None,
-                                 cond_video_rows_guard=None,
-                                 step_cond_noise_guard=None,
-                                 _apply_anchor_noise=None,
-                                 latent_t_to_frames=None,
-                                 frames_to_latent_t=None):
-        """实验 E4：双向过渡重生成（定向重采样，只改缝区 transition 窗）。
-
-        对超阈值缝区构造 past|transition|future 三窗，用双锚（缝前锚+缝后锚）+
-        缝区独占噪声对 transition 窗做低步数重采样。只替换 transition 窗的 latent，
-        前后帧保持不动。
-
-        返回 (frames, wav, sample_rate, video_t, audio_t, end_t, vis_len,
-              seg_bridge_score, gate_lines, new_d, lines)；失败返回 None。
-        失败原因：过渡窗过小、网格对齐失败、past/future 不足等（调用方跳过 E4）。
-        """
-        import torch
-
-        lines = []
-        sampled_fc = latent_t_to_frames(video_t.shape[2])
-        # 三窗划分：seam_index = skip_f（段首裁掉的帧数 = 接缝位置在本段帧坐标系）
-        wins = transition.transition_windows(sampled_fc, skip_f, transition_frames)
-        if wins is None:
-            return None
-        ps, pe, ts, te, fs, fe = wins
-        # 像素帧 -> token 索引（video_t 的 temporal 维度）
-        ps_t = frames_to_latent_t(ps, up=False)
-        pe_t = frames_to_latent_t(pe, up=True)
-        ts_t = frames_to_latent_t(ts, up=False)
-        te_t = frames_to_latent_t(te, up=True)
-        fs_t = frames_to_latent_t(fs, up=False)
-        fe_t = frames_to_latent_t(fe, up=True)
-        T = video_t.shape[2]
-        if ts_t >= te_t or te_t > T or pe_t < ps_t:
-            return None
-
-        # 切出三窗 latent
-        past_lat = video_t[:, :, ps_t:pe_t, :, :] if pe_t > ps_t else None
-        trans_lat = video_t[:, :, ts_t:te_t, :, :]
-        fut_lat = video_t[:, :, fs_t:fe_t, :, :] if fe_t > fs_t else None
-        trans_frames = latent_t_to_frames(te_t - ts_t)
-        if trans_frames < 5:
-            return None
-
-        # 构造双锚 cond：缝前锚=past 末帧（或 eff_guide 本身），缝后锚=future 首帧
-        # 锚定强度通过 aug 控制（dual_anchor_strength 越大锚越硬 = aug 越小）
-        trans_cond = node_helpers.conditioning_set_values(
-            [c[:] for c in cond], {})   # 深拷贝一份 cond，避免污染原 cond
-        dual_kfs = transition.dual_anchor_keyframes(
-            past_lat, fut_lat, ts, te, latent_t_to_frames, frames_to_latent_t)
-        if not dual_kfs:
-            return None
-        # 把双锚 keyframe 的 frame_index 映射到 transition 局部坐标系
-        local_kfs = []
-        for kf in dual_kfs:
-            kf_copy = dict(kf)
-            # resolved_frame_index 是在 transition 窗内的局部帧索引
-            local_idx = max(0, min(trans_frames - 1, int(kf["resolved_frame_index"]) - ts))
-            kf_copy["resolved_frame_index"] = local_idx
-            local_kfs.append(kf_copy)
-        trans_cond = node_helpers.conditioning_set_values(trans_cond, {
-            "minimax_keyframes": local_kfs,
-            "minimax_frame_count": trans_frames,
-        })
-
-        # 双锚强度：用 aug 控制（值越小锚越硬），dual_anchor_strength 越大 → aug 越小
-        if dual_anchor_strength > 0 and _apply_anchor_noise is not None:
-            # strength=1.0 → aug 不变；strength>1 → 锚更硬（aug 减小）
-            e4_aug = max(0.0, aug / max(0.01, dual_anchor_strength))
-            trans_cond = _apply_anchor_noise(trans_cond, e4_aug)
-
-        # 缝区独占噪声：transition 窗用全新随机噪声初始化（与原 latent 完全独立）
-        # 形状对齐 transition 窗的 latent 形状 [B,C,T_trans,H,W]
-        noise_shape = list(trans_lat.shape)
-        trans_noise = torch.randn(noise_shape, device=video_t.device, dtype=video_t.dtype)
-        trans_input = {"samples": trans_noise.clone()}
-
-        # 过渡重采样（低步数）
-        restore_rows = cond_audio_rows_guard(模型.model.diffusion_model) if cond_audio_rows_guard else None
-        # 双锚 keyframe 与参考图共存时同样会撞 0.33.x 的 cond_video_latents 覆盖
-        restore_video_rows = cond_video_rows_guard(模型.model.diffusion_model) \
-            if cond_video_rows_guard else None
-        restore_step = None
-        if fade_ratio > 0 and step_cond_noise_guard is not None and dual_anchor_strength > 0:
-            e4_aug_start = 1.0 - (aug / max(0.01, dual_anchor_strength)) if aug > 0 else 0.999
-            restore_step = step_cond_noise_guard(
-                模型.model.diffusion_model, e4_aug_start, 0.0, fade_ratio)
-        try:
-            sampled = nodes.common_ksampler(
-                模型, seed, resample_steps, CFG,
-                采样器, 调度器, trans_cond, negative, trans_input, denoise=1.0)[0]
-        finally:
-            if restore_rows:
-                restore_rows()
-            if restore_video_rows:
-                restore_video_rows()
-            if restore_step:
-                restore_step()
-
-        # 把重采样后的 transition latent 拼回原 video_t
-        new_video_t = video_t.clone()
-        new_trans = sampled["samples"]
-        # 确保 token 数对齐（采样器可能调整尺寸，取较小值）
-        nt = min(new_trans.shape[2], te_t - ts_t)
-        new_video_t[:, :, ts_t:ts_t + nt, :, :] = new_trans[:, :, :nt, :, :]
-
-        # 重新解码并走桥帧门控（门控结果可能改变 vis_len/end_t）
-        frames, wav, sr, end_t, vis_len, seg_bridge_score, gate_lines = _decode_crop(
-            seg_idx, new_video_t, audio_t, skip_f, gi=gi, next_bridge=next_wants_bridge)
-        new_d = None
-        if prev_tail_frame is not None:
-            new_d = qc.seam_metrics(prev_tail_frame, frames[0])[0]
-        lines.append(
-            f"段{gi + 1} E4：过渡窗 {trans_frames} 帧（token {ts_t}-{te_t}），"
-            f"重采样 {resample_steps} 步，缝差 {new_d:.3f}" if new_d is not None
-            else f"段{gi + 1} E4：过渡窗 {trans_frames} 帧，重采样 {resample_steps} 步")
-        return (frames, wav, sr, new_video_t, audio_t, end_t, vis_len,
-                seg_bridge_score, gate_lines, new_d, lines)

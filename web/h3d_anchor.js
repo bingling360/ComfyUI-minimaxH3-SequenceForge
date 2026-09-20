@@ -357,7 +357,7 @@
     onCb.type = "checkbox";
     onCb.checked = anchor.on !== false;
     onCb.title = "勾=本锚生效；不勾=本锚不注入（配置保留）。注意：段首锚关闭后会回落"
-      + "到默认自动桥（整段 ctx 宽），想连自动桥一起关请用设置页的「跳过自动引用上段」";
+      + "到默认自动桥（整段 ctx 宽），想连自动桥一起关请用卡片外框的「跳过自动引用上段」";
     onCb.onchange = () => { anchor.on = onCb.checked; commit(); };
     head.append(onCb, el("span", "", anchor.on === false ? "（已关）" : "生效中"));
     const del = el("button", "h3d-btn h3d-btn-danger", "✕ 删除");

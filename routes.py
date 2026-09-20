@@ -44,7 +44,6 @@ ROUTES = [
     ("GET", "/h3chain/project"),
     ("GET", "/h3chain/upscale_models"),
     ("GET", "/h3chain/vae_files"),
-    ("GET", "/h3chain/experiments"),
     ("GET", "/h3chain/prompt-rules"),
     ("GET", "/h3chain/optimizer-config"),
     ("POST", "/h3chain/optimize"),
@@ -285,15 +284,6 @@ def add_routes(routes):
         except Exception as e:
             return _err(f"无法列出 VAE 目录：{e}", code="VAE_LIST_FAILED", status=500)
         return web.json_response({"ok": True, "files": list(files or [])})
-
-    async def experiment_defs(request):
-        """实验定义与参数元数据（前端实验面板动态渲染唯一数据源；含后端硬开关状态）。"""
-        try:
-            from . import experiments
-            payload = experiments.experiment_defs_payload()
-        except Exception:
-            payload = {"ok": False, "force_disabled": True, "experiments": []}
-        return web.json_response(payload)
 
     async def upscale_reset(request):
         try:
@@ -2543,7 +2533,6 @@ def add_routes(routes):
         ("GET", "/h3chain/project", project_detail),
         ("GET", "/h3chain/upscale_models", upscale_models),
         ("GET", "/h3chain/vae_files", vae_files),
-        ("GET", "/h3chain/experiments", experiment_defs),
         ("GET", "/h3chain/prompt-rules", prompt_rules),
         ("GET", "/h3chain/optimizer-config", optimizer_config),
         ("POST", "/h3chain/optimize", optimize),

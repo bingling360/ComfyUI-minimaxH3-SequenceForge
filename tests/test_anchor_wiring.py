@@ -21,7 +21,6 @@ def _src(name):
 
 
 NODES = _src("nodes.py")
-EXPS = _src("experiments.py")
 ANCHORS_SRC = _src("anchors.py")
 
 
@@ -97,13 +96,16 @@ def test_apply_guide_call_sites_all_pass_three_args():
         assert len(c.args) == 3 and not c.keywords, ast.unparse(c)[:80]
 
 
-# ---- 实验三件套已并入 anchor ----
+# ---- 实验性功能框架已整体移除 ----
 
-def test_e1_e2_mid_experiments_are_retired():
-    for dead in ("e1_bridge_shard", "e2_memory_anchor", "mid_anchor"):
-        assert f'"{dead}": dict(' not in EXPS, f"{dead} 实验定义仍在"
-    for dead in ("e1_window_kf", "e1_windows", "memory_anchor_positions", "memory_tokens"):
-        assert f"def {dead}(" not in EXPS, f"{dead} 支撑函数仍在"
+def test_experiment_framework_is_gone():
+    """实验性功能已从前端到后端整体移除；只留「响度对齐强度」这一个普通控件。"""
+    for dead in ("experiments.py", "bridge.py"):
+        assert not os.path.exists(os.path.join(ROOT, dead)), f"{dead} 应当已删除"
+    for dead in ("ExperimentContext", "experiments.resolve", "exp.has(", "soft_bridge",
+                 "e3_motion_gate", "e4_transition_res", "audio_seam"):
+        assert dead not in NODES, f"nodes.py 仍有实验残留：{dead}"
+    assert '"响度对齐强度"' in NODES, "响度对齐强度 应当保留为普通控件"
 
 
 def test_memory_anchor_storage_is_retired():
@@ -113,12 +115,11 @@ def test_memory_anchor_storage_is_retired():
     assert "memory_anchor" not in NODES
 
 
-# ---- 实验开关不再触发重做 ----
-
-def test_experiment_switch_no_longer_triggers_rebuild():
-    """实验开关与 steps/cfg 同类：只影响此后新采样的段，不该触发整链重做。"""
+def test_experiment_field_no_longer_in_ckpt_params():
+    """存档指纹里不再有 experiments 键（实验框架已删）。"""
     ck = _src("checkpoint.py")
-    assert "experiments" not in ck, "assert_match 不应再特判 experiments"
+    assert "experiments" not in ck
+    assert 'ckpt_params["experiments"]' not in NODES
 
 
 # ---- 源归一化的三段路 ----

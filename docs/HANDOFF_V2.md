@@ -40,7 +40,7 @@
 
 ## 3. 接口速查（前缀 `/h3chain/`，均含 `/api` 副本）
 
-GET `ping/projects?summary=1/project/upscale_models/experiments`；
+GET `ping/projects?summary=1/project/upscale_models`；
 POST `create_project/save_prompts(+base_revision)/compile/assets/asset_check/latent_slice/latent_delete/trim/delete_project/delete_file/merge/upscale_reset/redo_cancel`。
 冲突一律 `409 {code:REVISION_CONFLICT, server_revision}`，前端刷新重试。
 

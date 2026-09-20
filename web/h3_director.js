@@ -110,70 +110,6 @@ const MODES = [
 const MODE_DEFAULT = "文生视频";
 const MAX_SEG = 64;
 
-/* ---- 实验性功能（唯一权威 = 后端 experiments.py，经 /h3chain/experiments 动态拉取）----
- * 状态存进「导演台状态」JSON 的 ds.experiments（不新增画布控件、不进 paramsSig）。
- * 契约端到端扁平：ds.experiments = {<id>: true, params: {<id>: {...}}, locked?: bool}
- * （locked 为前端 UI 主开关状态键，后端 ExperimentContext 只认 defs 内 id 与 params，自动忽略） */
-const EXP = { defs: null, forceDisabled: false, failed: "", loading: null };
-
-function loadExperimentDefs() {
-    if (EXP.defs || EXP.loading) return EXP.loading;    // 幂等：已缓存/在途不重复拉
-    EXP.failed = "";
-    EXP.loading = apiGet("/h3chain/experiments").then((r) => {
-        if (r.ok && Array.isArray(r.data?.experiments)) {
-            EXP.defs = r.data.experiments;
-            EXP.forceDisabled = !!r.data.force_disabled;
-        } else {
-            EXP.failed = `HTTP ${r.status || "??"}`;
-        }
-        EXP.loading = null;
-        scheduleRefresh(0);                              // defs 到达后触发面板重渲
-    }).catch(() => { EXP.failed = "network"; EXP.loading = null; scheduleRefresh(0); });
-    return EXP.loading;
-}
-
-function defaultExperiments(defs = EXP.defs) {
-    const out = { params: {} };
-    for (const e of defs || []) {
-        const pd = {};
-        for (const p of e.params || []) pd[p.key] = p.def;
-        out.params[e.id] = pd;
-    }
-    return out;
-}
-
-/* 扁平归一：defs 未到达时宽进（布尔 true 键与参数字典原样保留，避免 defs 到达前的
- * 早窗口期 setDs 把已存参数清掉；未知 id 交给后端过滤）；
- * defs 到达后严进（只认已知 id），参数按 defs 元数据钳位/白名单；
- * locked 键透传（前端主开关 UI 状态）。 */
-function normalizeExperiments(raw, defs = EXP.defs) {
-    const out = defaultExperiments(defs);
-    if (!raw || typeof raw !== "object") return out;
-    if (typeof raw.locked === "boolean") out.locked = raw.locked;
-    for (const [k, v] of Object.entries(raw)) {
-        if (k === "params" || k === "locked" || v !== true) continue;
-        if (defs && !defs.some((e) => e.id === k)) continue;
-        out[k] = true;
-    }
-    const rp = raw.params && typeof raw.params === "object" ? raw.params : {};
-    if (!defs) {
-        out.params = JSON.parse(JSON.stringify(rp));   // 宽进：参数字典深拷贝透传
-        return out;
-    }
-    for (const e of defs) {
-        const src = rp[e.id] && typeof rp[e.id] === "object" ? rp[e.id] : {};
-        for (const p of e.params || []) {
-            if (p.type === "num") {
-                const n = Number(src[p.key]);
-                out.params[e.id][p.key] = isFinite(n) ? Math.min(p.max, Math.max(p.min, n)) : p.def;
-            } else if (p.opts && p.opts.includes(src[p.key])) {
-                out.params[e.id][p.key] = src[p.key];
-            }
-        }
-    }
-    return out;
-}
-
 let miniBox = null;
 let desk = null;
 let pendingReset = false;
@@ -1763,7 +1699,7 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", end_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], redo_segs: [], upscale: defaultUpscale(), experiments: defaultExperiments() };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", end_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], redo_segs: [], upscale: defaultUpscale() };
 }
 
 function defaultUpscale() {
@@ -2034,7 +1970,6 @@ function getDs(node) {
                 .filter((x) => x && typeof x === "object" && Number.isInteger(Number(x.slot)))
                 .map((x) => ({ slot: Number(x.slot), mode: REDO_MODES.some((r) => r[0] === x.mode) ? x.mode : "双锚" })),
             upscale,
-            experiments: normalizeExperiments(raw.experiments),
             /* AI优化配置与历史（自研后端）：透存，不进后端指纹 */
             optimizer: (raw.optimizer && typeof raw.optimizer === "object") ? raw.optimizer : null,
             opt_hist: (raw.opt_hist && typeof raw.opt_hist === "object") ? raw.opt_hist : null,
@@ -2056,7 +1991,6 @@ function setDs(node, ds) {
         ds.ref_images = ds.ref_assets.filter((a) => (a.kind || "image") === "image" && a.file)
             .map((a) => String(a.file));
     }
-    /* 实验开关已是端到端扁平契约 {<id>:true, params:{...}}，直接序列化即存档格式 */
     w.value = JSON.stringify(ds);
     if (typeof w.callback === "function") {
         try { w.callback(w.value); } catch (e) { /* callback 可选 */ }
@@ -3353,12 +3287,12 @@ let _optBusy = null;
 const _optRulesCache = { loaded: false, files: {} };
 
 /** AI 扩写优化设置的默认值（段卡「AI扩写+优化」按钮用，配置在 AI 优化设置里）。
- *  以前这些参数在扩写弹窗里（填完才跑），现在弹窗没了，统一住进 ds.optimizer。 */
+ *  以前这些参数在扩写弹窗里（填完才跑），现在弹窗没了，统一住进 ds.optimizer。
+ *  「每段时长范围」已删：前端只剩单段扩写（segment_count:1），请求里的时长锁死为
+ *  本段时长（见 runExpandOptimizeForSegment），这个范围没有任何消费方。 */
 function optDefaultExpandSettings() {
     return {
         style: "balanced",            // strict / balanced / creative
-        seconds_min: 4,               // 每段时长下限（模型在范围内自定秒数）
-        seconds_max: 15,              // 每段时长上限
         then_optimize: true,          // 扩写后接着做提示词优化（关掉 = 只扩写不优化）
     };
 }
@@ -4290,20 +4224,9 @@ async function openOptSettings(node, onSaved) {
         ["balanced", "均衡（可补光位与材质）"],
         ["creative", "创意（可补 1 个视觉细节）"]]) exStyle.append(new Option(l, v));
     exStyle.value = ["strict", "creative"].includes(ex.style) ? ex.style : "balanced";
-    const exMin = el("input", ""); exMin.type = "number";
-    exMin.min = "4"; exMin.max = "15"; exMin.step = "1";
-    exMin.value = String(Math.max(4, Math.min(15, Number(ex.seconds_min) || 4)));
-    const exMax = el("input", ""); exMax.type = "number";
-    exMax.min = "4"; exMax.max = "15"; exMax.step = "1";
-    exMax.value = String(Math.max(4, Math.min(15, Number(ex.seconds_max) || 15)));
     const exThen = el("input", ""); exThen.type = "checkbox";
     exThen.checked = ex.then_optimize !== false;
-    const exRange = el("div", "h3d-opt-inline");
-    exRange.append(exMin, el("span", "", "–"), exMax, el("span", "", "秒"));
     row("扩写风格", exStyle);
-    const exRangeRow = el("label", "h3d-opt-row");
-    exRangeRow.append(el("span", "", "每段时长范围"), exRange);
-    dialog.append(exRangeRow);
     const exChecks = el("div", "h3d-opt-checks");
     {
         const lb = el("label", "");
@@ -4378,9 +4301,15 @@ async function openOptSettings(node, onSaved) {
     if (!model.value) model.value = current.model || "";
     protocol.value = ["openai", "responses", "gemini"].includes(current.protocol) ? current.protocol : "openai";
     provider.addEventListener("change", () => {
+        /* prev 是「上一次选中的服务商」，**必须即用即写回**。
+         * 少这一行时 dataset.prev 永远是初始值（默认 glm）：每次切换都把当前框里的
+         * 模型名存进**初始服务商**的记忆槽 —— 智谱的槽被别家的模型名逐次覆盖，
+         * 于是切回智谱看到的是上一个服务商的模型（其余服务商因为槽位从没被写过，
+         * 每次都回落预设默认名，反倒"看起来正常"）。 */
         const prev = provider.dataset.prev || current.provider || "glm";
         apiKeys[prev] = key.value;
         providerModels[prev] = model.value;
+        provider.dataset.prev = provider.value;
         key.value = apiKeys[provider.value] || "";
         applyPreset(provider.value);
         keyHint();
@@ -4448,16 +4377,9 @@ async function openOptSettings(node, onSaved) {
             /* AI 扩写优化设置（段卡「AI扩写+优化」按钮的参数） */
             expand: {
                 style: exStyle.value,
-                seconds_min: Math.max(4, Math.min(15, Number(exMin.value) || 4)),
-                seconds_max: Math.max(4, Math.min(15, Number(exMax.value) || 15)),
                 then_optimize: exThen.checked,
             },
         };
-        if (body.expand.seconds_max < body.expand.seconds_min) {
-            const t = body.expand.seconds_min;
-            body.expand.seconds_min = body.expand.seconds_max;
-            body.expand.seconds_max = t;
-        }
         if (body.mode === "local" && !body.local_model) { alert("请先选择一个本地视觉模型"); return; }
         /* Key 留空**不算错**：服务端可能内置了 Key（hasDefaultKey），此时留空
          * 就是"用内置的"。只有既没填、服务端也没有，才拦。 */
@@ -5320,7 +5242,6 @@ async function collectData() {
         }
         const um = await apiGet("/h3chain/upscale_models");
         if (um.ok) upscaleModels = um.data?.models || [];
-        loadExperimentDefs();    // 实验定义随刷新周期尽早到达（函数自身幂等）
     }
     setApiError(ping.ok ? "" :
         `项目存档接口未注册（HTTP ${ping.status || "??"}）：请重启 ComfyUI 并检查控制台是否出现`
@@ -5746,6 +5667,8 @@ function injectStyles() {
 .h3d-setsec{display:flex;flex-direction:column;gap:7px;margin-top:10px}
 .h3d-setsec-title{font-size:11px;font-weight:600;color:var(--h3d-copper);letter-spacing:.3px;border-bottom:1px solid #37332b;padding-bottom:4px}
 .h3d-setrow{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}
+/* 段级两个开关的外框行（不在任何页签里）：与下方 AI 优化设置条留一点间距 */
+.h3d-pubswitch{margin:0 0 8px}
 .h3d-refrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:7px 8px;border:1px solid #37332b;border-radius:7px;background:#181712}
     .h3d-refrow>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
     /* 有引用 → 整条转绿：chip 一多，"本段到底挂没挂素材"靠逐个找太慢 */
@@ -5850,6 +5773,9 @@ function injectStyles() {
     .h3d-updet summary::before{content:"✦ "}
     .h3d-updet.on{border-color:#316dca80;box-shadow:inset 0 0 0 1px #316dca26}
     .h3d-updet[open] summary{color:#9ecbff}
+    /* 二采的两个子面板（基础/高级）：与外框拉开层次，各自默认收起 */
+    .h3d-upsub{margin:8px 10px 0;border-color:#2c4a52}
+    .h3d-upsub summary{padding:7px 10px}
     .h3d-upwarn{grid-column:1/-1;padding:7px 10px;border:1px solid #9a4144;border-radius:7px;background:#402227;color:#f0a0a4;font-size:11.5px;line-height:1.6}
     .h3d-param{margin:0}
     .h3d-param .h3d-hint{display:block;margin-top:4px}
@@ -5891,26 +5817,6 @@ function injectStyles() {
     .h3d-param label{display:block;margin-bottom:4px;color:var(--h3d-muted);font-size:11px}
     .h3d-select,.h3d-seedrow input{width:100%;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:6px 7px;font-size:12px;outline:none;font-family:inherit}
     .h3d-select:focus,.h3d-seedrow input:focus{border-color:#a8d8bd}
-    /* 实验性功能面板 */
-    .h3d-expsec{padding-bottom:14px}
-    .h3d-exp-sec{margin:0 0 4px}
-    .h3d-exp-sec>summary{display:flex;gap:8px;align-items:center;padding:10px 12px;cursor:pointer;list-style:none;user-select:none;flex-wrap:wrap}
-    .h3d-exp-sec>summary::-webkit-details-marker{display:none}
-    .h3d-exp-sec>summary::before{content:"▸";color:var(--h3d-muted);font-size:11px}
-    .h3d-exp-sec[open]>summary::before{content:"▾";color:var(--h3d-cyan)}
-    .h3d-exp-sec>summary small{color:var(--h3d-muted);font-weight:400}
-    .h3d-exp-sec>summary .h3d-btn{margin-left:auto}
-    .h3d-exp-ban{margin:8px 12px 0;padding:7px 10px;border:1px solid #9a4144;border-radius:7px;background:#402227;color:#f0a0a4;font-size:11.5px;line-height:1.6}
-    .h3d-exp-card{margin:8px 12px 0;border:1px solid #332f27;border-radius:9px;background:#1b1a16;overflow:hidden}
-    .h3d-exp-card.on{border-color:#3f6b52;box-shadow:inset 3px 0 0 var(--h3d-cyan)}
-    .h3d-exp-head{display:flex;gap:8px;align-items:center;padding:9px 10px}
-    .h3d-exp-head input[type=checkbox]{accent-color:#7fc79f;width:15px;height:15px;cursor:pointer}
-    .h3d-exp-head input[type=checkbox]:disabled{opacity:.35;cursor:not-allowed}
-    .h3d-exp-head strong{font-size:12px;flex:1;min-width:0}
-    .h3d-exp-desc{display:block;padding:0 10px 9px;color:var(--h3d-muted);font-size:11px;line-height:1.55}
-    .h3d-exp-params{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px;border-top:1px solid #2a261f}
-    .h3d-exp-params .h3d-param{margin:0}
-    .h3d-exp-params .h3d-param label{font-size:10px}
     .h3d-seedrow{display:flex;gap:5px}
     .h3d-seedrow input{flex:1;min-width:0}
     .h3d-seedrow input::-webkit-outer-spin-button,.h3d-seedrow input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
@@ -6156,10 +6062,9 @@ function openDesk() {
     colC.append(cHead);
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
-    const rExp = el("section", "h3d-rsec h3d-expsec");
     const rUpscale = el("section", "h3d-rsec h3d-upsec");
     const rHist = el("section", "h3d-rsec h3d-hsec");
-    colR.append(rParams, rExp, rUpscale, rHist);
+    colR.append(rParams, rUpscale, rHist);
     stage.append(colL, colC, colR);
 
     /* 页脚 */
@@ -6178,7 +6083,7 @@ function openDesk() {
             project: sub,
             colC,
             lProj,
-            rParams, rExp, rUpscale, rHist,
+            rParams, rUpscale, rHist,
             footInfo, run,
             zoneErr,
         },
@@ -6295,16 +6200,6 @@ function updateDesk(data) {
         z.rParams.dataset.sig = psig;
         runZone("链参数", () => renderParamsZone(z.rParams, data));
     }
-    /* 实验性功能面板（ds.experiments 驱动；编辑动作经 setExp* -> repaintExperiments() 即时重渲，
-     * 不走此守卫；此处守卫仅为保护「全局刷新时区内有输入框正在打字」不丢焦；defs 到达/失败/硬开关变化也触发。
-     * !!node 必须进签名：面板曾在节点未就绪时渲染过「画布上未找到节点」，节点随后可用若
-     * 签名不变则永不重建（experiments 全空时两头签名相同），须先做点别的操作才能显示 */
-    const esig = JSON.stringify([data.ds?.experiments ?? {},
-        EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed, !!data.node]);
-    if (!z.rExp.contains(document.activeElement) && z.rExp.dataset.sig !== esig) {
-        z.rExp.dataset.sig = esig;
-        runZone("实验功能", () => renderExperimentsZone(z.rExp, data));
-    }
     const usig = upscaleSig(data);
     if (!z.rUpscale.contains(document.activeElement) && z.rUpscale.dataset.sig !== usig) {
         z.rUpscale.dataset.sig = usig;
@@ -6339,7 +6234,7 @@ function renderLeftColumn(sec, data) {
         const hint = el("div", "h3d-autohint");
         hint.append(el("div", "",
             "「存档目录」为空：保存按画布参数指纹自动开项目——参数（画幅/每段时长/"
-            + "步数/CFG/采样器/门控/递减锚定/实验开关等）一变就换新项目，不变则续用同一个。"
+            + "步数/CFG/采样器/门控/递减锚定等）一变就换新项目，不变则续用同一个。"
             + (state?.dir ? `上次运行存入 ${escapeHtml(state.dir)}。` : "")
             + "固定项目：读档任一项目，或点下方按钮。"));
         if (state?.dir) {
@@ -6799,11 +6694,13 @@ function framePictureNumbers(ds, segIdx) {
     }
 }
 
-/** 把一张已落盘的图片补进节点素材池（幂等，按 file 去重）。
+/** 把一份已落盘的素材补进节点素材池（幂等，按 file 去重）。
  *  必须补：ds.ref_assets 是 persistPool 写回 manifest["assets"] 的**唯一来源**，
  *  上传完不补进去，下一次任何"写资产清单"的动作都会按旧池整表覆盖，
- *  于是"刚传的图没了 / 传一张顶掉上一张"。 */
-function pushPoolAsset(node, file, label) {
+ *  于是"刚传的图没了 / 传一张顶掉上一张"。
+ *  kind 由调用方给（缺省 image）：素材池按 kind 分号（图片N/视频N/音频N）与分
+ *  9/3/3 限额，标错类会让引用条与编译一起错位。 */
+function pushPoolAsset(node, file, label, kind = "image") {
     const f = String(file || "").trim();
     if (!f) return false;
     const ds = getDs(node);
@@ -6824,7 +6721,7 @@ function pushPoolAsset(node, file, label) {
     }
     /* 标注（图片1 / 视频1 / 音频1）：按现有池子顺延编号，不回收旧号 */
     const withMark = assignMarks([...ds.ref_assets, {
-        file: f, kind: "image", label: lbl.slice(0, 24), asset_id: "", roles: [],
+        file: f, kind, label: lbl.slice(0, 24), asset_id: "", roles: [],
         /* 引用名取落盘文件名的 basename（含后缀）——它就是用户写进提示词的名字 */
         ref_name: cleanRefName(f) || lbl,
     }]);
@@ -8189,6 +8086,12 @@ function buildCards(data) {
                 tabbar.append(b);
             }
             body.append(tabbar);
+            /* 段级两个开关（跳过自动引用上段 / 跳过自动按序生成）也放**三页之外**的
+             * 公共区：它们既不是「提示词的引用」，也不是「锚定设置」页里的锚点参数，
+             * 而是"本段是否参与链路"的开关 —— 藏进页签里就要翻页才看得见。
+             * 容器先挂上，内容在下方 seg 快照就绪处填（那里才有本段状态）。 */
+            const pubSwitchRow = el("div", "h3d-setrow h3d-pubswitch");
+            body.append(pubSwitchRow);
             /* AI 优化设置放在**三页之外**的公共区：它是全链共用的一套（服务商 /
              * 输出语言 / 规则文件），跟「锚定设置」页里的本段开关不是一回事。
              * 以前挂在意图框里，既容易误点，也让人以为只对这段生效。 */
@@ -8350,7 +8253,63 @@ function buildCards(data) {
                 }
                 scheduleRefresh(60);
             };
-            aiBar.append(bExpandOpt, bOptRun, bResolve);
+            /* ---- ⬆ 上传素材：与素材库「上传到项目资产」**同一条通道**
+             * （H3Assets.uploadDirect + dest=project + link_dir=项目目录）。
+             * 上传即入池：ds.ref_assets 是写回 manifest["assets"] 的唯一来源，
+             * 不补进去，后面任何一次写清单都会按旧池整表覆盖，把刚传的抹掉。 */
+            const bUpload = el("button", "h3d-btn", "⬆ 上传素材");
+            bUpload.type = "button";
+            bUpload.disabled = !canEdit;
+            bUpload.title = "上传图片 / 视频 / 音频到本项目 assets/ 并登记进清单——"
+                + "与素材库「上传到项目资产」同一条通道（只落项目一份，不往全局库复制）。\n"
+                + "传完即可在正文里写 @别名 引用；要跨项目复用请去素材库点「存入全局库」。";
+            bUpload.onclick = () => {
+                if (!node || it.idx === undefined) return;
+                const dir = getDirValue(node);
+                if (!dir) { setLed("warn", "当前没有项目：先在左栏读档或新建项目，再上传素材"); return; }
+                const H3Assets = window.H3Assets;
+                if (!H3Assets?.uploadDirect) { setLed("err", "上传接口不可用（请更新插件）"); return; }
+                const inp = document.createElement("input");
+                inp.type = "file";
+                inp.multiple = true;
+                inp.onchange = async () => {
+                    const files = [...(inp.files || [])];
+                    if (!files.length) return;
+                    bUpload.disabled = true;
+                    const oldTxt = bUpload.textContent;
+                    bUpload.textContent = "上传中…";
+                    let ok = 0;
+                    const failed = [];
+                    for (const f of files) {
+                        try {
+                            const kind = H3Assets.guessKind(f);
+                            const res = await H3Assets.uploadDirect(f, {
+                                kind, dest: "project", link_dir: dir,
+                            });
+                            if (!res?.ok) throw new Error("上传返回异常");
+                            const file = res?.mirrored?.file || res?.stored?.file || "";
+                            if (!file) throw new Error(res?.mirror_error || "上传后没拿到项目内路径");
+                            const rel = String(file).startsWith("assets/")
+                                ? file : `assets/${String(file).split("/").pop()}`;
+                            pushPoolAsset(node, rel, res?.stored?.label || "", kind);
+                            ok++;
+                        } catch (e) { failed.push(`${f.name}（${e?.message || e}）`); }
+                    }
+                    bUpload.disabled = false;
+                    bUpload.textContent = oldTxt;
+                    if (!ok) { setLed("err", `上传失败：${failed.slice(0, 3).join("、")}`); return; }
+                    /* 立刻按最新 manifest 重建池并刷新（不等 240ms 轮询）：
+                     * 否则出现「传了没反应、切一下屏又好了」。 */
+                    try { await hydratePool(true); } catch (e) { /* 忽略 */ }
+                    setLed(failed.length ? "warn" : "done",
+                        `已上传 ${ok} 个到项目 assets/`
+                        + (failed.length ? `；${failed.length} 个失败：${failed.slice(0, 3).join("、")}` : "")
+                        + "——正文里写 @别名 即可引用");
+                    scheduleRefresh(120);
+                };
+                inp.click();
+            };
+            aiBar.append(bExpandOpt, bOptRun, bResolve, bUpload);
             pResult.body.append(aiBar);
             /* 工具条：原稿切换 / 结构化弹窗（paintOptbar 填）。
              * 挂在 paneMain 上、pResult.body 之外 —— 放进结果框里的话
@@ -8475,12 +8434,12 @@ function buildCards(data) {
                     secGen.append(row);
                 }
 
-                /* 两个开关并成一行。语义取**反向勾选**（用户拍板）：勾选 = 跳过，
-                 * 不勾 = 跟随全局默认开——「跟随全局」从来不是一个可点按钮该表达的
-                 * 状态，它只是"没勾"本身；旧版勾选框（自动引用上段）+旁置按钮的
-                 * 三件套让人分不清勾的到底是"开"还是"跟全局"。
+                /* 两个开关并成一行，落在**卡片外框的公共区**（pubSwitchRow，见上方
+                 * body.append(tabbar) 处）—— 它们不属于任何一页。语义取**反向勾选**
+                 * （用户拍板）：勾选 = 跳过，不勾 = 跟随全局默认开——「跟随全局」
+                 * 从来不是一个可点按钮该表达的状态，它只是"没勾"本身；旧版勾选框
+                 * （自动引用上段）+旁置按钮的三件套让人分不清勾的到底是"开"还是"跟全局"。
                  * 数据仍是三态：不勾写 null（跟随全局），勾写显式 false（跳过）。 */
-                const swRow = el("div", "h3d-setrow");
                 // —— 跳过自动引用上段（勾 = 与上段断链硬切；不勾 = 跟随全局，默认无缝续拍） ——
                 const refRow = el("label", "h3d-unlink h3d-offrow");
                 const refCb = document.createElement("input");
@@ -8508,8 +8467,7 @@ function buildCards(data) {
                     setSegmentField(node, it.idx, "disabled", seqCb.checked);
                     scheduleRefresh(60);
                 };
-                swRow.append(refRow, seqRow);
-                secGen.append(swRow);
+                pubSwitchRow.append(refRow, seqRow);
 
                 /* —— 本段 latent 保存（null=跟随默认「全存」）——
                  * 落盘策略的底层是 {mode: all|range|tail|off, start_f, end_f, tail_f,
@@ -8756,18 +8714,21 @@ function labeledAssetCard(node, ds, idx) {
 /* assetCard / labeledAssetCard / syncMirrors（画布镜像）保留复用。 */
 
 /* ---- 链参数（面板直写画布控件）：基础设置 + 视频延续（关键帧设置/检测重摇） ----
- * 基础设置 = 原生工作流画幅/时长/采样类；视频延续 = 段间引导相关（大折叠套两子折叠，
- * 大小均可伸缩）。ADVANCED_DEFS 保持全量（paramsSig/旧逻辑兼容口径）。 */
+ * 基础设置 = 原生工作流画幅/时长/采样类 + 链路存档策略（审片/自动保存/自动成片）
+ * + 参考图像尺寸；视频延续 = 段间引导相关（大折叠套两子折叠）。
+ * 「存档目录」「重跑起始段」不再在导演台露出（项目与续跑由导演台自己管）——
+ * 节点控件与后端逻辑照旧保留，只是不占界面。
+ * ADVANCED_DEFS 保持全量（paramsSig/旧逻辑兼容口径），新增控件都要登记进去，
+ * 否则改它不会触发面板重建。 */
 const BASIC_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数", "CFG", "采样器", "调度器",
-    "一采编码", "存档目录", W_WIDTH, W_HEIGHT];
-const KEYFRAME_DEFS = ["引导帧数", "锚定加噪", "递减锚定", "审片模式",
-    "自动保存", "自动成片", "重跑起始段"];
+    "一采编码", "审片模式", "自动保存", "自动成片", "参考图像尺寸", W_WIDTH, W_HEIGHT];
+const KEYFRAME_DEFS = ["引导帧数", "锚定加噪", "递减锚定", "响度对齐强度"];
 const SEAM_DEFS = ["桥帧门控", "清晰度阈值", "回退上限",
     "接缝重摇", "重摇阈值", "重摇上限"];
 const PRIMARY_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数"];
 const ADVANCED_DEFS = [
     "引导帧数", "CFG", "采样器", "调度器",
-    "存档目录", "审片模式", "自动保存", "自动成片", "重跑起始段", "一采编码",
+    "审片模式", "自动保存", "自动成片", "一采编码", "参考图像尺寸", "响度对齐强度",
     "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
     "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
     W_WIDTH, W_HEIGHT,
@@ -8849,10 +8810,10 @@ function renderParamsZone(sec, data) {
         return;
     }
     const ar = String(getWidgetValue(node, W_AR) ?? "");
-    /* —— 基础设置（原生画幅/时长/采样类，默认展开） —— */
+    /* —— 基础设置：**唯一默认展开**的一栏（其余栏与子面板初始一律收起） —— */
     const basic = el("details", "h3d-adv");
     basic.open = true;
-    basic.innerHTML = "<summary>📐 基础设置（分辨率 / 时长 / 采样器 / 调度器）</summary>";
+    basic.innerHTML = "<summary>📐 基础设置（分辨率 / 时长 / 采样器 / 存档与成片）</summary>";
     const bgrid = el("div", "h3d-adv-grid");
     for (const name of BASIC_DEFS) {
         if (name === W_WIDTH || name === W_HEIGHT) {
@@ -8872,14 +8833,14 @@ function renderParamsZone(sec, data) {
     }
     basic.append(bgrid);
     sec.append(basic);
-    /* —— 视频延续（大折叠套两子折叠，大小均可伸缩） —— */
+    /* —— 视频延续（大折叠套两子折叠；除基础设置外一律默认收起） —— */
     const cont = el("details", "h3d-adv");
-    cont.open = true;
+    cont.open = false;
     cont.innerHTML = "<summary>🔗 视频延续（段间引导 / 关键帧 / 接缝）</summary>";
     const cwrap = el("div", "h3d-adv-grid");
     const kf = el("details", "h3d-adv");
     kf.open = false;
-    kf.innerHTML = "<summary>📌 关键帧设置（尾部保存 / 注入帧数 / 加噪 / 自动保存成片）</summary>";
+    kf.innerHTML = "<summary>📌 关键帧设置（尾部保存 / 注入帧数 / 加噪 / 响度对齐）</summary>";
     const kgrid = el("div", "h3d-adv-grid");
     for (const name of KEYFRAME_DEFS) kgrid.append(renderWidgetField(node, name));
     kgrid.append(el("div", "h3d-hint",
@@ -8898,66 +8859,7 @@ function renderParamsZone(sec, data) {
         "「锚定设置」里同名子选项按段覆盖此处（分段优先）；「生成模式」由左侧模式条控制。"));
 }
 
-/* ---- 实验性功能面板（右栏，ds.experiments 扁平契约 {<id>:true, params:{...}} 驱动） ---- */
-
-function expActiveList(ex) { return Object.keys(ex || {}).filter((k) => ex[k] === true); }
-
-/* 主开关锁定态：ds JSON 里的 locked 键优先；缺省时 有开启=解锁 / 全关=锁定。
- * locked 持久化进 ds JSON（后端 ExperimentContext 只认 defs 内 id 与 params，自动忽略该键），
- * 保证刷新页面后「启用实验功能」的解锁选择不丢失。 */
-function expLocked(ex) {
-    if (ex && typeof ex.locked === "boolean") return ex.locked;
-    return expActiveList(ex).length === 0;
-}
-
-/* 落盘实验开关/参数并联动重渲面板（切换实验组合由后端指纹判整链重做） */
-function setExpOn(node, id, on) {
-    const ds = getDs(node);
-    if (on) ds.experiments[id] = true;
-    else delete ds.experiments[id];
-    setDs(node, ds);
-    repaintExperiments();        // 勾选后参数区当场出现（任意编辑动作即时重渲）
-}
-
-function setExpParam(node, id, key, value) {
-    const ds = getDs(node);
-    (ds.experiments.params[id] = ds.experiments.params[id] || {})[key] = value;
-    setDs(node, ds);
-    repaintExperiments();
-}
-
-/* 主开关：true=锁定（全部关闭并禁用子项），false=解锁（子项可勾选，仍保持全关） */
-function setExpLocked(node, locked) {
-    const ds = getDs(node);
-    if (locked) for (const id of expActiveList(ds.experiments)) delete ds.experiments[id];
-    ds.experiments.locked = !!locked;
-    setDs(node, ds);
-    repaintExperiments();   // 任意编辑动作即时重渲（绕过 updateDesk 焦点守卫）
-}
-
-/* 实验面板局部重渲：编辑动作（勾选/改参/主开关）后即时反映，不依赖全局 refresh，
- * 因而绕过 updateDesk 的「焦点在区内则不重建」守卫——那些守卫是为保护全局刷新时
- * 正在输入的文本框而设；而此处都是「提交型」编辑：勾选框提交后即重建无妨，数值输入
- * 走 onchange（提交时焦点本就离开）。直接读画布控件，零网络往返，点一下当场更新
- * （参数区出现 / 父级徽章计数 / 子项禁用态）。父级 <details> 折叠态由 renderExperimentsZone 自身保留。
- * 同步更新 rExp.dataset.sig，避免紧随的全局 refresh 因签名已一致而重复重建。 */
-function repaintExperiments() {
-    if (!desk) return;
-    const z = desk.zones;
-    if (!z.rExp) return;
-    try {
-        const node = findNode();
-        const ds = node ? getDs(node) : {};
-        const esig = JSON.stringify([ds?.experiments ?? {},
-            EXP.defs ? EXP.defs.length : 0, EXP.forceDisabled, EXP.failed, !!node]);
-        z.rExp.dataset.sig = esig;   // 与 updateDesk 同公式，防止后续全局刷新重复重建
-        renderExperimentsZone(z.rExp, { node });
-    } catch (e) {
-        console.warn("[h3-director] repaintExperiments failed:", e);
-    }
-}
-
-/* 二采/链参数面板局部重渲：与 repaintExperiments 同款机制，修「编辑后界面不动」。
+/* 二采/链参数面板局部重渲：提交型编辑当场重建，修「编辑后界面不动」。
  * 病根：数值/下拉的 onchange 以回车提交时焦点仍在区内控件上，updateDesk 的焦点守卫
  * 会跳过重渲，且此后没有事件再触发刷新——目标画布徽章、换算徽章、「已开启」角标
  * 就一直停留旧值。此处改为提交型编辑当场重建：直读画布控件零网络往返；
@@ -8993,111 +8895,6 @@ function repaintAfterWidget(name) {
     if (name !== W_AR && name !== W_MP && name !== W_WIDTH && name !== W_HEIGHT) return;
     repaintParams();
     repaintUpscale();
-}
-
-function renderExperimentsZone(sec, data) {
-    const { node } = data;
-    // 重渲前记住父级折叠态，避免每次 setDs 触发的重渲把面板弹回默认
-    const wasOpen = sec.querySelector("details.h3d-exp-sec")?.open;
-    sec.replaceChildren();
-    if (!node) {
-        sec.append(el("div", "h3d-empty", "画布上未找到节点，实验性功能面板不可用"));
-        return;
-    }
-    loadExperimentDefs();   // 兜底触发（幂等）
-    const ds = getDs(node);
-    const ex = ds.experiments || {};
-    const active = expActiveList(ex).length;
-    const locked = expLocked(ex);
-
-    // 父级单 <details> 折叠（与「高级设置」一致）；子卡不折叠
-    const det = el("details", "h3d-exp-sec");
-    det.open = wasOpen ?? active > 0;          // 首次：有开启项默认展开，全关默认收起
-    const sum = document.createElement("summary");
-    sum.insertAdjacentHTML("beforeend",
-        "<strong>🧪 实验性功能</strong><small>生成期干预 · 默认全关 · 逐项试效果再试组合</small>");
-    if (active) sum.insertAdjacentHTML("beforeend", badge(`开启 ${active} 项`, "cyan"));
-    // 主开关：永远真实可按（不用 disabled 属性）；点在 summary 里须阻止折叠联动
-    const msbtn = el("button", "h3d-btn " + (locked ? "h3d-btn-cyan" : "h3d-btn-warn"),
-        locked ? "▶ 启用实验功能" : `✕ 全部关闭（当前${active}项）`);
-    msbtn.title = locked
-        ? "解锁下方实验复选框（仍保持全关，逐项手动开启）"
-        : "一键关闭所有实验并锁定复选框；不同实验组合会触发对应段重新生成（后端指纹），结论请用同一项目文件夹对比。";
-    msbtn.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); setExpLocked(node, !locked); };
-    sum.append(msbtn);
-    det.append(sum);
-
-    if (EXP.forceDisabled) {
-        det.append(el("div", "h3d-exp-ban",
-            "后端已强制关闭实验性功能（H3_EXPERIMENTS=0），以下开关不生效。"));
-    } else if (!EXP.defs) {
-        det.append(el("div", "h3d-empty", EXP.failed
-            ? `实验定义拉取失败（${EXP.failed}）：请确认后端已重启、路由已注册。`
-            : "实验定义加载中…"));
-        if (EXP.failed) {
-            const retry = el("button", "h3d-btn", "重试");
-            retry.onclick = () => { EXP.failed = ""; loadExperimentDefs(); };
-            det.append(retry);
-        }
-    } else {
-        for (const e of EXP.defs) {
-            const isOn = ex[e.id] === true;
-            const card = el("div", "h3d-exp-card" + (isOn ? " on" : ""));
-            const head = el("div", "h3d-exp-head");
-            const cb = document.createElement("input");
-            cb.type = "checkbox";
-            cb.checked = isOn;
-            cb.disabled = locked || EXP.forceDisabled;   // 锁定/后端强制关闭时子项灰显不可选
-            cb.onchange = () => setExpOn(node, e.id, cb.checked);
-            head.append(cb);
-            head.append(el("strong", "", escapeHtml(e.name)));
-            head.insertAdjacentHTML("beforeend", badge(e.group, "media"));  // badge 返回 HTML 字符串，须以 HTML 方式插入
-            card.append(head);
-            card.append(el("small", "h3d-exp-desc", escapeHtml(e.desc)));
-            // 参数区：仅该实验开启时渲染；setExpOn -> repaintExperiments() 保证勾选即现
-            if (isOn) {
-                const paramBox = el("div", "h3d-exp-params");
-                for (const p of e.params || []) {
-                    const row = el("div", "h3d-param");
-                    row.append(el("label", "", escapeHtml(p.key)));
-                    const cur = ds.experiments.params?.[e.id]?.[p.key] ?? p.def;
-                    if (p.type === "enum" && p.opts) {
-                        const sel = document.createElement("select");
-                        sel.className = "h3d-select";
-                        for (const v of p.opts) {
-                            const o = document.createElement("option");
-                            o.value = v; o.textContent = v;
-                            if (String(v) === String(cur)) o.selected = true;
-                            sel.append(o);
-                        }
-                        sel.onchange = () => setExpParam(node, e.id, p.key, sel.value);
-                        row.append(sel);
-                    } else {
-                        // 包 .h3d-seedrow 命中既有深色 width:100% 样式，避免浏览器默认亮色/宽度溢出
-                        const sr = el("div", "h3d-seedrow");
-                        const inp = document.createElement("input");
-                        inp.type = "number";
-                        inp.value = cur;
-                        inp.min = String(p.min); inp.max = String(p.max); inp.step = String(p.step);
-                        inp.addEventListener("wheel", (ev) => ev.preventDefault(), { passive: false });
-                        inp.onchange = () => {
-                            const n = Number(inp.value);
-                            if (isFinite(n)) setExpParam(node, e.id, p.key, Math.min(p.max, Math.max(p.min, n)));
-                        };
-                        sr.append(inp);
-                        row.append(sr);
-                    }
-                    paramBox.append(row);
-                }
-                card.append(paramBox);
-            }
-            det.append(card);
-        }
-        det.append(el("div", "h3d-foot",
-            "全部默认关闭；切换实验组合会触发对应段重新生成（改存档指纹判定整链重做）。"
-            + "逐项开启试效果，再试组合；结论请用同一项目文件夹对比，避免缓存污染。"));
-    }
-    sec.append(det);
 }
 
 /* ---- 潜空间放大二采面板（右栏，独立后处理通道：主链完成后的清扫执行） ---- */
@@ -9157,13 +8954,28 @@ function renderUpscaleZone(sec, data) {
     const upFinals = mf?.upscale?.finals || [];
 
     const det = el("details", "h3d-adv h3d-updet" + (on ? " on" : ""));
-    det.open = on;
+    /* 除「基础设置」那一栏外一律默认收起（含二采本身与它的两个子面板）：不再因为
+     * 「模式≠关闭」自动展开——面板一进来就撑开，会把下边的成片历史挤下去。 */
+    det.open = false;
     det.innerHTML = `<summary>✦ 潜空间放大二采${on ? ' <span class="h3d-chip cyan">已开启</span>' : ""}</summary>`;
-    const body = el("div", "h3d-adv-grid h3d-upgrid");
+
+    /* 两个子面板：基础（普通二采参数）/ 高级（抗糊增强那一套）。
+     * body 就是**基础面板的网格** —— 原有 body.append 全部原样落进基础；
+     * 只有明确属于「抗糊 / 自适应 / 细节」的字段改写进 agrid。 */
+    const basicBox = el("details", "h3d-adv h3d-upsub");
+    basicBox.open = false;
+    basicBox.innerHTML = "<summary>⚙ 基础二采设置（模型 / 尺寸 / 采样 / 编码）</summary>";
+    const body = el("div", "h3d-adv-grid");
+    basicBox.append(body);
+    const advBox = el("details", "h3d-adv h3d-upsub");
+    advBox.open = false;
+    advBox.innerHTML = "<summary>🧪 高级二采设置（抗糊增强 / 细节混合 / 段自适应）</summary>";
+    const agrid = el("div", "h3d-adv-grid");
+    advBox.append(agrid);
 
     if (!node) {
         body.append(el("div", "h3d-empty", "画布上未找到节点，二采面板不可用"));
-        det.append(body);
+        det.append(basicBox);
         sec.append(det);
         return;
     }
@@ -9406,7 +9218,7 @@ function renderUpscaleZone(sec, data) {
             "尾段精化窗口内把模型看到的时间向更干净方向偏置（Detail-Daemon/T8 机制，零额外前向）："
             + "0=关（默认）；0.025-0.05 常用，过大可能过锐/伪细节。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "time_bias", v)));
-        body.append(upNumField("细节混合", up.mix, 0.0, 1.0, 0.05,
+        agrid.append(upNumField("细节混合", up.mix, 0.0, 1.0, 0.05,
             "频域分层混合：把精化结果的低频（结构）换回纯放大 latent、只保留精化补出的高频细节"
             + "——对冲精化带花/内容漂移，段间接缝更稳：0=关（默认，完全用精化结果）；"
             + "0.3-0.6 常用；1=结构全锁放大 latent。仅在 >0 时进二采指纹",
@@ -9425,37 +9237,38 @@ function renderUpscaleZone(sec, data) {
         adCb.onchange = () => setUpscaleField(node, "adaptive", adCb.checked);
         adRow.append(adCb);
         adField.append(adRow);
-        body.append(adField);
+        agrid.append(adField);
         body.append(upNumField("调度偏移", up.shift, 0.0, 16.0, 0.5,
             "二采档 flow shift（T8 实证 12→6：高分辨率下调度更线性、细节合成更充分；"
             + "镜像官方 MiniMaxH3SigmaShift 的克隆补丁，主链模型零改动）：0=关（默认，沿用主链 "
             + "H3 默认 12）；6=推荐档。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "shift", v)));
 
-        /* ---- 抗糊武器库（全部默认关；详见《更新说明_二采抗糊抗条纹》） ---- */
-        body.append(el("div", "h3d-convbadge", "⟡ 抗糊增强（全部默认关，按需开启）"));
-        body.append(upNumField("STG 引导", up.stg, 0.0, 2.0, 0.05,
+        /* ---- 抗糊武器库（全部默认关；详见《更新说明_二采抗糊抗条纹》）----
+         * 与「细节混合 / 段自适应σ」同属打画质实验手感的一套，统一放高级面板。 */
+        agrid.append(el("div", "h3d-convbadge", "⟡ 抗糊增强（全部默认关，按需开启）"));
+        agrid.append(upNumField("STG 引导", up.stg, 0.0, 2.0, 0.05,
             "跳块差分细节引导（T8 机制移植，GPL）：激活窗内每步多跑一次「跳掉一个 double block」"
             + "的弱前向，把完整前向多出来的细节显式放大——CFG=1.0 下也有效。0=关（默认）；"
             + "0.5-1.0 常用（每激活步约 +1 次前向 ≈ +50% 精化耗时）。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "stg", v)));
-        body.append(upNumField("STG 跳块", up.stg_block, 0, 49, 1,
+        agrid.append(upNumField("STG 跳块", up.stg_block, 0, 49, 1,
             "STG 弱前向跳过的 double block 编号（H3 共 50 个）：T8 默认 25（中段块，"
             + "细节/纹理引导最稳）；换块号可改变引导性质（前段块=构图、后段块=质感）",
             (v) => setUpscaleField(node, "stg_block", v)));
-        body.append(upNumField("精化轮数", up.passes, 1, 3, 1,
+        agrid.append(upNumField("精化轮数", up.passes, 1, 3, 1,
             "多轮递降精化：每轮以更小 σ 在上一轮输出上再精化（先修结构、再抠细节）。"
             + "1=单轮（默认，现行为）；2-3=递进（耗时×轮数）。仅在 >1 时进二采指纹",
             (v) => setUpscaleField(node, "passes", v)));
-        body.append(upNumField("σ 衰减", up.decay, 0.2, 0.8, 0.05,
+        agrid.append(upNumField("σ 衰减", up.decay, 0.2, 0.8, 0.05,
             "多轮递降的每轮 σ 缩放系数：第 k 轮 σ=σ₀·衰减^k（默认 0.5 → 0.35/0.18/0.09）。"
             + "仅精化轮数 >1 时生效",
             (v) => setUpscaleField(node, "decay", v)));
-        body.append(upNumField("latent 锐化", up.sharpen, 0.0, 1.0, 0.05,
+        agrid.append(upNumField("latent 锐化", up.sharpen, 0.0, 1.0, 0.05,
             "latent 域 unsharp 锐化（精化输出高频再放大一档，CPU 零显存零前向）："
             + "0=关（默认）；0.2-0.4 常用；过大可能放大噪声/伪影。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "sharpen", v)));
-        body.append(upNumField("像素锐化", up.pixel_sharpen, 0.0, 1.0, 0.05,
+        agrid.append(upNumField("像素锐化", up.pixel_sharpen, 0.0, 1.0, 0.05,
             "解码后逐帧 unsharp 锐化（连 VAE 解码的软化一起补偿，编码前生效）："
             + "0=关（默认）；0.2-0.4 常用。与 latent 锐化正交可叠加。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "pixel_sharpen", v)));
@@ -9480,31 +9293,48 @@ function renderUpscaleZone(sec, data) {
         encField.append(encSel);
         body.append(encField);
 
-        /* 独立采样器/调度器（空 = 沿用主链） */
-        const upTextField = (label, value, tip, commit) => {
+        /* 独立采样器/调度器（空 = 沿用主链）：**下拉选择**，选项直接取主节点
+         * 「采样器 / 调度器」两个控件的注册名单——与一采基础栏同一份来源，
+         * 不再手打名字（打错只能等运行时静默回退，用户看不出自己填错了）。 */
+        const upChoiceField = (label, value, widgetName, tip, commit) => {
             const field = el("div", "h3d-param");
             field.append(el("label", "", label));
-            const row = el("div", "h3d-seedrow");
-            const inp = document.createElement("input");
-            inp.type = "text";
-            inp.value = value;
-            inp.placeholder = "沿用主链";
-            inp.title = tip;
-            inp.onchange = () => commit(inp.value.trim());
-            row.append(inp);
-            field.append(row);
+            const sel = document.createElement("select");
+            sel.className = "h3d-select";
+            sel.title = tip;
+            const w = node ? (node.widgets || []).find((x) => x.name === widgetName) : null;
+            const opts = (w && w.options && Array.isArray(w.options.values)) ? w.options.values : [];
+            const o0 = document.createElement("option");
+            o0.value = "";
+            o0.textContent = "沿用主链";
+            sel.append(o0);
+            for (const v of opts) {
+                const o = document.createElement("option");
+                o.value = v;
+                o.textContent = v;
+                sel.append(o);
+            }
+            /* 存档里存了主链当前列表没有的名字（换过插件/自定义节点）→ 照样列出来，
+             * 静默丢掉等于把用户的设置无声抹掉 */
+            if (value && !opts.includes(value)) {
+                const o = document.createElement("option");
+                o.value = value;
+                o.textContent = `${value}（不在当前列表）`;
+                sel.append(o);
+            }
+            sel.value = value || "";
+            sel.onchange = () => commit(sel.value);
+            field.append(sel);
             return field;
         };
-        body.append(upTextField("采样器", up.sampler,
-            "二采独立采样器（空=沿用主链；名字须为 ComfyUI 注册名，如 euler / res_multistep，"
-            + "写错自动回退主链并报告）。非空进二采指纹",
+        body.append(upChoiceField("采样器", up.sampler, "采样器",
+            "二采独立采样器（沿用主链=不另设）。非空进二采指纹",
             (v) => setUpscaleField(node, "sampler", v)));
-        body.append(upTextField("调度器", up.scheduler,
-            "二采独立调度器（空=沿用主链；如 simple / beta / ddim_uniform，"
-            + "写错自动回退主链并报告）。非空进二采指纹",
+        body.append(upChoiceField("调度器", up.scheduler, "调度器",
+            "二采独立调度器（沿用主链=不另设）。非空进二采指纹",
             (v) => setUpscaleField(node, "scheduler", v)));
 
-        /* 增益自适应重试 */
+        /* 增益自适应重试（判据依赖精化后的细节增益，属高级项） */
         const rtField = el("div", "h3d-param");
         rtField.append(el("label", "", "增益重试"));
         const rtRow = el("div", "h3d-seedrow");
@@ -9516,8 +9346,8 @@ function renderUpscaleZone(sec, data) {
         rtCb.onchange = () => setUpscaleField(node, "retry", rtCb.checked);
         rtRow.append(rtCb);
         rtField.append(rtRow);
-        body.append(rtField);
-        body.append(upNumField("重试目标", up.retry_target, 0.05, 1.0, 0.05,
+        agrid.append(rtField);
+        agrid.append(upNumField("重试目标", up.retry_target, 0.05, 1.0, 0.05,
             "细节增益目标（+15%=0.15 健康线下限）：增益低于此值才触发重试。"
             + "仅增益重试开启时生效",
             (v) => setUpscaleField(node, "retry_target", v)));
@@ -9541,7 +9371,8 @@ function renderUpscaleZone(sec, data) {
                 `注意：倍率 ${up.scale}× 目标画布大，二采显存/耗时显著增加，建议先小倍率试一段`));
         }
     }
-    det.append(body);
+    det.append(basicBox);
+    if (on) det.append(advBox);   // 关闭时高级面板没有可调项，不占位
 
     /* 分区脚注：模式说明 + 当前进度 */
     const footBits = [];
@@ -10437,7 +10268,7 @@ app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",
     /* 画布节点就绪即刷新：面板首刷可能早于工作流载入（节点未就绪 → 各区渲染
      * 「画布上未找到节点」），之后没有任何事件再触发刷新——这里在节点载入/
-     * 新建时主动补一刷，mini 卡与实验/参数/二采区随之恢复可用 */
+     * 新建时主动补一刷，mini 卡与参数/二采区随之恢复可用 */
     loadedGraphNode(node) {
         if (node && node.type === NODE_TYPE) scheduleRefresh(250);
     },

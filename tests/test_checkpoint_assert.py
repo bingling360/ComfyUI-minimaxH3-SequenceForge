@@ -51,17 +51,11 @@ def test_non_resolution_change_reports_instead_of_raising(key, value):
     assert notes[0].startswith(f"{key}:")
 
 
-def test_experiments_change_is_not_fatal():
-    """实验开关组合变了也不该炸——旧实现专门把它升级为「整链重做」。"""
-    ck = _load_checkpoint()
-    notes = ck.assert_match(_params(experiments=""), _params(experiments="e1:1"))
-    assert notes == ["experiments: 存档='' 当前='e1:1'"]
-
-
 def test_key_absent_from_old_is_not_a_diff():
-    """旧存档没有的新键按「沿用当前值」处理——否则每次加参数都会误报变更。"""
+    """旧存档没有的新键按「沿用当前值」处理——否则每次加参数都会误报变更。
+    （新增控件如「参考图像尺寸」「响度对齐强度」正是这种情形。）"""
     ck = _load_checkpoint()
-    assert ck.assert_match(_params(), _params(experiments="e1:1")) == []
+    assert ck.assert_match(_params(), _params(参考图像尺寸="max")) == []
 
 
 @pytest.mark.parametrize("key,bad", [("width", 1920), ("height", 1080)])

@@ -27,10 +27,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 只扫插件自己的模块（不扫 node_modules / docs / web 前端）
 MODULES = [
     "anchors.py", "asset_store.py", "checkpoint.py", "cond_cache.py",
-    "eav_feta.py", "experiments.py", "grid.py", "guides.py", "latent_tools.py",
+    "eav_feta.py", "grid.py", "guides.py", "latent_tools.py",
     "library.py", "media.py", "metrics.py", "nodes.py", "optimizer.py",
     "perf.py", "projects.py", "prompts.py", "qc.py", "routes.py",
-    "seam_doctor.py", "transition.py", "upscale.py", "upscale_net.py",
+    "seam_doctor.py", "upscale.py", "upscale_net.py",
 ]
 
 try:

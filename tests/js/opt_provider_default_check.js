@@ -287,7 +287,55 @@ const checkOf = (dlg, label) => {
         assert.strictEqual(saved.reasoning_effort, "", "关掉思考要顺手清掉强度，否则残留档位会复活");
     });
 
-    console.log("\n== 6 设置面板实际显示（有内置 Key） ==");
+    console.log("\n== 6 切换服务商：各家默认模型名互不串（回归） ==");
+    /* 用户报的原始问题：来回切服务商后，切回智谱时模型框里留下的是**上一家**的
+     * 默认模型名。根因是 provider.dataset.prev 在 change 里没有写回 —— 它永远是初始
+     * 服务商（默认 glm），于是每次切换都把当前模型名记进 glm 的槽，智谱的记忆被
+     * 后一家家的默认名逐次覆盖。其它服务商因为槽位从没被写过、每次回落预设默认名，
+     * 反倒"看起来正常"，所以这个 bug 只在智谱身上显形。 */
+    const { w: wp, errors: errorsP } = load({});
+    const pNode = mkNode({});
+    const pDlg = () => wp.document.querySelector(".h3d-opt-dialog");
+    const provSel = () => rowOf(pDlg(), "服务商").querySelector("select");
+    const modelInp = () => rowOf(pDlg(), "模型").querySelector("input");
+    const switchTo = (v) => {
+        const s = provSel();
+        s.value = v;
+        s.dispatchEvent(new wp.Event("change"));
+    };
+    await ta("面板打开：默认 glm / glm-5.3-flashx", async () => {
+        await wp.openOptSettings(pNode);
+        assert.ok(pDlg(), "面板没打开");
+        assert.strictEqual(provSel().value, "glm");
+        assert.strictEqual(modelInp().value, "glm-5.3-flashx");
+    });
+    await ta("切到 openai -> 落到该家默认模型", async () => {
+        switchTo("openai");
+        assert.strictEqual(modelInp().value, "gpt-4.1-mini");
+    });
+    await ta("再切 gemini -> 落到该家默认模型", async () => {
+        switchTo("gemini");
+        assert.strictEqual(modelInp().value, "gemini-2.5-flash");
+    });
+    await ta("切回 glm -> 仍是智谱自己的默认模型（不是上一家的）", async () => {
+        switchTo("glm");
+        assert.strictEqual(modelInp().value, "glm-5.3-flashx",
+            "智谱的记忆槽被别家的模型名覆盖了");
+    });
+    await ta("再切 openai -> 回到它自己的模型", async () => {
+        switchTo("openai");
+        assert.strictEqual(modelInp().value, "gpt-4.1-mini");
+    });
+    await ta("手改模型后再切走切回 -> 记住的是手改值，不是预设名", async () => {
+        const inp = modelInp();
+        inp.value = "openai/gpt-5.6-sol";
+        inp.dispatchEvent(new wp.Event("input"));
+        switchTo("glm");
+        switchTo("openai");
+        assert.strictEqual(modelInp().value, "openai/gpt-5.6-sol");
+    });
+
+    console.log("\n== 7 设置面板实际显示（有内置 Key） ==");
     const { w: w2, errors: errors2 } = load({
         H3Api: {
             async getOptimizerConfig() {
@@ -309,7 +357,7 @@ const checkOf = (dlg, label) => {
         assert.strictEqual(await w2.optNeedsSetup(mkNode({}), st), false);
     });
 
-    console.log("\n== 7 无内置 Key 时仍要拦 ==");
+    console.log("\n== 8 无内置 Key 时仍要拦 ==");
     await ta("没填 Key 且服务端没有 -> 拦截", async () => {
         const st = w.optGetSettings(mkNode({}));
         assert.strictEqual(await w.optNeedsSetup(mkNode({}), st), true);
@@ -320,7 +368,7 @@ const checkOf = (dlg, label) => {
     });
 
     results.forEach((r) => console.log(r));
-    const allErr = [...errors, ...errors2, ...errorsC];
+    const allErr = [...errors, ...errors2, ...errorsC, ...errorsP];
     if (allErr.length) { console.log("\n页面错误: " + allErr.join(" | ")); ok = false; }
     console.log(ok ? "\nopt_provider_default_check 全部通过" : "\nopt_provider_default_check 失败");
     process.exit(ok ? 0 : 1);

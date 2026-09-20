@@ -4120,8 +4120,9 @@ async function openOptSettings(node, onSaved) {
      * 以前只有一个「深度思考」勾选框 —— 用户选了 glm-5.3-flash 这类分档模型
      * 却只能开/关，低/高/最高三档根本选不到（用户报的就是这个）。
      * 默认关：同一份改写从分钟级降到二三十秒，结构化改写并不需要长思考。
-     * 选项**按型号能力重建**（见 rebuildThinking），非智谱服务商整行隐藏 ——
-     * 后端对它们根本不下发这两个字段，摆着只会让人以为调了有用。 */
+     * 选项**按型号能力重建**（见 rebuildThinking）：智谱按型号给强度档，本地模型给
+     * 开/关两档（它没有 thinking 字段，关思考靠 Qwen 系 /no_think 软开关），
+     * 其它服务商整行隐藏 —— 后端对它们根本不下发这两个字段，摆着只会让人以为调了有用。 */
     const thinking = el("select", "");
     /* 当前档位：强度档 > 开启 > 关闭。历史值 `auto`（= 服务商默认）按「开启」显示 ——
      * GLM 系默认就是开思考，显示成「关闭」才是骗人。 */
@@ -4162,16 +4163,32 @@ async function openOptSettings(node, onSaved) {
     const rowThinking = row("思考强度", thinking);
     const thinkingHint = el("div", "h3d-opt-hint");
     dialog.append(thinkingHint);
-    /* 选项按**当前框里的型号**重建。三档形态：
+    /* 选项按**当前模式与型号**重建：
      *   支持强度（glm-5.x）  → 关闭 / 低 / 高 / 最高
      *   不支持强度（glm-4.6v）→ 关闭 / 开启
-     *   非智谱端点           → 整行隐藏（后端不下发这两个字段）
+     *   本地模型             → 关闭 / 开启（本地没有 thinking 字段，关思考靠 /no_think）
+     *   其它端点             → 整行隐藏（后端不下发这两个字段）
      * 强制思考型号（glm-5.3 / 4.7 / 4.5v）选「关闭」会被后端翻译成 low，
      * 界面上**直接说明**，否则用户以为自己关成功了、实际还在思考。 */
     const rebuildThinking = () => {
-        const glm = optIsGlm(url.value);
-        rowThinking.classList.toggle("h3d-opt-hidden", !glm);
-        thinkingHint.classList.toggle("h3d-opt-hidden", !glm);
+        const local = mode.value === "local";
+        const glm = !local && optIsGlm(url.value);
+        rowThinking.classList.toggle("h3d-opt-hidden", !(glm || local));
+        thinkingHint.classList.toggle("h3d-opt-hidden", !(glm || local));
+        if (local) {
+            /* 本地通道没有 thinking / reasoning_effort 字段 —— 后端只能往输入里塞
+             * Qwen 系的 /no_think 软开关，所以只有开/关两档，没有低/高/最高。 */
+            thinking.replaceChildren();
+            thinking.append(new Option("关闭思考（最快）", "disabled"),
+                            new Option("开启思考", "enabled"));
+            thinking.value = level === "disabled" ? "disabled" : "enabled";
+            const w = thinking.value === "enabled"
+                ? "本地模型的长思考同样占「最大输出 token」配额，正文可能被截断"
+                  + "（思考过程由后端剥掉，不会写进提示词）。" : "";
+            thinkingHint.textContent = w;
+            thinkingHint.classList.toggle("h3d-opt-hidden", !w);
+            return;
+        }
         if (!glm) return;
         const caps = optModelCaps(model.value);
         const opts = [["disabled", "关闭思考（最快）"]];
@@ -4276,14 +4293,10 @@ async function openOptSettings(node, onSaved) {
         rowLocal.classList.toggle("h3d-opt-hidden", !local);
         refreshRow.classList.toggle("h3d-opt-hidden", !local);
         rowDevice.classList.toggle("h3d-opt-hidden", !local);
-        /* 思考强度跟 URL/型号走，所以每次重绘都重建一遍（本地模式整行藏起来 ——
-         * 本地模型不走这两个字段）。 */
-        if (local) {
-            rowThinking.classList.add("h3d-opt-hidden");
-            thinkingHint.classList.add("h3d-opt-hidden");
-        } else {
-            rebuildThinking();
-        }
+        /* 思考强度跟 URL/型号/模式走，所以每次重绘都重建一遍。本地模式**也要给**：
+         * 本地靠 /no_think 软开关关思考，藏起来的话用户既看不见也改不了，
+         * 只能被默认值支配（后端报错时还让他去调一个看不见的下拉）。 */
+        rebuildThinking();
         const sel = models.find((m) => m.relative_path === localModel.value);
         rowMmproj.classList.toggle("h3d-opt-hidden", !local || !(sel && sel.format === "gguf"));
         void rowMode; void rowProv;

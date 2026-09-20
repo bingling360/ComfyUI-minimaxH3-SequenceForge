@@ -7,8 +7,8 @@
 - prompt/*.txt 规则文件只读下发，由调用方按 rule_file=auto/指定/none 注入
 - 云通道：OpenAI 兼容（openai/openrouter/百炼/SiliconFlow/RunningHub 走兼容路径）、
   Gemini GenerateContent、Responses 路径；同步 urllib 实现，调用方放线程池
-- 本地通道：Transformers 视觉模型 / GGUF（llama-cpp-python），句柄进程内缓存，
-  只扫 ComfyUI/models/llm；未装依赖时报明确缺件错误
+- 本地通道：Transformers 视觉模型 / GGUF（llama-cpp-python），每次生成完即关句柄、
+  归还显存（不做进程内缓存），只扫 ComfyUI/models/llm；未装依赖时报明确缺件错误
 - 媒体：图片 dataURL 直传；视频/音频只传 label（不传二进制），与前端约定一致
 
 无第三方导入（torch/transformers/llama_cpp 只在函数内按需 import）。
@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -197,10 +198,6 @@ RULE_BASE = {"中文": "minimaxh3_base_prompt_writing_zh.txt",
              "English": "minimaxh3_base_prompt_writing.txt"}
 RULE_REF = {"中文": "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
             "English": "minimaxh3_custom_ref2v_prompt_writing.txt"}
-
-# 本地模型句柄进程内缓存：同一模型只加载一次（加载一次几十秒，反复加载会拖死节点）
-_GGUF_CACHE: dict = {}
-_TF_CACHE: dict = {}
 
 
 def prompt_dir() -> str:
@@ -812,73 +809,137 @@ def _b64_to_pil(data_url: str):
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
 
+def _reclaim_vram() -> None:
+    """丢弃句柄后的显存收尾：先 gc（让 llama/torch 的 __del__ 立刻跑），再清分配器缓存。
+
+    TF 路径的显存归 torch 分配器管，empty_cache 直接有效；GGUF 的显存走 ggml 自己的池，
+    靠 Llama.close() 归还，torch 这步对它无效（但无害）。
+    **不调 llama_backend_free()**：llama-cpp-python 用类级 `__backend_initialized` 把 backend
+    锁成「每进程初始化一次」，free 掉之后再次 load 不会重新 init —— 下一次优化必崩。
+    """
+    gc.collect()
+    try:
+        import torch  # type: ignore
+    except ImportError:
+        return
+    torch.cuda.empty_cache()
+
+
+def _strip_think(text: str) -> str:
+    """剥掉本地模型内联回来的思维链 —— 云通道不需要这步（思考在 reasoning_content 里）。
+
+    Qwen 系有三种落法，都要认：
+      1. `<think>…</think>正文`：标签完整，按最后一个闭合标签切；
+      2. `思考正文</think>正文`：起始标签被 chat template 吃掉、只剩闭合标签，同样按它切；
+      3. 只有思考、没有闭合标签：思考被 max_tokens 截断、正文还没开始 —— 返回空串，
+         由调用方按「没给正文」报错，绝不把半段思考当提示词填进编辑器。
+    """
+    raw = str(text or "").strip()
+    raw = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", raw, flags=re.S).strip()
+    ends = [m.end() for m in re.finditer(r"</think\s*>", raw)]
+    if ends:
+        return raw[ends[-1]:].strip()
+    if "<think" in raw:
+        return ""
+    return raw
+
+
 def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
                     temperature: float = 0.2) -> str:
-    """本地视觉模型推理（GGUF / Transformers 两路），进程内缓存句柄避免重复加载。"""
+    """本地视觉模型推理（GGUF / Transformers 两路）。
+
+    **用完即卸**：本次调用一结束就关掉模型句柄、归还显存（不再进程内缓存句柄）。
+    27B 级权重常驻会把后续 H3 采样的显存吃掉，而 ComfyUI 的 unload_all_models()
+    管不到 llama.cpp（ggml 自己的池）。代价是每次优化都要重新加载模型 —— 取显存。
+    """
     sel = str(cfg.get("local_model") or "").strip()
     if not sel:
         raise ValueError("请先在优化设置里选择本地视觉模型")
     images = _media_images(media) if cfg.get("read_media") else []
     root = (_llm_roots() or [""])[0]
+    # 本地通道没有 API 那种 thinking 字段，Qwen 系的软开关就是往输入里塞 /no_think。
+    # 不塞的话它默认长思考，把正文预算吃光（实测 3100 字思考 / 1100 字正文）。
+    if str(cfg.get("thinking") or "disabled").lower() == "disabled":
+        user_prompt = user_prompt.rstrip() + "\n/no_think"
 
-    # ---- GGUF 路径（llama-cpp-python + mmproj 视觉投影）----
-    if sel.lower().endswith(".gguf"):
-        try:
-            from llama_cpp import Llama  # type: ignore
-            from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore
-        except ImportError:
-            raise ValueError("未安装 llama-cpp-python，无法加载 GGUF 本地模型"
-                             "（按 CUDA/Python 版本装轮子，详见 goohai 项目说明）")
-        mmproj = str(cfg.get("local_mmproj") or "").strip()
-        llm = _GGUF_CACHE.get(sel)
-        if llm is None:
-            kw = {"model_path": os.path.join(root, sel), "n_ctx": 8192, "verbose": False}
+    try:
+        if sel.lower().endswith(".gguf"):
+            # ---- GGUF 路径（llama-cpp-python + mmproj 视觉投影）----
+            try:
+                from llama_cpp import Llama  # type: ignore
+                from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore
+            except ImportError:
+                raise ValueError("未安装 llama-cpp-python，无法加载 GGUF 本地模型"
+                                 "（按 CUDA/Python 版本装轮子，详见 goohai 项目说明）")
+            mmproj = str(cfg.get("local_mmproj") or "").strip()
+            budget = int(cfg.get("max_tokens") or 8192)
+            # n_ctx 必须容得下「提示词 + 生成」：旧值写死 8192，而 max_tokens 默认 16384
+            # → 生成本身就大于窗口，思考刚写完就被截断。多留 8192 给系统提示+规则文件+图。
+            n_ctx = (max(8192, budget + 8192) + 511) // 512 * 512
+            kw = {"model_path": os.path.join(root, sel), "n_ctx": n_ctx, "verbose": False}
             if mmproj:
                 # mproj 走 GPU 加速（视觉塔比语言模型轻，显存占用小）
                 kw["chat_handler"] = Llava15ChatHandler(
                     clip_model_path=os.path.join(root, mmproj), verbose=False)
-            if str(cfg.get("local_device") or "").lower() == "cuda":
+            # auto 也算 GPU：llama-cpp-python 没有「自动铺层」这回事，不设 n_gpu_layers
+            # 就是 0 层 = 纯 CPU，27B 在 CPU 上出 1000 字要按分钟算。
+            if str(cfg.get("local_device") or "cuda").lower() != "cpu":
                 kw["n_gpu_layers"] = -1
             llm = Llama(**kw)
-            _GGUF_CACHE[sel] = llm
-        content: list = [{"type": "text", "text": user_prompt}]
-        for u in images:
-            content.append({"type": "image_url", "image_url": {"url": u}})
-        res = llm.create_chat_completion(
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": content}],
-            max_tokens=int(cfg.get("max_tokens") or 4096), temperature=_temp(temperature))
-        return str(res["choices"][0]["message"]["content"] or "").strip()
+            content: list = [{"type": "text", "text": user_prompt}]
+            for u in images:
+                content.append({"type": "image_url", "image_url": {"url": u}})
+            try:
+                res = llm.create_chat_completion(
+                    messages=[{"role": "system", "content": system},
+                              {"role": "user", "content": content}],
+                    max_tokens=budget, temperature=_temp(temperature))
+            finally:
+                # 显存靠它归还（同 __del__，但此刻立刻生效）：生成报错时也不能漏关，
+                # 否则句柄会挂在线程池 future 的 traceback 上，一直到那次异常被回收。
+                llm.close()
+            raw = str(res["choices"][0]["message"]["content"] or "")
+        else:
+            # ---- Transformers 路径 ----
+            try:
+                import torch  # type: ignore
+                from transformers import AutoModelForImageTextToText, AutoProcessor  # type: ignore
+            except ImportError:
+                raise ValueError("未安装 transformers/torch，无法加载本地视觉模型（请改用云 API）")
+            path = os.path.join(root, sel)
+            device = str(cfg.get("local_device") or "cuda").lower()
+            dtype = torch.float32 if device == "cpu" else torch.float16
+            processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+            model = AutoModelForImageTextToText.from_pretrained(
+                path, dtype=dtype, device_map=device, trust_remote_code=True)
+            model.eval()
+            content = [{"type": "image"} for _ in images] + [{"type": "text", "text": user_prompt}]
+            messages = [{"role": "system", "content": [{"type": "text", "text": system}]},
+                        {"role": "user", "content": content}]
+            # tokenize=False 才是「可读的 prompt 文本」；默认 True 返回 input_ids，
+            # 再喂 processor(text=...) 等于把 id 列表当字符串用。
+            prompt = processor.apply_chat_template(messages, tokenize=False,
+                                                   add_generation_prompt=True)
+            inputs = processor(text=prompt, images=[_b64_to_pil(u) for u in images] or None,
+                               return_tensors="pt").to(model.device)
+            # 与 GGUF 路径同口径：温度 > 0 才采样，否则贪心（温度 0 传进 HF 会直接报错）
+            gen_kw = ({"do_sample": True, "temperature": temperature} if temperature > 0
+                      else {"do_sample": False})
+            with torch.inference_mode():
+                out = model.generate(**inputs,
+                                     max_new_tokens=int(cfg.get("max_tokens") or 4096),
+                                     **gen_kw)
+            gen = out[:, inputs["input_ids"].shape[1]:]
+            raw = processor.batch_decode(gen, skip_special_tokens=True)[0]
+            del model, processor, inputs, out, gen
+    finally:
+        _reclaim_vram()
 
-    # ---- Transformers 路径（AutoModelForImageTextToText + 进程内缓存）----
-    try:
-        import torch  # type: ignore
-        from transformers import AutoModelForImageTextToText, AutoProcessor  # type: ignore
-    except ImportError:
-        raise ValueError("未安装 transformers/torch，无法加载本地视觉模型（请改用云 API）")
-    cached = _TF_CACHE.get(sel)
-    if cached is None:
-        path = os.path.join(root, sel)
-        device = str(cfg.get("local_device") or "cuda").lower()
-        dtype = torch.float16 if device == "cuda" else torch.float32
-        processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
-        model = AutoModelForImageTextToText.from_pretrained(
-            path, dtype=dtype, device_map=device, trust_remote_code=True)
-        model.eval()
-        cached = (processor, model)
-        _TF_CACHE[sel] = cached
-    processor, model = cached
-    content = [{"type": "image"} for _ in images] + [{"type": "text", "text": user_prompt}]
-    messages = [{"role": "system", "content": [{"type": "text", "text": system}]},
-                {"role": "user", "content": content}]
-    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-    inputs = processor(text=prompt, images=[_b64_to_pil(u) for u in images] or None,
-                       return_tensors="pt").to(model.device)
-    with torch.inference_mode():
-        out = model.generate(**inputs, max_new_tokens=int(cfg.get("max_tokens") or 4096),
-                             do_sample=False)
-    gen = out[:, inputs["input_ids"].shape[1]:]
-    return processor.batch_decode(gen, skip_special_tokens=True)[0].strip()
+    text = _strip_think(raw)
+    if not text:
+        raise RuntimeError("本地模型只输出了思维链、正文被截断（max_tokens 被思考吃光）："
+                           "请把「最大生成」调大，或把「思考强度」设为关闭后重试")
+    return text
 
 
 def generate_text(config_in: dict | None, system: str, user_prompt: str,

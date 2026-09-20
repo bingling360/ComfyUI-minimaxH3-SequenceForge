@@ -197,6 +197,13 @@ const checkOf = (dlg, label) => {
         assert.ok(rowOf(dlg, "API Key").classList.contains("h3d-opt-hidden"));
         assert.ok(rowOf(dlg, "请求超时").classList.contains("h3d-opt-hidden"));
     });
+    await ta("本地模式保留「思考强度」：开/关两档（本地靠 /no_think 软开关关思考）", async () => {
+        const dlg = w.document.querySelector(".h3d-opt-dialog");
+        assert.ok(!rowOf(dlg, "思考强度").classList.contains("h3d-opt-hidden"),
+            "本地模式该保留思考强度：藏起来用户既看不见也改不了，只能被默认值支配");
+        assert.deepStrictEqual([...ctrlOf(dlg, "思考强度").options].map((o) => o.value),
+            ["disabled", "enabled"], "本地只有开/关两档（没有 low/high/max）");
+    });
 
     console.log("\n== 5 思考强度：按型号能力重建选项 ==");
     /* 用户报的原始问题：选 glm-5.3-flash 这种型号时"有不同的思考强度，

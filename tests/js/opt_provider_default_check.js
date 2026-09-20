@@ -265,9 +265,26 @@ const checkOf = (dlg, label) => {
         const hint = cDlg().querySelector(".h3d-opt-hint");
         assert.ok(/无强度分级/.test(hint.textContent), "应提示无强度分级：" + hint.textContent);
     });
-    await ta("切到非智谱端点 -> 整行隐藏（后端对别家不下发这两个字段）", async () => {
+    /* 2026-09-21 改口径：思考不再只有智谱一家。GPT / DeepSeek 是**已知**端点，
+     * 要给档位；其它（如百炼的 qwen）是未知型号 —— 整行**要显示**并写明"不干预"，
+     * 以前整行隐藏会让用户误以为"没得选 = 关掉了"。 */
+    await ta("切到 OpenAI -> 给统一五档（不是隐藏）", async () => {
         cSet("API URL", "https://api.openai.com/v1");
-        assert.ok(rowOf(cDlg(), "思考强度").classList.contains("h3d-opt-hidden"), "非智谱端点该隐藏");
+        const sel = ctrlOf(cDlg(), "思考强度");
+        assert.strictEqual(rowOf(cDlg(), "思考强度").classList.contains("h3d-opt-hidden"), false,
+            "GPT 是已知端点，该给档位");
+        assert.deepStrictEqual([...sel.options].map((o) => o.value),
+            ["off", "low", "medium", "high", "max"], "GPT 走统一五档");
+    });
+    await ta("切到未知端点 -> 显示「不干预」，而不是整行隐藏", async () => {
+        cSet("API URL", "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        cSet("模型", "qwen-vl-max");
+        const row = rowOf(cDlg(), "思考强度");
+        assert.strictEqual(row.classList.contains("h3d-opt-hidden"), false,
+            "未知型号也要显示，否则用户以为默认关了");
+        assert.strictEqual(ctrlOf(cDlg(), "思考强度").value, "", "未知型号不写档位");
+        const hint = cDlg().querySelector(".h3d-opt-hint");
+        assert.ok(/不干预/.test(hint.textContent), "要写明不干预：" + hint.textContent);
         cSet("API URL", "https://open.bigmodel.cn/api/paas/v4");
         assert.ok(!rowOf(cDlg(), "思考强度").classList.contains("h3d-opt-hidden"), "切回智谱该恢复");
     });

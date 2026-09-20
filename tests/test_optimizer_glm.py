@@ -84,6 +84,97 @@ def test_default_request_uses_low_effort(opt, monkeypatch):
     assert seen["body"]["reasoning_effort"] == "low"
 
 
+# ---- 思考：三家能力档案（GLM / GPT / DeepSeek），其余一律未知 ----
+
+def test_thinking_family_detection(opt):
+    glm = {"api_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-5.3-flashx"}
+    gpt = {"api_url": "https://api.openai.com/v1", "model": "gpt-5.6-luna"}
+    ds = {"api_url": "https://api.deepseek.com", "model": "deepseek-flash"}
+    unk = {"api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-vl-max"}
+    assert opt._thinking_family(glm) == "glm"
+    assert opt._thinking_family(gpt) == "gpt"
+    assert opt._thinking_family(ds) == "deepseek"
+    assert opt._thinking_family(unk) == "unknown"
+    # OpenRouter 会把型号写成 openai/gpt-5.6，要认得出来
+    assert opt._thinking_family({"api_url": "https://openrouter.ai/api/v1",
+                                 "model": "openai/gpt-5.6"}) == "gpt"
+    assert opt._model_base("openai/gpt-5.6") == "gpt-5.6"
+
+
+def test_unknown_model_gets_no_thinking_fields(opt):
+    """未知型号：一个思考字段都不下发（下错私有字段只会 400）。"""
+    cfg = {"api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+           "model": "qwen-vl-max", "thinking": "disabled"}
+    assert opt._thinking_fields(cfg) == {}
+    caps = opt._thinking_caps(cfg)
+    assert caps["known"] is False
+    assert caps["levels"] == []
+
+
+def test_gpt_56_can_disable_gpt6_cannot(opt):
+    """gpt-5.6 支持 none（真关）；gpt-6 档位里**没有 none**，只能降到最低档。"""
+    base = {"api_url": "https://api.openai.com/v1", "thinking_level": "off"}
+    assert opt._thinking_fields(dict(base, model="gpt-5.6-luna")) == {"reasoning_effort": "none"}
+    assert opt._thinking_fields(dict(base, model="gpt-6-astra")) == {"reasoning_effort": "low"}
+    caps = opt._thinking_caps(dict(base, model="gpt-6-astra"))
+    assert caps["forced"] is True
+
+
+def test_gpt_level_mapping(opt):
+    base = {"api_url": "https://api.openai.com/v1", "model": "gpt-5.6-sol"}
+    for lv in ("low", "medium", "high", "max"):
+        assert opt._thinking_fields(dict(base, thinking_level=lv)) == {"reasoning_effort": lv}
+    # 早期 gpt-5.1 系：不支持 none，"关闭"降到最低档 low
+    assert opt._thinking_fields({"api_url": "https://api.openai.com/v1",
+                                 "model": "gpt-5.1", "thinking_level": "off"}) == {"reasoning_effort": "low"}
+
+
+def test_deepseek_thinking_fields(opt):
+    """DeepSeek：开关用 thinking.type，强度只有 low/high/max（medium 就近取 high）。"""
+    base = {"api_url": "https://api.deepseek.com", "model": "deepseek-flash"}
+    assert opt._thinking_fields(dict(base, thinking_level="off")) == {"thinking": {"type": "disabled"}}
+    assert opt._thinking_fields(dict(base, thinking_level="low")) == {
+        "thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+    assert opt._thinking_fields(dict(base, thinking_level="medium")) == {
+        "thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    assert opt._thinking_fields(dict(base, thinking_level="max")) == {
+        "thinking": {"type": "enabled"}, "reasoning_effort": "max"}
+
+
+def test_gpt6_drops_temperature(opt):
+    """GPT-6 不接受 temperature（官方：不支持 temperature/top_p），传了就是 400。"""
+    assert opt._temp_fields({"api_url": "https://api.openai.com/v1",
+                             "model": "gpt-6-astra"}, 0.2) == {}
+    assert opt._temp_fields({"api_url": "https://api.openai.com/v1",
+                             "model": "gpt-5.6-luna"}, 0.2) == {"temperature": 0.2}
+    assert opt._temp_fields({"api_url": "https://api.deepseek.com",
+                             "model": "deepseek-flash"}, 0.2) == {"temperature": 0.2}
+
+
+def test_legacy_thinking_fields_still_drive_level(opt):
+    """老配置没有 thinking_level：按 thinking 开关 + reasoning_effort 推导。"""
+    assert opt._cfg_think_level({"thinking": "disabled"}) == "off"
+    assert opt._cfg_think_level({"thinking": "enabled"}) == "high"
+    assert opt._cfg_think_level({"thinking": "enabled", "reasoning_effort": "low"}) == "low"
+    assert opt._cfg_think_level({"thinking": "auto"}) is None
+    assert opt._cfg_think_level({"thinking_level": "max"}) == "max"
+
+
+def test_deepseek_provider_preset(opt):
+    """DeepSeek 服务商预设：OpenAI 兼容端点 + 唯一支持图片的型号 deepseek-flash。"""
+    url, model, proto = opt.PROVIDERS["deepseek"]
+    assert url == "https://api.deepseek.com"
+    assert model == "deepseek-flash", "只有 deepseek-flash 支持图片输入（V4 Pro 不支持视觉）"
+    assert proto == "openai"
+    # 端点拼接：不带 /v1 的 base 会自动补 /chat/completions
+    assert opt._endpoint_for({"api_url": url, "protocol": "openai"}) == \
+        "https://api.deepseek.com/chat/completions"
+    # 选它之后思考字段要走 DeepSeek 档案（默认开思考，可关）
+    cfg = {"api_url": url, "model": model, "thinking_level": "off"}
+    assert opt._thinking_family(cfg) == "deepseek"
+    assert opt._thinking_fields(cfg) == {"thinking": {"type": "disabled"}}
+
+
 def test_timeout_default_and_clamp(opt):
     assert opt.normalize_config(None)["timeout"] == 300
     assert opt.normalize_config({"timeout": 1})["timeout"] == 30

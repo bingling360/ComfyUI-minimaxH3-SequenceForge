@@ -205,6 +205,9 @@
       _postStream("/h3chain/expand_optimize_stream", payload, onEvent, opts),
     /* 多段提示词优化（格式编译器）：N 段剧本 -> N 段 H3 官方格式 + 逐段校验 */
     optimizeMulti: (payload) => _json("POST", "/h3chain/optimize_multi", payload),
+    /* 显存清理：卸载 ComfyUI 驻留的全部模型 + 清空分配器缓存（OOM 后点一下再重跑）。
+     * 生成中后端回 423 BUSY（把正在用的模型卸了等于砍掉这次运行）。 */
+    vramCleanup: () => _json("POST", "/h3chain/vram_cleanup"),
     /* 同上，**流式版**：N 段串行跑，进度帧多带 seg / seg_no / total
      * （前端据此画「第 i/N 段」的整条进度）。 */
     optimizeMultiStream: (payload, onEvent, opts) =>

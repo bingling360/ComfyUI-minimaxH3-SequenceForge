@@ -4023,6 +4023,24 @@ function optIsGlm(url) {
     return String(url || "").toLowerCase().indexOf("bigmodel") >= 0;
 }
 
+/* 端点属于哪家（与后端 optimizer._thinking_family 同口径，改一处要改两处）。
+ * 只认三家：glm / deepseek / gpt；其余一律 unknown —— **不干预思考**，
+ * 由服务商默认决定（思考型模型多半是开的，这点必须在界面上说清楚，
+ * 否则用户会以为"没选项 = 关了"）。 */
+function optThinkingFamily(url, model) {
+    const u = String(url || "").toLowerCase();
+    const m = String(model || "").toLowerCase();
+    if (u.indexOf("bigmodel") >= 0) return "glm";
+    if (u.indexOf("deepseek") >= 0 || m.startsWith("deepseek")) return "deepseek";
+    const base = m.split("/").pop();
+    /* 与后端同口径：只认官方域名或明确的 GPT 型号名，不做宽松子串匹配
+     * （中转地址里带 openai 字样但跑别家模型的情况很常见）。 */
+    if (u.indexOf("openai.com") >= 0 || base.startsWith("gpt-")
+        || base.startsWith("o1") || base.startsWith("o3") || base.startsWith("o4")
+        || base.startsWith("chatgpt")) return "gpt";
+    return "unknown";
+}
+
 /** 该型号的思考能力：能不能关、能不能调强度、选「关闭」实际会被翻译成什么。 */
 function optModelCaps(model) {
     const m = String(model || "").toLowerCase();
@@ -4050,6 +4068,9 @@ const OPT_PROVIDERS = {
     gemini: { label: "Google Gemini", url: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-2.5-flash", protocol: "gemini" },
     openrouter: { label: "OpenRouter", url: "https://openrouter.ai/api/v1", model: "google/gemini-2.5-flash", protocol: "openai" },
     dashscope: { label: "阿里云百炼", url: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-vl-max", protocol: "openai" },
+    /* deepseek-flash（V4.1 Flash）是 DeepSeek 唯一支持图片输入的型号
+     * （V4 Pro 不支持视觉），本插件要读参考图，所以默认只能是它。 */
+    deepseek: { label: "DeepSeek（官方）", url: "https://api.deepseek.com", model: "deepseek-flash", protocol: "openai" },
     siliconflow: { label: "SiliconFlow", url: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen2.5-VL-72B-Instruct", protocol: "openai" },
     custom: { label: "自定义", url: "", model: "", protocol: "openai" },
 };
@@ -4068,6 +4089,7 @@ async function openOptSettings(node, onSaved) {
                 current = Object.assign({}, current);
                 if (Array.isArray(r.body.models)) current._models = r.body.models;
                 if (Array.isArray(r.body.mmproj_models)) current._mmproj = r.body.mmproj_models;
+                if (r.body.llm_env && typeof r.body.llm_env === "object") current._env = r.body.llm_env;
                 hasDefaultKey = r.body.has_default_key === true;
                 _optBackend.loaded = true;
                 _optBackend.hasKey = hasDefaultKey;
@@ -4156,6 +4178,12 @@ async function openOptSettings(node, onSaved) {
     const _lv0 = String(current.reasoning_effort || "").toLowerCase();
     let level = ["low", "high", "max"].includes(_lv0) ? _lv0
         : (String(current.thinking || "disabled") === "disabled" ? "disabled" : "enabled");
+    /* 内部统一档位（off/low/medium/high/max）：GPT / DeepSeek 用这一套，
+     * GLM 与本地继续用老的「开关 + 强度」两字段（后端会自己推导）。 */
+    let tkLevel = ["off", "low", "medium", "high", "max"].includes(
+        String(current.thinking_level || "").toLowerCase())
+        ? String(current.thinking_level).toLowerCase()
+        : (level === "disabled" ? "off" : "high");
 
     const language = el("div", "h3d-opt-language");
     for (const value of ["中文", "English"]) {
@@ -4200,8 +4228,43 @@ async function openOptSettings(node, onSaved) {
     const rebuildThinking = () => {
         const local = mode.value === "local";
         const glm = !local && optIsGlm(url.value);
-        rowThinking.classList.toggle("h3d-opt-hidden", !(glm || local));
-        thinkingHint.classList.toggle("h3d-opt-hidden", !(glm || local));
+        const fam = local ? "local" : optThinkingFamily(url.value, model.value);
+        const show = local || glm || fam === "gpt" || fam === "deepseek" || fam === "unknown";
+        rowThinking.classList.toggle("h3d-opt-hidden", !show);
+        thinkingHint.classList.toggle("h3d-opt-hidden", !show);
+        if (fam === "unknown") {
+            /* 未知型号：后端一个思考字段都不下发。这句话必须写出来 —— 以前整行
+             * 隐藏，用户看到的是"没得选"，很容易误以为等于关掉了。 */
+            thinking.replaceChildren();
+            thinking.append(new Option("不干预（用服务商默认）", ""));
+            thinking.value = "";
+            thinkingHint.textContent = "型号不在已知名单（GLM / GPT / DeepSeek）：本插件**不干预**思考，"
+                + "一个思考参数都不下发，由服务商默认决定 —— 思考型模型多半是**开**的，"
+                + "若遇正文被截断请调大「最大输出 token」。";
+            thinkingHint.classList.remove("h3d-opt-hidden");
+            return;
+        }
+        if (fam === "gpt" || fam === "deepseek") {
+            const opts = [["off", "关闭思考（最快）"], ["low", "低"], ["medium", "中"],
+                          ["high", "高"], ["max", "最高"]];
+            thinking.replaceChildren();
+            for (const [v, l] of opts) thinking.append(new Option(l, v));
+            thinking.value = opts.some(([v]) => v === tkLevel) ? tkLevel : "off";
+            const notes = [];
+            if (fam === "gpt") {
+                notes.push("GPT-5.6 可关闭思考；GPT-6 档位里没有「关闭」，选关闭会降到最低档。"
+                    + "GPT-6 不接受温度参数，后端已自动不下发。");
+            } else {
+                notes.push("DeepSeek 默认开思考（high）；档位只有 低/高/最高（选「中」按官方映射落到「高」）。");
+            }
+            /* 推理 token 与正文共用 max_tokens 配额（GLM 那条同理） */
+            if (["high", "max"].includes(thinking.value) && Number(maxTokens.value) < 16384) {
+                notes.push("高强度思考的推理过程也占「最大输出 token」配额，建议调到 16384 以上。");
+            }
+            thinkingHint.textContent = notes.join(" ");
+            thinkingHint.classList.remove("h3d-opt-hidden");
+            return;
+        }
         if (local) {
             /* 本地通道没有 thinking / reasoning_effort 字段 —— 后端只能往输入里塞
              * Qwen 系的 /no_think 软开关，所以只有开/关两档，没有低/高/最高。 */
@@ -4287,6 +4350,38 @@ async function openOptSettings(node, onSaved) {
     let models = Array.isArray(current._models) ? current._models : [];
     let mmprojModels = Array.isArray(current._mmproj) ? current._mmproj : [];
 
+    /* 模型存放位置 + 缺件提示（后端 llm_env 下发，随「刷新模型」一起更新）。
+     * 只在本地模式下显示；后端没给（旧后端/接口异常）就整块省略，别挡设置。 */
+    const envHint = el("div", "h3d-opt-hint h3d-opt-env");
+    envHint.style.whiteSpace = "pre-line";
+    dialog.append(envHint);
+    const renderEnv = () => {
+        const env = current._env;
+        if (mode.value !== "local" || !env) { envHint.classList.add("h3d-opt-hidden"); return; }
+        const lines = [];
+        if (env.llm_dir) {
+            lines.push("模型目录：" + env.llm_dir
+                + "（.gguf 主模型与 *mmproj*.gguf 投影都放这里，放好后点上面「刷新模型」）");
+            if (env.llm_dir_exists === false) {
+                lines.push("⚠ 这个目录还不存在：请在 ComfyUI 的 models 文件夹下新建一个 llm 目录再放模型");
+            }
+        }
+        const dep = env.deps || {};
+        const miss = [];
+        if (dep.llama_cpp?.installed === false) miss.push("llama-cpp-python（GGUF 必需）");
+        if (dep.transformers?.installed === false) miss.push("transformers（Transformers 格式模型必需）");
+        if (miss.length) {
+            lines.push("缺少依赖：" + miss.join("、") + "\n装进 ComfyUI 同一个 Python 环境，"
+                + "GGUF 显卡加速参考：pip install llama-cpp-python --extra-index-url "
+                + "https://abetlen.github.io/llama-cpp-python/whl/cu130"
+                + "（cu130 = CUDA 13.0；驱动较老往下换 cu125 / cu124 / cu123）\n"
+                + "注意：预编译轮子只支持 Python 3.10/3.11/3.12；CUDA 13 轮子要求显卡算力 7.5 以上");
+        }
+        envHint.textContent = lines.join("\n");
+        envHint.classList.toggle("h3d-opt-hidden", !lines.length);
+    };
+    renderEnv();
+
     const fillLocal = () => {
         const cur = localModel.value || current.local_model || "";
         localModel.replaceChildren();
@@ -4326,6 +4421,7 @@ async function openOptSettings(node, onSaved) {
         rebuildThinking();
         const sel = models.find((m) => m.relative_path === localModel.value);
         rowMmproj.classList.toggle("h3d-opt-hidden", !local || !(sel && sel.format === "gguf"));
+        renderEnv();
         void rowMode; void rowProv;
     };
     /* 预设只在**切换服务商时**落地一次。放进 sync() 会在任何一次重绘
@@ -4363,7 +4459,17 @@ async function openOptSettings(node, onSaved) {
     url.addEventListener("input", rebuildThinking);
     /* max_tokens 也参与提示：高强度思考 + 额度不够要当场提醒（见 rebuildThinking） */
     maxTokens.addEventListener("input", rebuildThinking);
-    thinking.addEventListener("change", () => { level = thinking.value; rebuildThinking(); });
+    thinking.addEventListener("change", () => {
+        /* 两个口径的取值**有重叠**（low/high/max 既是 GLM 的强度档也是新档位），
+         * 所以不能靠值判断走哪套：两套变量都要更新，各自的下拉自己挑着用。
+         * 只更新一个的话，GLM 上选「max」会被当成新档位，老口径的 level 停在
+         * 原值 → 重建下拉时又被拉回「关闭」，用户看着像没选上。 */
+        level = thinking.value;
+        tkLevel = ["off", "low", "medium", "high", "max"].includes(thinking.value)
+            ? thinking.value
+            : (thinking.value === "disabled" ? "off" : (thinking.value === "enabled" ? "high" : ""));
+        rebuildThinking();
+    });
     localModel.addEventListener("change", () => { fillLocal(); sync(); guide.style.display = localModel.value ? "none" : ""; });
     refreshModels.onclick = async () => {
         refreshModels.disabled = true;
@@ -4373,6 +4479,7 @@ async function openOptSettings(node, onSaved) {
             if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "刷新失败"));
             models = Array.isArray(r.body.models) ? r.body.models : [];
             mmprojModels = Array.isArray(r.body.mmproj_models) ? r.body.mmproj_models : [];
+            if (r.body.llm_env && typeof r.body.llm_env === "object") current._env = r.body.llm_env;
             fillLocal(); sync();
         } catch (e) { alert(e.message); }
         finally { refreshModels.disabled = false; }
@@ -4413,6 +4520,12 @@ async function openOptSettings(node, onSaved) {
             max_tokens: mt, timeout: to,
             thinking: isEffort ? "enabled" : lv,
             reasoning_effort: isEffort ? lv : "",
+            /* 内部统一档位：只给 GPT / DeepSeek 存（这两家后端按它翻译字段）；
+             * 未知型号留空 = 不干预，别把档位写死到不认识的型号上。 */
+            thinking_level: (optThinkingFamily(url.value.trim(), model.value.trim()) === "gpt"
+                || optThinkingFamily(url.value.trim(), model.value.trim()) === "deepseek")
+                ? (["off", "low", "medium", "high", "max"].includes(thinking.value)
+                    ? thinking.value : tkLevel) : "",
             cfg_ver: OPT_CFG_VER,
             /* AI 扩写优化设置（段卡「AI扩写+优化」按钮的参数） */
             expand: {
@@ -6074,13 +6187,36 @@ function openDesk() {
         const ed = desk?.page?.querySelector(".h3d-rta, textarea, input");
         if (ed) { try { ed.focus(); } catch (e) { /* 忽略 */ } }
     };
+    /* 27B 本地模型 + H3 采样轮流抢显存，谁后加载谁 OOM。兜底动作：把 ComfyUI
+     * 驻留的模型全卸了再清缓存 —— OOM 之后点一下就能重跑，不用重启 ComfyUI。
+     * 本地 LLM 句柄本来就是用完即卸，这里只管 torch 这边的驻留模型。
+     * 生成中会被后端 423 拒掉（把正在用的模型卸了等于砍掉这次运行）。 */
+    const vramBtn = el("button", "h3d-btn h3d-vrambtn", "🧹 显存清理");
+    vramBtn.title = "OOM / 显存吃紧时点这个：卸载 ComfyUI 当前驻留的全部模型并清空缓存。"
+        + "本地大模型优化完，先点一下再跑 H3，就不会被挤 OOM";
+    vramBtn.onclick = async () => {
+        if (vramBtn.disabled) return;
+        if (!window.H3Api?.vramCleanup) { alert("h3_api.js 未更新（缺 vramCleanup），刷新页面试试"); return; }
+        vramBtn.disabled = true;
+        const old = vramBtn.textContent;
+        vramBtn.textContent = "清理中…";
+        try {
+            const r = await window.H3Api.vramCleanup();
+            if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "清理失败"));
+            vramBtn.textContent = "✓ 已清理";
+            setTimeout(() => { vramBtn.textContent = old; }, 2000);
+        } catch (e) {
+            vramBtn.textContent = old;
+            alert(e.message);
+        } finally { vramBtn.disabled = false; }
+    };
     const close = el("button", "h3d-close", "✕");
     close.title = "关闭导演台（Esc）";
     /* 分区渲染出错的可见出口：以前异常只进 console，用户看到的是"某个区空了"，
      * 无从判断是没数据还是代码挂了。这里把区名与错误一行摆到顶栏。 */
     const zoneErr = el("span", "h3d-zoneerr", "");
     zoneErr.style.display = "none";
-    right.append(fixFocus, ledWrap, sub, zoneErr, close);
+    right.append(fixFocus, vramBtn, ledWrap, sub, zoneErr, close);
     topbar.append(left, right);
 
     /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */

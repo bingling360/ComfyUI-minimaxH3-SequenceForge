@@ -83,6 +83,7 @@ ROUTES = [
     ("POST", "/h3chain/expand_multi"),
     ("POST", "/h3chain/expand_optimize"),
     ("POST", "/h3chain/optimize_multi"),
+    ("POST", "/h3chain/vram_cleanup"),
     ("POST", "/h3chain/expand_validate"),
     ("GET", "/h3chain/lib_list"),
     ("GET", "/h3chain/lib_item"),
@@ -1059,7 +1060,11 @@ def add_routes(routes):
         return web.json_response({"ok": True, "files": _opt.load_rule_files()})
 
     async def optimizer_config(request):
-        """优化器配置（脱敏）+ 本地模型扫描，供设置面板使用。"""
+        """优化器配置（脱敏）+ 本地模型扫描，供设置面板使用。
+
+        llm_env：本地模型目录与依赖探测结果 —— 前端拿它显示「模型放哪」
+        和「缺什么件去哪装」，不再让用户对着空的模型下拉猜。
+        """
         try:
             from . import optimizer as _opt
         except ImportError:
@@ -1068,7 +1073,60 @@ def add_routes(routes):
             cfg = _opt.public_config(_opt.normalize_config(None))
         except Exception:
             cfg = {"ok": False}
-        return web.json_response({"ok": True, **cfg})
+        resp = {"ok": True, **cfg}
+        try:
+            resp["llm_env"] = _opt.llm_env_info()
+        except Exception:
+            pass
+        return web.json_response(resp)
+
+    async def vram_cleanup(request):
+        """显存清理：卸载 ComfyUI 当前驻留的全部模型 + 清空分配器缓存。
+
+        给「OOM 之后点一下再重跑」用：27B 本地模型和 H3 采样轮流抢显存，
+        谁后加载谁 OOM。本地 LLM 句柄本来就用完即卸（ggml 的池要靠 close()
+        归还），这里只需要管 torch 这边 —— ComfyUI 自己的扩散模型/VAE/CLIP。
+
+        正在生成时拒绝（423）：把正在用的模型卸了等于把这次运行砍了。
+        """
+        if _busy():
+            return _err("正在生成中，不能清显存（等这轮跑完再点）",
+                        code="BUSY", status=423)
+        try:
+            import comfy.model_management as mm
+        except Exception:
+            return _err("找不到 comfy.model_management（不在 ComfyUI 环境里？）",
+                        code="NO_COMFY", status=500)
+        import gc as _gc
+        try:
+            dev = mm.get_torch_device()
+            try:
+                before = mm.get_free_memory(dev)
+            except Exception:
+                before = None
+            mm.unload_all_models()
+            _gc.collect()
+            try:
+                mm.soft_empty_cache()
+            except Exception:
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            freed = None
+            try:
+                after = mm.get_free_memory(dev)
+                if before is not None:
+                    freed = max(0, after - before)
+            except Exception:
+                freed = None
+        except Exception as e:
+            return _err(f"显存清理失败：{e}", code="CLEANUP_FAILED", status=500)
+        msg = "已卸载全部模型并清理显存缓存"
+        if freed:
+            msg += f"（释放约 {freed / 1024 ** 3:.1f} GB）"
+        return web.json_response({"ok": True, "freed_bytes": freed, "message": msg})
 
     async def optimize(request):
         """提示词优化（长耗时，放线程池）：自研后端，云/本地双通道。"""
@@ -2542,6 +2600,7 @@ def add_routes(routes):
         ("POST", "/h3chain/expand_optimize", expand_optimize),
         ("POST", "/h3chain/expand_optimize_stream", expand_optimize_stream),
         ("POST", "/h3chain/optimize_multi", optimize_multi),
+        ("POST", "/h3chain/vram_cleanup", vram_cleanup),
         ("POST", "/h3chain/optimize_multi_stream", optimize_multi_stream),
         ("POST", "/h3chain/expand_validate", expand_validate),
         ("POST", "/h3chain/create_project", create_project),

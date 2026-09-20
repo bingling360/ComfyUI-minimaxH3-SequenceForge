@@ -70,6 +70,9 @@ DEFAULT_CONFIG = {
     #   见 _glm_thinking_fields() 的自动降级：它会翻译成最低强度 low，
     #   而不是什么都不发（什么都不发 = 服务商默认，通常是 max，最慢的）。
     "thinking": "disabled",
+    # 内部统一思考档位（off/low/medium/high/max，空=不干预）。三家之外的型号
+    # 一律不干预（那是"未知型号"，下发私有字段只会 400）—— 见 _thinking_fields。
+    "thinking_level": "off",
     # 思考强度（仅智谱 GLM-5 系支持）：""=不指定（服务商用默认，通常 max）
     # / low / high / max。5.3 系只认这三档，别的值会报错。
     "reasoning_effort": "",
@@ -85,6 +88,12 @@ PROVIDERS = {
     "gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", "gemini"),
     "openrouter": ("https://openrouter.ai/api/v1", "google/gemini-2.5-flash", "openai"),
     "dashscope": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-vl-max", "openai"),
+    # DeepSeek 官方 OpenAI 兼容端点（base_url 不带 /v1，SDK/本插件会自动补
+    # /chat/completions）。默认型号 deepseek-flash = DeepSeek-V4.1-Flash：
+    # 它是**唯一支持图片输入**的 DeepSeek 型号（V4 Pro 不支持视觉），而本插件
+    # 的提示词优化要读参考图，所以只能拿它当默认。思考默认开、默认 high，
+    # 档位 off/low/high/max —— 见 _deepseek_thinking_fields()。
+    "deepseek": ("https://api.deepseek.com", "deepseek-flash", "openai"),
     "siliconflow": ("https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-VL-72B-Instruct", "openai"),
     "runninghub": ("https://www.runninghub.cn/openapi/v2", "openai/gpt-5.6-sol", "openai"),
     "runninghub_overseas": ("https://www.runninghub.ai/openapi/v2", "openai/gpt-5.6-sol", "openai"),
@@ -113,43 +122,6 @@ def _is_forced_thinking(model: str) -> bool:
 
 def _supports_effort(model: str) -> bool:
     return str(model or "").lower().startswith(GLM_EFFORT_PREFIXES)
-
-
-def _glm_thinking_fields(cfg: dict) -> dict:
-    """智谱系专有的 `thinking` / `reasoning_effort` 字段。非智谱端点返回 {}。
-
-    四条规则，都是被实测打出来的：
-    1. `thinking` 是智谱私有字段，塞进 OpenAI/百炼的请求体直接 400 → 非智谱不下发。
-    2. **「始终思考」型号不能收 `disabled`**（实测 400 / code 1210：
-       「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」）。
-       用户选了「关闭」时，把它**翻译成最低强度 `low`** —— 用户的意图是"别想太久、
-       快点出结果"，`low` 才是这个意图在强制思考模型上的对应物。
-       什么都不发是不行的：那等于让服务商用默认值（通常是 `max`，最慢）。
-    3. `reasoning_effort` 只在 thinking 没被真正关掉时有意义。
-    4. 模型不支持 effort 时不发 —— 换个不认识这字段的型号整个请求就废了。
-    """
-    url = str(cfg.get("api_url") or "").lower()
-    if not any(h in url for h in _GLM_HOSTS):
-        return {}
-    model = str(cfg.get("model") or "")
-    mode = str(cfg.get("thinking") or "auto").lower()
-    effort = str(cfg.get("reasoning_effort") or "").lower()
-    forced = _is_forced_thinking(model)
-    supports = _supports_effort(model)
-    out: dict = {}
-    if mode == "disabled":
-        if not forced:
-            out["thinking"] = {"type": "disabled"}
-        elif supports:
-            out["reasoning_effort"] = "low"
-    elif mode == "enabled":
-        out["thinking"] = {"type": "enabled"}
-    # auto（或强制思考型号被降级）→ 不下发 thinking，交给服务商默认
-    # 显式指定的强度永远优先于上面的翻译
-    if effort in GLM_EFFORT_VALUES and supports \
-            and out.get("thinking", {}).get("type") != "disabled":
-        out["reasoning_effort"] = effort
-    return out
 
 
 def _glm_caps(model: str) -> dict:
@@ -297,6 +269,11 @@ def normalize_config(raw: dict | None) -> dict:
         "timeout": timeout,
         "thinking": thinking,
         "reasoning_effort": effort,
+        # 新的**内部统一档位**（off/low/medium/high/max）。空串 = 不干预（auto）。
+        # 旧的两个字段（thinking 开关 + reasoning_effort 强度）继续保留：
+        # 没给新值时 _cfg_think_level() 会按旧字段推导，老配置不用迁移。
+        "thinking_level": str(raw.get("thinking_level")
+                              or cur.get("thinking_level") or "").lower(),
         "rule_file": str(raw.get("rule_file") or cur["rule_file"]),
         "expand": _clean_expand(raw.get("expand"), cur.get("expand")),
     }
@@ -345,6 +322,9 @@ def public_config(cfg: dict) -> dict:
     out["glm_effort_prefixes"] = list(GLM_EFFORT_PREFIXES)
     out["glm_effort_values"] = list(GLM_EFFORT_VALUES)
     out["model_caps"] = _glm_caps(cfg.get("model") or "")
+    # 思考能力（三家之外的型号 known=false：前端要写明"不干预"，别让人以为默认关了）
+    out["thinking_caps"] = _thinking_caps(cfg)
+    out["thinking_levels"] = list(THINK_LEVELS)
     try:
         out["models"] = scan_visual_models()
     except Exception:
@@ -360,6 +340,17 @@ def _llm_roots() -> list:
     try:
         import folder_paths
         base = os.path.join(os.path.dirname(str(folder_paths.get_input_directory())), "models")
+        # extra_model_paths.yaml 可以把模型目录搬到别的盘/别的目录：那时 ComfyUI 装在哪
+        # 都跟实际模型位置无关了，models/ 下也就没有 llm 子目录。有人在配置里注册过
+        # 「llm」这个目录名就优先用注册的路径 —— 提示的目录得是模型真正在的地方。
+        try:
+            reg = getattr(folder_paths, "folder_names_and_paths", {}).get("llm")
+            paths = reg[0] if isinstance(reg[0], (list, tuple)) else [reg[0]]
+            extra = [p for p in paths if p and os.path.isdir(str(p))]
+            if extra:
+                return [str(p) for p in extra]
+        except Exception:
+            pass
     except Exception:
         base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
     pref = os.path.join(base, "llm")
@@ -371,6 +362,37 @@ def _llm_roots() -> list:
     except OSError:
         pass
     return found or [pref]
+
+
+def llm_env_info() -> dict:
+    """本地通道环境信息：模型目录 + 依赖装没装（设置面板的存放位置/缺件提示用）。
+
+    只做 find_spec / metadata 探测，**不 import torch 这类重货** —— 设置面板每开
+    一次就调一回，开销必须是毫秒级。
+    """
+    import importlib.metadata as _md
+    import importlib.util as _util
+    deps = {}
+    for mod_name, pkg_name in (("llama_cpp", "llama-cpp-python"),
+                               ("transformers", "transformers"),
+                               ("torch", "torch")):
+        try:
+            installed = _util.find_spec(mod_name) is not None
+        except (ImportError, ValueError):
+            installed = False
+        version = ""
+        if installed:
+            try:
+                version = _md.version(pkg_name)
+            except Exception:
+                version = ""
+        deps[mod_name] = {"installed": installed, "version": version}
+    roots = _llm_roots()
+    primary = roots[0] if roots else ""
+    # 目录可能压根还没建（models/ 下没有 llm 子目录）→ 路径照给，但带一个
+    # exists 标记，前端据此补一句"先手动建这个文件夹"，别让人对着不存在的路径找。
+    return {"llm_dir": primary, "llm_dir_exists": bool(primary) and os.path.isdir(primary),
+            "llm_dirs": roots, "deps": deps}
 
 
 def _is_visual_dir(path: str) -> bool:
@@ -645,9 +667,10 @@ def _api_generate(cfg: dict, system: str, user_prompt: str, media: list, max_tok
         "model": cfg["model"],
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": content2}],
-        "max_tokens": max_tokens, "temperature": _temp(temperature),
+        "max_tokens": max_tokens,
     }
-    payload.update(_glm_thinking_fields(cfg))
+    payload.update(_temp_fields(cfg, temperature))
+    payload.update(_thinking_fields(cfg))
     res = _http_post_json(_endpoint_for(cfg), payload,
                           headers={"Authorization": f"Bearer {cfg['api_key']}"},
                           timeout=timeout)
@@ -689,10 +712,11 @@ def _api_generate_stream(cfg: dict, system: str, user_prompt: str, media: list, 
         "model": cfg["model"],
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": content2}],
-        "max_tokens": max_tokens, "temperature": _temp(temperature),
+        "max_tokens": max_tokens,
         "stream": True,
     }
-    payload.update(_glm_thinking_fields(cfg))
+    payload.update(_temp_fields(cfg, temperature))
+    payload.update(_thinking_fields(cfg))
     req = urllib.request.Request(
         _endpoint_for(cfg), data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json",
@@ -844,6 +868,267 @@ def _strip_think(text: str) -> str:
     return raw
 
 
+def _new_llama(kw: dict):
+    """构造 Llama，带一次「新参数不被老轮子认识」的降级重试。
+
+    flash_attn / type_k / type_v / n_ubatch 都是较新 llama-cpp-python 才有的构造
+    参数：老轮子（或没编 FA 的 CUDA 轮子 + 量化 KV 的组合）会在构造时直接抛异常。
+    第一次带满加速参数，失败就剥掉它们重试一次 —— 能吃到多少算多少，
+    绝不因为加速项把整次生成弄挂。
+
+    降级要**打到日志里**：KV 回到 fp16 意味着显存翻倍，27B 在 24G 卡上就 spill
+    到内存了，速度掉一个数量级 —— 这种"能跑但慢十倍"的状态必须看得见，
+    否则用户只会觉得"这个插件好慢"，根本查不到是加速项没生效。
+    """
+    from llama_cpp import Llama  # type: ignore
+    fast_keys = ("flash_attn", "type_k", "type_v", "n_ubatch")
+    try:
+        return Llama(**kw)
+    except Exception:
+        if not any(k in kw for k in fast_keys):
+            raise
+        slow = {k: v for k, v in kw.items() if k not in fast_keys}
+        # 老轮子的 n_batch 同时充当物理批，2048 会按最坏情况撑爆计算缓冲区
+        slow["n_batch"] = 512
+        print("[ComfyUI_H3_SeamlessChain] llama-cpp-python 不认本插件的加速参数，已降级运行："
+              "关掉 flash attention、KV 缓存退回 fp16（显存占用翻倍，27B 在 24G 卡上会掉层到内存，"
+              "速度慢一个数量级）。建议升级 llama-cpp-python 到较新版本")
+        return Llama(**slow)
+
+
+def _torch_bf16_ok(torch_mod) -> bool:
+    """这张卡能不能跑 bf16（Ampere / sm_80 及以上才有硬件 bf16）。
+
+    20 系及更早没有 bf16 单元：硬上会报错或退化成慢速模拟，那种卡只能回 fp16。
+    """
+    try:
+        if not torch_mod.cuda.is_available():
+            return False
+        checker = getattr(torch_mod.cuda, "is_bf16_supported", None)
+        return True if checker is None else bool(checker())
+    except Exception:
+        return False
+
+
+def _pick_hf_dtype(torch_mod, config_dtype, device: str):
+    """挑推理精度：**不硬写死**，优先照模型自己 config 标的来。
+
+    为什么不能一律 fp16：这批 VL 模型（Qwen-VL / Gemma 系）是 bf16 训练的，
+    激活值超出 fp16 范围会直接溢出 —— 表现是输出乱码/重复/空，不是悄悄变差。
+    反过来也不能一律 bf16：bf16 要 Ampere 以上，老卡没有硬件支持，只能回落 fp16。
+    """
+    if device == "cpu":
+        return torch_mod.float32          # CPU 上 bf16 没收益，fp32 更稳
+    want = str(config_dtype or "").lower()
+    if "bfloat16" in want:
+        return torch_mod.bfloat16 if _torch_bf16_ok(torch_mod) else torch_mod.float16
+    if "float16" in want:
+        return torch_mod.float16
+    # config 没标（或标了 float32）：按 bf16 走（当前主流训练精度），老卡回落 fp16
+    return torch_mod.bfloat16 if _torch_bf16_ok(torch_mod) else torch_mod.float16
+
+
+# ---- 思考（thinking）能力档案 -------------------------------------------------
+#
+# 只维护三家（智谱 / GPT / DeepSeek），其余一律「未知」→ 不下发任何思考字段，
+# 交给服务商默认。理由：模型名是手填的，名单穷举不完；对不认识的型号发自家
+# 私有字段只会换来 400。三家之外的"默认开还是关"由服务商决定，UI 会写明。
+#
+# 各家 2026-09 现状（联网核实，别按训练数据写）：
+#   GLM    私有 thinking.type + reasoning_effort(low/high/max)，部分型号强制思考
+#   GPT    OpenAI 的 reasoning_effort
+#            gpt-6-astra：low/medium/high/xhigh/max —— **没有 none，关不掉**（强制）
+#            gpt-5.6-sol|terra|luna：none/low/medium/high/xhigh/max，默认 none
+#            gpt-5.1 及更早：默认 medium，不支持 none
+#            ⚠ GPT-6 及以后不支持 temperature / top_p —— 见 _temp_fields()
+#   DeepSeek  deepseek-flash（V4.1 Flash）/ deepseek-v4-pro
+#            思考**默认开、默认 high**；档位 low/high/max（OpenAI 风格档名就近映射）
+#            开关是 thinking.type，强度用 reasoning_effort
+THINK_LEVELS = ("off", "low", "medium", "high", "max")
+
+# 型号前缀 → (默认档, 支持的档位, 能否关闭)
+_GPT_EFFORT = {
+    "gpt-6": ("medium", ("low", "medium", "high", "xhigh", "max"), False),
+    "gpt-5.6": ("none", ("none", "low", "medium", "high", "xhigh", "max"), True),
+}
+_GPT_MAP = {"off": "none", "low": "low", "medium": "medium", "high": "high", "max": "max"}
+# DeepSeek 档位比我们少：medium/high 都落到 high（官方映射表：medium/high/xhigh→high）
+_DS_MAP = {"low": "low", "medium": "high", "high": "high", "max": "max"}
+# GLM 只有三档：medium 就近取 high（三档里的中间档）
+_GLM_MAP = {"low": "low", "medium": "high", "high": "high", "max": "max"}
+
+
+def _model_base(model: str) -> str:
+    """取型号名本体：OpenRouter 之类会写成 `openai/gpt-5.6`。"""
+    return str(model or "").split("/")[-1].strip().lower()
+
+
+def _thinking_family(cfg: dict) -> str:
+    """判断当前端点属于哪家：glm / deepseek / gpt / unknown（unknown 一律不干预）。"""
+    url = str(cfg.get("api_url") or "").lower()
+    model = str(cfg.get("model") or "").lower()
+    if any(h in url for h in _GLM_HOSTS):
+        return "glm"
+    if "deepseek" in url or model.startswith("deepseek"):
+        return "deepseek"
+    base = _model_base(model)
+    # 只认官方域名或明确的 GPT 型号名 —— 不做宽松子串匹配：有些中转/代理地址里
+    # 带 "openai" 字样，但后面接的是别家模型，给它发 reasoning_effort 就是 400。
+    if "openai.com" in url or base.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
+        return "gpt"
+    return "unknown"
+
+
+def _cfg_think_level(cfg: dict):
+    """内部统一档位 off/low/medium/high/max；None = 不干预（auto）。
+
+    兼容旧的两个字段（thinking 开关 + reasoning_effort 强度）：没给新字段时按旧
+    字段推导，老配置不用迁移。
+    """
+    lv = str(cfg.get("thinking_level") or "").lower()
+    if lv in THINK_LEVELS:
+        return lv
+    mode = str(cfg.get("thinking") or "auto").lower()
+    if mode == "auto":
+        return None                  # 什么都不下发，交给服务商默认
+    effort = str(cfg.get("reasoning_effort") or "").lower()
+    # 显式强度优先于开关：历史配置里有「关闭 + 指定强度」这种组合（强度才是真正
+    # 被用户挑过的那一项），按旧口径让强度说话。
+    mapped = {"low": "low", "high": "high", "max": "max"}.get(effort)
+    if mapped:
+        return mapped
+    return "off" if mode == "disabled" else "high"
+
+
+def _gpt_thinking_fields(cfg: dict) -> dict:
+    """OpenAI 系：只发标准的 reasoning_effort，不发任何私有字段。"""
+    base = _model_base(cfg.get("model"))
+    prof = None
+    for prefix, value in _GPT_EFFORT.items():
+        if base.startswith(prefix):
+            prof = value
+            break
+    if prof is None:
+        # 更早的 gpt-5.1/5/5-mini 等：官方口径「默认 medium，不支持 none」。
+        # 档位只取各家都认的那三个，别去猜 minimal 之类的边界值。
+        if not base.startswith(("gpt-", "o1", "o3", "o4")):
+            return {}
+        prof = ("medium", ("low", "medium", "high"), False)
+    _default, values, can_off = prof
+    lv = _cfg_think_level(cfg)
+    if lv is None:
+        return {}
+    want = _GPT_MAP.get(lv)
+    if lv == "off" and not can_off:
+        want = "low"                 # gpt-6 关不掉：按"少想点"的意图降到最低档
+    if want not in values:
+        want = values[0] if lv == "off" else values[-1]
+    return {"reasoning_effort": want}
+
+
+def _deepseek_thinking_fields(cfg: dict) -> dict:
+    """DeepSeek：开关用 thinking.type，强度用 reasoning_effort（low/high/max）。"""
+    lv = _cfg_think_level(cfg)
+    if lv is None:
+        return {}
+    if lv == "off":
+        return {"thinking": {"type": "disabled"}}
+    return {"thinking": {"type": "enabled"},
+            "reasoning_effort": _DS_MAP.get(lv, "high")}
+
+
+def _glm_thinking_fields(cfg: dict) -> dict:
+    """智谱系专有的 `thinking` / `reasoning_effort` 字段。非智谱端点返回 {}。
+
+    四条规则，都是被实测打出来的：
+    1. `thinking` 是智谱私有字段，塞进 OpenAI/百炼的请求体直接 400 → 非智谱不下发。
+    2. **「始终思考」型号不能收 `disabled`**（实测 400 / code 1210：
+       「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」）。
+       用户选了「关闭」时，把它**翻译成最低强度 `low`** —— 用户的意图是"别想太久、
+       快点出结果"，`low` 才是这个意图在强制思考模型上的对应物。
+       什么都不发是不行的：那等于让服务商用默认值（通常是 `max`，最慢）。
+    3. `reasoning_effort` 只在 thinking 没被真正关掉时有意义。
+    4. 模型不支持 effort 时不发 —— 换个不认识这字段的型号整个请求就废了。
+    """
+    url = str(cfg.get("api_url") or "").lower()
+    if not any(h in url for h in _GLM_HOSTS):
+        return {}
+    model = str(cfg.get("model") or "")
+    forced = _is_forced_thinking(model)
+    supports = _supports_effort(model)
+    out: dict = {}
+    lv = _cfg_think_level(cfg)
+    if lv is None:
+        # auto：沿用旧逻辑（开关字段优先），不下发 reasoning_effort
+        mode = str(cfg.get("thinking") or "auto").lower()
+        if mode == "disabled" and not forced:
+            out["thinking"] = {"type": "disabled"}
+        elif mode == "enabled":
+            out["thinking"] = {"type": "enabled"}
+        return out
+    # 「按的是关闭」这条链路（新字段 off，或旧字段 thinking=disabled）一律**不下发
+    # thinking.type**：强制思考型号没有"关"这个概念，传进去是多余的一份风险，
+    # 只把意图翻译成强度（用户真挑过强度时以强度为准）。
+    legacy_off = (not str(cfg.get("thinking_level") or "").strip()
+                  and str(cfg.get("thinking") or "auto").lower() == "disabled")
+    if lv == "off" or legacy_off:
+        if not forced:
+            return {"thinking": {"type": "disabled"}}
+        return {"reasoning_effort": _GLM_MAP.get(lv, "low")} if supports else {}
+    out["thinking"] = {"type": "enabled"}
+    if supports:
+        out["reasoning_effort"] = _GLM_MAP.get(lv, "high")
+    return out
+
+
+def _thinking_fields(cfg: dict) -> dict:
+    """按端点的能力档案下发思考字段。**未知型号一律返回 {}（不干预）。**"""
+    fam = _thinking_family(cfg)
+    if fam == "glm":
+        return _glm_thinking_fields(cfg)
+    if fam == "gpt":
+        return _gpt_thinking_fields(cfg)
+    if fam == "deepseek":
+        return _deepseek_thinking_fields(cfg)
+    return {}
+
+
+def _temp_fields(cfg: dict, temperature: float) -> dict:
+    """温度字段：GPT-6 及以后**不接受 temperature**（官方：不支持 temperature/
+    top_p/logprobs），传了就是 400。其它家照旧。
+
+    DeepSeek 在思考模式下是"忽略不报错"，不用特殊处理；GLM 照旧。
+    """
+    base = _model_base(cfg.get("model"))
+    if _thinking_family(cfg) == "gpt" and base.startswith("gpt-6"):
+        return {}
+    return {"temperature": _temp(temperature)}
+
+
+def _thinking_caps(cfg: dict) -> dict:
+    """给前端的能力提示：这家能不能关、有几档、默认是什么、未知型号怎么说明。"""
+    fam = _thinking_family(cfg)
+    if fam == "unknown":
+        return {"family": "unknown", "known": False, "levels": [],
+                "note": "型号不在已知名单（GLM / GPT / DeepSeek），不干预思考，"
+                        "由服务商默认决定（思考型模型多半是开的）"}
+    if fam == "glm":
+        return {"family": "glm", "known": True, "levels": list(THINK_LEVELS),
+                "forced": _is_forced_thinking(cfg.get("model") or ""),
+                "note": ""}
+    if fam == "gpt":
+        base = _model_base(cfg.get("model"))
+        for prefix, (_d, values, can_off) in _GPT_EFFORT.items():
+            if base.startswith(prefix):
+                return {"family": "gpt", "known": True, "levels": list(THINK_LEVELS),
+                        "forced": not can_off,
+                        "note": ("该型号不能关闭思考，已按最低档处理" if not can_off else "")}
+        return {"family": "gpt", "known": True, "levels": ["low", "medium", "high"],
+                "forced": True, "note": "较早期的 GPT 思考型号：不能关闭，只调强度"}
+    return {"family": "deepseek", "known": True, "levels": list(THINK_LEVELS),
+            "forced": False, "note": "DeepSeek 默认开思考（high），可关闭"}
+
+
 def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
                     temperature: float = 0.2) -> str:
     """本地视觉模型推理（GGUF / Transformers 两路）。
@@ -866,17 +1151,45 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
         if sel.lower().endswith(".gguf"):
             # ---- GGUF 路径（llama-cpp-python + mmproj 视觉投影）----
             try:
-                from llama_cpp import Llama  # type: ignore
+                import llama_cpp  # noqa: F401  （GGML_TYPE_Q8_0 常量探测用）
+                from llama_cpp import Llama  # noqa: F401  （探测「装没装」的哨兵）
                 from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore
             except ImportError:
-                raise ValueError("未安装 llama-cpp-python，无法加载 GGUF 本地模型"
-                                 "（按 CUDA/Python 版本装轮子，详见 goohai 项目说明）")
+                raise ValueError(
+                    "未安装 llama-cpp-python，无法加载 GGUF 本地模型。安装方法"
+                    "（必须装进 ComfyUI 用的那个 Python 环境）：\n"
+                    "· NVIDIA 显卡（默认 cu130 = CUDA 13.0）：pip install llama-cpp-python "
+                    "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130\n"
+                    "  驱动/工具链较老就往下换档：cu125（CUDA 12.5，12.x 线最高档）/ "
+                    "cu124 / cu123 / cu122 / cu121 / cu118\n"
+                    "· 纯 CPU：pip install llama-cpp-python\n"
+                    "两个坑：预编译轮子只给 Python 3.10/3.11/3.12（3.13 及以上要从源码编）；"
+                    "CUDA 13 轮子要求显卡算力 7.5 以上（3090 是 8.6，可用）\n"
+                    "项目主页：https://github.com/abetlen/llama-cpp-python")
             mmproj = str(cfg.get("local_mmproj") or "").strip()
+            if mmproj and not os.path.isfile(os.path.join(root, mmproj)):
+                raise ValueError(f"视觉投影文件不存在：{mmproj}"
+                                 "（请确认已放进本地模型目录，再回设置里点「刷新模型」）")
             budget = int(cfg.get("max_tokens") or 8192)
             # n_ctx 必须容得下「提示词 + 生成」：旧值写死 8192，而 max_tokens 默认 16384
             # → 生成本身就大于窗口，思考刚写完就被截断。多留 8192 给系统提示+规则文件+图。
             n_ctx = (max(8192, budget + 8192) + 511) // 512 * 512
-            kw = {"model_path": os.path.join(root, sel), "n_ctx": n_ctx, "verbose": False}
+            # 通用加速项（全部是 llama-cpp-python 自带参数，不引新依赖）：
+            # - flash_attn：显存与长上下文速度双赢；
+            # - type_k/type_v=q8_0：KV 缓存显存减半 —— 24G 卡上 27B 能不能整个
+            #   塞进显存（塞不下会静默掉层到 CPU，速度掉一个数量级）的胜负手。
+            #   llama.cpp 要求 V 量化必须开 FA，所以两个都只在 FA 请求发出时带上；
+            # - n_batch / n_ubatch：n_batch 是「一次喂多少 token」，加到 2048 给长系统
+            #   提示 + 规则文件的 prefill 提速；n_ubatch 是「物理微批」，**必须单独压到
+            #   512** —— llama.cpp 按微批的最坏情况撑开计算缓冲区，2048 的物理批会凭
+            #   空吃掉 1~2G 显存，正好是 27B 挤不上 24G 卡的那部分。
+            kw = {"model_path": os.path.join(root, sel), "n_ctx": n_ctx,
+                  "verbose": False, "n_batch": 2048, "n_ubatch": 512,
+                  "flash_attn": True}
+            q8 = getattr(llama_cpp, "GGML_TYPE_Q8_0", None)
+            if q8 is not None:
+                kw["type_k"] = q8
+                kw["type_v"] = q8
             if mmproj:
                 # mproj 走 GPU 加速（视觉塔比语言模型轻，显存占用小）
                 kw["chat_handler"] = Llava15ChatHandler(
@@ -885,7 +1198,7 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
             # 就是 0 层 = 纯 CPU，27B 在 CPU 上出 1000 字要按分钟算。
             if str(cfg.get("local_device") or "cuda").lower() != "cpu":
                 kw["n_gpu_layers"] = -1
-            llm = Llama(**kw)
+            llm = _new_llama(kw)
             content: list = [{"type": "text", "text": user_prompt}]
             for u in images:
                 content.append({"type": "image_url", "image_url": {"url": u}})
@@ -905,13 +1218,45 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
                 import torch  # type: ignore
                 from transformers import AutoModelForImageTextToText, AutoProcessor  # type: ignore
             except ImportError:
-                raise ValueError("未安装 transformers/torch，无法加载本地视觉模型（请改用云 API）")
+                raise ValueError("未安装 transformers/torch，无法加载本地视觉模型。"
+                                 "请在 ComfyUI 的 Python 环境里执行："
+                                 "pip install torch transformers accelerate"
+                                 "（或改用云 API / 换 GGUF 模型）")
             path = os.path.join(root, sel)
+            # 设备归一：设置里的 "auto" 要在这里落地成具体设备（device_map 认 "auto"，
+            # 但 .to(torch.device("auto")) 会直接抛错）。
             device = str(cfg.get("local_device") or "cuda").lower()
-            dtype = torch.float32 if device == "cpu" else torch.float16
+            dev = device if device in ("cuda", "cpu", "mps") else (
+                "cuda" if torch.cuda.is_available() else "cpu")
+            # 精度：读模型 config 自己标的 torch_dtype，别硬写死 —— 见 _pick_hf_dtype
+            try:
+                from transformers import AutoConfig  # type: ignore
+                cfg_dtype = getattr(
+                    AutoConfig.from_pretrained(path, trust_remote_code=True),
+                    "torch_dtype", None)
+            except Exception:
+                cfg_dtype = None
+            dtype = _pick_hf_dtype(torch, cfg_dtype, dev)
             processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
-            model = AutoModelForImageTextToText.from_pretrained(
-                path, dtype=dtype, device_map=device, trust_remote_code=True)
+            kw = {"dtype": dtype, "trust_remote_code": True}
+            # device_map 走 accelerate 的「边读边搬」：大模型不必先在内存里整份摊开。
+            # 但它传字符串必须装了 accelerate —— 没装就退到 .to()（能跑，代价是内存
+            # 峰值等于整份权重，32B bf16 ≈ 64G），所以 .to() 只是兜底，不是首选。
+            try:
+                import accelerate  # noqa: F401  （只探测在不在，不用它的 API）
+                kw["device_map"] = dev
+            except ImportError:
+                pass
+            # sdpa 是 torch 自带的高性能注意力（不用装 flash-attn），算的是**精确**
+            # 注意力，但不像 eager 那样摊开 N×N 的大矩阵（8000 token 就是几 GB）。
+            # 极少数模型/老 transformers 不认这个参数 → 剥掉重试一次。
+            try:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    path, attn_implementation="sdpa", **kw)
+            except Exception:
+                model = AutoModelForImageTextToText.from_pretrained(path, **kw)
+            if "device_map" not in kw:
+                model = model.to(torch.device(dev))
             model.eval()
             content = [{"type": "image"} for _ in images] + [{"type": "text", "text": user_prompt}]
             messages = [{"role": "system", "content": [{"type": "text", "text": system}]},

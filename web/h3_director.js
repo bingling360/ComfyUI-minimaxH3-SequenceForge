@@ -1613,16 +1613,40 @@ function remapOldWidgetValues(wv) {
     ];
 }
 
-/* 旧版工作流 widget 布局迁移到当前 29 值 schema。
- * 当前后端 define_schema 共 29 个控件值（28 控件 + 种子 control 占 1 位）。
+/* 旧版工作流 widget 布局迁移到当前 31 值 schema。
+ * 当前后端 define_schema 共 31 个控件值（30 控件 + 种子 control 占 1 位）。
  * 第二阶段提交 7435084 剔除了 8 个接缝/精修控件（接缝处理/混合帧数/精修强度/
  * 精修窗口/智能切镜/切镜最多丢帧/全链丢弃预算/自适应精修）并新增「自动成片」，
  * 旧 35 值布局因此中段错位、缺自动成片；更早的「导演台时代」极老工作流为 25 值。
- * 下面统一把这两种（及任意短于 29 的）旧布局直接映射到当前 29 值：
+ * 下面统一把这两种旧布局直接映射到当前 31 值：
  * 头部 0..16 位与当前一致，中段已删控件取当前默认值，自动成片插在生成模式前，
- * 生成模式/导演台状态从尾部取，缺失尾部按默认值补齐（新尾部「一采编码」恒补标准）。 */
+ * 生成模式/导演台状态从尾部取，缺失尾部按默认值补齐
+ * （「一采编码」恒补标准，「参考图像尺寸」「响度对齐强度」恒补 match / 1.0）。
+ *
+ * ⚠ 2026-09-20 修：旧判据是 `wv.length !== CUR_WIDGET_COUNT`，而 CUR_WIDGET_COUNT
+ * 是手写常数 —— 1148ae3 把控件从 29 值加到 31 值时忘了同步它，于是**完全正确的
+ * 31 值工作流（含插件自带默认工作流）被判成旧布局并强行重排**，参数整体错位：
+ * 锚定加噪收到"分段"、审片模式收到 0、重摇上限收到导演台状态 JSON…
+ * 现改为按「值形态」识别，长度漂移不再致病。 */
 const V35_WIDGET_COUNT = 35;   // 第二阶段剔除控件后、未加自动成片的陈旧布局
-const CUR_WIDGET_COUNT = 29;   // 当前 schema 控件值总数
+const CUR_WIDGET_COUNT = 31;   // 当前 schema 控件值总数（仅供日志/断言，判据不依赖它）
+
+/* 当前布局判据：长度精确等于当前值数，或第 0 位（宽高比）与第 27 位
+ * （导演台状态）都是字符串。这两条能覆盖全部历史布局：
+ *   当前 31 值 / 上一版 29 值 → true（29 值只缺末尾两个控件，ComfyUI 会用控件默认值
+ *                              补齐 match / 1.0，恰是所需，无需重排）
+ *   35 值陈旧布局 → 第 27 位是数字「重摇上限」→ false
+ *   极老 25 值布局 → 第 0 位是数字「宽度」→ false
+ * 刻意不比较长度：控件增删会让长度漂移，忘了同步常数就会误迁移正确工作流。 */
+function isCurrentWidgetLayout(wv) {
+    if (!Array.isArray(wv)) return false;
+    // 长度恰好等于当前值数 → 必然逐位对齐（历史布局是 25 / 29 / 35，撞不上）。
+    // 这一条还兜住「已被旧版迁移层改坏、又被用户存进 ComfyUI 的工作流」：
+    // 那种存档长度仍是 31，但第 27 位是数字 1.0，靠形态判据会被再迁一次。
+    if (wv.length === CUR_WIDGET_COUNT && typeof wv[0] === "string") return true;
+    // 否则看跨版本稳定的两个位置：宽高比（0）与导演台状态（27）都应是字符串
+    return typeof wv[0] === "string" && typeof wv[27] === "string";
+}
 
 // 当前 schema「中段」默认值（位置 17..26）：锚定加噪, 审片模式, 自动保存, 重跑起始段,
 // 接缝重摇, 重摇阈值, 重摇上限, 递减锚定, 自动成片
@@ -1635,9 +1659,10 @@ const V35_PICK = {
     genmode: 33, ds: 34,                            // 生成模式, 导演台状态
 };
 
-/* 旧布局 wv → 当前 28 值布局。头部 0..16 原样；中段 8 个控件从 V35 对应位取
+/* 旧布局 wv → 当前 31 值布局。头部 0..16 原样；中段 8 个控件从 V35 对应位取
  * （更老布局这些位不存在则取 CUR_MID_DEFAULTS）；自动成片固定 "开启"；
- * 生成模式/导演台状态取尾部（35 值取末两位，更老布局取最后两元素）。 */
+ * 生成模式/导演台状态取尾部（35 值取末两位，更老布局取最后两元素）；
+ * 末尾两个后加控件（参考图像尺寸 / 响度对齐强度）恒补 match / 1.0。 */
 function remapOldWidgetValuesToCurrent(wv) {
     const head = wv.slice(0, 17);                    // 宽高比…回退上限（0..16）
     const pick = (i) => (i < wv.length ? wv[i] : undefined);
@@ -1657,6 +1682,8 @@ function remapOldWidgetValuesToCurrent(wv) {
         "开启",                                         // 自动成片（新增控件，恒开启，idx26）
         (tailDs !== undefined ? tailDs : ""),           // 导演台状态（应为 JSON 字符串，idx27）
         "标准",                                          // 一采编码（新增控件，恒标准，idx28）
+        "match",                                        // 参考图像尺寸（新增控件，恒 match，idx29）
+        1.0,                                            // 响度对齐强度（新增控件，恒 1.0，idx30）
     ];
 }
 
@@ -1666,9 +1693,9 @@ function migrateGraphWidgets(graphData) {
     for (const n of graphData.nodes) {
         if (n.type !== NODE_TYPE || !Array.isArray(n.widgets_values) || !n.widgets_values.length) continue;
         const wv = n.widgets_values;
-        // 已是当前合法布局则跳过；否则（极老数字首项 / 35 值陈旧 / 其它长短不一）统一迁移
-        const legacy = (typeof wv[0] !== "string") || (wv.length !== CUR_WIDGET_COUNT);
-        if (!legacy) continue;
+        // 已是当前布局则跳过；否则（极老数字首项 / 35 值陈旧）统一迁移。
+        // 判据看形态不看长度 —— 长度会随控件增删漂移，比错判更危险（详见上方说明）。
+        if (isCurrentWidgetLayout(wv)) continue;
         try {
             n.widgets_values = remapOldWidgetValuesToCurrent(wv);
             migrated += 1;
@@ -1676,7 +1703,7 @@ function migrateGraphWidgets(graphData) {
             console.warn(`[h3-director] 节点 ${n.type} 参数迁移失败，保持原样交由兜底修正`, e);
         }
     }
-    if (migrated) console.log(`[h3-director] 已迁移 ${migrated} 个旧版 H3 节点的参数（旧布局 → 当前 28 控件）`);
+    if (migrated) console.log(`[h3-director] 已迁移 ${migrated} 个旧版 H3 节点的参数（旧布局 → 当前 ${CUR_WIDGET_COUNT} 值）`);
     return graphData;
 }
 

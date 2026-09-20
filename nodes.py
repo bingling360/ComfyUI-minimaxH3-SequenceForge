@@ -1468,6 +1468,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 return grid.snap_window_down(ctx), True, True
             _av = _a["branches"]["av"]
             return _a["window"], _av in ("both", "video"), _av in ("both", "audio")
+        def _takes_bridge(pi):
+            """段 pi 是否会取用「段首接片」——与 `_inject_guide` 的产物**同口径**。
+
+            画面或音频任一要接就算：`_tail_keyframe(with_video=False)` 明明为「仅音频」
+            写了专门分支（见其文档字符串），「仅音频」段首锚是真接片，不是"不用桥"。
+
+            交棒（上段算 `guide`）与取用（本段拿 `eff_guide`）必须都问这一个函数。
+            此前交棒借的是 `next_wants_bridge`（**门控/裁帧**口径，只看视频分支），
+            于是「仅音频」段拿到的是上一轮残留的旧接片——设了锚却按别的源钉，
+            且不报错（详见 2026-09-20 日志）。
+            """
+            fr, want_v, want_a = _eff_inject(pi)
+            return bool(fr > 0 and (want_v or want_a))
         def _inject_guide(video_t, audio_t, for_pi, end_tokens=None):
             """段首桥 keyframe；src 非 prev_tail 时改取该外源（库/段/视频/图片）。
 
@@ -2564,6 +2577,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
         seg_wavs = []
         trims = []
         seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
+        # 段首接片的**交棒位**：开局摆一块写着「无」的牌子。链首（没接起始视频、
+        # 当然也没有上段）本来就无片可接，但这个名字**必须存在**——否则第一段取片
+        # 时直接 UnboundLocalError、整链停摆（`cc93c7d` 删掉过这一行，见 2026-09-20 日志）。
+        # 之后只由「本段收工、下一个会上链的段要取片」那一处覆写。
+        guide = None
+        # 段间衔接的三件「上段尾」快照 + 成片音轨累积：`cc93c7d` 把这几行**一起删过**
+        # （于是只剩序章分支里赋值）→ 没接起始视频时第 1 段一读就崩：
+        # 3045 读 prev_tail_frame、3187 读自身累积的 all_wav、E3 开着时 3095 读
+        # prev_tail_clip。语义与 guide 一样：链首本来就"没有上段"。
+        prev_tail_frame = None   # 上段末帧（成片顺序）
+        prev_tail_clip = None    # 上段末 24 帧（E3 运动 z 用）
+        prev_tail_wav = None     # 上段末 0.25s 音频（接缝测量/响度对齐用）
+        all_wav = None           # 成片音轨累积（首段直接取本段）
 
         if use_ckpt:  # 运行起点状态（面板据此定位当前链）
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
@@ -2707,13 +2733,28 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     return False
             return True
 
+        def _next_consumer(item_i):
+            """item_i 之后第一个真正会上链执行的提示词段索引；没有 → -1。
+
+            交棒对象是**下一个会取用接片的段**，而不是"紧邻的下一个 item"：
+            中间夹着禁用段时，接片要由本段的 latent 直接交给禁用段之后那一段
+            （否则窗宽会按禁用段的配置算，接片宽度与实际相邻段对不上）。
+            """
+            for _it in exec_items[item_i + 1:]:
+                if _it[0] == "prompt" and not seg_disabled[_it[1]]:
+                    return _it[1]
+            return -1
+
         def _next_wants_bridge(item_i):
-            """item_i 的下一段是否接收本段尾帧桥：下段不存在 / 关闭自动引用上段 /
-            关闭 latent 注入 → False（独立镜头与 latent_ref.on=false 都不要桥）"""
+            """下一段是否接收本段尾帧桥——**只用于桥帧门控与裁帧**（视频口径）。
+
+            裁头/门控/接缝测量都按视频帧算，故纯音频锚不算「要桥」。
+            ⚠ 接片交棒（算 `guide`）**不要**用它，用 `_next_consumer` + `_takes_bridge`：
+            那才是取用端的口径，两者不是同一个问题。
+            """
             nxt = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
             if not (nxt and nxt[0] == "prompt" and not seg_unlink[nxt[1]]):
                 return False
-            # 视频分支是主干：裁头/门控/接缝测量都按视频帧算，故纯音频锚不算「要桥」。
             fr, want_v, _w = _eff_inject(nxt[1])
             return bool(fr > 0 and want_v)
 
@@ -2724,8 +2765,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 段禁用（不上链）：槽位占位跳过——不采样/不解码/不进成片；manifest
             # 记录类列表沿用旧记录（无则空占位）保槽位不错位；done 照常推进
             #（禁用段视作已处理；段文件缺失由下方 replay 存在性守卫兜底，重新
-            # 上链时自动采样）；guide/prev_tail 不更新 → 下段锚定最近一个已执行
-            # 段的尾帧（与成片实际顺序一致）
+            # 上链时自动采样）；禁用段整轮 continue、不经手接片——交棒交给
+            # `_next_consumer` 越过它、直接算给下一个会执行的段（与成片实际顺序一致）
             if seg_disabled[i]:
                 def _old_rec(k, default):
                     seq = (_old_lists or {}).get(k) or []
@@ -2848,8 +2889,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         end_frame_latent
                         if (seg_end_on[i] and end_frame_latent is not None) else _anchor_tail(i))
                     if _redo_mode in ("双锚", "仅锚上段"):
-                        # unlink 前段没为它留 guide（陈旧），需直读前段存档现算尾桥
-                        eff_guide = _redo_prev_bridge(g) if seg_unlink[i] else guide
+                        # 断链（且无显式头锚）的段交棒端判「不取片」→ 手上没有为它
+                        # 现算的新接片，需直读前段存档；其余段用本段该取的那一片。
+                        eff_guide = _redo_prev_bridge(g) if seg_unlink[i] else (
+                            guide if _takes_bridge(i) else None)
                     else:
                         eff_guide = None
                     if _user_tail is not None:
@@ -2859,9 +2902,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     else:
                         _tail_kf = None
                 else:
-                    # 独立镜头段：上段桥不注入（guide 屏蔽为 None）；每段尾帧锚定是用户主动
-                    # 设定的本段结尾身份锚点，与段间衔接无关，不受断链影响
-                    eff_guide = None if seg_unlink[i] else guide
+                    # 取用口径与交棒口径同一个（`_takes_bridge`）：`guide` 里那一片
+                    # 就是**为这一段算的**（交棒端判过"它会取片"才更新）。所以这里
+                    # 不再二次判 seg_unlink —— 那会把显式 head 锚一起屏蔽掉
+                    # （unlink 只是"不自动引用上段"，`_eff_inject` 里显式锚优先）。
+                    # 每段尾帧锚定是用户主动设定的本段结尾身份锚点，不受断链影响。
+                    eff_guide = guide if _takes_bridge(i) else None
                     # 尾帧图片（FL2VA 剧情终点/段级尾锚）：勾了尾帧图的段末帧 keyframe
                     # = 尾帧图 latent（同位置唯一锚，优先于段尾锚）；未勾段回落
                     # 段 tail_src（资产图/latent），再回退旧全局尾帧锚定
@@ -3160,7 +3206,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if _redo_mode is not None:
                     _up_guide_kf, _up_tail_kf = eff_guide, _tail_kf
                 else:
-                    _up_guide_kf = None if seg_unlink[i] else guide
+                    # 与基础链同一取用口径（同一个 `_takes_bridge`）：回放段补渲染时
+                    # 也要用本段该取的那一片，而不是"只要没断链就吃 guide"。
+                    _up_guide_kf = guide if _takes_bridge(i) else None
                     _up_tail_kf = _seg_end_img or (
                         end_frame_latent
                         if (seg_end_on[i] and end_frame_latent is not None)
@@ -3187,14 +3235,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # migrate_legacy_seg 迁走、新状态里已无此概念 —— 故取空字典，
             # 等价于原实现「越界/无记录时的 {}」分支（不改写 note）。
             _lr_cur = {}
-            if guide is not None:
+            # 报告按「本段是否取片」+「那一片里到底有什么」说，不按段属性反推：
+            # 以前按 seg_unlink 与 audio_latent 猜，于是断链段上的显式头锚被说成
+            # "guide=无"（其实钉了）、「仅音频」锚被说成"上段尾N帧+音频"（其实没钉画面）。
+            # 回放段不注入接片，这里仍读交棒位（与旧报告口径一致）。
+            if guide is None or not _takes_bridge(i):
+                note = ("guide=无（关闭自动引用上段·断链）" if seg_unlink[i]
+                        else "guide=无（本段不挂段首桥）")
+            elif "latent" not in guide:
+                note = f"guide=仅音频{_eff_fr}帧" if full_bridge else "guide=仅音频（单帧桥降级）"
+            else:
                 note = (f"guide=上段尾{_eff_fr}帧" if full_bridge else "guide=单帧桥(旧协议降级)") \
                     + ("+音频" if "audio_latent" in guide else "")
-            else:
-                note = "guide=无（首段）"
-            if seg_unlink[i]:
-                note = "guide=无（关闭自动引用上段·断链）"
-            elif _lr_cur.get("on") is False:   # _lr_cur 见上方「本段 latent 注入开关」
+            if _lr_cur.get("on") is False:   # _lr_cur 见上方「本段 latent 注入开关」
                 note = "guide=无（本段关闭 latent 注入）"
             if _redo_mode is not None:
                 note = f"重摇（{_redo_mode}）：首锚{'上段尾帧桥' if eff_guide is not None else '无'}" \
@@ -3214,11 +3267,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 生成段输出末端 token 边界（重摇 unlink 段上锚现算对齐用）
             prev_end_t = end_t
 
-            if next_wants_bridge:
-                # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）。
-                # 分段优先：按下段的 latent_ref.frames/分支取桥。
-                _nxt2 = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
-                _nxt_pi = _nxt2[1] if _nxt2 and _nxt2[0] == "prompt" else -1
+            # 接片交棒：只问「下一个会上链的段是不是真的要取片」——与取用端同一个
+            # `_takes_bridge`，且用 `_next_consumer` 越过禁用段算给真正相邻的那一段。
+            # 不再借用 next_wants_bridge（那是门控/裁帧口径，只看视频分支）：那会让
+            # 「仅音频」段首锚拿不到新接片、只能读上一轮残留的旧接片。
+            # end_tokens=kept 末端：锚定末端与输出末端重合（回退量已含在 vis_len 里）。
+            # 分段优先：按下段的 latent_ref.frames/分支取桥。
+            _nxt_pi = _next_consumer(item_i)
+            if _nxt_pi >= 0 and _takes_bridge(_nxt_pi):
                 guide = _inject_guide(video_t, audio_t, _nxt_pi, end_tokens=end_t)
 
             if use_ckpt and not replay:

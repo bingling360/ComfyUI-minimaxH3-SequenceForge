@@ -1669,7 +1669,45 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
     return manifest
 
 
-def create_project(name: str):
+# 复制项目时**继承哪些键**（白名单，不是黑名单）。
+#
+# 为什么必须是白名单：产物清单（finals / merges / latents / clips）与进度
+# （done / 种子 / 提示词指纹 / 缩略图 / 分段视频 / 二采段记录 / 重跑队列）都是
+# **不该跟过来**的东西 —— 复制只拷 assets/，带过去就等于让新 manifest 指向
+# 新项目里不存在的文件。用黑名单就得穷举"所有该丢的键"，日后新加一个进度键
+# 没人记得补，就会静默漏带；名单是开放的，白名单是封闭的。
+# （checkpoint.truncate 不能复用：它是"重做第 N 段"的语义，会连 prompts 一起截掉。）
+_COPY_CONTENT_KEYS = ("prompts", "seg_fields", "inserts", "assets", "asset_links",
+                      "params", "has_prologue", "upscale", "total")
+
+
+def _seg_latent_files(manifest):
+    """seg_fields 引用到的项目内 latent 文件（外源 keyframe / 段尾 latent 锚）。
+
+    复制项目必须连**文件**一起拷：只带引用不带文件，新项目挂的就是指向空气的锚，
+    一跑就报缺文件。只认 latent/<名>.pt 这一种形态（与 _clean_seg_field 同口径，
+    防穿越），其余一律忽略。
+    """
+    out = []
+    for seg in (manifest.get("seg_fields") or []):
+        if not isinstance(seg, dict):
+            continue
+        cands = []
+        lr = seg.get("latent_ref")
+        if isinstance(lr, dict) and isinstance(lr.get("src"), dict):
+            cands.append(lr["src"].get("file"))
+        ts = seg.get("tail_src")
+        if isinstance(ts, dict):
+            cands.append(ts.get("latent"))
+        for f in cands:
+            parts = [p for p in str(f or "").replace("\\", "/").split("/") if p and p != "."]
+            if len(parts) == 2 and parts[0] == "latent" \
+                    and safe_name(parts[1]) and parts[1].endswith(".pt"):
+                out.append("/".join(parts))
+    return out
+
+
+def create_project(name: str, copy_from=None):
     """新建项目：当场建文件夹 + 写初始 manifest（0 段草稿态），列表立即可见。
 
     游戏存档槽语义——此前文件夹要等首次运行 ckpt_dir() 才建、manifest 要等
@@ -1677,6 +1715,15 @@ def create_project(name: str):
     params 留空：首跑 assert_match 对空旧档按「沿用当前值」放行（旧档缺键
     视为一致），跑完由真实参数覆写；title/created_at 首跑会被继承保留。
     已存在（含跑过一段以上的正式项目）直接幂等返回现 manifest，不重写。
+
+    copy_from：给了就按「复制当前项目」建 —— 只继承 _COPY_CONTENT_KEYS
+    （提示词 / 分段字段 / 插入段 / 素材清单 / 资产链接 / 共享参数 / 二采设置），
+    并把 assets/ 目录与被引用到的 latent 文件整份复制。**文件必须跟着走**：
+    段级 frame_img 存的是项目相对路径（assets/xxx.png），只带清单不带文件的话，
+    新项目挂的就是一份指向空气的引用 —— 看着有锚、跑起来找不到。
+    产物（成片/合并/latent 清单/切片）与进度（done/种子/指纹/缩略图/分段视频/
+    二采段记录/重跑队列）一律不带：新项目从 0 段起跑。
+    源项目不存在/名字非法时按空白项目建（不为此报错阻断）。
     """
     name = safe_name(name)
     if not name:
@@ -1686,6 +1733,9 @@ def create_project(name: str):
     if manifest is not None:
         checkpoint.ensure_project_dirs(root)
         return _ensure_revision(manifest)
+    src_name = safe_name(copy_from) if copy_from else ""
+    src_root = os.path.join(checkpoint.projects_root(), src_name) if src_name else ""
+    src_manifest = checkpoint.load_manifest(src_root) if src_root else None
     os.makedirs(root, exist_ok=True)
     checkpoint.ensure_project_dirs(root)
     now = time.time()
@@ -1695,6 +1745,25 @@ def create_project(name: str):
         "title": name, "created_at": now, "updated_at": now,
         "prompts": [], "params": {}, "finals": [],
     }
+    if isinstance(src_manifest, dict):
+        for k in _COPY_CONTENT_KEYS:
+            if k in src_manifest:
+                manifest[k] = src_manifest[k]
+        up = manifest.get("upscale")
+        if isinstance(up, dict):
+            up = dict(up)
+            up.pop("segs", None)          # 二采设置留，二采分段记录是产物，不留
+            manifest["upscale"] = up
+        src_assets = os.path.join(src_root, "assets")
+        if os.path.isdir(src_assets):
+            shutil.copytree(src_assets, os.path.join(root, "assets"), dirs_exist_ok=True)
+        for rel in _seg_latent_files(src_manifest):
+            src_f = os.path.join(src_root, *rel.split("/"))
+            if not os.path.isfile(src_f):
+                continue
+            dst_f = os.path.join(root, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst_f), exist_ok=True)
+            shutil.copy2(src_f, dst_f)
     checkpoint.save_manifest(root, manifest)
     return manifest
 

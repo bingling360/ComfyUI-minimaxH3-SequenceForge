@@ -149,7 +149,8 @@
   const Api = {
     getProjects: (summary) => _call(summary ? "/h3chain/projects?summary=1" : "/h3chain/projects"),
     getProject: (dir) => _call("/h3chain/project?dir=" + encodeURIComponent(dir || "")),
-    createProject: (dir) => _json("POST", "/h3chain/create_project", { dir }),
+    createProject: (dir, copyFrom) => _json("POST", "/h3chain/create_project",
+    { dir, copy_from: copyFrom || "" }),
     savePrompts: (dir, prompts, segments, base_revision) =>
       _json("POST", "/h3chain/save_prompts", { dir, prompts, segments, base_revision }),
     compilePreview: (payload) => _json("POST", "/h3chain/compile", payload),

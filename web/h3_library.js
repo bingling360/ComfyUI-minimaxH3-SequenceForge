@@ -1030,7 +1030,7 @@
              * 前端再拼一份必然漂移 —— 旧代码只去扩展名、把空格与括号留在了别名里。 */
             const opt = onlyGlobal
               ? { kind, dest: "global" }
-              : { kind, dest, link_dir: S.dir, mirror: "1" };
+              : { kind, dest, link_dir: S.dir };
             const res = await H3Assets.uploadDirect(f, opt);
             if (!res?.ok) throw new Error("上传返回异常");
             if (res.store_error) fail(`${f.name}：${res.store_error}`);
@@ -1041,11 +1041,8 @@
         if (onlyGlobal) {
           say(`已上传 ${ok} 个到全局库（跨项目可复用）\n要落进当前项目，点瓦片上的「调入项目」`);
         } else {
-          say(`已上传 ${ok} 个到${DEST_CN[dest]}（只这一份，不往别处复制）`
+          after(`已上传 ${ok} 个到${DEST_CN[dest]}（只这一份，不往别处复制）`
             + (dest === "project" ? "\n提示词里写 @别名 即可引用" : ""));
-          if (typeof S.onChanged === "function") {
-            try { S.onChanged(); } catch (e) { /* 通知导演台刷新（可选） */ }
-          }
         }
         fetchPage(false);
       };

@@ -139,11 +139,20 @@ def add_routes(routes):
 
     async def list_projects(request):
         # ?summary=1 走轻量分页（M1 新增）；默认保持旧 {ok,projects} 兼容
+        # state = 链状态指针（h3_projects/h3chain_state.json）。**必须由这里回**：
+        # 前端以前经 /api/view 直读它，而 /api/view 是可启发式缓存的 FileResponse，
+        # 这个文件每跑一段就改写 —— 240ms 轮询会反复拿到旧指针。
+        try:
+            from . import checkpoint as _ck
+        except ImportError:
+            import checkpoint as _ck
+        state = _ck.load_state()
         if str(request.query.get("summary") or "").lower() in ("1", "true", "yes"):
             data = projects.list_projects_summary(
                 request.query.get("page") or 1, request.query.get("size") or 50)
-            return web.json_response({"ok": True, **data})
-        return web.json_response({"ok": True, "projects": projects.list_projects()})
+            return web.json_response({"ok": True, "state": state, **data})
+        return web.json_response({"ok": True, "state": state,
+                                  "projects": projects.list_projects()})
 
     async def project_detail(request):
         manifest = projects.read_project(request.query.get("dir") or "")
@@ -156,7 +165,8 @@ def add_routes(routes):
             data = await request.json()
         except Exception:
             return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
-        manifest = projects.create_project(str(data.get("dir") or ""))
+        manifest = projects.create_project(str(data.get("dir") or ""),
+                                          str(data.get("copy_from") or ""))
         if manifest is None:
             return _err("无效的项目目录名", code="BAD_NAME", status=400)
         return web.json_response({"ok": True, "manifest": manifest})
@@ -832,9 +842,8 @@ def add_routes(routes):
             tags = [t.strip() for t in str(fields.get("tags") or "").split(",") if t.strip()]
             desc, link_dir = str(fields.get("desc") or ""), str(fields.get("link_dir") or "")
             alias = str(fields.get("alias") or "")
-            # 落点与镜像开关：multipart 走文本字段（旧实现只读 JSON 分支的 data，
-            # 于是浏览器上传永远拿不到 mirror —— 「上传只会进全局库」的根因）
-            mirror_raw = str(fields.get("mirror") or "")
+            # 落点走文本字段（旧实现只读 JSON 分支的 data，于是浏览器上传永远
+            # 拿不到 dest —— 「上传只会进全局库」的根因）。落点只由 dest 决定。
             dest = str(fields.get("dest") or "")
         else:
             # JSON：input 内文件（防穿越 + realpath 复核，与 import_asset 同口径）
@@ -863,7 +872,6 @@ def add_routes(routes):
             tags = [str(t).strip() for t in tags if str(t).strip()]
             desc, link_dir = str(data.get("desc") or ""), str(data.get("link_dir") or "")
             alias = str(data.get("alias") or "")
-            mirror_raw = str(data.get("mirror") or "")
             dest = str(data.get("dest") or "")
         # 落点 dest（前端按当前 scope 传）——**上传到哪里就是哪里，不顺手复制**：
         #   global  —— 只进全局库（跨项目复用）

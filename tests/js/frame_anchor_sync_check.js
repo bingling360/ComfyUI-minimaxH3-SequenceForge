@@ -35,7 +35,7 @@ function envWith(frameImg) {
     };
     const node = mkNode(ds);
     node.type = "H3SeamlessChainSampler";
-    const { w, dom } = load({ node, routes: { "manifest.json": () => manifest } });
+    const { w, dom } = load({ node, apiRoutes: { "/h3chain/project": () => ({ ok: true, manifest }) } });
     return { w, dom, node };
 }
 

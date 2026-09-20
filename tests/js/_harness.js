@@ -36,13 +36,24 @@ function load(opts = {}) {
         loadGraphData() {},
         canvas: {},
     };
-    /* 记录 /h3chain/* 请求，供端到端断言（如 flushPrompts 有没有把 frame_img 带上） */
+    /* 记录 /h3chain/* 请求，供端到端断言（如 flushPrompts 有没有把 frame_img 带上）。
+     * apiRoutes：按路径片段给 API 体（值可以是对象或 path => 体 的函数）。
+     * 为什么需要它：manifest 一律走 /h3chain/project 读（API 直读磁盘）；
+     * /api/view 那条路是可启发式缓存的 FileResponse，读高频改写的 JSON 会拿到旧副本。 */
     const apiCalls = [];
+    const apiRoutes = Object.assign({}, opts.apiRoutes);
     w.api = {
         addEventListener() {},
         async fetchApi(path, init) {
             const body = init && init.body ? JSON.parse(String(init.body)) : null;
             apiCalls.push({ path: String(path || ""), body });
+            for (const k of Object.keys(apiRoutes)) {
+                if (String(path || "").indexOf(k) >= 0) {
+                    const v = apiRoutes[k];
+                    return { ok: true, status: 200,
+                        json: async () => (typeof v === "function" ? v(String(path)) : v) };
+                }
+            }
             return { ok: true, status: 200, json: async () => (opts.apiReply || { ok: true }) };
         },
     };

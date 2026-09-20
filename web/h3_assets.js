@@ -162,7 +162,6 @@
     if (o.dest) fd.append("dest", o.dest);
     if (o.link_dir) fd.append("link_dir", o.link_dir);
     if (o.alias) fd.append("alias", o.alias);
-    if (o.mirror) fd.append("mirror", "1");
     const res = await H3Api.libraryUpload(fd);
     if (!res.body?.ok) throw new Error(H3Api.errText(res, "上传入库失败"));
     return res.body;

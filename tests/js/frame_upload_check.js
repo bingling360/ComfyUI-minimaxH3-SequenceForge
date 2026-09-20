@@ -76,7 +76,7 @@ function ok(cond, msg) {
     const { w, dom } = load({
         node,
         onAlert: (m) => alerts.push(String(m)),
-        routes: { "manifest.json": () => manifest },
+        apiRoutes: { "/h3chain/project": () => ({ ok: true, manifest }) },
         H3Api: {
             async libraryUpload() {
                 manifest.assets.push({ file: "assets/B.png", label: "B", kind: "image" });

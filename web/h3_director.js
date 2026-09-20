@@ -241,14 +241,18 @@ function fetchWithTimeout(url, ms = 12000) {
     return fetch(url, { signal: ac.signal }).finally(() => clearTimeout(t));
 }
 
-async function fetchJson(subfolder, filename) {
-    try {
-        const r = await fetchWithTimeout(viewUrl(subfolder, filename), 12000);
-        if (!r.ok) return null;
-        return JSON.parse(await r.text());
-    } catch (e) {
-        return null;
-    }
+/** 读项目 manifest：统一走 /h3chain/project（API 直读磁盘）。
+ *
+ * **不要用 /api/view 读它**：那条路是 FileResponse，只带 Last-Modified/ETag，
+ * ComfyUI 只在"危险内容类型"上才补 Cache-Control: no-store —— JSON 是按启发式
+ * 可缓存的。而 manifest 是**高频改写**的文件（上传 / 保存 / 入库都动它），又处在
+ * 240ms 轮询里：一旦命中缓存就拿到"改动之前"的副本，表现正是「刚上传的素材不进
+ * 引用条 / 引用素材一片空白」，而切一下屏（新鲜期过期）又好了。
+ * 历史上那些"传了没反应、刷一下就好"的怪象，根子都在这里。 */
+async function fetchManifest(dir) {
+    if (!dir) return null;
+    const r = await apiGet(`/h3chain/project?dir=${encodeURIComponent(dir)}`);
+    return (r.ok && r.data && r.data.manifest) || null;
 }
 
 /* 项目存档后端接口（/h3chain/*，与 /api/view 文件读取不同源） */
@@ -2311,7 +2315,7 @@ async function persistPool(node) {
         const dir = getDirValue(node);
         if (!dir || !window.H3Api) return false;
         const ds = getDs(node);
-        const mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
+        const mf = await fetchManifest(dir);
         const legacy = (ds.ref_assets || []).filter((a) => a && !a.asset_id);
         const r = await window.H3Api.saveAssets(dir, legacy, mf?.revision);
         if (r.body?.ok) { scheduleRefresh(400); return true; }
@@ -2757,7 +2761,7 @@ async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
         /* 2. 存档参数静默套用（后端 assert_match 同口径）——二采段与链上其余段
               共享锚定与采样配置，参数漂移会让整次运行在校验处失败 */
         let restored = [];
-        const mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
+        const mf = await fetchManifest(dir);
         if (mf?.params) restored = applyChainParams(node, mf.params);
         /* 3. 临时切手动选择+只勾本段提交（原模式"关闭"时 parse_state 返回 None 不执行）；
               同时清残留重摇标记（redo 优先会劫持成本段重采样）、关审片逐段确认
@@ -3074,13 +3078,21 @@ const V2_MODES = ["FL2VA", "Ref2VA"];
 
 /* details 开合状态记忆：卡片任何操作后都会全量重建 DOM，新建的 details 默认收起，
  * 于是不记住开合就会表现为「点＋对白后莫名切走」「点完按钮面板自己合上」。
- * key 带段号（必要时带镜号）避免不同段/镜互相串。 */
+ * key 带段号（必要时带镜号）避免不同段/镜互相串，**并且带项目目录**：
+ * 只带段号的话，切到别的项目会沿用上一个项目里那些组的开合状态
+ * （"这个项目的更多面板怎么自己开着"）。一个构造函数管住全部写入口径。 */
 const _v2Open = new Map();
+function v2Key(key) {
+    let dir = "";
+    try { dir = getDirValue(findNode()) || ""; } catch (e) { dir = ""; }
+    return `${dir}|${key}`;
+}
 function v2Details(key, cls, summaryHtml, defOpen) {
+    const k = v2Key(key);
     const g = el("details", cls);
-    g.open = _v2Open.has(key) ? _v2Open.get(key) : !!defOpen;
+    g.open = _v2Open.has(k) ? _v2Open.get(k) : !!defOpen;
     g.innerHTML = `<summary>${summaryHtml}</summary>`;
-    g.addEventListener("toggle", () => _v2Open.set(key, g.open));
+    g.addEventListener("toggle", () => _v2Open.set(k, g.open));
     return g;
 }
 
@@ -3307,10 +3319,36 @@ function v2InstrPreview(mode, seconds, hasStart, hasEnd, nShots) {
 
 /* ---- AI提示词优化（自研后端 /h3chain/optimize，轻量移植测试分支能力） ----
  * 主框=最终文本；优化结果双写主框+回填v2（可解析字段才回填，失败只写主框）。
- * 配置存 ds.optimizer，历史存 ds.opt_hist（原稿/优化稿可切），与测试分支键名一致。 */
+ * 配置存 ds.optimizer；原稿/优化稿历史存 ds.opt_hist，**按项目分桶**（见 optKey）。 */
+/* ---- 原稿/优化稿：键里为什么必须带"项目目录" ------------------------------
+ * 这三个 Map 是模块级（浏览器进程级），键以前只有 `node.id:idx`：切到另一个项目后
+ * 同一个段号**仍然命中上一个项目的记录** —— 「原稿」按钮显示的是别的项目的状态，
+ * 点下去还会把别的项目的老稿写进当前段；而恢复函数 optRestoreMaps 只在"键不存在"
+ * 时才填，新项目的历史永远进不来。两头一夹就是"先到者胜"，症状正是
+ * 「切了项目，原稿/优化稿切换不跟着换」。
+ * 现在键里带 dir：跨项目天然命中不到，不依赖谁记得清。ds.opt_hist 同步改成
+ * { dir: { idx: 记录 } } 分桶 —— 历史跟着项目走，也仍然留在工作流里。 */
 const _optBefore = new Map();
 const _optAfter = new Map();
 const _optShown = new Map();
+
+function optKey(node, idx) {
+    let dir = "";
+    try { dir = getDirValue(node) || ""; } catch (e) { dir = ""; }
+    return `${dir}|${node ? node.id : 0}:${idx}`;
+}
+
+/** 丢掉不属于 dir 的原稿/优化稿缓存。键带 dir 本来就命中不到，这里只为别让缓存
+ *  无限攒 —— 数据在 widget 的 ds.opt_hist[dir] 里，切回去会由 optRestoreMaps
+ *  重新装回来，丢了不心疼。 */
+function optPurgeOtherScopes(dir) {
+    const keep = String(dir || "") + "|";
+    for (const m of [_optBefore, _optAfter, _optShown]) {
+        for (const k of [...m.keys()]) {
+            if (!k.startsWith(keep)) m.delete(k);
+        }
+    }
+}
 let _optBusy = null;
 const _optRulesCache = { loaded: false, files: {} };
 
@@ -3571,26 +3609,40 @@ async function optFetchRuleFiles() {
 function optPersist(node, idx, shown) {
     try {
         const ds = getDs(node);
+        const dir = String(getDirValue(node) || "");
         if (!ds.opt_hist || typeof ds.opt_hist !== "object") ds.opt_hist = {};
-        const key = `${node.id}:${idx}`;
-        ds.opt_hist[String(idx)] = {
+        const bucket = (ds.opt_hist[dir] && typeof ds.opt_hist[dir] === "object")
+            ? ds.opt_hist[dir] : {};
+        const key = optKey(node, idx);
+        bucket[String(idx)] = {
             before: _optBefore.get(key) ?? null,
             after: _optAfter.get(key) ?? null,
             shown: shown || "after",
         };
+        ds.opt_hist[dir] = bucket;
         setDs(node, ds);
     } catch (e) { /* 持久失败不阻断 */ }
 }
 
 function optRestoreMaps(node, ds) {
     try {
-        const hist = (ds || {}).opt_hist || {};
-        for (const [k, h] of Object.entries(hist)) {
+        const hist = (ds || {}).opt_hist;
+        if (!hist || typeof hist !== "object") return;
+        const dir = String(getDirValue(node) || "");
+        /* 旧的扁平结构 {idx: 记录} 没有 dir，无法判断属于哪个项目 —— 那正是
+         * "切了项目还显示上一个项目原稿"的来源，直接丢弃（纯数字键不可能是目录名）。 */
+        for (const k of Object.keys(hist)) {
+            if (/^\d+$/.test(k)) delete hist[k];
+        }
+        const bucket = (hist[dir] && typeof hist[dir] === "object") ? hist[dir] : {};
+        for (const [k, h] of Object.entries(bucket)) {
             if (!h || typeof h !== "object") continue;
-            const key = `${node.id}:${k}`;
-            if (!_optBefore.has(key) && h.before != null) _optBefore.set(key, h.before);
-            if (!_optAfter.has(key) && h.after != null) _optAfter.set(key, h.after);
-            if (!_optShown.has(key) && h.shown) _optShown.set(key, h.shown);
+            const key = optKey(node, k);
+            /* 不再有 !has 守卫：键已经带 dir，命中就是本项目的记录，
+             * 工作流里存的才是权威，Map 里的旧值必须让位。 */
+            if (h.before != null) _optBefore.set(key, h.before);
+            if (h.after != null) _optAfter.set(key, h.after);
+            if (h.shown) _optShown.set(key, h.shown);
         }
     } catch (e) { /* 忽略 */ }
 }
@@ -3844,7 +3896,7 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
          * 正文里会显示成红框，不静默丢）。 */
         const result = fromLLMText(String(r.body.prompt || "").trim() || before,
             ds.ref_assets || []);
-        const key = `${node.id}:${idx}`;
+        const key = optKey(node, idx);
         _optBefore.set(key, before);
         _optShown.set(key, "after");
         setPromptText(node, idx, result);
@@ -3946,7 +3998,7 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
         if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "扩写失败"));
         const result = fromLLMText(String(r.body.prompt || "").trim() || before,
             ds.ref_assets || []);
-        const key = `${node.id}:${idx}`;
+        const key = optKey(node, idx);
         _optBefore.set(key, before);          // 原稿：误点了可以原样还原
         _optShown.set(key, "after");
         setPromptText(node, idx, result);
@@ -3964,7 +4016,7 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
 }
 
 function optToggle(node, idx, ta, ui) {
-    const key = `${node.id}:${idx}`;
+    const key = optKey(node, idx);
     const shown = _optShown.get(key);
     if (shown === "after") {
         const before = _optBefore.get(key);
@@ -4514,7 +4566,7 @@ function paintOptbar(optbar, node, data, idx, ta) {
     try {
         optbar.replaceChildren();
         optRestoreMaps(node, data.ds);
-        const key = node ? `${node.id}:${idx}` : "";
+        const key = node ? optKey(node, idx) : "";
         const shown = key ? _optShown.get(key) : null;
         const bReset = el("button", "h3d-btn", shown === "before" ? "优化稿" : "原稿");
         bReset.title = "原稿 ⇄ 优化稿切换";
@@ -4728,7 +4780,7 @@ async function submitRedo() {
     if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再提交重摇"); return; }
     let restored = [];
     if (lastDir) {
-        const mf = await fetchJson(`h3_projects/${lastDir}`, "manifest.json");
+        const mf = await fetchManifest(lastDir);
         if (mf?.params) restored = applyChainParams(node, mf.params);
     }
     const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
@@ -5033,6 +5085,9 @@ async function switchProject(dir) {
     if (stale()) return;
     if (!setDirValue(node, dir)) { alert("节点上没有「存档目录/断点目录」控件"); return; }
     setWidgetValue(node, W_REROLL, 0);
+    /* 原稿/优化稿缓存按目录分作用域：换项目即清掉旧作用域的条目（数据在 widget 的
+     * ds.opt_hist[dir] 里，切回去会重新装回来）—— 留着也不会被命中，只是白占内存。 */
+    optPurgeOtherScopes(dir);
     const r = await apiGet(`/h3chain/project?dir=${encodeURIComponent(dir)}`);
     if (stale()) return;
     const mf = r.ok ? (r.data?.manifest || null) : null;
@@ -5254,9 +5309,15 @@ async function collectData() {
     const ping = await apiGet("/h3chain/ping");
     let projects = [];
     let upscaleModels = [];
+    /* 链状态指针（h3_projects/h3chain_state.json）随项目列表一起回。它以前由前端
+     * 经 /api/view 直读 —— 同一个陈旧缓存问题：这个文件每跑一段就改写。 */
+    let stateRaw = null;
     if (ping.ok) {
         const r = await apiGet("/h3chain/projects");
-        if (r.ok) projects = r.data?.projects || [];
+        if (r.ok) {
+            projects = r.data?.projects || [];
+            stateRaw = r.data?.state || null;
+        }
         const um = await apiGet("/h3chain/upscale_models");
         if (um.ok) upscaleModels = um.data?.models || [];
         loadExperimentDefs();    // 实验定义随刷新周期尽早到达（函数自身幂等）
@@ -5266,11 +5327,10 @@ async function collectData() {
         + `「[ComfyUI_H3_SeamlessChain] 路由已注册」日志；若仍失败请把控制台报错反馈给开发。`);
 
     /* 当前项目：节点「存档目录」指向优先（用户刚切换还没跑），回落 state 指针 */
-    const stateRaw = await fetchJson("h3_projects", "h3chain_state.json");
     const nodeDir = node ? String(getDirValue(node) || "").trim() : "";
     const dir = nodeDir || stateRaw?.dir || "";
     lastDir = dir;                                           // 合并导出等即时动作取当前项目
-    const mf = dir ? await fetchJson(`h3_projects/${dir}`, "manifest.json") : null;
+    const mf = dir ? await fetchManifest(dir) : null;
     const state = stateRaw || {};
     const sameChain = !!stateRaw && dir === stateRaw.dir;
     state.dir = dir;
@@ -5903,7 +5963,13 @@ function injectStyles() {
     .h3d-mplabel b{color:var(--h3d-cyan);font-size:11.5px;font-weight:700}
     .h3d-mplabel small{color:var(--h3d-muted);font-size:10.5px;line-height:1.4;flex:1;min-width:0}
     .h3d-mpboxbtn{padding:2px 9px;font-size:11px;flex:none;align-self:center}
-    .h3d-mpboxwrap textarea{flex:1;min-height:0;width:100%;resize:none;border:0;background:transparent;color:var(--h3d-bone);padding:0;font:12.5px/1.7 ui-monospace,Consolas,monospace;outline:none}
+    /* 编辑器是 contenteditable 的 DIV（createPromptEditor 产出 div.h3d-ta.h3d-rta，
+     * 工作台这里再补一个 .h3d-mpbox），**不是 textarea**。原来这条选择器写的是元素名
+     * 「textarea」，对 DIV 永远匹配不上，于是内层高度落到 .h3d-rta 的 max-height:40vh，
+     * 外框却被 -main 的 height:100% 撑满 —— 正文只占上半截，下半截全是死空白。
+     * 现在按真实类名选（.h3d-mpbox 由 JS 加在编辑器根上，也是单框用例的句柄），
+     * 并顺手解开 40vh 封顶：高度交给 flex 分配，正文填满整块。 */
+    .h3d-mpboxwrap>.h3d-mpbox{flex:1;min-height:0;max-height:none;width:100%;overflow:auto;resize:none;border:0;box-shadow:none;background:transparent;color:var(--h3d-bone);padding:0;font:12.5px/1.7 ui-monospace,Consolas,monospace;outline:none}
     /* 段卡：AI 优化设置条（三页之外的公共区，区别于「锚定设置」页的本段设置）
      * 注：总提示词框曾经的「模式 / 缺省时长」行与「参考素材（AI 可见）」chips 的
      * 样式已随那一跳一起删掉——工作台不做 AI，就没有它们的服务对象。 */
@@ -6392,7 +6458,14 @@ function renderV2Section(sec, data) {
             window.H3Lib.open({
                 dir,
                 seg: (typeof _selSeg === "number" ? _selSeg : 0) + 1,
-                onChanged: () => scheduleRefresh(300),
+                /* 素材库改的是**项目 manifest**，而导演台的池子是画布 widget 里的
+                 * 一份快照。这里必须**强制**重拉（hydratePool(true)）：非 force 会被
+                 * "revision+签名没变"的节流挡掉，池子就停在改动之前 —— 期间任何一次
+                 * persistPool（删素材 / 改标签）都会拿旧池整表覆盖 manifest["assets"]，
+                 * 把刚上传的条目抹掉。这是「上传了但引用素材里不显示」的直接成因。 */
+                onChanged: () => {
+                    hydratePool(true).catch(() => {}).then(() => scheduleRefresh(60));
+                },
             });
         };
         hub.append(b);
@@ -6554,11 +6627,11 @@ function registerPromptEditor(node, idx, api) {
                 if (!v || !v.el || !v.el.isConnected) _promptEditors.delete(k);
             }
         }
-        _promptEditors.set(`${node && node.id}:${idx}`, api);
+        _promptEditors.set(`${getDirValue(node)}|${node && node.id}:${idx}`, api);
     } catch (e) { /* 忽略 */ }
 }
 function syncPromptEditor(node, idx, text) {
-    const api = _promptEditors.get(`${node && node.id}:${idx}`);
+    const api = _promptEditors.get(`${getDirValue(node)}|${node && node.id}:${idx}`);
     if (!api || !api.el || !api.el.isConnected) return false;
     try {
         if (api.value === text) return false;
@@ -6774,7 +6847,7 @@ async function openFramePicker(node, idx, key, name, done) {
         .filter((a) => (a.kind || "image") === "image").map((a) => ({ ...a }));
     const seen = new Set(imgs.map((a) => `${a.file || ""}|${a.asset_id || ""}`));
     try {
-        const mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
+        const mf = await fetchManifest(dir);
         const links = await fetchAssetLinks(dir);
         for (const a of poolFromManifest(mf, links)) {
             if ((a.kind || "image") !== "image") continue;
@@ -6851,7 +6924,7 @@ async function openFramePicker(node, idx, key, name, done) {
                  * 用户只能猜。这里 45s 无响应就明确报错并放行下一次尝试。 */
                 const res = await Promise.race([
                     H3Assets.uploadDirect(f, {
-                        kind: "image", alias, dest: "project", link_dir: dir, mirror: "1",
+                        kind: "image", alias, dest: "project", link_dir: dir,
                     }),
                     new Promise((_, rej) => setTimeout(
                         () => rej(new Error("后端 45 秒无响应（ComfyUI 可能已卡死，请查看控制台/重启）")),
@@ -7395,8 +7468,8 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                     (pv.shots[si].dialogues = pv.shots[si].dialogues || []).push({ speaker: "S1", language: "Chinese", text: "", delivery: "", voiceover: false });
                 });
                 /* 重建后保持展开，否则刚加的对白连同「更多」一起被收起来 */
-                _v2Open.set(`more${segIdx}_${si}`, true);
-                _v2Open.set(`shot${segIdx}`, true);
+                _v2Open.set(v2Key(`more${segIdx}_${si}`), true);
+                _v2Open.set(v2Key(`shot${segIdx}`), true);
                 scheduleRefresh(60);
             };
             gMoreBody.append(addD);
@@ -7534,7 +7607,7 @@ function renderPromptV2Panel(body, node, data, segIdx) {
                 setPromptV2Field(node, segIdx, (pv) => {
                     pv.references = want.map((w) => ({ label: w.label, note: "" }));
                 });
-                _v2Open.set(`sub${segIdx}`, true);
+                _v2Open.set(v2Key(`sub${segIdx}`), true);
                 scheduleRefresh(80);
             };
             gSubBody.append(rebuild);
@@ -8090,7 +8163,9 @@ function buildCards(data) {
             const tabbar = el("div", "h3d-tabs");
             const paneMain = el("div", "h3d-tabpane");
             const paneSet = el("div", "h3d-tabpane");
-            const tabKey = `seg${it.idx}`;
+            /* 页签记忆同样带项目目录：不带的话，切项目后这一段的页签会停在
+             * 上一个项目选的那一页（纯界面状态，但同样是"跨项目串味"）。 */
+            const tabKey = `${getDirValue(node) || ""}|seg${it.idx}`;
             let curTab = _segTab.get(tabKey) || "main";
             const tabs = [["main", "提示词"], ["set", "锚定设置"]];
             /* 「具象化」不再是独立 tab：三框合一后它只是**同一份提示词的另一种
@@ -9687,8 +9762,9 @@ function openNewProjectModal() {
     dialog.innerHTML = `
         <h3>＋ 新建项目</h3>
         <p class="h3d-lead">新开一条视频链：换存档目录名即换链，旧链原样保留可随时切回。
-        点「创建项目」会在 output/h3_projects/ 下立即建好文件夹（游戏存档槽：创建即可见，0 段起跑）。
-        提示词沿用当前内容作底稿（可勾选下方清空）。</p>`;
+        点「创建项目」会在 output/h3_projects/ 下立即建好文件夹（游戏存档槽：创建即可见）。
+        默认建<b>空白项目</b>（0 段起跑，零继承）；勾选下方<b>复制当前项目</b>则把提示词、
+        分段设置、共享参数与参考图整份带过来。</p>`;
     const input = document.createElement("input");
     input.type = "text";
     input.value = def;
@@ -9697,7 +9773,8 @@ function openNewProjectModal() {
     const check = el("label", "h3d-check");
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    check.append(cb, document.createTextNode("创建后清空全部提示词（否则沿用当前底稿）"));
+    check.append(cb, document.createTextNode(
+        "复制当前项目（提示词 / 分段设置 / 参考图整份带过来）"));
     const row = el("div", "h3d-dialog-row");
     const cancel = el("button", "h3d-btn", "取消");
     const ok = el("button", "h3d-btn h3d-btn-cta", "创建项目");
@@ -9719,14 +9796,25 @@ function openNewProjectModal() {
             err.textContent = "仅允许中文、字母、数字、下划线、连字符";
             return;
         }
-        /* 立即落盘建项目文件夹（游戏存档槽语义：创建即可见）。
-           接口 404/405（未注册）时降级为旧的惰性行为——首次运行仍会建目录，不阻断。 */
+        /* 要复制的源项目：节点「存档目录」优先，回落 lastDir（自动命名模式下没有
+           显式目录名，但画布上正在编辑的就是上次运行的那个项目）。 */
+        const srcDir = String(getDirValue(node) || lastDir || "");
+        const copyFrom = cb.checked ? srcDir : "";
+        if (cb.checked && !copyFrom) {
+            err.textContent = "当前没有可复制的项目：存档目录为空，且还没跑过任何项目";
+            return;
+        }
+        clearTimeout(promptFlushTimer);     // 取消挂起的批量防抖：旧项目下面显式回写
+        await flushPrompts(node);           // 旧项目先落盘 —— 复制要拷的就是这一份
+        /* 立即落盘建项目文件夹（游戏存档槽语义：创建即可见）。copy_from 让后端把
+           源项目的 manifest + assets/ 整份复制过来（素材文件跟着走，路径才成立）。
+           接口 404/405（未注册）时降级为惰性建目录，不阻断。 */
         let diskOk = false;
         try {
             const r = await api.fetchApi("/h3chain/create_project", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ dir: name }),
+                body: JSON.stringify({ dir: name, copy_from: copyFrom }),
             });
             if (r.ok) {
                 diskOk = true;
@@ -9745,15 +9833,21 @@ function openNewProjectModal() {
         } catch (e) {
             console.warn("[h3-director] create_project failed:", e);
         }
-        clearTimeout(promptFlushTimer);       // 同上：取消挂起防抖，旧项目由下方显式回写
-        await flushPrompts(node);   // 旧项目底稿先落盘，再切走
-        if (!setDirValue(node, name)) { err.textContent = "节点上没有「存档目录/断点目录」控件"; return; }
-        setWidgetValue(node, W_REROLL, 0);
-        if (cb.checked) clearPrompts(node);
-        if (diskOk) flushPrompts(node, name);   // 沿用底稿时把携带的提示词存进新项目
-        setLed("idle", `新项目「${name}」已就绪${diskOk ? "（文件夹已建）" : ""}`);
         close();
-        scheduleRefresh(200);
+        if (!diskOk) {
+            /* 接口未注册（旧版 / 未重启）：退回惰性路径 —— 首次运行会自动建目录。
+               此时没法复制文件，只能沿用底稿或清空，并在 LED 里说清降级了。 */
+            if (!setDirValue(node, name)) { alert("节点上没有「存档目录/断点目录」控件"); return; }
+            setWidgetValue(node, W_REROLL, 0);
+            if (copyFrom) flushPrompts(node, name); else clearPrompts(node);
+            setLed("idle", `新项目「${name}」已就绪（接口未注册，首次运行时自动建目录）`);
+            scheduleRefresh(200);
+            return;
+        }
+        /* 装载走**读档那一条路径**：新建与读档共用同一套加载逻辑，不再有
+           "新建一套、读档另一套"的双轨 —— 双轨正是状态串味的温床。
+           空项目装出空画布；复制项目装出与源一致的画布。 */
+        await switchProject(name);
     };
     ok.onclick = submit;
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
@@ -10240,10 +10334,12 @@ async function hydratePool(force) {
     if (!node) return;
     const dir = getDirValue(node);
     if (!dir) return;
-    let mf = null;
-    try {
-        mf = await fetchJson(`h3_projects/${dir}`, "manifest.json");
-    } catch (e) { return; }
+    const mf = await fetchManifest(dir);
+    /* 读不到 **不等于** 项目是空的。把读取失败当成空池会把 widget 里的池子清掉，
+     * 紧接着任何一次 persistPool（删素材 / 改标签）就拿这个空池整表覆盖
+     * manifest["assets"] —— 那是真丢数据。所以只在确确实实读到 manifest 时才用它的
+     * 池子覆盖（读到但无资产 = 真空项目，那时清空才是对的）。 */
+    if (!mf) return;
     const links = await fetchAssetLinks(dir);
     const pool = poolFromManifest(mf, links);
     const dirChanged = _poolDir !== dir;

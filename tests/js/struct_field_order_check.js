@@ -33,11 +33,14 @@ function groupsOf(withRefs) {
     const node = mkNode(ds);
     const { w, dom } = load({
         node,
-        routes: {
-            "manifest.json": () => ({
-                revision: 1,
-                assets: [{ file: "a.png", label: "阿依", kind: "image" }],
-                prompts, segments, done: 0, finals: [], merges: [],
+        apiRoutes: {
+            "/h3chain/project": () => ({
+                ok: true,
+                manifest: {
+                    revision: 1,
+                    assets: [{ file: "a.png", label: "阿依", kind: "image" }],
+                    prompts, segments, done: 0, finals: [], merges: [],
+                },
             }),
         },
     });

@@ -1,7 +1,9 @@
 /* H3 长片导演台 · 配套默认工作流模板
  *
  * 由「长视频接续二采导演台工作流.json」导出生成（D:/Downloads）：
- * - 模型加载器（ref2va UNET / Qwen3-VL CLIP / 视频+音频 VAE）+ 主节点（导演台模式）
+ * - 模型加载器（UNET / Qwen3-VL CLIP / 视频+音频 VAE）
+ * - 注意力后端 + 块稀疏注意力（ModelAttentionBackend → BlockSparseAttention，
+ *   长序列下省算力）+ 主节点（导演台模式）
  * - 提示词与素材全走导演台状态，画布无任何外联
  *   （提示词 1–64 段不限，全在导演台管理）
  * - 每段视频由主节点「自动保存=分段」存进项目文件夹 output/h3_projects/<项目名>/，
@@ -12,13 +14,13 @@
  *   H3LatentUpscale（库内放大）与现抽输入链（LoadVideo/GetVideoComponents）已整体下线——
  *   它们均无执行入口（非 OUTPUT_NODE）且全部前端代码零引用，属资产库时代残留。
  * - 注意：本文件由导出 JSON 直接转换，widget 顺序须与 nodes.py define_schema 严格一致
- *   （已校验 29 项）。如需改默认参数，改导出 JSON 后重新生成，勿手工编辑此数组。
+ *   （已校验 31 项）。如需改默认参数，改导出 JSON 后重新生成，勿手工编辑此数组。
  */
 window.H3_DEFAULT_WORKFLOW = {
   "id": "h3-chain-director-default",
   "revision": 2,
-  "last_node_id": 59,
-  "last_link_id": 44,
+  "last_node_id": 60,
+  "last_link_id": 46,
   "nodes": [
     {
       "id": 3,
@@ -51,7 +53,7 @@ window.H3_DEFAULT_WORKFLOW = {
         "Node name for S&R": "VAELoader"
       },
       "widgets_values": [
-        "minimax_h3_video_vae_fp16.safetensors"
+        "minimax_h3_video_vae_int8_convrot.safetensors"
       ]
     },
     {
@@ -116,8 +118,8 @@ window.H3_DEFAULT_WORKFLOW = {
       "id": 53,
       "type": "ModelAttentionBackend",
       "pos": [
-        -197.16773635195113,
-        -184.82842218805052
+        -539.5497629506184,
+        -201.4399075229341
       ],
       "size": [
         270,
@@ -138,7 +140,7 @@ window.H3_DEFAULT_WORKFLOW = {
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            35
+            45
           ]
         }
       ],
@@ -148,7 +150,7 @@ window.H3_DEFAULT_WORKFLOW = {
         "Node name for S&R": "ModelAttentionBackend"
       },
       "widgets_values": [
-        "pytorch attention"
+        "comfy kitchen attention"
       ]
     },
     {
@@ -204,7 +206,7 @@ window.H3_DEFAULT_WORKFLOW = {
         {
           "name": "模型",
           "type": "MODEL",
-          "link": 35
+          "link": 46
         },
         {
           "name": "文本编码器",
@@ -293,7 +295,7 @@ window.H3_DEFAULT_WORKFLOW = {
         "simple",
         "关闭",
         "",
-        "自动回退",
+        "关闭",
         30,
         34,
         0,
@@ -377,9 +379,65 @@ window.H3_DEFAULT_WORKFLOW = {
         "Node name for S&R": "UNETLoader"
       },
       "widgets_values": [
-        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
         "default"
       ]
+    },
+    {
+      "id": 60,
+      "type": "BlockSparseAttention",
+      "pos": [
+        -193.19832687618307,
+        -275.32737438866627
+      ],
+      "size": [
+        270,
+        250
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 45
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            46
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BlockSparseAttention"
+      },
+      "widgets_values": [
+        "sol-attn",
+        1.3,
+        0.2,
+        1,
+        "",
+        12288,
+        256,
+        "exact_kv_and_rows",
+        false
+      ],
+      "widgets_values_named": {
+        "selection": "sol-attn",
+        "selection.tau": 1.3,
+        "start_percent": 0.2,
+        "end_percent": 1,
+        "dense_blocks": "",
+        "min_tokens": 12288,
+        "extra_tokens": 256,
+        "sink_conditioning": "exact_kv_and_rows",
+        "verbose": false
+      }
     }
   ],
   "links": [
@@ -416,20 +474,28 @@ window.H3_DEFAULT_WORKFLOW = {
       "MODEL"
     ],
     [
-      35,
-      53,
-      0,
-      10,
-      0,
-      "MODEL"
-    ],
-    [
       36,
       10,
       3,
       54,
       0,
       "STRING"
+    ],
+    [
+      45,
+      53,
+      0,
+      60,
+      0,
+      "MODEL"
+    ],
+    [
+      46,
+      60,
+      0,
+      10,
+      0,
+      "MODEL"
     ]
   ],
   "groups": [

@@ -5423,6 +5423,8 @@ function injectStyles() {
     .h3d-led.done i{background:var(--h3d-ok);box-shadow:0 0 12px #57ab5a88}
     .h3d-led.error i{background:var(--h3d-warn);box-shadow:0 0 12px #e0823d88}
     .h3d-btn{cursor:pointer;border:1px solid #444c56;border-radius:6px;background:#2d333b;color:var(--h3d-bone);padding:6px 11px;font-size:12px;font-family:inherit;transition:border-color .12s,filter .12s}
+    /* 禁用态必须看得出来：否则「按钮灰了」和「点了没反应」从外观上分不出来 */
+    .h3d-btn:disabled{opacity:.45;cursor:not-allowed}
     .h3d-btn:hover{filter:brightness(1.18)}
     .h3d-btn:disabled{opacity:.5;cursor:not-allowed;filter:none}
     .h3d-btn-cyan{border-color:#316dca;background:#1f2f45;color:#9ecbff}
@@ -6396,6 +6398,18 @@ function foldBox(id, title, defaultOpen) {
     det.append(box);
     det.addEventListener("toggle", () => { _foldState[id] = det.open; });
     return { det, box };
+}
+
+/* 右栏可折叠面板：与 foldBox **共用同一份** _foldState（都是同一次会话内的界面偏好，
+ * 不按项目分桶）。面板每次数据刷新都会被整块重建 —— 不记展开态的话，用户改一个设置
+ * 面板就当场折叠回去（"默认折叠"只该管**首次打开**的样子）；关掉导演台再进来，
+ * 展开态也要跟上一次一致。 */
+function foldSection(id, defaultOpen, summaryHtml) {
+    const det = el("details", "h3d-adv");
+    det.open = (_foldState[id] !== undefined) ? !!_foldState[id] : !!defaultOpen;
+    det.innerHTML = summaryHtml;
+    det.addEventListener("toggle", () => { _foldState[id] = det.open; });
+    return det;
 }
 
 /* 资产库：链路说明 + 旧槽迁移 + 素材池（标注/引用/移除/剪辑/转码/入库）+ 登记表
@@ -8277,20 +8291,37 @@ function buildCards(data) {
                 + "与素材库「上传到项目资产」同一条通道（只落项目一份，不往全局库复制）。\n"
                 + "传完即可在正文里写 @别名 引用；要跨项目复用请去素材库点「存入全局库」。";
             bUpload.onclick = () => {
-                if (!node || it.idx === undefined) return;
+                if (!node || it.idx === undefined) {
+                    alert("画布上没找到导演台节点，无法上传素材");
+                    return;
+                }
                 const dir = getDirValue(node);
-                if (!dir) { setLed("warn", "当前没有项目：先在左栏读档或新建项目，再上传素材"); return; }
+                if (!dir) {
+                    alert("当前还没有项目：请先在左栏读档或新建一条项目，再上传素材。");
+                    return;
+                }
                 const H3Assets = window.H3Assets;
-                if (!H3Assets?.uploadDirect) { setLed("err", "上传接口不可用（请更新插件）"); return; }
+                if (!H3Assets?.uploadDirect) {
+                    alert("上传接口不可用（请更新插件并重启 ComfyUI）");
+                    return;
+                }
+                /* input **必须真的挂进文档**再 click()：未挂载的 file input 调 click()
+                 * 在部分 WebView / 桌面壳里不会弹选择框，表现就是「点了完全没反应」。
+                 * 选中或取消后立刻移除，不留 DOM 垃圾。 */
                 const inp = document.createElement("input");
                 inp.type = "file";
                 inp.multiple = true;
+                inp.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0";
+                document.body.append(inp);
+                const drop = () => { try { inp.remove(); } catch (e) { /* 已移除 */ } };
+                inp.oncancel = () => { drop(); setLed("idle", "已取消选择素材"); };
                 inp.onchange = async () => {
                     const files = [...(inp.files || [])];
-                    if (!files.length) return;
+                    if (!files.length) { drop(); return; }
                     bUpload.disabled = true;
                     const oldTxt = bUpload.textContent;
-                    bUpload.textContent = "上传中…";
+                    bUpload.textContent = `上传中…（${files.length}）`;
+                    setLed("running", `正在上传 ${files.length} 个素材…`);
                     let ok = 0;
                     const failed = [];
                     for (const f of files) {
@@ -8308,9 +8339,15 @@ function buildCards(data) {
                             ok++;
                         } catch (e) { failed.push(`${f.name}（${e?.message || e}）`); }
                     }
+                    drop();
                     bUpload.disabled = false;
                     bUpload.textContent = oldTxt;
-                    if (!ok) { setLed("err", `上传失败：${failed.slice(0, 3).join("、")}`); return; }
+                    /* 失败必须显性报出来：只改顶上那盏小灯的话，用户会以为"点了没反应"。 */
+                    if (!ok) {
+                        setLed("err", `上传失败：${failed.slice(0, 3).join("、")}`);
+                        alert(`上传失败（${failed.length} 个）：\n- ` + failed.join("\n- "));
+                        return;
+                    }
                     /* 立刻按最新 manifest 重建池并刷新（不等 240ms 轮询）：
                      * 否则出现「传了没反应、切一下屏又好了」。 */
                     try { await hydratePool(true); } catch (e) { /* 忽略 */ }
@@ -8318,9 +8355,11 @@ function buildCards(data) {
                         `已上传 ${ok} 个到项目 assets/`
                         + (failed.length ? `；${failed.length} 个失败：${failed.slice(0, 3).join("、")}` : "")
                         + "——正文里写 @别名 即可引用");
+                    if (failed.length) alert("部分文件上传失败：\n- " + failed.join("\n- "));
                     scheduleRefresh(120);
                 };
                 inp.click();
+                setLed("idle", "已打开文件选择框：选中素材即上传到本项目 assets/");
             };
             aiBar.append(bExpandOpt, bOptRun, bResolve, bUpload);
             pResult.body.append(aiBar);
@@ -8823,10 +8862,10 @@ function renderParamsZone(sec, data) {
         return;
     }
     const ar = String(getWidgetValue(node, W_AR) ?? "");
-    /* —— 基础设置：**唯一默认展开**的一栏（其余栏与子面板初始一律收起） —— */
-    const basic = el("details", "h3d-adv");
-    basic.open = true;
-    basic.innerHTML = "<summary>📐 基础设置（分辨率 / 时长 / 采样器 / 存档与成片）</summary>";
+    /* —— 基础设置：**首次打开默认展开**的一栏（其余栏与子面板首次一律收起）；
+     * 之后一律跟随用户的折叠操作（见 foldSection）。 —— */
+    const basic = foldSection("param-basic", true,
+        "<summary>📐 基础设置（分辨率 / 时长 / 采样器 / 存档与成片）</summary>");
     const bgrid = el("div", "h3d-adv-grid");
     for (const name of BASIC_DEFS) {
         if (name === W_WIDTH || name === W_HEIGHT) {
@@ -8846,22 +8885,19 @@ function renderParamsZone(sec, data) {
     }
     basic.append(bgrid);
     sec.append(basic);
-    /* —— 视频延续（大折叠套两子折叠；除基础设置外一律默认收起） —— */
-    const cont = el("details", "h3d-adv");
-    cont.open = false;
-    cont.innerHTML = "<summary>🔗 视频延续（段间引导 / 关键帧 / 接缝）</summary>";
+    /* —— 视频延续（大折叠套两子折叠） —— */
+    const cont = foldSection("param-cont", false,
+        "<summary>🔗 视频延续（段间引导 / 关键帧 / 接缝）</summary>");
     const cwrap = el("div", "h3d-adv-grid");
-    const kf = el("details", "h3d-adv");
-    kf.open = false;
-    kf.innerHTML = "<summary>📌 关键帧设置（尾部保存 / 注入帧数 / 加噪 / 响度对齐）</summary>";
+    const kf = foldSection("param-kf", false,
+        "<summary>📌 关键帧设置（尾部保存 / 注入帧数 / 加噪 / 响度对齐）</summary>");
     const kgrid = el("div", "h3d-adv-grid");
     for (const name of KEYFRAME_DEFS) kgrid.append(renderWidgetField(node, name));
     kgrid.append(el("div", "h3d-hint",
         "尾部 latent 保存量与分段注入帧数在各段「锚定设置」里按段覆盖（分段优先，空=跟随此处）。"));
     kf.append(kgrid);
-    const seam = el("details", "h3d-adv");
-    seam.open = false;
-    seam.innerHTML = "<summary>🩺 检测重摇（桥帧门控 / 接缝重摇）</summary>";
+    const seam = foldSection("param-seam", false,
+        "<summary>🩺 检测重摇（桥帧门控 / 接缝重摇）</summary>");
     const sgrid = el("div", "h3d-adv-grid");
     for (const name of SEAM_DEFS) sgrid.append(renderWidgetField(node, name));
     seam.append(sgrid);
@@ -8966,23 +9002,23 @@ function renderUpscaleZone(sec, data) {
     const upDone = upRecs.filter((r) => r && r.done).length;
     const upFinals = mf?.upscale?.finals || [];
 
-    const det = el("details", "h3d-adv h3d-updet" + (on ? " on" : ""));
-    /* 除「基础设置」那一栏外一律默认收起（含二采本身与它的两个子面板）：不再因为
-     * 「模式≠关闭」自动展开——面板一进来就撑开，会把下边的成片历史挤下去。 */
-    det.open = false;
-    det.innerHTML = `<summary>✦ 潜空间放大二采${on ? ' <span class="h3d-chip cyan">已开启</span>' : ""}</summary>`;
+    const det = foldSection("up-top", false,
+        `<summary>✦ 潜空间放大二采${on ? ' <span class="h3d-chip cyan">已开启</span>' : ""}</summary>`);
+    det.classList.add("h3d-updet");
+    if (on) det.classList.add("on");
 
     /* 两个子面板：基础（普通二采参数）/ 高级（抗糊增强那一套）。
      * body 就是**基础面板的网格** —— 原有 body.append 全部原样落进基础；
-     * 只有明确属于「抗糊 / 自适应 / 细节」的字段改写进 agrid。 */
-    const basicBox = el("details", "h3d-adv h3d-upsub");
-    basicBox.open = false;
-    basicBox.innerHTML = "<summary>⚙ 基础二采设置（模型 / 尺寸 / 采样 / 编码）</summary>";
+     * 只有明确属于「抗糊 / 自适应 / 细节」的字段改写进 agrid。
+     * 三层的展开态都由 foldSection 记忆：改一个参数触发重渲时不会再弹回去。 */
+    const basicBox = foldSection("up-basic", false,
+        "<summary>⚙ 基础二采设置（模型 / 尺寸 / 采样 / 编码）</summary>");
+    basicBox.classList.add("h3d-upsub");
     const body = el("div", "h3d-adv-grid");
     basicBox.append(body);
-    const advBox = el("details", "h3d-adv h3d-upsub");
-    advBox.open = false;
-    advBox.innerHTML = "<summary>🧪 高级二采设置（抗糊增强 / 细节混合 / 段自适应）</summary>";
+    const advBox = foldSection("up-adv", false,
+        "<summary>🧪 高级二采设置（抗糊增强 / 细节混合 / 段自适应）</summary>");
+    advBox.classList.add("h3d-upsub");
     const agrid = el("div", "h3d-adv-grid");
     advBox.append(agrid);
 

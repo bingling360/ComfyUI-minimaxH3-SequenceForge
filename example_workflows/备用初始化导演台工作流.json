@@ -1,8 +1,8 @@
 {
   "id": "h3-chain-director-default",
   "revision": 2,
-  "last_node_id": 59,
-  "last_link_id": 44,
+  "last_node_id": 60,
+  "last_link_id": 46,
   "nodes": [
     {
       "id": 3,
@@ -35,7 +35,7 @@
         "Node name for S&R": "VAELoader"
       },
       "widgets_values": [
-        "minimax_h3_video_vae_fp16.safetensors"
+        "minimax_h3_video_vae_int8_convrot.safetensors"
       ]
     },
     {
@@ -73,11 +73,35 @@
       ]
     },
     {
+      "id": 40,
+      "type": "MarkdownNote",
+      "pos": [
+        40,
+        2820
+      ],
+      "size": [
+        620,
+        380
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "导演台使用说明",
+      "properties": {},
+      "widgets_values": [
+        "# H3 长片导演台 · 配套工作流\n\n- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，提示词只走导演台状态（画布无任何提示词/素材外联）\n- 资产全在导演台三库面板管理（项目资产 / 全局库 / 成片）：瓦片拖放与正文 @素材名 引用，画布上没有任何资产节点与拉线\n- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），导演台段卡片直接预览播放\n- 链路自动推导（无模式选择）：有段引用素材即走 ref conditioning；UNET 请按引用情况接 ref2va（或混用权重），纯文生链用 fl2va 也可\n- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
       "id": 53,
       "type": "ModelAttentionBackend",
       "pos": [
-        -197.16773635195113,
-        -184.82842218805052
+        -539.5497629506184,
+        -201.4399075229341
       ],
       "size": [
         270,
@@ -98,7 +122,7 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            35
+            45
           ]
         }
       ],
@@ -108,8 +132,43 @@
         "Node name for S&R": "ModelAttentionBackend"
       },
       "widgets_values": [
-        "pytorch attention"
+        "comfy kitchen attention"
       ]
+    },
+    {
+      "id": 54,
+      "type": "PreviewAny",
+      "pos": [
+        922.7541434875644,
+        -132.0233707446445
+      ],
+      "size": [
+        210,
+        122
+      ],
+      "flags": {},
+      "order": 31,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 36
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": []
     },
     {
       "id": 10,
@@ -129,7 +188,7 @@
         {
           "name": "模型",
           "type": "MODEL",
-          "link": 35
+          "link": 46
         },
         {
           "name": "文本编码器",
@@ -199,7 +258,7 @@
       ],
       "title": "H3 Seamless Chain · 导演台主节点",
       "properties": {
-        "aux_id": "bingling360/ComfyUI-minimaxH3-SequenceForge",
+        "aux_id": "bingling360/ComfyUI_H3_SeamlessChain",
         "ver": "731bde31a74ff438381a07c8d647795aed63952c",
         "Node name for S&R": "H3SeamlessChainSampler"
       },
@@ -218,7 +277,7 @@
         "simple",
         "关闭",
         "",
-        "自动回退",
+        "关闭",
         30,
         34,
         0,
@@ -229,9 +288,9 @@
         0.06,
         1,
         "关闭",
-        "多参视频",
+        "文生视频",
         "开启",
-        "{\"mode\":\"多参视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"unlink\":false,\"disabled\":false,\"frame_refs\":null}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"3D\",\"scale\":1.5,\"denoise\":0.35,\"steps\":3,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0.03,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"encode\":\"高清\",\"sampler\":\"\",\"scheduler\":\"\",\"retry\":false,\"retry_target\":0.15,\"include\":[]}}",
+        "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"unlink\":false,\"disabled\":false,\"frame_refs\":null}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"3D\",\"scale\":1.5,\"denoise\":0.35,\"steps\":3,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0.03,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"encode\":\"高清\",\"sampler\":\"\",\"scheduler\":\"\",\"retry\":false,\"retry_target\":0.15,\"include\":[]}}",
         "高清",
         "match",
         1.0
@@ -249,7 +308,7 @@
         120
       ],
       "flags": {},
-      "order": 23,
+      "order": 24,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -284,7 +343,7 @@
         90
       ],
       "flags": {},
-      "order": 24,
+      "order": 25,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -302,69 +361,65 @@
         "Node name for S&R": "UNETLoader"
       },
       "widgets_values": [
-        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
         "default"
       ]
     },
     {
-      "id": 54,
-      "type": "PreviewAny",
+      "id": 60,
+      "type": "BlockSparseAttention",
       "pos": [
-        847.7113509410657,
-        -148.03244075466645
+        -193.19832687618307,
+        -275.32737438866627
       ],
       "size": [
-        210,
-        122
+        270,
+        250
       ],
       "flags": {},
-      "order": 31,
+      "order": 6,
       "mode": 0,
       "inputs": [
         {
-          "name": "source",
-          "type": "*",
-          "link": 36
+          "name": "model",
+          "type": "MODEL",
+          "link": 45
         }
       ],
       "outputs": [
         {
-          "name": "STRING",
-          "type": "STRING",
-          "links": null
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            46
+          ]
         }
       ],
-      "title": "运行报告",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "PreviewAny"
+        "Node name for S&R": "BlockSparseAttention"
       },
-      "widgets_values": []
-    },
-    {
-      "id": 40,
-      "type": "MarkdownNote",
-      "pos": [
-        -689.2984229963597,
-        682.8287737651384
-      ],
-      "size": [
-        620,
-        380
-      ],
-      "flags": {},
-      "order": 25,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "导演台使用说明",
-      "properties": {},
       "widgets_values": [
-        "# H3 长片导演台 · 配套工作流\n\n- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，提示词只走导演台状态（画布无任何提示词/素材外联）\n- 资产全在导演台三库面板管理（项目资产 / 全局库 / 成片）：瓦片拖放与正文 @素材名 引用，画布上没有任何资产节点与拉线\n- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），导演台段卡片直接预览播放\n- 链路自动推导（无模式选择）：有段引用素材即走 ref conditioning；UNET 请按引用情况接 ref2va（或混用权重），纯文生链用 fl2va 也可\n- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」"
+        "sol-attn",
+        1.3,
+        0.2,
+        1,
+        "",
+        12288,
+        256,
+        "exact_kv_and_rows",
+        false
       ],
-      "color": "#432",
-      "bgcolor": "#653"
+      "widgets_values_named": {
+        "selection": "sol-attn",
+        "selection.tau": 1.3,
+        "start_percent": 0.2,
+        "end_percent": 1,
+        "dense_blocks": "",
+        "min_tokens": 12288,
+        "extra_tokens": 256,
+        "sink_conditioning": "exact_kv_and_rows",
+        "verbose": false
+      }
     }
   ],
   "links": [
@@ -401,20 +456,28 @@
       "MODEL"
     ],
     [
-      35,
-      53,
-      0,
-      10,
-      0,
-      "MODEL"
-    ],
-    [
       36,
       10,
       3,
       54,
       0,
       "STRING"
+    ],
+    [
+      45,
+      53,
+      0,
+      60,
+      0,
+      "MODEL"
+    ],
+    [
+      46,
+      60,
+      0,
+      10,
+      0,
+      "MODEL"
     ]
   ],
   "groups": [
@@ -446,10 +509,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.6512906823746609,
+      "scale": 0.6512906823746598,
       "offset": [
-        2021.7747737708528,
-        -249.0103999670236
+        1868.9135086855777,
+        765.6611648228783
       ]
     },
     "frontendVersion": "1.48.7"

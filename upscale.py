@@ -1696,6 +1696,14 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             if report is not None:
                 report.append(f"⚠ 二采调度器「{ks_scheduler}」不存在，沿用主链「{调度器}」")
             ks_scheduler = ""
+        # 换调度器 = 连「实际起始 σ」一起换：denoise 只定步数比例
+        # （new_steps = int(steps/denoise)），尾部那几步的 σ 落点由调度器形状决定。
+        # 例（H3 shift=12 表，σ₀=0.25 / 3 步）：simple 走 0.800→0.706→0.524→0，
+        # beta 走 0.719→0.549→0.271→0 —— 同样的 denoise，beta 起点更低、收尾更细，
+        # 也就是精化更温和。所以换调度器后必须重调 σ₀，否则强度悄悄变了。
+        if ks_scheduler and report is not None:
+            report.append("提示：二采换调度器会连「实际起始 σ」一起变（denoise 只定步数比例，"
+                          "尾部几步的 σ 落点由调度器形状决定），换后请重调 σ₀")
     ks_sampler = ks_sampler or 采样器
     ks_scheduler = ks_scheduler or 调度器
 

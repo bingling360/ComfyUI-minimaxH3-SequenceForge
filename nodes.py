@@ -63,6 +63,14 @@ except Exception:
 _full_bridge_cache = None
 
 
+# 自定义 sigma 表（少步蒸馏 LoRA：HyperFlow 8 步 / H3 Turbo）走 sigmas_adapter：
+# 单独成模块一是可脱离 ComfyUI 单测，二是这部分逻辑与续拍/接缝无关。
+try:
+    from . import sigmas_adapter as _sigmas_adapter
+except ImportError:      # 兜底：作为顶层脚本被直接 import 时
+    import sigmas_adapter as _sigmas_adapter
+
+
 def cond_audio_rows_guard(dit):
     """安装 _cond_audio_rows 兜底 patch，返回恢复函数（try/finally 调用）。
 
@@ -904,6 +912,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "1.0=全量对齐（默认）；0=完全不对齐（保留内容本身的响度差）；"
                                        "0.2-0.4 常用于只兜内容本身的残留响度差。"
                                        "段间隔链（勾了「跳过自动引用上段」）本就不做对齐。"),
+                # 纯连线槽：没有 widget，不进 widgets_values（不影响控件值布局）。
+                io.Sigmas.Input("自定义Sigmas", optional=True,
+                                tooltip="可选：接自定义 sigma 表（少步蒸馏 LoRA 用），接了就覆盖「步数」与「调度器」，"
+                                        "实际步数 = sigma 点数 - 1。典型用法：ApplyHyperFlow / ManualSigmas / "
+                                        "BasicScheduler 的输出接进来（HyperFlow 官方 8 步表 = "
+                                        "1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0）。"
+                                        "不接则完全沿用「步数 + 采样器 + 调度器」，与旧行为逐字节一致。"
+                                        "注意：只作用于本节点的一采（基础链），二采（潜空间放大高清）仍用自己的参数。"),
             ],
             outputs=[
                 io.Image.Output("图像"),
@@ -923,7 +939,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
                 递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准",
-                二采模型=None, 参考图像尺寸="match", 响度对齐强度=1.0):
+                二采模型=None, 参考图像尺寸="match", 响度对齐强度=1.0, 自定义Sigmas=None):
         # P4d：画布媒体/提示词/参考入口已从 schema 删除，对应形参一并移除；
         # 起始视频（序章）是唯一的画布媒体入口，保留。
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
@@ -1905,6 +1921,28 @@ class H3SeamlessChainSampler(io.ComfyNode):
             aug_start = 1.0 - aug if aug > 0 else 0.999
             report.append(f"递减锚定：前 {fade_ratio*100:.0f}% 步数内锚定 {aug_start:.2f} → 0 递减消失"
                           + (f"（起点=锚定加噪 {aug:.2f}）" if aug > 0 else "（硬锚定起点）"))
+        # 自定义 sigma 表（少步蒸馏 LoRA 用：HyperFlow 8 步 / Turbo 等）
+        _sig_tag = _sigmas_adapter.fingerprint_tag(自定义Sigmas)
+        if _sig_tag is not None:
+            _sig_steps = _sigmas_adapter.sigmas_steps(自定义Sigmas) or 0
+            report.append(f"自定义 Sigmas：{_sig_steps} 步"
+                          + f"（「步数 {int(步数)}」与「调度器 {调度器}」已忽略，采样器仍为「{采样器}」）"
+                          + "；只作用于一采，二采沿用自身参数")
+            if fade_ratio > 0:
+                report.append(f"注意：递减锚定按 sigma 进度计算，{_sig_steps} 步下曲线只有 {_sig_steps} 个采样点（阶梯化）")
+            if 采样器 != "euler":
+                report.append(f"提示：少步蒸馏配方一般用 euler，当前是「{采样器}」——"
+                              "每步吃 (t,r) 区间端点的蒸馏假设与多步高阶采样器不一致，属未验证组合")
+            if 二采模型 is None and up_cfg:
+                report.append("提示：二采未接独立模型，仍沿用一采模型——即二采会带着这份少步蒸馏权重跑，"
+                              "但用的是二采自己的步数/调度器（不是蒸馏表），轨迹对不上；"
+                              "不想让二采用这个 LoRA，请在「二采模型」另接一份基础（非蒸馏）权重")
+            if up_cfg:
+                _miss = [k for k in ("sampler", "scheduler") if not str(up_cfg.get(k) or "").strip()]
+                if _miss:
+                    report.append("提示：二采未指定" + "、".join(_miss)
+                                  + f"，会沿用主链「{采样器}/{调度器}」——该组值对一采已被 sigma 表覆盖、"
+                                    "对二采**仍然生效**；要区分请在二采面板显式填写")
 
         # 身份锚张量占位：真实编码在 root 确定后（见 pbar 前「资产加载与锚解析」）。
         # 旧三槽位（首帧/尾帧/每段尾帧图）与资产标注在此汇合：旧槽位优先，空则用标注。
@@ -1947,6 +1985,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             "fade_ratio": fade_ratio,
             "gate": {"mode": 桥帧门控, "threshold": float(清晰度阈值), "limit": gate_limit},
         }
+        # 自定义 sigma 表进指纹（改表即整链重做）。未接时不加键——json.dumps(sort_keys)
+        # 下「多一个空键」也是新指纹，会让既有项目的存档全部续不上。
+        if _sig_tag is not None:
+            ckpt_params["sigmas"] = _sig_tag
         # 衔接诊断参数（下阶段基建：重摇/锚定）只记录不进指纹（改值不触发重跑；报告回看用）
         seam_refine = {"reroll": 接缝重摇, "reroll_th": float(重摇阈值),
                        "reroll_max": int(重摇上限), "anchor_aug": aug}
@@ -2977,9 +3019,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         t0 = time.perf_counter()
                         # 初始 latent 是官方空 latent（段首内容由引导桥 cond 承载），
                         # 与旧版逐字节一致
-                        sampled = nodes.common_ksampler(
+                        sampled = _sigmas_adapter.ksampler_with_sigmas(
                             模型, cur_seed, 步数, CFG,
-                            采样器, 调度器, cond, negative, _sampling_latent, denoise=1.0)[0]
+                            采样器, 调度器, cond, negative, _sampling_latent,
+                            sigmas=自定义Sigmas, denoise=1.0)[0]
                     finally:
                         restore_audio_rows()
                         restore_video_rows()

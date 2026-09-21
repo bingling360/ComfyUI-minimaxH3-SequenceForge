@@ -476,7 +476,9 @@ def test_v2_group_form_wired():
     # 复位后开合状态要记下来（否则加对白/重建会被 details 默认收起打断）
     assert "const _v2Open = new Map();" in d, "缺 details 开合记忆"
     assert 'function v2Details(key, cls, summaryHtml, defOpen)' in d, "缺 v2Details 工厂"
-    assert '_v2Open.set(key, g.open)' in d, "toggle 未记录开合"
+    # b17b003 起 _v2Open 的 key 统一过 v2Key()（前缀项目目录，该口径由
+    # tests/js/cross_project_scope_check.js 守卫）→ v2Details 里形参 key 先算成局部 k
+    assert "_v2Open.set(k, g.open)" in d, "toggle 未记录开合"
     # 组 key：官方六段的前三段拆成 sub/sum/ret 三组（不再塞在一个 ref 里），
     # 素材调度单独成组（它不是官方字段）；「画面」组（pic）已并入整体描述组。
     for k in ["v2${segIdx}", "shot${segIdx}", "snd${segIdx}", "sub${segIdx}",

@@ -32,3 +32,6 @@ tools/anchor_preview.html
 
 # 性能探测日志（运行时生成，回读用 tools/perf_report.py）
 logs/
+
+# 提示词产出与运行时目录（个人创作产出 + 未来的 h3_projects 存档，不属于插件本体）
+output/

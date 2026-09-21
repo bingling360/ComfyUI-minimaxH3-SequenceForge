@@ -868,6 +868,97 @@ def _strip_think(text: str) -> str:
     return raw
 
 
+# ============================ 本地通道观测 ============================
+#
+# 为什么必须单独立这一块：提示词优化走本地 GGUF 时，「加速到底生效没有」和
+# 「显存用了多少」原本**完全不可见**——
+#
+# - llama.cpp 用自己的 CUDA 分配器，`torch.cuda.memory_allocated()` 看不见它，
+#   只有设备级 `total − free`（`mem_get_info`）才量得到；
+# - `n_gpu_layers=-1` 只是**请求**全铺：放不下时 llama.cpp 不报错、只是把层
+#   丢给 CPU，decode 从 ~25 tok/s 掉到个位数，**日志里什么都不会说**；
+# - `_new_llama` 的降级分支只在失败时吭一声，成功时零输出。
+#
+# docs/本地LLM保守加速提案_3090.md §2 早就写了验收标准
+# （「看到 offloaded X/Y layers to GPU 时 X 必须等于 Y」），只是一直没落到代码里。
+# 下面前三个函数补齐「可测的那一半」；想拿 llama.cpp 那句原始凭据时设
+# 环境变量 `H3_LLM_VERBOSE=1`（它会把装载日志原样打出来）。
+
+LOCAL_LLM_VERBOSE_ENV = "H3_LLM_VERBOSE"
+
+
+def _vram_used_gb():
+    """设备级显存占用（GB）；无 CUDA / 异常 → None。
+
+    测 llama.cpp 的唯一可用口径：它的分配不属于 torch 的 caching allocator，
+    `torch.cuda.memory_allocated()` 会读出接近 0 的假象。
+    """
+    try:
+        import torch  # type: ignore
+
+        if not torch.cuda.is_available():
+            return None
+        free, total = torch.cuda.mem_get_info()
+        return (total - free) / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _file_gb(path):
+    """模型文件大小（GB）；拿不到 → None。用于对照「铺了多少」。"""
+    try:
+        return os.path.getsize(path) / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _plan_line(plan):
+    """加速项生效清单（一行）；无 plan → ""。
+
+    `plan` 由 `_new_llama` 回传，记录**这次实际吃到**的项（降级后是剥掉之后的）。
+    """
+    if not plan:
+        return ""
+    ok = "√" if plan.get("flash_attn") else "×"
+    kv = "q8_0（省一半）" if plan.get("kv_quant") else "fp16（未量化）"
+    ub = plan.get("n_ubatch")
+    ngl = plan.get("n_gpu_layers")
+    if ngl == -1:
+        ngl_txt = "n_gpu_layers=-1（请求全铺，能否铺满由显存决定）"
+    elif not ngl:
+        ngl_txt = "未设 n_gpu_layers（= 纯 CPU）"
+    else:
+        ngl_txt = f"n_gpu_layers={ngl}"
+    txt = (f"加速项：flash_attn {ok} · KV {kv}"
+           f" · n_batch {plan.get('n_batch')} · n_ubatch {ub or '默认'} · {ngl_txt}")
+    if plan.get("mode") == "degraded":
+        txt += (f" ⚠ 已降级（被剥掉 {'/'.join(plan.get('dropped') or [])}）")
+    return txt
+
+
+def _llm_verdict(model_gb, vram_delta_gb, tok_s, plan):
+    """按实测数字给结论行（纯函数，可单测；没有可说的返回 []）。
+
+    三条判据都刻意保守——只报**能确定**的：
+    1. 降级：功能层面已确知（plan 记着），必报；
+    2. 显存增量 << 权重文件：mmap 下铺满 GPU 时增量应 ≥ 文件大小（还要叠 KV），
+       明显小于 → 有层在 CPU；阈值取 0.8 倍，给量化打包与 mmap 留余量；
+    3. tok/s 过低：同档位正常 20–30，个位数就是掉层/降级的典型表现。
+    """
+    out = []
+    if plan and plan.get("mode") == "degraded":
+        out.append("⚠ 加速项被降级（这条 llama-cpp-python 不认新参数）：KV 回 fp16 "
+                   "→ 显存翻倍，27B 级模型在 24G 卡上会掉层。建议升级 llama-cpp-python")
+    if model_gb and vram_delta_gb is not None and vram_delta_gb < model_gb * 0.8:
+        out.append(f"⚠ 显存增量 {vram_delta_gb:.1f}GB 明显小于权重文件 {model_gb:.1f}GB "
+                   f"——有层被丢在 CPU（llama.cpp 不报错，只是变慢）。"
+                   f"可减小 n_ctx、不挂 mmproj，或换更小的量化")
+    if tok_s is not None and tok_s < 10:
+        out.append(f"⚠ 生成只有 {tok_s:.1f} tok/s（同档位正常约 20–30）"
+                   "——典型是掉层或降级后的表现")
+    return out
+
+
 def _new_llama(kw: dict):
     """构造 Llama，带一次「新参数不被老轮子认识」的降级重试。
 
@@ -879,21 +970,36 @@ def _new_llama(kw: dict):
     降级要**打到日志里**：KV 回到 fp16 意味着显存翻倍，27B 在 24G 卡上就 spill
     到内存了，速度掉一个数量级 —— 这种"能跑但慢十倍"的状态必须看得见，
     否则用户只会觉得"这个插件好慢"，根本查不到是加速项没生效。
+
+    返回 `(llm, plan)`：`plan` 记着**这次实际吃到了哪些项**（降级后是剥掉之后的），
+    供 `_plan_line` / `_llm_verdict` 渲染。成功路径原来零输出，只有失败才吭声，
+    于是"加速生效了没"永远无从判断——这份 plan 就是补这个洞。
     """
     from llama_cpp import Llama  # type: ignore
     fast_keys = ("flash_attn", "type_k", "type_v", "n_ubatch")
+    plan = {"mode": "fast",
+            "dropped": [],
+            "flash_attn": bool(kw.get("flash_attn")),
+            "kv_quant": ("type_k" in kw and "type_v" in kw),
+            "n_batch": kw.get("n_batch"),
+            "n_ubatch": kw.get("n_ubatch"),
+            "n_gpu_layers": kw.get("n_gpu_layers")}
     try:
-        return Llama(**kw)
+        return Llama(**kw), plan
     except Exception:
         if not any(k in kw for k in fast_keys):
             raise
         slow = {k: v for k, v in kw.items() if k not in fast_keys}
         # 老轮子的 n_batch 同时充当物理批，2048 会按最坏情况撑爆计算缓冲区
         slow["n_batch"] = 512
+        plan.update({"mode": "degraded",
+                     "dropped": [k for k in fast_keys if k in kw],
+                     "flash_attn": False, "kv_quant": False,
+                     "n_batch": 512, "n_ubatch": None})
         print("[ComfyUI_H3_SeamlessChain] llama-cpp-python 不认本插件的加速参数，已降级运行："
               "关掉 flash attention、KV 缓存退回 fp16（显存占用翻倍，27B 在 24G 卡上会掉层到内存，"
               "速度慢一个数量级）。建议升级 llama-cpp-python 到较新版本")
-        return Llama(**slow)
+        return Llama(**slow), plan
 
 
 def _torch_bf16_ok(torch_mod) -> bool:
@@ -1198,10 +1304,22 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
             # 就是 0 层 = 纯 CPU，27B 在 CPU 上出 1000 字要按分钟算。
             if str(cfg.get("local_device") or "cuda").lower() != "cpu":
                 kw["n_gpu_layers"] = -1
-            llm = _new_llama(kw)
+            if os.environ.get(LOCAL_LLM_VERBOSE_ENV) == "1":
+                # 想看 llama.cpp 自己那句「offloaded X/Y layers to GPU」的原始凭据
+                # （提案 §2 的验收标准）就开它；平时关着——否则每次优化都刷几百行
+                # 张量装载日志。开了之后 X≠Y 就是掉层的铁证。
+                kw["verbose"] = True
+            _model_path = os.path.join(root, sel)
+            _model_gb = _file_gb(_model_path)
+            _vram0 = _vram_used_gb()
+            _t_load = time.perf_counter()
+            llm, _plan = _new_llama(kw)
+            _load_s = time.perf_counter() - _t_load
+            _vram1 = _vram_used_gb()
             content: list = [{"type": "text", "text": user_prompt}]
             for u in images:
                 content.append({"type": "image_url", "image_url": {"url": u}})
+            _t_gen = time.perf_counter()
             try:
                 res = llm.create_chat_completion(
                     messages=[{"role": "system", "content": system},
@@ -1211,6 +1329,53 @@ def _local_generate(cfg: dict, system: str, user_prompt: str, media: list,
                 # 显存靠它归还（同 __del__，但此刻立刻生效）：生成报错时也不能漏关，
                 # 否则句柄会挂在线程池 future 的 traceback 上，一直到那次异常被回收。
                 llm.close()
+            _gen_s = time.perf_counter() - _t_gen
+            _vram2 = _vram_used_gb()
+            # 本地通道的性能与显存账：**加不加这行差别很大**——llama.cpp 用自己的
+            # CUDA 分配器（torch 计数器看不见）、掉层又是静默的，不打出来就只剩
+            # 「感觉这个插件好慢」这一种反馈。
+            try:
+                _u = (res or {}).get("usage") or {}
+                _ct = _u.get("completion_tokens")
+                _pt = _u.get("prompt_tokens")
+                _tok_s = (float(_ct) / _gen_s) if (_ct and _gen_s > 0) else None
+                _delta = (None if (_vram1 is None or _vram0 is None)
+                          else _vram1 - _vram0)
+                _line1 = (f"[本地LLM] {sel} · 权重文件 "
+                          f"{'?' if _model_gb is None else f'{_model_gb:.1f}GB'}"
+                          f" · 装载 {_load_s:.1f}s"
+                          + ("" if _delta is None else
+                             f" · 装载前后显存 {_vram0:.1f} → {_vram1:.1f}GB"
+                             f"（+{_delta:.1f}）"))
+                _line2 = (f"[本地LLM] 生成 {_gen_s:.1f}s · prompt "
+                          f"{_pt if _pt is not None else '?'} tok · 输出 "
+                          f"{_ct if _ct is not None else '?'} tok"
+                          + ("" if _tok_s is None else f" · {_tok_s:.1f} tok/s"))
+                _line3 = _plan_line(_plan)
+                _line4 = ("" if (_vram2 is None or _vram1 is None) else
+                          f"[本地LLM] 关闭后显存 {_vram1:.1f} → {_vram2:.1f}GB"
+                          f"（已归还 {_vram1 - _vram2:.1f}GB）")
+                for _ln in (_line1, _line2, _line3, _line4):
+                    if _ln:
+                        print(_ln, flush=True)
+                for _w in _llm_verdict(_model_gb, _delta, _tok_s, _plan):
+                    print(f"[本地LLM] {_w}", flush=True)
+                try:   # 落盘：抓崩时的唯一留存（与 perf 的其它埋点同一份 JSONL）
+                    from . import perf as _perf
+
+                    _perf.emit({"kind": "local_llm", "model": sel,
+                                "model_gb": _model_gb,
+                                "vram_before": _vram0, "vram_after_load": _vram1,
+                                "vram_after_close": _vram2, "vram_delta": _delta,
+                                "load_s": round(_load_s, 2),
+                                "gen_s": round(_gen_s, 2),
+                                "prompt_tokens": _pt, "completion_tokens": _ct,
+                                "tok_s": None if _tok_s is None else round(_tok_s, 2),
+                                "plan": _plan})
+                except Exception:
+                    pass
+            except Exception:
+                pass
             raw = str(res["choices"][0]["message"]["content"] or "")
         else:
             # ---- Transformers 路径 ----

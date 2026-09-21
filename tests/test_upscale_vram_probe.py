@@ -161,22 +161,27 @@ def test_vram_report_empty_returns_blank():
 
 
 def test_vram_report_full_contains_six_stages():
-    """六个节点全部采到时，一行里六个标签齐备且数值格式化为两位小数。"""
+    """六个节点全部采到时，一行里六个标签齐备且数值格式化为两位小数。
+
+    ⚠ 2026-09-22 改口径：六段一律报**设备级占用**（元组第二个数），不再区分
+    「当时占用 / 阶段峰值」。原来那条区分建立在 `max_memory_allocated()` 上，
+    而它量不到 DynamicVRAM 的权重池——24GB 卡跑 32GB 模型会报出 0.43GB。
+    故此处 base/unload 也断言第二个数（23.60 / 19.00）而不是第一个。
+    """
     v = {
-        "base": (1.5, 1.6),
+        "base": (1.5, 23.6),
         "up": (None, 2.25),
         "cond": (None, 3.5),
-        "unload": (0.125, 3.5),
+        "unload": (0.125, 19.0),
         "refine": (None, 4.0),
         "decode": (None, 5.75),
     }
     line = upscale._vram_report(7, v)
-    assert line.startswith("[H3二采] 段7 显存峰值：")
+    assert line.startswith("[H3二采] 段7 显存占用（设备级）：")
     for label in ("放大前", "放大后", "cond后", "卸载后", "精化后", "解码后"):
         assert label in line
-    # 放大前 / 卸载后 报「当时占用」，其余报「阶段峰值」
-    assert "放大前1.50GB" in line
-    assert "卸载后0.12GB" in line
+    assert "放大前23.60GB" in line
+    assert "卸载后19.00GB" in line
     assert "放大后2.25GB" in line
     assert "解码后5.75GB" in line
 

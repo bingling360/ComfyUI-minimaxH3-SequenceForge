@@ -30,6 +30,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 
 GB = float(1024 ** 3)
@@ -262,10 +263,30 @@ def offload_guard(hw, ratio=DEFAULT_GUARD_RATIO):
     else:
         level = "critical"
 
-    swap_txt = "未知" if swap_free is None else f"{swap_free:.0f}GB"
+    swap_total = hw.get("swap_total_gb")
+    if swap_free is None and swap_total is None:
+        swap_txt = "未知"
+    elif swap_free is None:
+        swap_txt = f"?/{swap_total:.0f}GB"
+    elif swap_total is None:
+        swap_txt = f"{swap_free:.0f}/?GB"
+    else:
+        # 空闲/总量 并列写：真机日志里报告行打 total、守卫行打 free，两行相邻
+        # 同名不同口径，被读成「前后矛盾」（2026-09-22）。这里强制成一对。
+        swap_txt = f"{swap_free:.0f}/{swap_total:.0f}GB"
     disk = hw.get("disk_free_gb")
     disk_txt = "未知" if disk is None else f"{disk:.0f}GB"
     ram_txt = "未知" if ram_avail is None else f"{ram_avail:.0f}GB"
+
+    # 平台分流：Windows 有 pagefile，内存压力的表现是「变慢」不是「被杀」；
+    # Linux 无 swap 才是 OOM killer SIGKILL。未知平台按 Linux 给（更保守）。
+    is_windows = str(hw.get("os") or "").lower().startswith("win")
+    if is_windows:
+        crit_tail = ("Windows 有 pagefile，不会 OOM kill，但会把采样拖到分钟级；"
+                     "建议先关掉其它进程，或改用不卸载策略")
+    else:
+        crit_tail = ("本机 swap 不足，Linux 无 swap 时不是变慢而是被 OOM killer 杀掉"
+                     "——建议先关掉其它进程，或改用不卸载策略")
 
     if ok:
         msg = (f"卸载可落内存：可用内存 {ram_txt} + swap {swap_txt} ≥ 需求 {need:.0f}GB")
@@ -273,8 +294,7 @@ def offload_guard(hw, ratio=DEFAULT_GUARD_RATIO):
         msg = (f"⚠ 本次卸载会把权重挤出到 swap —— 可用内存 {ram_txt} + swap {swap_txt}"
                f" < 需求 {need:.0f}GB（权重 {weights:.1f}GB × {ratio:g}）；"
                f"可用磁盘 {disk_txt}。"
-               f"{'本机 swap 不足，Linux 无 swap 时不是变慢而是被 OOM killer 杀掉' if level == 'critical' else '接近临界，建议先释放内存'}"
-               "——建议先关掉其它进程，或改用不卸载策略")
+               f"{crit_tail if level == 'critical' else '接近临界，建议先释放内存'}")
 
     return {"need_gb": round(need, 1), "have_gb": round(have, 1),
             "ok": ok, "level": level, "message": msg}
@@ -401,9 +421,14 @@ def parse_state(raw):
 def report_line(hw, profile=None):
     """一行硬件概览（阶段 0 报告行，§6.3 第 1 行同源）：
 
-    `[H3性能] 显存 32.0GB · 内存 80GB · swap 0GB · R_v 0.83 · R_m 0.65 · 档位 云端高显存`
+    `[H3性能] 显存 32.0GB · 内存 80GB · swap 0GB（空闲 0 · 源 linux-meminfo）`
+    ` · R_v 0.83 · R_m 0.65 · 档位 云端高显存 · 平台 Linux`
 
     缺项显示 "?" 而不是编一个数字——诊断行的价值全在可信。
+
+    swap 同时给「总量（空闲）」：只给总量时，与守卫行（只给空闲）相邻会出现
+    21GB / 0GB 这种看似矛盾的读数（2026-09-22 真机）。末尾的「平台」是判定
+    落盘守卫该给哪套建议的唯一依据，必须可见。
     """
     def _g(key, nd=1):
         v = hw.get(key)
@@ -412,11 +437,18 @@ def report_line(hw, profile=None):
     rv = ratio_v(hw)
     rm = ratio_m(hw)
     prof = profile or resolve_profile(hw)
+    sf = hw.get("swap_free_gb")
+    sf_txt = "?" if sf is None else f"{sf:.0f}"
+    # swap 后面标「源」：windows=GlobalMemoryStatusEx、linux-meminfo=/proc/meminfo、
+    # psutil=兜底。真机排障时「这数哪来的」与「这数是多少」同等重要——Windows 的
+    # pagefile 与 Linux 的 swap 不是一回事，认错分支整套建议都会跑偏。
     return (f"[H3性能] 显存 {_g('vram_total_gb')}GB · 内存 {_g('ram_total_gb', 0)}GB"
-            f" · swap {_g('swap_total_gb', 0)}GB"
+            f" · swap {_g('swap_total_gb', 0)}GB（空闲 {sf_txt}"
+            f" · 源 {hw.get('swap_source') or '?'}）"
             f" · R_v {'?' if rv is None else f'{rv:.2f}'}"
             f" · R_m {'?' if rm is None else f'{rm:.2f}'}"
-            f" · 档位 {PROFILE_LABELS.get(prof, prof)}")
+            f" · 档位 {PROFILE_LABELS.get(prof, prof)}"
+            f" · 平台 {hw.get('os') or '?'}")
 
 
 # ============================ 探测（best-effort，绝不抛） ============================
@@ -450,6 +482,12 @@ def _ram_swap_windows():
     （实测：16GB 内存 + 19GB pagefile，AvailPageFile 7.6 / AvailPhys 5.1
     → swap_free 2.5GB；若误减 TotalPhys 会因减出负数被 clamp 成 0，
     把「swap 还有点余量」误报成「swap 已满」。）
+
+    ⚠ 该式在「大量 mmap 文件页」时会**高估**：ComfyUI 用 safetensors mmap 映射几十 GB
+    权重，这些页计入 PhysInUse 但不计入 CommitTotal，于是式子变成
+    `PF + (PhysInUse − CommitTotal)` 并可能**超过页面文件总容量**。故结果必须
+    再 clamp 到 [0, pagefile]——否则日志里会出现「swap 空闲 > swap 总量」的怪值。
+    （真机 2026-09-22 日志：swap 21GB / free 0GB，即命中下界。）
     """
     try:
         import ctypes
@@ -473,7 +511,9 @@ def _ram_swap_windows():
             return None, None
         phys = st.ullTotalPhys / GB
         pagefile = max(0.0, (st.ullTotalPageFile - st.ullTotalPhys) / GB)
-        avail_pagefile = max(0.0, (st.ullAvailPageFile - st.ullAvailPhys) / GB)
+        avail_pagefile = (st.ullAvailPageFile - st.ullAvailPhys) / GB
+        # 双向 clamp：下界 0（负数无意义），上界 pagefile（mmap 文件页会把它顶穿）
+        avail_pagefile = min(max(0.0, avail_pagefile), pagefile)
         return ({"total_gb": phys, "avail_gb": st.ullAvailPhys / GB},
                 {"total_gb": pagefile, "free_gb": avail_pagefile})
     except Exception:
@@ -494,13 +534,95 @@ def _ram_swap_linux():
         return None, None
 
 
+def probe_os():
+    """平台名（"Windows" / "Linux" / …）；探不到 → None。
+
+    为什么必须有：落盘守卫的结论在 Windows 与 Linux 上**完全相反**——Windows 有
+    pagefile，内存压力的表现是「变慢」；Linux 无 swap 时是「进程被 OOM killer
+    SIGKILL」。不看平台就给建议，等于把一台机器的话术套到另一台上（2026-09-22
+    真机日志：报告行 swap 21GB / 守卫行 swap 0GB，用户据此怀疑系统检测错了，
+    而日志里根本没有平台信息可供判断）。
+    """
+    try:
+        import platform
+
+        return platform.system() or None
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def watch_vram_peak(interval=0.2):
+    """区间内**设备级**显存占用的采样峰值（GB）；量不到 → 峰值保持 None。
+
+    为什么不能用 `torch.cuda.max_memory_allocated()`：它只统计 torch 的 caching
+    allocator，量不到 DynamicVRAM / aimdo 的权重池（见 `upscale._vram_probe`），
+    在 24GB 卡跑 32GB 模型时会报 0.43GB 这种假象。
+
+    为什么必须用采样线程：设备级占用只有**瞬时值**（`mem_get_info` 给 free/total，
+    没有 peak 计数器），而 nvidia-ml / NVML 在相当多机器上初始化失败，
+    `nvidia-smi` 也不可用。故起一个 daemon 线程定时轮询取 max——
+    每次轮询 ~10µs，0.2s 一次，对采样中的前向无可测影响。
+
+    用法（`yield` 的是一个可变 dict，退出后读 `["peak"]`）：
+
+        with perf.watch_vram_peak() as w:
+            ...采样...
+        print(w["peak"])
+
+    只回答一个问题：**这段区间里显存最高到过多少**。它是「不腾挪 / 少腾挪
+    会不会 OOM」这类决策的唯一硬依据——没有它，A/B 只能靠崩不崩来试。
+    """
+    box = {"peak": None, "samples": 0}
+    stop = threading.Event()
+
+    def _loop():
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return
+            while not stop.is_set():
+                try:
+                    free, total = torch.cuda.mem_get_info()
+                    used = (total - free) / GB
+                    box["samples"] += 1
+                    if box["peak"] is None or used > box["peak"]:
+                        box["peak"] = used
+                except Exception:
+                    return
+                stop.wait(interval)
+        except Exception:
+            return
+
+    th = threading.Thread(target=_loop, daemon=True)
+    try:
+        th.start()
+    except Exception:
+        pass
+    try:
+        yield box
+    finally:
+        stop.set()
+
+
+_LAST_SWAP_SOURCE = "none"
+
+
 def probe_ram_swap():
-    """(ram, swap) 两个 dict（GB）；探不到给 None。Linux 优先 /proc/meminfo。"""
+    """(ram, swap) 两个 dict（GB）；探不到给 None。Linux 优先 /proc/meminfo。
+
+    走到哪条分支记进 `perf._LAST_SWAP_SOURCE`（"windows" / "linux-meminfo" /
+    "psutil" / "none"），供报告行标注——真机排障时「这个数字是哪条路来的」
+    和「这个数字是多少」同样重要。
+    """
+    global _LAST_SWAP_SOURCE
     ram = swap = None
     if os.name == "nt":
         ram, swap = _ram_swap_windows()
+        _LAST_SWAP_SOURCE = "windows" if ram is not None else "none"
     if ram is None:
         ram, swap = _ram_swap_linux()
+        _LAST_SWAP_SOURCE = "linux-meminfo" if ram is not None else "none"
     if ram is None:
         # 最后兜底：psutil（ComfyUI 环境常见，但不是必须）
         try:
@@ -510,6 +632,7 @@ def probe_ram_swap():
             sm = psutil.swap_memory()
             ram = {"total_gb": vm.total / GB, "avail_gb": vm.available / GB}
             swap = {"total_gb": sm.total / GB, "free_gb": sm.free / GB}
+            _LAST_SWAP_SOURCE = "psutil"
         except Exception:
             pass
     return ram, swap
@@ -636,6 +759,156 @@ def probe_aimdo():
         return None
 
 
+def probe_vram_policy():
+    """DynamicVRAM 的「余量策略」参数（只读镜像）；拿不到 → None。
+
+    为什么必须单独探它：ComfyUI 0.35 起把重心放在**拉高显存利用率**上
+    （官方 issue #16150 里维护者的定性是「H3 显存利用率不足是自始的 bug，
+    Comfy 编译器就是来修它的」，不是回归）。结果是低显存卡上余量被吃光、
+    二采这种「在同一张卡上再插一段高清采样」的流程最容易炸。
+
+    相关旋钮（全部在 comfy/cli_args.py，本函数只读不改）：
+
+    | 键 | 来源 | 作用面 |
+    |---|---|---|
+    | `vram_headroom_gb` | `--vram-headroom`（0.35 新增，默认 0） | `main.py` 交给 `comfy_aimdo.control.init_devices` 的**每设备**预留 |
+    | `reserve_vram_gb` | `--reserve-vram`（老开关） | 同时喂 Python 侧 `EXTRA_RESERVED_VRAM` 与 aimdo 的 `simple_vram_headroom` |
+    | `extra_reserved_gb` | 运行时可变 | 只影响 Python 侧 `minimum_inference_memory()` = 0.8GB + 它 |
+    | `comfy_compiler` | `--disable-comfy-compiler` | 0.35 新增的编译器，正是拉高占用的主因 |
+
+    ⚠ 「运行时改 `EXTRA_RESERVED_VRAM`」（常见第三方 ReservedVRAM 节点）**盖不到
+    aimdo 原生那侧**——原生预留是进程启动时设定的。要真留出余量得给启动参数。
+    """
+    try:
+        from comfy import cli_args  # type: ignore
+
+        a = cli_args.args
+        extra = None
+        try:
+            from comfy import model_management as mm  # type: ignore
+
+            extra = mm.extra_reserved_memory() / GB
+        except Exception:
+            pass
+        return {
+            "vram_headroom_gb": float(getattr(a, "vram_headroom", 0) or 0.0),
+            "reserve_vram_gb": getattr(a, "reserve_vram", None),
+            "extra_reserved_gb": extra,
+            "comfy_compiler": not bool(getattr(a, "disable_comfy_compiler", False)),
+            "dynamic_vram": bool(cli_args.enables_dynamic_vram()),
+        }
+    except Exception:
+        return None
+
+
+# `minimum_inference_memory()` 的固定项（comfy/model_management.py:877）：
+# 0.8GB + extra_reserved_memory()。load_models_gpu 用它当「最低必须留空」的地板。
+MIN_INFERENCE_BASE_GB = 0.8
+
+
+def vram_budget(hw, policy=None):
+    """显存预算账（纯函数，只吃 dict）：留了多少 / 能给权重多少 / 每步要重读多少。
+
+    回答的是**「到底有没有把显存用满」**——这个问题的另一半是「0.35 想吃满，
+    我挡住了多少」。
+
+    机制（comfy/model_management.py）：
+
+        minimum_inference_memory() = 0.8GB + extra_reserved_memory()
+        load_models_gpu:  minimum_memory_required = max(inference_memory,
+                                                        memory_required + extra)
+
+    也就是 `EXTRA_RESERVED_VRAM` 被**数了两次**（保底项与需求项各一次），
+    所以运行时把它抬到 2.88GB 的实际后果是「至少留空 3.68GB」，占 24GB 卡的 15%。
+
+    ⚠ 关键语义：DynamicVRAM 下显存是**权重缓存**。留空的每一 GB 都等于每步要多
+    重读 1GB 权重（模型 34GB 装不进 24GB，缓存越大、每步重读越少、越快）。
+    所以「用满」不是无脑正确的目标——激活（736×1312×57 高清 latent）需要一块
+    固定空间，把它挤掉就是 OOM。正确目标是「**缓存尽量大 + 激活峰值刚好够**」。
+
+    返回 {total_gb, reserve_gb, cache_gb, unet_gb, reread_gb}；关键项缺就 None。
+    """
+    total = hw.get("vram_total_gb")
+    if not total:
+        return None
+    extra = (policy or {}).get("extra_reserved_gb")
+    reserve = None if extra is None else MIN_INFERENCE_BASE_GB + float(extra)
+    cache = None if reserve is None else max(0.0, float(total) - reserve)
+    unet = hw.get("unet_gb")
+    reread = None
+    if unet and cache is not None:
+        reread = max(0.0, float(unet) - cache)
+    return {"total_gb": float(total), "reserve_gb": reserve, "cache_gb": cache,
+            "unet_gb": unet, "reread_gb": reread}
+
+
+def vram_budget_line(b):
+    """把 vram_budget 渲染成一行（无数据返回 ""）。"""
+    if not b:
+        return ""
+    if b.get("reserve_gb") is None:
+        return f"显存预算：总量 {b['total_gb']:.1f}GB · 预留未探明（拿不到 EXTRA_RESERVED_VRAM）"
+    txt = (f"显存预算：总量 {b['total_gb']:.1f}GB · 主动留空 {b['reserve_gb']:.2f}GB"
+           f"（保底 {MIN_INFERENCE_BASE_GB:g} + EXTRA {b['reserve_gb'] - MIN_INFERENCE_BASE_GB:.2f}）"
+           f" · 可给权重缓存 ≈ {b['cache_gb']:.1f}GB")
+    if b.get("reread_gb") is not None:
+        txt += (f" · 模型 {b['unet_gb']:.1f}GB 装不下 → 每步需重读 ≈ {b['reread_gb']:.1f}GB"
+                f"（{b['reread_gb'] / b['unet_gb']:.0%} 的权重）")
+    return txt
+
+
+def vram_slack_hint(peak_gb, total_gb):
+    """精化峰值出来后，给一句「预留该不该调」的判据（纯函数；不提则 None）。
+
+    这是「有没有把显存用满」的**实测**答案：`总量 − 精化峰值` 就是真正没被用上的
+    那一块。DynamicVRAM 下显存是权重缓存，留空的每 GB 都等于每步多重读 1GB 权重，
+    所以余量长期猜不出来、只能量——这也是 `watch_vram_peak` 存在的理由。
+    """
+    try:
+        peak, total = float(peak_gb), float(total_gb)
+    except (TypeError, ValueError):
+        return None
+    if peak <= 0 or total <= 0:
+        return None
+    slack = total - peak
+    if slack >= 4.0:
+        return (f"显存没吃满：精化峰值 {peak:.1f}GB / 总量 {total:.1f}GB，"
+                f"空着 {slack:.1f}GB —— 留空的每 GB 都在让每步多重读 1GB 权重。"
+                f"可下调 EXTRA_RESERVED_VRAM（或改用 --vram-headroom 精确控制），"
+                f"把省下的给权重缓存")
+    if slack <= 2.0:
+        return (f"显存已吃到临界：精化峰值 {peak:.1f}GB / 总量 {total:.1f}GB，"
+                f"只剩 {slack:.1f}GB —— 不要再压预留，再压就得靠手动腾挪兜底了")
+    return None
+
+
+def vram_headroom_advice(hw, policy=None):
+    """余量策略是否「有风险」——有则回一行可执行的中文建议，否则 None。
+
+    纯函数（只吃 dict）。判定刻意保守：**只有「DynamicVRAM 开着 + headroom 为 0
+    + 没给 --reserve-vram」同时成立**才提示。这三条都满足时，0.35 的默认行为会
+    把显存吃到接近 100%，靠 `unload_all_models()` 这类手动腾挪才勉强活下来
+    ——那正是本项目二采路径一堆腾挪代码的由来。
+    """
+    if not policy or not policy.get("dynamic_vram"):
+        return None
+    hr = policy.get("vram_headroom_gb") or 0.0
+    rv = policy.get("reserve_vram_gb")
+    if hr > 0 or (rv is not None and float(rv) > 0):
+        return None
+    bits = []
+    if policy.get("comfy_compiler"):
+        bits.append("Comfy 编译器在跑（0.35 新增，官方定位就是拉高 H3 显存利用率）")
+    return ("⚠ 显存余量策略为默认：DynamicVRAM 已启用但 `--vram-headroom` 为 0、"
+            "也未给 `--reserve-vram`——0.35 起显存会被吃到接近 100%，二采"
+            "（高清采样 + 放大网络）最先炸。"
+            + ("；".join(bits) + "。" if bits else "")
+            + "建议启动加 `--vram-headroom 1`；仍不稳再加 `--disable-comfy-compiler`"
+              "（实测显存 100% → ~77%，代价约 5% 耗时）。"
+              "注意：运行时改 EXTRA_RESERVED_VRAM 的第三方节点只影响 Python 侧记账，"
+              "盖不到 aimdo 原生预留。")
+
+
 def probe_attn_backend():
     """当前 attention 后端名（只读镜像用）；量不到 → None。
 
@@ -687,12 +960,30 @@ def probe_pcie():
 def weight_bytes(obj):
     """模型权重总字节（duck-typed，**不 import torch**，故本模块仍零依赖）。
 
-    ModelPatcher → 取 `.model`；CLIP → 取 `.cond_stage_model`；都不是就用对象本身。
+    **优先 `ModelPatcher.model_size()`**——这是 ComfyUI 自己算「模型多大」的口径，
+    也是 `load_models_gpu` 决定要不要卸载时的依据。R_v / R_m 回答的正是
+    「能不能常驻 / 卸载会不会落盘」，用别的口径等于拿一把没校准过的尺子去量
+    另一个系统的判据。
+
+    回落路径（CLIP / 裸模块 / 老版本）：ModelPatcher → `.model`，CLIP →
+    `.cond_stage_model`，都不是就用对象本身，按张量 element_size 累加。
     拿不到返回 None（绝不猜——R_v 算错比不算更糟）。
 
-    ⚠ 口径说明：按张量实际 element_size 累加，int8 打包存储（ComfyUI 常见的
-    fp16 权重 + 独立 scale）会**低估**。诊断看的是量级与跨段趋势，不追求字节级精确。
+    ⚠ 为什么必须换口径（2026-09-22 真机）：按 element_size 累加在同一份日志里
+    推出 UNET 61.6GiB / TE 48.1GiB（合计 109.7GB），而 ComfyUI 自己报的是
+    MiniMaxH3 32427MiB + MiniMaxH3TEModel_ 14956MiB（合计约 47GB），差 2.3 倍。
+    量化/混合精度模型（`convrot_w4a4` / `int8_tensorwise` / fp8）在 CPU 侧的
+    张量布局与 staged 到设备上的布局不是一回事，累加 element_size 会系统性偏高，
+    进而让 R_v / R_m 和落盘守卫的 132GB 需求全部虚高。
     """
+    fn = getattr(obj, "model_size", None)
+    if callable(fn):
+        try:
+            v = int(fn())
+            if v > 0:
+                return v
+        except Exception:
+            pass
     inner = obj
     for name in ("model", "cond_stage_model"):
         cand = getattr(obj, name, None)
@@ -746,6 +1037,32 @@ def watch_model_loads(mark=_MODEL_LOAD_MARK):
         root.removeHandler(handler)
         if root.level != prev_level:
             root.setLevel(prev_level)
+
+
+def classify_loads(hits, unet_name=None):
+    """把 `watch_model_loads` 抓到的原始行按模型名归类。
+
+    ComfyUI 打的是 `Requested to load {model.__class__.__name__}`
+    （comfy/model_management.py:964），故名可解析。分类的意义在于把
+    「UNET 回载了几次」从「本段总共回载了几次」里**分离**出来：
+
+    - 总次数里混着 TE（建高清 cond）与 VAE（解码）的回载，那两次是代码主动
+      触发的既定流程，与「换 LoRA 会不会重传权重」毫无关系；
+    - 只有 **UNET ≥2 次**才是重传的证据——第一次是精化前那次主动
+      `unload_all_models()` 之后必然的回载。
+
+    返回 {"total": int, "by_model": {name: n}, "unet_loads": int}。
+    `unet_name` 给不出（None / 没匹配上）时 unet_loads 记 0，由调用方据此
+    判定「本次观测不足以支撑结论」，而不是硬凑一个结论出来。
+    （2026-09-22 真机即栽在这里：总次数 3 被直接读成「确实在重传 → 两遍式
+    有价值」，实际三次全是既定流程。）
+    """
+    counts = {}
+    for m in hits or ():
+        name = str(m).split(_MODEL_LOAD_MARK, 1)[-1].strip() or "?"
+        counts[name] = counts.get(name, 0) + 1
+    return {"total": len(hits or ()), "by_model": counts,
+            "unet_loads": int(counts.get(unet_name, 0)) if unet_name else 0}
 
 
 # ============================ 探测日志（崩溃安全） ============================
@@ -869,12 +1186,17 @@ def list_runs(path=None, limit=LOG_KEEP_LINES):
 # 六段的固定顺序（与 _vram_report 一致）
 STAGES = ("base", "up", "cond", "unload", "refine", "decode")
 STAGE_LABELS = ("放大前", "放大后", "cond后", "卸载后", "精化后", "解码后")
-# 这两段报「当时占用」，其余报「阶段峰值」
+# 历史口径：「放大前 / 卸载后」报当时占用，其余报阶段峰值。
+# ⚠ 2026-09-22 起**不再用于展示**——「峰值」那一列量不到 DynamicVRAM 权重池
+# （upscale._vram_probe），六段已统一成设备级占用。保留该常量只为回读老日志。
 ALLOC_STAGES = ("base", "unload")
 
-# 耗时四阶段（与 upscale.render_segment 的 _timing 键一致）
-TIMING_KEYS = ("up", "cond", "refine", "decode")
-TIMING_LABELS = ("放大", "条件", "精化", "解码")
+# 耗时四阶段 + 腾挪（与 upscale.render_segment 的 _timing 键一致）
+#
+# "unload" 是 2026-09-22 加的：精化前那次 `unload_all_models()` 到底值不值，
+# 需要它自己的耗时做分母（腾挪不是免费的，卸载调用本身也要搬权重回 CPU）。
+TIMING_KEYS = ("up", "cond", "unload", "refine", "decode")
+TIMING_LABELS = ("放大", "条件", "腾挪", "精化", "解码")
 
 
 def summarize(events):
@@ -893,6 +1215,10 @@ def summarize(events):
         out.append("硬件概览：" + o.get("line", ""))
         if o.get("guard"):
             out.append("落盘守卫：" + o["guard"])
+        if o.get("headroom"):
+            out.append("余量策略：" + o["headroom"])
+        if o.get("budget"):
+            out.append(o["budget"])
         out.append("")
 
     segs = {}
@@ -901,7 +1227,7 @@ def summarize(events):
             continue
         segs.setdefault(e.get("seg"), {})[e.get("stage")] = e
 
-    for title, key, pick in (("显存峰值（GB）", "vram", _pick_vram),
+    for title, key, pick in (("显存占用（设备级 GB）", "vram", _pick_vram),
                              ("内存 RSS（GB）", "rss", _pick_rss)):
         rows = []
         for seg in sorted(s for s in segs if s is not None):
@@ -930,12 +1256,67 @@ def summarize(events):
                        + f"{tot:9.1f}")
         out.append("")
 
+    # 精化峰值（设备级）：与「腾挪回收量」配着看，是「该不该在精化前全卸」的判据
+    peaks = [e for e in events if e.get("kind") == "refine_peak"]
+    if peaks:
+        out.append("精化显存峰值（设备级 GB）")
+        for e in peaks:
+            v = e.get("vram_used")
+            t = e.get("vram_total")
+            cell = "n/a" if v is None else f"{v:.2f}"
+            if v is not None and t:
+                cell += f" / {t:.1f}（空 {t - v:.1f}）"
+            out.append(f"  段{str(e.get('seg')).rjust(3)}   {cell}")
+            if e.get("hint"):
+                out.append(f"        {e['hint']}")
+        out.append("")
+
+    # 放大前腾挪：为把放大网络搬上卡而做的一次**全卸**，代价与收益（那 659MB）
+    # 完全不成比例——打出来才判断得了值不值
+    pres = [e for e in events if e.get("kind") == "pre_unload"]
+    if pres:
+        out.append("放大前腾挪（为搬放大网络上卡而全卸）")
+        for e in pres:
+            out.append(f"  段{str(e.get('seg')).rjust(3)}   "
+                       f"放大网络 {e.get('net_mb') or 0:.0f}MB"
+                       f" · 全卸耗时 {e.get('seconds')}s")
+        out.append("")
+
+    # 本地 LLM（提示词优化）：加速项是否生效 + 显存账 + 吞吐。
+    # 这一段原本完全没有数据——llama.cpp 用自己的 CUDA 分配器（torch 看不见），
+    # 掉层又是静默的，不看这几个数就只剩「感觉插件好慢」这一种反馈。
+    llms = [e for e in events if e.get("kind") == "local_llm"]
+    if llms:
+        out.append("本地 LLM（提示词优化）")
+        for e in llms:
+            mg = e.get("model_gb")
+            ds = e.get("vram_delta")
+            out.append(f"  {e.get('model')}"
+                       f" · 权重 {'?' if mg is None else f'{mg:.1f}GB'}"
+                       f" · 装载 {e.get('load_s')}s · 生成 {e.get('gen_s')}s"
+                       + ("" if e.get("tok_s") is None else f" · {e['tok_s']} tok/s")
+                       + ("" if ds is None else f" · 显存 +{ds:.1f}GB"))
+            p = e.get("plan") or {}
+            if p:
+                out.append(f"      加速项：flash_attn={'√' if p.get('flash_attn') else '×'}"
+                           f" · KV={'q8_0' if p.get('kv_quant') else 'fp16'}"
+                           f" · n_batch={p.get('n_batch')}"
+                           f" · n_ubatch={p.get('n_ubatch') or '默认'}"
+                           f" · n_gpu_layers={p.get('n_gpu_layers')}"
+                           + ("　⚠ 已降级" if p.get("mode") == "degraded" else ""))
+        out.append("")
+
     for e in events:
         if e.get("kind") == "swap_probe":
+            # UNET 回载 ≥2 才算重传证据：总次数里混着 TE/VAE 的既定回载
+            # （nodes.py 二采入口探测的口径，2026-09-22 修正）
+            _un = e.get("unet_loads")
+            _tag = ("（无回载）" if not e.get("loads")
+                    else "（UNET≥2 次 → 确实重传，两遍式有价值）" if (_un or 0) >= 2
+                    else "（UNET<2 次 → 观测到的都是既定流程，不构成重传证据）")
             out.append(f"二采换页探测：段{e.get('seg')} A≠B={e.get('up_swap')} "
-                       f"回载 {e.get('loads')} 次"
-                       + ("（零换页 → 两遍式无省头）" if not e.get("loads")
-                          else "（确实重传 → 两遍式有价值）"))
+                       f"回载 {e.get('loads')} 次（UNET {_un if _un is not None else '?'} 次）"
+                       + _tag)
         elif e.get("kind") == "fail":
             out.append(f"⚠ 段{e.get('seg')} 中断（{e.get('where', '?')}）——"
                        "其后无数据，说明进程在此终止")
@@ -945,7 +1326,13 @@ def summarize(events):
 def _pick_vram(e):
     if not e:
         return "n/a"
-    v = e.get("vram_peak") if e.get("stage") not in ALLOC_STAGES else e.get("vram_alloc")
+    # `vram_used` = 设备级占用（2026-09-22 起）。老日志没有该键时才回落历史口径：
+    # 那时 vram_peak 装的是 torch max_memory_allocated，在 DynamicVRAM 下是废数
+    # （详见 upscale._vram_probe），回落到它只是为了让旧报告还能读出来。
+    v = e.get("vram_used")
+    if v is None:
+        v = (e.get("vram_peak") if e.get("stage") not in ALLOC_STAGES
+             else e.get("vram_alloc"))
     return "n/a" if v is None else f"{v:.2f}"
 
 
@@ -978,4 +1365,7 @@ def probe_hardware(unet_bytes=None, te_bytes=None, disk_path=None):
         "pcie": probe_pcie(),
         "aimdo": probe_aimdo(),
         "attn_backend": probe_attn_backend(),
+        "os": probe_os(),
+        "swap_source": _LAST_SWAP_SOURCE,   # 必须在 probe_ram_swap() 之后读
+        "vram_policy": probe_vram_policy(),
     }

@@ -901,16 +901,28 @@ def _vram_gb(unet_model=None):
 
 
 def _vram_probe():
-    """显存探针快照 `(当前分配 GB, 峰值分配 GB)`；无 CUDA / 异常 -> `(None, None)`。
+    """显存探针快照 `(torch 侧分配 GB, 设备级占用 GB)`；无 CUDA / 异常 -> `(None, None)`。
 
-    本机 `nvidia-smi` 不可用（`Failed to initialize NVML`），显存实测只能靠
-    torch 计数器——这是阶段 0 埋点的唯一数据源。
+    ⚠ 第二个数原来是 `torch.cuda.max_memory_allocated()`，**在 DynamicVRAM /
+    aimdo 环境下是废数**：H3 的 UNET/TE/VAE 权重由 ComfyUI 自己的池子（vbar）
+    分配，不进 torch 的 caching allocator，于是 24GB 卡跑 32GB 模型、736×1312
+    高清 latent 的精化阶段能报出 **0.43GB** 这种数（2026-09-22 真机）。
+    只有裸 `nn.Module`（放大网络）走 torch 分配，所以「放大后 1.92GB」反而是真的。
+
+    现改设备级口径 `total - free`（`torch.cuda.mem_get_info()`）：含权重池、
+    激活、驱动与其它进程，量级真实。代价是它包含别的进程——共享卡上要按
+    「跨段增量」看，不按绝对值看（与 RSS 行同一个看法）。
+
+    本机 `nvidia-smi` 不可用（`Failed to initialize NVML`），只能用 torch 计数器。
+    第一个数（torch 侧分配）保留：区分「权重池」与「普通张量」时仍有参考价值。
     """
     try:
         if not torch.cuda.is_available():
             return None, None
-        return (torch.cuda.memory_allocated() / (1024 ** 3),
-                torch.cuda.max_memory_allocated() / (1024 ** 3))
+        alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+        free, total = torch.cuda.mem_get_info()
+        used = (total - free) / (1024 ** 3)
+        return (alloc, max(used, alloc))   # 设备占用恒 ≥ torch 侧分配，保序
     except Exception:
         return None, None
 
@@ -938,21 +950,25 @@ def _rss_probe():
 
 
 def _vram_report(seg_no, v):
-    """显存峰值埋点汇总行（阶段 0 诊断；无数据返回 ""，调用方据此跳过打印）。
+    """显存占用埋点汇总行（阶段 0 诊断；无数据返回 ""，调用方据此跳过打印）。
 
-    「放大前 / 卸载后」报**当时占用**（看腾挪是否真回收），其余报**该阶段峰值**。
+    六段**一律报设备级当时占用**（`_vram_probe` 第二个数）。
+
+    为什么不再区分「当时占用 / 阶段峰值」：那个区分建立在
+    `max_memory_allocated()` 上，而它在 DynamicVRAM 下量不到权重池（详见
+    `_vram_probe`），「峰值」那一列长期是废数。统一成设备级占用后，
+    这条线的原始目的才能真正达成——**卸载后那个数是不是真的掉下来了**。
     """
     if not v or v.get("up") is None:
         return ""
 
-    def _f(key, which="peak"):
+    def _f(key):
         t = v.get(key)
-        return "n/a" if t is None or t[1 if which == "peak" else 0] is None \
-            else f"{t[1 if which == 'peak' else 0]:.2f}"
+        return "n/a" if t is None or t[1] is None else f"{t[1]:.2f}"
 
-    return (f"[H3二采] 段{seg_no} 显存峰值：放大前{_f('base', 'alloc')}GB · "
+    return (f"[H3二采] 段{seg_no} 显存占用（设备级）：放大前{_f('base')}GB · "
             f"放大后{_f('up')}GB · cond后{_f('cond')}GB · "
-            f"卸载后{_f('unload', 'alloc')}GB · 精化后{_f('refine')}GB · "
+            f"卸载后{_f('unload')}GB · 精化后{_f('refine')}GB · "
             f"解码后{_f('decode')}GB")
 
 
@@ -1460,14 +1476,15 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         _v = (_vram or {}).get(key)
         _r = (_rss or {}).get(key)
         _alloc = None if _v is None else _v[0]
-        _peak = None if _v is None else _v[1]
-        # 「放大前 / 卸载后」看当时占用（腾挪回收了多少），其余看阶段峰值
-        _shown = _alloc if key in perf.ALLOC_STAGES else _peak
-        _vb = "n/a" if _shown is None else f"{_shown:.2f}"
+        _used = None if _v is None else _v[1]
+        # 一律报设备级占用：torch 侧分配（_alloc）量不到 DynamicVRAM 权重池，
+        # 拿它当「显存」会读出 0.05GB 这种假象（2026-09-22 真机）
+        _vb = "n/a" if _used is None else f"{_used:.2f}"
         _rb = "n/a" if _r is None else f"{_r:.2f}"
         print(f"[H3二采] 段{seg_no} · {label} 显存{_vb}GB · RSS{_rb}GB", flush=True)
         perf.emit({"kind": "mark", "seg": seg_no, "stage": key, "label": label,
-                   "vram_alloc": _alloc, "vram_peak": _peak, "rss": _r})
+                   "vram_alloc": _alloc, "vram_peak": _used, "vram_used": _used,
+                   "rss": _r})
 
     if net is not None:
         dev = next(net.parameters()).device
@@ -1477,6 +1494,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             # 账面 free 极小、_cuda_if_room 必失败，原地纠偏必回落 CPU。
             # 先 unload_all_models 腾出真空闲再抢 GPU；cond 构建随后按需回载
             # TE/VAE（Comfy 原生机制），精化前本就还有一次全卸，只多一次换页。
+            _t_pre = time.perf_counter()
             try:
                 comfy.model_management.unload_all_models()
                 gc.collect()
@@ -1486,6 +1504,26 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                     pass
                 print(f"[H3二采] 段{seg_no}：放大前显存腾挪（放大网络在 CPU，先卸驻留模型再抢 GPU）…",
                       flush=True)
+            except Exception:
+                pass
+            # 把这笔交易记清楚：**为了使多少显存腾走多少**。放大网络是裸 nn.Module
+            # （ComfyUI 的显存账看不见它，也无法按需挤占），所以只能手工上卡；
+            # 而手工上卡就得先手工腾地方——这里用的却是 `unload_all_models()`
+            # 这个**全卸**，把 TE/VAE 也一起赶走了，而 cond 构建马上就要用 TE。
+            # 打出来才知道这笔交换划不划算（`net.cpu()` 那一侧的 659MB 与之相比
+            # 微不足道，真正的大头是这次全卸）。
+            try:
+                _nbytes = getattr(net, "_h3_bytes", None)
+                if _nbytes is None:
+                    _nbytes = sum(int(p.numel()) * int(p.element_size())
+                                  for p in net.parameters())
+                    net._h3_bytes = _nbytes
+                _t_pre_el = time.perf_counter() - _t_pre
+                print(f"[H3二采] 段{seg_no}：为把放大网络 {_nbytes / (1024 ** 2):.0f}MB "
+                      f"搬上卡，全卸腾挪耗时 {_t_pre_el:.1f}s", flush=True)
+                perf.emit({"kind": "pre_unload", "seg": seg_no,
+                           "net_mb": _nbytes / (1024 ** 2),
+                           "seconds": round(_t_pre_el, 2)})
             except Exception:
                 pass
             # 上段二采异常后放大网络留在 CPU：优先纠偏回 GPU（intermediate_device
@@ -1626,10 +1664,31 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # gc.collect：跨段累积的 Python 侧 GPU 张量（上段精化输出/条件中间量/
     # STG 克隆）只有引用回收后显存块才真正归还——多段链后段比首段更易 OOM 的
     # 主因即在此（引用挂着的 CUDA 块 empty_cache 也收不回）
+    #
+    # ⚠ 2026-09-22 真机实测留下的 A/B 待办（**未改行为**，改前必须先实测）：
+    # 在 24GB 卡 / 32GB 模型上，模型本来就装不下、本来就在流式分页，这次全卸
+    # 的实测代价是 RSS 4.98 → 36.96GB（+32GB 页面换入），精化 3 步共 69s
+    # （进度条本身只 61s）——即「赶走主模型 → 精化时原样搬回」付了一次完整
+    # 32GB 传输。待验的两个替代方案：
+    #   ① 只卸 TE/VAE、保留 UNET（本段马上要用它，卸了立刻装回，纯亏一次传输）
+    #   ② 干脆不卸，交给 common_ksampler 内部的 load_models_gpu 按需挤占
+    #      （本函数上面那句注释自己就写了「原生机制只回载 UNET」）
+    # 判据：同一段重跑，比 69s 短且不 OOM 才算赢。32GB 卡上的既有 OOM 实测
+    # 仍然有效——换卡前不要凭这台 24GB 的数据改默认行为。
+    _t_unload = time.perf_counter()
     comfy.model_management.unload_all_models()
     gc.collect()
     torch.cuda.empty_cache()
+    _tmark("unload", _t_unload)   # 卸载本身花了多久（腾挪的分子成本）
     _mark("unload", "卸载后")   # 埋点④卸载后（报当时占用——腾挪到底回收了多少，就看它）
+    # 显式打出**回收量**：它是「这次腾挪值不值」的分子。以前要读者自己拿
+    # 「cond后 − 卸载后」去减，而这两个数在两行日志里隔了好几行，没人会去减。
+    _c = (_vram or {}).get("cond")
+    _u = (_vram or {}).get("unload")
+    if _c and _u and _c[1] is not None and _u[1] is not None:
+        print(f"[H3二采] 段{seg_no}：腾挪回收显存 {_c[1] - _u[1]:+.2f}GB"
+              f"（cond后 {_c[1]:.2f} → 卸载后 {_u[1]:.2f}）"
+              f" · 卸载耗时 {(_timing or {}).get('unload', 0.0):.1f}s", flush=True)
     # 面包屑：本行之后应立刻出现「Requested to load MiniMaxH3」+ 精化进度条；
     # 长时间没有 = 主模型回载（DynamicVRAM 分页加载）或上面的卸载调用本身卡死
     print(f"[H3二采] 段{seg_no}：显存已腾挪，精化重采样回载主模型…", flush=True)
@@ -1710,6 +1769,11 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     def _is_dev_err(e):
         return "to be on the same device" in str(e)
 
+    # 精化期间的设备级显存峰值（GB）；由 _ksample 内的采样线程回填。
+    # 用单元素列表是因为它在嵌套函数里写、在外层读（Python 闭包不支持 nonlocal
+    # 跨两层时的简洁写法，且外层还要把它交给 _mark / report）。
+    _refine_peak = [None]
+
     def _inventory():
         """设备错误时的张量设备清单——把 mat1 在哪钉到报告里，不再猜。"""
         def _first(obj):
@@ -1755,10 +1819,18 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                         ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
 
                 def _ksample():
-                    return comfy_nodes.common_ksampler(
-                        ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
-                        ks_scheduler, cond, negative, cur_latent,
-                        denoise=ks_denoise)[0]
+                    # 采设备级显存峰值：这是「精化到底需要多少显存」的唯一硬数，
+                    # 也是判断「精化前那次全卸该不该做」的依据（详见 1629 行待办）。
+                    # torch 的 max_memory_allocated 量不到权重池，必须走采样线程。
+                    with perf.watch_vram_peak() as _w:
+                        _out = comfy_nodes.common_ksampler(
+                            ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
+                            ks_scheduler, cond, negative, cur_latent,
+                            denoise=ks_denoise)[0]
+                    if _w["peak"] is not None:
+                        _refine_peak[0] = _w["peak"] if _refine_peak[0] is None \
+                            else max(_refine_peak[0], _w["peak"])
+                    return _out
 
                 try:
                     return _ksample()
@@ -1888,6 +1960,23 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         restore_video_rows()
     _tmark("refine", _t)
     _mark("refine", "精化后")   # 埋点⑤精化重采样后（与放大后对比即可量化 autograd 图的影响）
+    # 精化期间的**设备级峰值**——「不腾挪 / 少腾挪会不会 OOM」的判定依据。
+    # 与「腾挪回收量」配着看即可定案：峰值 ≤ 卸载前可用 ⇒ 那次腾挪是白卸。
+    if _refine_peak[0] is not None:
+        print(f"[H3二采] 段{seg_no}：精化显存峰值（设备级）{_refine_peak[0]:.2f}GB",
+              flush=True)
+        # 「有没有把显存用满」的实测答案：总量 − 峰值 = 真正没被用上的那块。
+        # 只在明显偏松/偏紧时给一句，别每段都唠叨。
+        try:
+            _tot = torch.cuda.mem_get_info()[1] / (1024 ** 3)
+        except Exception:
+            _tot = None
+        _slack = perf.vram_slack_hint(_refine_peak[0], _tot) if _tot else None
+        if _slack:
+            print(f"[H3二采] 段{seg_no}：{_slack}", flush=True)
+        perf.emit({"kind": "refine_peak", "seg": seg_no,
+                   "vram_used": _refine_peak[0], "vram_total": _tot,
+                   "hint": _slack or ""})
     print(f"[H3二采] 段{seg_no}：精化重采样完成（{(_timing or {}).get('refine', 0.0):.0f}s）"
           "→ 高清解码…", flush=True)
     del cond, latent
@@ -2006,17 +2095,18 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _vram["decode"] = _vram_probe()
     _vram_probe_reset()
     _rss["decode"] = _rss_probe()
-    _alloc, _peak = _vram["decode"] or (None, None)
-    _vb = "n/a" if _peak is None else f"{_peak:.2f}"
+    _alloc, _used = _vram["decode"] or (None, None)
+    _vb = "n/a" if _used is None else f"{_used:.2f}"
     _rb = "n/a" if _rss["decode"] is None else f"{_rss['decode']:.2f}"
     print(f"[H3二采] 段{g + 1} · 解码后 显存{_vb}GB · RSS{_rb}GB", flush=True)
     perf.emit({"kind": "mark", "seg": g + 1, "stage": "decode", "label": "解码后",
-               "vram_alloc": _alloc, "vram_peak": _peak, "rss": _rss["decode"]})
+               "vram_alloc": _alloc, "vram_peak": _used, "vram_used": _used,
+               "rss": _rss["decode"]})
     # 耗时账：「多段变卡」归根结底是**时间**现象，只记字节看不出来。
     # 每段四个阶段，跨段对比即可定位到底是哪一阶段在爬。
     perf.emit({"kind": "timing", "seg": g + 1,
                **{k: round(float(_timing.get(k) or 0.0), 2)
-                  for k in ("up", "cond", "refine", "decode")}})
+                  for k in perf.TIMING_KEYS}})
     # 段末汇总（六段一行，便于对比；逐点行已经先打过了，这里只是 recap）
     _vram_line = _vram_report(g + 1, _vram)
     if _vram_line:

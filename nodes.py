@@ -1818,9 +1818,36 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _guard_msg = _gd["message"] if not _gd["ok"] else ""
                 if _guard_msg:
                     print(f"[H3性能] 落盘守卫：{_guard_msg}", flush=True)
+                # 余量策略：0.35 起 DynamicVRAM 会把显存吃到接近 100%，
+                # 二采这种「同卡再插一段高清采样」最先炸——先把根因说清楚
+                _hr_msg = perf.vram_headroom_advice(_hw, _hw.get("vram_policy")) or ""
+                if _hr_msg:
+                    print(f"[H3性能] 余量策略：{_hr_msg}", flush=True)
+                # 显存预算账：主动留空多少 / 能给权重缓存多少 / 每步要重读多少。
+                # 「有没有把显存用满」的静态一半答案（实测一半看段末的精化峰值）。
+                _bd = perf.vram_budget(_hw, _hw.get("vram_policy"))
+                _bd_line = perf.vram_budget_line(_bd)
+                if _bd_line:
+                    print(f"[H3性能] {_bd_line}", flush=True)
+                # 放大网络是**裸 nn.Module**（不是 ModelPatcher）：ComfyUI 的显存账
+                # 看不见它，也不会按需挤占它 —— 所以它必须手工上卡 / 下卡，而手工
+                # 上卡就得先手工腾地方（每段一次全卸的根因）。把这笔「幽灵占用」讲明。
+                if up_net is not None:
+                    try:
+                        _nb = getattr(up_net, "_h3_bytes", None)
+                        if _nb is None:
+                            _nb = sum(int(p.numel()) * int(p.element_size())
+                                      for p in up_net.parameters())
+                            up_net._h3_bytes = _nb
+                        print(f"[H3性能] 放大网络 {_nb / (1024 ** 2):.0f}MB 是裸 nn.Module："
+                              "ComfyUI 的显存账看不见它、也不会按需挤占 → 只能手工上/下卡，"
+                              "这是每段一次全卸腾挪的根因", flush=True)
+                    except Exception:
+                        pass
                 # 落盘：被 OOM kill 时 stdout 可能一起没了，JSONL 是唯一留存
                 perf.emit({"kind": "overview", "line": _line,
-                           "guard": _guard_msg, "hw": _hw})
+                           "guard": _guard_msg, "headroom": _hr_msg,
+                           "budget": _bd_line, "hw": _hw})
             except Exception:
                 pass
         if up_cfg:
@@ -2551,19 +2578,35 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         _up_swap=_up_swap)
                 if not _reload_logged[0]:
                     _reload_logged[0] = True
-                    n = len(_loads)
-                    if n == 0:
-                        _verdict = ("未触发权重回载 → 确认零换页，"
-                                    "「两遍式」没有省头（不必做）")
-                    else:
-                        _verdict = (f"触发 {n} 次权重回载 → 同 base 换 LoRA 确实在重传，"
+                    # ⚠ 窗口包住的是整个 render_segment，n 里混着 TE（建高清 cond）
+                    # 与 VAE（解码）的回载——那两次是代码主动触发的既定流程，
+                    # 不是「换 LoRA 导致重传」的证据。判定只看 UNET 回载次数：
+                    # 第 1 次是精化前 unload_all_models() 之后必然的回载，
+                    # ≥2 次才是真的在重传。
+                    _unet_cls = getattr(getattr(_up_model, "model", None),
+                                        "__class__", None)
+                    _cls = perf.classify_loads(
+                        _loads, getattr(_unet_cls, "__name__", None))
+                    n = _cls["total"]
+                    _un = _cls["unet_loads"]
+                    _detail = "，".join(f"{k}×{v}" for k, v in _cls["by_model"].items())
+                    if _up_swap:
+                        _verdict = (f"A≠B：UNET 级换页属已知代价（观测 {n} 次：{_detail}）"
+                                    f"「两遍式」有价值（2N → 1）")
+                    elif _un >= 2:
+                        _verdict = (f"UNET 回载 {_un} 次（>1）→ 同 base 换 LoRA 确实在重传，"
                                     f"「两遍式」重新有价值（2N → 1）")
+                    else:
+                        _verdict = (f"观测 {n} 次回载（{_detail}），其中 UNET 仅 {_un} 次"
+                                    f"——TE/VAE 与首次 UNET 回载均为本段既定流程，"
+                                    f"**不构成**重传证据，「两遍式」仍需单独实测")
                     print(f"[H3性能] 段{g + 1} 二采入口换页探测（A≠B={_up_swap}）：{_verdict}",
                           flush=True)
                     for _m in _loads[:4]:
                         print(f"[H3性能]   ↳ {_m}", flush=True)
                     perf.emit({"kind": "swap_probe", "seg": g + 1,
                                "up_swap": bool(_up_swap), "loads": n,
+                               "unet_loads": _un, "by_model": _cls["by_model"],
                                "verdict": _verdict})
                 return True, False
             except upscale.UpscaleAbortError:

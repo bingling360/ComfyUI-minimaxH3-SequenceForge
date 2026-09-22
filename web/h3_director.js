@@ -7419,27 +7419,6 @@ function buildCards(data) {
                     "全链共用：服务商 / 输出语言 / 规则文件（本段参数在「锚定设置」页）"));
                 body.append(optBar);
             }
-            /* ⚙ 性能优化也放**三页之外**的公共区：它是**机器级**设置（这台卡多大、
-             * 内存多少），跟本段的锚定参数不是一回事，也不是项目数据 ——
-             * 展开时才拉后端（避免每张段卡渲染都发一次请求）。 */
-            if (node && window.H3Api && window.H3Api.perfGet) {
-                const perfBar = el("div", "h3d-optsetbar");
-                const bPerf = el("button", "h3d-btn", "⚙ 性能优化");
-                bPerf.type = "button";
-                bPerf.title = "性能优化设置（Upcast Attention / 素材库索引 / 缩略图 / 分块）——"
-                    + "全局共用，不是本段设置";
-                const perfPane = el("div", "h3d-setsec");
-                perfPane.style.display = "none";
-                let perfLoaded = false;
-                bPerf.onclick = async () => {
-                    if (perfPane.style.display !== "none") { perfPane.style.display = "none"; return; }
-                    perfPane.style.display = "";
-                    if (!perfLoaded) { perfLoaded = true; await paintPerfPane(perfPane); }
-                };
-                perfBar.append(bPerf, el("span", "h3d-secs-hint",
-                    "全局：显存 / 内存 / 素材库 / 分块（不是本段设置）"));
-                body.append(perfBar, perfPane);
-            }
             /* 三栏各自独立的引用条：意图 / 剧本 / 结果 各一条，谁也不改谁。
              * 唯一的引用条直接进模型（ds.prompts + seg.refs，走官方 9/3/3）；
              * ①② 只是标注，写完只落在自己的正文里。 */
@@ -8140,7 +8119,7 @@ function renderParamsZone(sec, data) {
     const { node } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>链参数</strong><small>基础设置 + 视频延续（关键帧/检测重摇）</small>"));
+        "<strong>链参数</strong><small>基础设置 + 视频延续（关键帧/检测重摇）+ 性能优化</small>"));
     if (!node) {
         sec.append(el("div", "h3d-empty", "画布上未找到节点，参数面板不可用"));
         return;
@@ -8188,6 +8167,24 @@ function renderParamsZone(sec, data) {
     cwrap.append(kf, seam);
     cont.append(cwrap);
     sec.append(cont);
+    /* —— 性能优化（与「视频延续」并列的大折叠）——
+     * 为什么放右栏链参数区而不是段卡：它是**机器级**设置（这台卡多大、内存多少），
+     * 跟某一节的锚定参数不是一回事，也不属于任何单个项目段落。
+     * 与链参数同层，折叠状态由 foldSection 记住（_foldState），跟其余栏一致。
+     * 展开时才拉后端：renderParamsZone 会随参数改动重建，不能每次都发请求。 */
+    const perfBox = foldSection("param-perf", false,
+        "<summary>⚡ 性能优化（Upcast Attention / 素材库 / 分块）</summary>");
+    const perfBody = el("div");
+    perfBox.append(perfBody);
+    let perfLoaded = false;
+    const loadPerf = () => {
+        if (perfLoaded) return;
+        perfLoaded = true;
+        paintPerfPane(perfBody);
+    };
+    perfBox.addEventListener("toggle", () => { if (perfBox.open) loadPerf(); });
+    if (perfBox.open) loadPerf();
+    sec.append(perfBox);
     sec.append(el("div", "h3d-foot",
         "「锚定设置」里同名子选项按段覆盖此处（分段优先）；「生成模式」由左侧模式条控制。"));
 }

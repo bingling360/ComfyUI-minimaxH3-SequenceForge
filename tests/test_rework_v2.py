@@ -13,6 +13,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -359,7 +360,7 @@ class _Req:
 def test_routes_mount_and_handlers(routes, projects):
     r = _Router()
     routes.add_routes(r)
-    for p in ["/h3chain/create_project", "/h3chain/compile", "/h3chain/assets",
+    for p in ["/h3chain/create_project", "/h3chain/compile_refs", "/h3chain/assets",
               "/h3chain/asset_check", "/h3chain/latent_slice", "/h3chain/latent_delete",
               "/h3chain/trim", "/h3chain/probe", "/h3chain/move_media", "/h3chain/split_av",
               "/h3chain/import_asset", "/h3chain/merge"]:
@@ -367,7 +368,7 @@ def test_routes_mount_and_handlers(routes, projects):
     assert ("GET", "/h3chain/ping") in r.paths
     assert ("GET", "/h3chain/busy") in r.paths
     assert ("GET", "/api/h3chain/busy") in r.paths
-    # handler 冒烟：ping + create + assets + asset_check + compile
+    # handler 冒烟：ping + create + assets + asset_check + compile_refs
     h = {}
     r2 = types.SimpleNamespace(
         add_get=lambda p, fn: h.setdefault(("GET", p), fn),
@@ -382,10 +383,11 @@ def test_routes_mount_and_handlers(routes, projects):
     res = asyncio.run(h[("POST", "/h3chain/asset_check")](
         _Req({"assets": [{"label": "A", "kind": "image", "file": "a1.png"}]})))
     assert res.status in (200, 422)
-    res = asyncio.run(h[("POST", "/h3chain/compile")](
-        _Req({"prompt": {"environment": "room", "shots": [{"description": "a man walks"}]},
-              "seconds": 5.0})))
-    assert res.status in (200, 422) and "compiled" in res.data
+    # 段引用干跑编译：`/h3chain/compile`（结构化提示词编译预览）已在
+    # 「下线结构化提示词」提交中删除，路由位置由 `/h3chain/compile_refs` 接管。
+    # 空 refs 走通即可（200/422 均属正常：422 只表示引用不完整）。
+    res = asyncio.run(h[("POST", "/h3chain/compile_refs")](_Req({"refs": []})))
+    assert res.status in (200, 422)
 
 
 # ---- M4 / expander ----
@@ -464,9 +466,16 @@ def test_structured_prompt_fully_removed():
     assert "compile_prompt" not in r and '"/h3chain/compile"' not in r
     assert "compilePreview" not in open(os.path.join(ROOT, "web/h3_api.js"), encoding="utf-8").read()
     pr = open(os.path.join(ROOT, "prompts.py"), encoding="utf-8").read()
+    # 只禁「定义」与「调用」——文档注释里提到已下线的旧函数名是**允许的**：
+    # prompts.py 的模块 docstring 与 validate_compiled 的 docstring 都写了
+    # `compile_segment`，那是「该能力已整体下线」的说明文字，不是残留实现。
+    # （原先用裸子串 `g not in pr` 会把这句说明也判成违规。）
     for g in ["compile_segment", "clean_prompt", "default_prompt", "migrate_legacy_seg",
               "compose_description", "compose_reference"]:
-        assert g not in pr, f"prompts.py 结构化遗留：{g}"
+        assert not re.search(rf"^\s*def\s+{g}\b", pr, re.M), \
+            f"prompts.py 结构化遗留定义：{g}"
+        assert not re.search(rf"(?<![\w.]){g}\s*\(", pr), \
+            f"prompts.py 结构化遗留调用：{g}"
 
 
 def test_structured_removal_kept_the_right_things():

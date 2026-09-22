@@ -2884,6 +2884,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         # 别再叠一个帧 0 keyframe；有素材（Ref2VA）才补 keyframe，
                         # 否则首帧图在混合模式里根本不生效。
                         and (i > 0 or _seg0_has_refs)) else None)
+            # 段级尾帧参考图（本段自己指定的图）：与 `_head_kf` 同款——**定义在 replay
+            # 分支之前，两路都消费**。生成段拿它当尾锚；回放段二采补渲染时也必须取同一
+            # 片，否则二采尾锚与基础链不一致，基础/高清接缝行为漂移（与下方二采取用
+            # 口径同一条规矩）。原先只在生成分支里赋值，回放分支读它就是 UnboundLocal。
+            _seg_end_img = seg_end_img_latent[i] if i < len(seg_end_img_latent) else None
             _seg_t.update(cond=0.0, sample=0.0, decode=0.0)
             if replay:
                 video_t, audio_t = checkpoint.load_segment(root, g)
@@ -2946,7 +2951,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 重摇段 = 四种锚定模式（本次重做的临时策略，独立于段属性 unlink）——
                 # 显式身份锚（尾帧图/每段尾帧锚定/首帧图）不受模式影响，模式只控制接缝锚
                 # 段级尾帧参考图优先（本段自己指定的图），其次链级尾帧图，再回落段尾锚
-                _seg_end_img = seg_end_img_latent[i] if i < len(seg_end_img_latent) else None
+                # （`_seg_end_img` 已在上方 replay 分支之前取好，两路共用，此处不再重复赋值）
                 if _redo_mode is not None:
                     _user_tail = _seg_end_img or (
                         end_frame_latent

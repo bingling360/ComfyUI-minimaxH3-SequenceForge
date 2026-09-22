@@ -36,7 +36,7 @@ try:
                       "GET /h3chain/ping, /h3chain/busy, /h3chain/projects, /h3chain/project, "
                       "/h3chain/upscale_models, /h3chain/prompt-rules, "
                       "/h3chain/optimizer-config, "
-                      "POST /h3chain/create_project, /h3chain/save_prompts, /h3chain/compile, "
+                      "POST /h3chain/create_project, /h3chain/save_prompts, "
                       "/h3chain/optimize, /h3chain/expand, /h3chain/expand_validate, "
                        "/h3chain/assets, /h3chain/asset_check, /h3chain/compile_refs, "
                        "/h3chain/transcode_submit|jobs|job|cancel, /h3chain/library_upload, "

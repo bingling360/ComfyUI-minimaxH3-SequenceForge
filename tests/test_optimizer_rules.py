@@ -47,9 +47,14 @@ def test_pick_rule_split_by_task():
     # 常规模式绝不能再拿到全参考规则（历史 bug）
     assert "integrated_multimodal_description" in base_zh
     assert "<@" not in base_zh and "<#" not in base_zh
-    # 全参考模式仍走 ref 规则（含 <@名字>/<#名字> 语法与主字段 detailed_description）
-    assert "summary" in ref_zh and "detailed_description" in ref_zh
-    assert "<@" in ref_zh and "<#" in ref_zh
+    # 全参考模式走**六段式** ref 规则 —— 与 build_system_prompt 的 REF2VA 分支、
+    # prompts.REF_FIELDS 三者同口径（历史 bug：这里是四字段版，模型收到两条互斥的最高优先级指令）
+    assert "subject_definitions" in ref_zh and "retention_analysis" in ref_zh
+    assert "detailed_description" in ref_zh and "summary" in ref_zh
+    # 参考素材走 @素材名（后端压实成 <Picture k>）；保留标记与说话人 ID 照官方写法
+    assert "@素材名" in ref_zh
+    assert "fully_preserved" in ref_zh and "<Subject " in ref_zh
+    assert "<#" not in ref_zh, "旧的 <#名字:对话> 语法应已下线"
     # 英文 + 常规
     base_en = optimizer.pick_rule_text(
         {"rule_file": "auto", "output_language": "English"}, files, "FL2VA")

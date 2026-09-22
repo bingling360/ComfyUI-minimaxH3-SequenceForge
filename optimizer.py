@@ -1539,35 +1539,55 @@ def optimize_once(config_in: dict | None, payload: dict | None, on_progress=None
                        "此规则优先于其他通用格式要求：\n\n" + rule_text +
                        "\n\n===== 待重写的用户提示词 =====\n" + user_prompt)
     if cfg.get("mode") == "local":
-        return _local_generate(cfg, system, user_prompt, media,
-                               _temp(payload.get("temperature")))
-    max_tokens = int(cfg.get("max_tokens") or 4096)
-    temp = _temp(payload.get("temperature"))
-    # 要进度就走流式。只有 openai 兼容协议有 SSE；gemini/responses 退回整包模式，
-    # 前端拿不到进度事件就会显示不确定态进度条（不会卡住，只是没有百分比）。
-    if on_progress and str(cfg.get("protocol") or "openai").lower() == "openai":
-        return _api_generate_stream(cfg, system, user_prompt, media, max_tokens, temp, on_progress)
-    return _api_generate(cfg, system, user_prompt, media, max_tokens, temp)
+        raw = _local_generate(cfg, system, user_prompt, media,
+                              _temp(payload.get("temperature")))
+    else:
+        max_tokens = int(cfg.get("max_tokens") or 4096)
+        temp = _temp(payload.get("temperature"))
+        # 要进度就走流式。只有 openai 兼容协议有 SSE；gemini/responses 退回整包模式，
+        # 前端拿不到进度事件就会显示不确定态进度条（不会卡住，只是没有百分比）。
+        if on_progress and str(cfg.get("protocol") or "openai").lower() == "openai":
+            raw = _api_generate_stream(cfg, system, user_prompt, media, max_tokens,
+                                       temp, on_progress)
+        else:
+            raw = _api_generate(cfg, system, user_prompt, media, max_tokens, temp)
+    # 收尾：LLM 算不准的活（对齐指令的 S.SS、[Shot 1] 时间戳、单镜 no cuts）由后端确定性做。
+    return _finalize_optimized(raw, task, duration, payload)
 
 
-def _validate_optimized(text: str, mode: str, seconds: float) -> dict:
-    """给优化结果补一道官方格式校验（历史缺口：优化结果从来不校验）。
+def _load_prompts():
+    """prompts 模块：包内相对导入 / 独立运行两种路径。"""
+    try:
+        from . import prompts as _p
+    except ImportError:
+        import prompts as _p
+    return _p
 
-    优化产出的是**文本**，用 prompts.parse_override 解析官方字段头，再走
-    validate_compiled。解析/导入失败不阻断（校验只是提示层）。
+
+def _finalize_optimized(raw: str, task: str, duration: float, payload: dict) -> str:
+    """优化产物 → 确定性收尾（对齐指令 / [Shot 1] 时间戳 / 单镜 no cuts / 前置废话）。
+
+    `payload["frames"]` 是本段长的**帧数**（前端给，与 segAlignSeconds 同源）。
+    给了就与实跑 `nodes.py` 用同一个 `frames_to_seconds` 换算对齐句的 S.SS；
+    没给才回落到 duration 秒 —— 那种情况下 5 秒段会算成 5.00 而不是 5.17。
     """
-    try:
-        import prompts as _prompts
-    except Exception:
-        return {"ok": True, "errors": [], "warnings": []}
-    try:
-        parsed, order, _preamble = _prompts.parse_override(text)
-        compiled = {"mode": mode, "duration": float(seconds or 5.0), "fields": parsed,
-                    "prompt_text": text, "warnings": [], "diagnostics": {},
-                    "override": True}
-        return _prompts.validate_compiled(compiled)
-    except Exception:
-        return {"ok": True, "errors": [], "warnings": []}
+    return _load_prompts().finalize_optimized(
+        raw, mode=str(task or "T2VA").upper(), seconds=duration,
+        frames=payload.get("frames") or None,
+        has_start=bool(payload.get("has_start")),
+        has_end=bool(payload.get("has_end")))["text"]
+
+
+def _validate_optimized(text: str, mode: str, seconds: float, *, frames=None,
+                        source_text: str = "") -> dict:
+    """优化结果校验：结构检查（字段 / 镜头 / 时间戳 / 对齐句）＋ 语义检查。
+
+    语义那半套搬自 `tools/h3_prompt_expander/validate.py`：双引号归属、否定堆叠、
+    裸抽象词、全镜静止句、节拍与长度密度。`source_text` 传用户原稿，用于核对
+    引号原文是否逐字保留。
+    """
+    return _load_prompts().validate_text(text, mode, seconds,
+                                         source_text=source_text, frames=frames)
 
 
 def optimize_multi_once(config_in: dict | None, payload: dict | None,
@@ -1632,7 +1652,8 @@ def optimize_multi_once(config_in: dict | None, payload: dict | None,
             "media": s.get("media") if isinstance(s.get("media"), list) else shared_media,
             "context": {"main_mode": task},
         }, on_progress=_relay if on_progress else None)
-        verdict = _validate_optimized(text, task, seconds)
+        verdict = _validate_optimized(text, task, seconds, frames=s.get("frames"),
+                                      source_text=script)
         ok = bool(verdict.get("ok"))
         all_ok = all_ok and ok
         out.append({"index": i, "seconds": seconds, "task": task, "result": text,

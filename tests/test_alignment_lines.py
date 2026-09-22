@@ -18,8 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from prompts import (FRAME_FPS, frames_to_seconds, alignment_lines,  # noqa: E402
-                     compose_reference, detect_mode, default_prompt)
+from prompts import FRAME_FPS, frames_to_seconds, alignment_lines, detect_mode  # noqa: E402
 
 
 def test_frames_to_seconds_is_the_single_clock():
@@ -73,51 +72,10 @@ def test_alignment_lines_requires_the_anchor_it_claims():
     assert alignment_lines("FL2VA", 5.0, False, False, 1) == []
 
 
-def _prompt_with_refs():
-    p = default_prompt()
-    p["references"] = [{"label": "<Picture 3>", "note": "角色定妆照"}]
-    p["shots"][0]["description"] = "她转身。"
-    return p
-
-
-def test_mixed_mode_puts_frame_anchors_first():
-    """帧锚排在 subject_definitions **最前**，并标 fully_preserved。"""
-    p = _prompt_with_refs()
-    fields = compose_reference(p, duration=5.17,
-                               frame_anchors=[("<Picture 1>", "首帧锚点，0.00s 起手帧"),
-                                              ("<Picture 2>", "尾帧锚点，末帧终点")])
-    subj = fields["subject_definitions"].splitlines()
-    assert subj[0].startswith("<Picture 1>: 首帧锚点")
-    assert subj[1].startswith("<Picture 2>: 尾帧锚点")
-    assert any("角色定妆照" in s for s in subj)
-    ret = fields["retention_analysis"].splitlines()
-    assert ret[0].startswith("<Picture 1>: fully_preserved")
-    assert ret[1].startswith("<Picture 2>: fully_preserved")
-    # 参考素材是"参考一下"，不能跟着升成 fully_preserved
-    assert any(s.startswith("<Picture 3>: partially_preserved") for s in ret)
-
-
-def test_mixed_mode_declares_both_roles_in_summary():
-    """任务前缀必须同时声明 keyframe completion，模型才知道有硬钉的帧。"""
-    p = _prompt_with_refs()
-    fields = compose_reference(p, duration=5.17,
-                               frame_anchors=[("<Picture 1>", "首帧锚点")])
-    assert fields["summary"].startswith("[keyframe completion + reference generation]")
-    assert "anchored on <Picture 1>" in fields["summary"]
-
-
-def test_no_frame_anchors_keeps_plain_reference_generation():
-    """没有帧锚时不能凭空加 keyframe completion 前缀。"""
-    p = _prompt_with_refs()
-    fields = compose_reference(p, duration=5.17)
-    assert fields["summary"].startswith("[reference generation]")
-    assert "keyframe completion" not in fields["summary"]
-    assert "anchored on" not in fields["summary"]
-
-
 def test_detect_mode_hybrid_is_ref2va():
     """首尾帧锚 + 参考素材同时存在 → Ref2VA（走六段式，不生成对齐句）。"""
-    p = _prompt_with_refs()
-    assert detect_mode(p, has_start=True, has_end=True) == "Ref2VA"
+    with_refs = {"references": [{"label": "<Picture 3>", "note": "角色定妆照"}], "subjects": []}
+    assert detect_mode(with_refs, has_start=True, has_end=True) == "Ref2VA"
     # 只有帧锚、没有素材 → 仍是 base 模式，该生成对齐句
-    assert detect_mode(default_prompt(), has_start=True, has_end=True) == "FL2VA"
+    no_refs = {"references": [], "subjects": []}
+    assert detect_mode(no_refs, has_start=True, has_end=True) == "FL2VA"

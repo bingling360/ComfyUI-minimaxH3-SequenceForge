@@ -79,34 +79,29 @@ function envWith(frameImg) {
     ok(m.mode === "T2VA" && !m.first && !m.end, `无锚应 T2VA 无编号，实际 ${m.mode}`);
 }
 
-/* ---------- 3) 端到端：清锚后结构化面板的对齐预览要跟着变 ----------
- * B05 起「具象化」不再是段卡里的常驻 tab，而是提示词工具条上的
- * 「⇄ 结构化提示词」弹窗 —— 所以这里改成**打开弹窗**再看 .h3d-v2out。 */
-function openStruct(w, doc, node) {
-    for (const o of [...doc.querySelectorAll(".h3d-overlay")]) o.remove();
-    w.eval("openStructuredModal")(node, { ds: w.eval("getDs")(node) }, 0, null);
-    for (const d of doc.querySelectorAll("details")) { d.open = true; }
-}
+
+/* ---------- 3) 端到端：清锚后**锚定栏的对齐指令预览**要跟着变 ----------
+ * 结构化提示词已下线（弹窗与 .h3d-v2out 都没了），对齐预览改由锚定栏的
+ * mkAlignPreview 渲染进 .h3d-alignprev —— 断言随之下移到那里。 */
+const alignText = (doc) => [...doc.querySelectorAll(".h3d-alignprev")]
+    .map((n) => n.textContent || "").join(" | ");
 
 (async () => {
     const { w, dom, node } = envWith({ first: "assets/A.png" });
     const doc = w.document;
     w.eval("openDesk")();
     await new Promise((r) => setTimeout(r, 60));
-    openStruct(w, doc, node);
 
-    const outText = () => [...doc.querySelectorAll(".h3d-v2out")]
-        .map((n) => n.textContent || "").join(" | ");
-    ok(outText().indexOf("0.00-second mark") >= 0 || outText().indexOf("fully referenced") >= 0,
-        `有首帧锚时预览应含对齐指令，实际：${outText()}`);
+    const before = alignText(doc);
+    ok(before.indexOf("0.00-second mark") >= 0 || before.indexOf("fully referenced") >= 0,
+        `有首帧锚时对齐预览应含对齐指令，实际：${before}`);
 
     /* 清锚 */
     w.eval("setSegmentFrameImg")(node, 0, "first", "");
     await w.eval("refresh")();
     await new Promise((r) => setTimeout(r, 30));
-    openStruct(w, doc, node);
 
-    const after = outText();
+    const after = alignText(doc);
     ok(after.indexOf("fully referenced") < 0 && after.indexOf("0.00-second mark") < 0,
         `清锚后预览不得再显示对齐指令，实际：${after}`);
     const frBtn = [...doc.querySelectorAll(".h3d-frm")].map((b) => b.textContent).join(" | ");

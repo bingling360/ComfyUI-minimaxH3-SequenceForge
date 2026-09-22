@@ -1,36 +1,42 @@
-"""H3 结构化提示词 -> 官方英文编译 + 校验（M2.5 轻量版）。
+"""H3 官方格式契约：帧数换算 / 对齐指令 / 字段解析 / 格式校验。
+
+**结构化提示词（prompt_v2 逐镜表单 + compile_segment 编译预览）已整体下线**，
+本模块只保留实跑链路与优化链路都要用的确定性部分：
+
+- 契约常量：主字段名 / BASE_FIELDS / REF_FIELDS / VALID_MODES
+- 关键帧对齐指令：KEYFRAME_LINE / FL2VA_HEAD / L2VA_HEAD / alignment_lines / keyframe_line
+  `S.SS` 由段长**帧数**换算（frames_to_seconds, 24fps），与 nodes.py 实跑注入同口径 ——
+  5 秒段是 124 帧 = 5.17s，不是 5.00。
+- 模式判定：detect_mode（有参考素材即 Ref2VA，否则按首尾帧实际有无）
+- 官方格式文本解析与校验：parse_override / serialize_fields / validate_compiled
+- 优化链路专用：
+  · `finalize_optimized` —— 确定性收尾（剥模型自写的对齐指令、[Shot 1] 去时间戳、
+    单镜补 no cuts、按帧数重算对齐指令），LLM 算不准的活由后端做
+  · `validate_text` —— 结构检查 + 语义检查（引号归属 / 否定 / 裸抽象词 / 静止句 / 密度）
 
 对照 docs/ref_rework/official_h3/{SKILL.md,base-en.txt,ref-en.txt}：
 - base：integrated_multimodal_description + overall_soundscape(空省略) + non_diegetic_music(空=N/A)
 - ref：subject_definitions + summary + retention_analysis + detailed_description + soundscape + music
-- Shot：[Shot 1]无时间戳，[Shot N] At MM:SS.mmm 严格递增；单镜单运镜；对白 <d>[语言] 原文</d> + (S1)；双引号只给屏显。
-- 模式：默认自动判定（detect_mode），前端可传 mode 手动覆写（T2VA/I2VA/FL2VA/L2VA/Ref2VA），
-  覆盖仅切换字段集与校验口径，对齐指令行仍按实际 has_start/has_end 生成（缺帧会如实报错）。
+- Shot：[Shot 1] 无时间戳，[Shot N] At MM:SS.mmm 严格递增；单镜单运镜；
+  对白 `<d>[语言] 原文</d>` + (S1)；双引号只给屏显。
 
-与旧链关系：只增不改。旧 seg {scene_prompt/character_prompt/soundscape/music}
-由 migrate_legacy_seg 转新结构；nodes.py 主链继续用旧组装，新前端段卡用本模块
-编译预览（POST /h3chain/compile），提交时仍走 save_prompts（prompt_v2 随 seg_fields 透存）。
 无第三方依赖，无 ComfyUI 导入，可单测。
 """
 
 import re
 
-CAMERA_MOVES = ("Zoom In", "Zoom Out", "Push In", "Pull Out", "Pan Left", "Pan Right",
-                "Truck Left", "Truck Right", "Tilt Up", "Tilt Down", "Pedestal Up",
-                "Pedestal Down", "Arc Shot", "Tracking Shot", "Static Shot",
-                "Shake Slightly", "Shake Strongly", "POV", "Roll Clockwise",
-                "Roll Counterclockwise")
 
-BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
+# 主字段名。优化链路的收尾与校验都要知道「正文写在哪个字段」：
+# base 三字段是 integrated_multimodal_description，全参考六段式是 detailed_description。
+BASE_MAIN_FIELD = "integrated_multimodal_description"
+REF_MAIN_FIELD = "detailed_description"
+BASE_FIELDS = (BASE_MAIN_FIELD, "overall_soundscape", "non_diegetic_music")
 REF_FIELDS = ("subject_definitions", "summary", "retention_analysis",
-              "detailed_description", "overall_soundscape", "non_diegetic_music")
+              REF_MAIN_FIELD, "overall_soundscape", "non_diegetic_music")
 
-MAX_PIC, MAX_VID, MAX_AUD = 9, 3, 3  # 官方单段上限（与 nodes.py REF_CAPS 一致）
 
 VALID_MODES = ("T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA")
 
-_SHOT_TAG_RE = re.compile(r"^\s*\[Shot\s+\d+\]\s*")
-_LABEL_RE = re.compile(r"<(Subject|Picture|Video|Audio)\s+(\d+)>", re.I)
 _FIELD_LINE_RE = re.compile(
     r"^(integrated_multimodal_description|overall_soundscape|non_diegetic_music"
     r"|subject_definitions|summary|retention_analysis|detailed_description)\s*:\s*", re.I)
@@ -60,143 +66,6 @@ FL2VA_HEAD = ("How the reference pictures align with the target video — "
 L2VA_HEAD = ("How the reference pictures align with the target video — "
              "<Picture 1> (from [Shot {shot}]) aligns with the {t:.2f}-second mark "
              "of the target video.")
-
-
-def _s(v, d=""):
-    return v.strip() if isinstance(v, str) else d
-
-
-def _f(v, d, lo, hi):
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return d
-    if f < lo or f > hi:
-        return d
-    return f
-
-
-def default_shot(index=1):
-    return {"index": index, "start_seconds": None, "description": "",
-            "camera_move": "", "camera_amplitude": "", "camera_speed": "",
-            "dialogues": [], "screen_texts": [], "diegetic_music": "", "ref_usage": []}
-
-
-def default_prompt():
-    """visual = 画面整述（导演台合并框：风格/构图/环境/光照/角色/道具写在一处）。
-
-    有值时优先于下面六个分立字段；六个旧字段保留只为兼容旧存档，界面已不再暴露。"""
-    return {"intent_zh": "", "visual": "", "medium_style": "", "composition": "",
-            "environment": "", "lighting": "", "characters": "", "props": "",
-            "shots": [default_shot(1)], "diegetic_music": "", "soundscape": "",
-            "non_diegetic_music": "", "references": [], "subjects": [],
-            "task_types": [], "summary_override": "", "retention": [],
-            "override_text": None}
-
-
-def clean_prompt(raw):
-    out = default_prompt()
-    if not isinstance(raw, dict):
-        return out
-    for k in ("intent_zh", "visual", "medium_style", "composition", "environment", "lighting",
-              "characters", "props", "diegetic_music", "soundscape",
-              "non_diegetic_music", "summary_override"):
-        out[k] = _s(raw.get(k))[:2000] if isinstance(raw.get(k), str) else ""
-    out["override_text"] = raw["override_text"] if isinstance(raw.get("override_text"), str) else None
-    shots = raw.get("shots")
-    if isinstance(shots, list) and shots:
-        cleaned = []
-        for sh in shots:
-            if not isinstance(sh, dict):
-                continue
-            c = default_shot(len(cleaned) + 1)
-            c["index"] = len(cleaned) + 1
-            c["start_seconds"] = _f(sh.get("start_seconds"), None, 0.0, 3600.0)
-            for k in ("description", "camera_move", "camera_amplitude", "camera_speed",
-                      "diegetic_music"):
-                c[k] = _s(sh.get(k))[:2000]
-            if c["camera_move"] not in CAMERA_MOVES:
-                c["camera_move"] = ""
-            if c["camera_amplitude"] not in ("", "small", "large"):
-                c["camera_amplitude"] = ""
-            if c["camera_speed"] not in ("", "slow", "fast"):
-                c["camera_speed"] = ""
-            dl = sh.get("dialogues")
-            if isinstance(dl, list):
-                for d in dl:
-                    if isinstance(d, dict) and _s(d.get("text")):
-                        c["dialogues"].append({
-                            "speaker": _s(d.get("speaker"), "S1")[:16] or "S1",
-                            "language": _s(d.get("language"), "Chinese")[:16] or "Chinese",
-                            "text": _s(d.get("text"))[:2000],
-                            "delivery": _s(d.get("delivery"))[:200],
-                            "voiceover": bool(d.get("voiceover"))})
-            st = sh.get("screen_texts")
-            if isinstance(st, list):
-                c["screen_texts"] = [_s(x)[:200] for x in st if _s(x)][:16]
-            ru = sh.get("ref_usage")
-            if isinstance(ru, list):
-                c["ref_usage"] = [_s(x)[:64] for x in ru if _s(x)][:32]
-            cleaned.append(c)
-        out["shots"] = cleaned or [default_shot(1)]
-    if out["shots"]:
-        out["shots"][0]["start_seconds"] = None  # 官方：Shot 1 无时间戳，入口强制归零
-    refs = raw.get("references")
-    if isinstance(refs, list):
-        for r in refs:
-            if not isinstance(r, dict):
-                continue
-            label = _s(r.get("label") or r.get("asset_id"))[:64]
-            if not label:
-                continue
-            out["references"].append({"label": label,
-                                      "note": _s(r.get("note"))[:200]})
-        out["references"] = out["references"][:16]
-    subs = raw.get("subjects")
-    if isinstance(subs, list):
-        for s in subs:
-            if not isinstance(s, dict) or not _s(s.get("definition")):
-                continue
-            out["subjects"].append({"definition": _s(s.get("definition"))[:1000]})
-        out["subjects"] = out["subjects"][:16]
-    tt = raw.get("task_types")
-    if isinstance(tt, list):
-        out["task_types"] = [_s(x)[:64] for x in tt if _s(x)][:8]
-    rt = raw.get("retention")
-    if isinstance(rt, list):
-        for r in rt:
-            if not isinstance(r, dict) or not _s(r.get("label")):
-                continue
-            marker = str(r.get("marker") or "fully_preserved")
-            if marker not in ("fully_preserved", "partially_preserved",
-                              "attribute_transfer", "weak_reference",
-                              "fully_copy", "partially_copy", "reference"):
-                marker = "fully_preserved"
-            out["retention"].append({"label": _s(r.get("label"))[:64], "marker": marker,
-                                     "shots": [_s(x)[:16] for x in (r.get("shots") or [])][:16],
-                                     "note": _s(r.get("note"))[:300]})
-    return out
-
-
-def migrate_legacy_seg(seg):
-    """旧 seg {scene_prompt/character_prompt/soundscape/music/prompt} -> 新 prompt。
-
-    场景 -> environment，角色 -> characters，主提示词 -> shots[0].description，
-    环境音/配乐直搬。返回新 prompt dict（未清洗，调用方再 clean_prompt）。
-    """
-    seg = seg if isinstance(seg, dict) else {}
-    p = default_prompt()
-    p["environment"] = _s(seg.get("scene_prompt"))
-    p["characters"] = _s(seg.get("character_prompt"))
-    p["soundscape"] = _s(seg.get("soundscape"))
-    p["non_diegetic_music"] = _s(seg.get("music"))
-    main = _s(seg.get("prompt") or seg.get("main") or seg.get("text"))
-    if main:
-        p["shots"] = [dict(default_shot(1), description=main)]
-    refs = seg.get("refs")
-    if isinstance(refs, list):
-        p["references"] = [{"label": _s(r)[:64], "note": ""} for r in refs if _s(r)][:16]
-    return p
 
 
 FRAME_FPS = 24.0
@@ -264,231 +133,6 @@ def keyframe_line(t, label, shot=1):
     return KEYFRAME_LINE.format(t=float(t), label=str(label), shot=int(shot))
 
 
-def format_ts(seconds):
-    t = max(0.0, float(seconds))
-    mm = int(t // 60)
-    ss = t - mm * 60
-    si = int(ss)
-    ms = int(round((ss - si) * 1000))
-    if ms >= 1000:
-        ms -= 1000
-        si += 1
-    return f"{mm:02d}:{si:02d}.{ms:03d}"
-
-
-def _sentence(t):
-    s = str(t).strip().rstrip("。.；;，, ")
-    return s + "." if s else ""
-
-
-_CAMVERBS = {"Zoom In": "zooms in", "Zoom Out": "zooms out", "Push In": "pushes in",
-             "Pull Out": "pulls out", "Pan Left": "pans left", "Pan Right": "pans right",
-             "Truck Left": "trucks left", "Truck Right": "trucks right",
-             "Tilt Up": "tilts up", "Tilt Down": "tilts down",
-             "Pedestal Up": "pedestals up", "Pedestal Down": "pedestals down",
-             "Arc Shot": "arcs around the subject", "Tracking Shot": "tracks beside the subject",
-             "Static Shot": "holds a static shot", "Shake Slightly": "shakes slightly",
-             "Shake Strongly": "shakes strongly", "POV": "adopts a POV perspective",
-             "Roll Clockwise": "rolls clockwise", "Roll Counterclockwise": "rolls counterclockwise"}
-
-
-def _camera_clause(shot):
-    verb = _CAMVERBS.get(shot.get("camera_move") or "")
-    if not verb:
-        return ""
-    parts = [verb]
-    if shot.get("camera_amplitude"):
-        parts.append(f"with {shot['camera_amplitude']} amplitude")
-    if shot.get("camera_speed"):
-        parts.append(f"at {shot['camera_speed']} speed")
-    return " as the camera " + " ".join(parts)
-
-
-def _dialogue_sentence(d):
-    sp = _s(d.get("speaker"), "S1") or "S1"
-    lang = _s(d.get("language"), "Chinese") or "Chinese"
-    text = _s(d.get("text"))
-    if d.get("voiceover"):
-        return (f"({sp}) says in an off-screen voiceover <d>[{lang}] {text}</d> "
-                f"while their lips remain completely closed.")
-    delivery = _s(d.get("delivery"))
-    prose = {"chinese": "Mandarin", "mandarin": "Mandarin"}.get(lang.lower(), lang)
-    if delivery:
-        return f"({sp}) speaks {delivery} in {prose} <d>[{lang}] {text}</d>"
-    return f"({sp}) says in {prose} <d>[{lang}] {text}</d>"
-
-
-def compose_description(prompt, *, instruction_lines=(), duration=None):
-    shots = prompt.get("shots") or []
-    if not shots:
-        return "\n".join(instruction_lines) if instruction_lines else ""
-    scene = _s(prompt.get("visual")).strip()
-    if not scene:
-        scene = " ".join(x for x in (_sentence(v) for v in (
-            prompt.get("medium_style"), prompt.get("composition"),
-            prompt.get("environment"), prompt.get("lighting"),
-            prompt.get("characters"), prompt.get("props"))) if x)
-    times = [0.0] + [s.get("start_seconds") for s in shots[1:]]
-    if any(t is None for t in times[1:]):
-        gap = (duration or float(len(shots))) / max(1, len(shots))
-        times = [i * gap for i in range(len(shots))]
-    out = list(instruction_lines)
-    for i, shot in enumerate(shots):
-        desc = _SHOT_TAG_RE.sub("", _s(shot.get("description"))).strip()
-        cam = _camera_clause(shot)
-        body = _sentence(desc.rstrip("。.；;，, ") + (cam or "")) if desc else ""
-        sents = []
-        if i == 0:
-            first = " ".join(x for x in (scene, body) if x)
-            if first:
-                sents.append(first)
-        elif body:
-            sents.append(f"[Shot {i + 1}] At {format_ts(times[i])}, the camera cuts to {body}")
-        else:
-            sents.append(f"[Shot {i + 1}] At {format_ts(times[i])}.")
-        for d in shot.get("dialogues") or []:
-            sents.append(_dialogue_sentence(d))
-        for t in shot.get("screen_texts") or []:
-            t = str(t).strip()
-            sents.append(_sentence(t if '"' in t else f'The on-screen text "{t}" is clearly visible.'))
-        if shot.get("diegetic_music"):
-            sents.append(_sentence(shot["diegetic_music"]))
-        if sents:
-            if i == 0:
-                sents[0] = "[Shot 1] " + sents[0]
-            out.append(" ".join(sents))
-    text = " ".join(out)
-    if len(shots) == 1 and "no cuts" not in text.lower():
-        if out and "[Shot 1]" in text:
-            out.append("One continuous shot with no cuts.")
-        else:
-            base = " ".join(x for x in (scene,) if x) or "An establishing shot."
-            out = [f"[Shot 1] {_sentence(base)}", "One continuous shot with no cuts."]
-    if not out:
-        out = ["[Shot 1] An establishing shot.", "One continuous shot with no cuts."]
-    elif "[Shot 1]" not in " ".join(out):
-        out[0] = "[Shot 1] " + out[0]
-    if prompt.get("diegetic_music"):
-        out.append(_sentence(prompt["diegetic_music"]))
-    return "\n".join(x for x in out if x)
-
-
-def compose_base(prompt, *, keyframe_lines=()):
-    desc = compose_description(prompt, instruction_lines=keyframe_lines)
-    fields = {"integrated_multimodal_description": desc}
-    if _s(prompt.get("soundscape")):
-        fields["overall_soundscape"] = _s(prompt.get("soundscape"))
-    fields["non_diegetic_music"] = _s(prompt.get("non_diegetic_music")) or "N/A"
-    return fields
-
-
-def _norm_label(label):
-    s = _s(label)
-    m = s.strip("<>").split()
-    if len(m) == 2 and m[0].lower() in ("subject", "picture", "video", "audio"):
-        return f"<{m[0][0].upper()}{m[0][1:].lower()} {m[1]}>"
-    return s
-
-
-def compose_reference(prompt, *, duration=5.0, frame_anchors=()):
-    """Ref2VA 六段式。**混合模式**下 frame_anchors 是首尾帧锚（已编号的官方标签）。
-
-    frame_anchors: [(token, note)]，如 `[("<Picture 1>", "首帧锚点，0.00s 起手帧")]`。
-    帧锚排在 subject_definitions 最前 —— 它就是本段最先要交代的两张图（模型按
-    <Picture k> 编号认图，帧锚占 1/2，参考素材顺延）。retention 一律
-    `fully_preserved`：帧锚是硬钉在 0.00s / 末帧的，不是"参考一下"。
-    """
-    refs = prompt.get("references") or []
-    subs = prompt.get("subjects") or []
-    subj_lines = []
-    for tok, note in (frame_anchors or ()):
-        subj_lines.append(f"{tok}: {_s(note) or 'keyframe anchor'}")
-    subj_lines += [f"<Subject {i + 1}>: {_s(s.get('definition'))}" for i, s in enumerate(subs)]
-    for r in refs:
-        subj_lines.append(f"{_norm_label(r.get('label'))}: {_s(r.get('note')) or 'reference asset'}")
-    tasks = [_s(t) for t in (prompt.get("task_types") or []) if _s(t)]
-    if frame_anchors and "keyframe completion" not in tasks:
-        # 混合模式：任务前缀必须同时声明两种职责，模型才知道"这两张是锚、其余是参考"
-        tasks = ["keyframe completion"] + (tasks or ["reference generation"])
-    prefix = "[" + " + ".join(tasks or ["reference generation"]) + "]"
-    summary = _s(prompt.get("summary_override"))
-    if not summary:
-        bits = [f"{prefix} A {max(1, int(round(float(duration or 5.0))))}-second clip"]
-        if frame_anchors:
-            bits.append("anchored on " + " and ".join(tok for tok, _ in frame_anchors))
-        if subs:
-            bits.append("of " + " and ".join(f"<Subject {i + 1}>" for i in range(len(subs))))
-        if refs:
-            bits.append("based on " + " and ".join(_norm_label(r.get("label")) for r in refs))
-        summary = " ".join(bits) + "."
-    ret_lines = []
-    for tok, _note in (frame_anchors or ()):
-        ret_lines.append(f"{tok}: fully_preserved, keyframe anchor pinned at its timestamp")
-    for r in prompt.get("retention") or []:
-        lbl = _norm_label(r.get("label"))
-        if lbl:
-            ret_lines.append(f"{lbl}: {r.get('marker') or 'fully_preserved'}"
-                             + (f", {_s(r.get('note'))}" if _s(r.get("note")) else ""))
-    seen = {(_norm_label(r.get("label")) or "").lower() for r in prompt.get("retention") or []}
-    for r in refs:
-        lbl = _norm_label(r.get("label"))
-        if lbl and lbl.lower() not in seen:
-            ret_lines.append(f"{lbl}: partially_preserved, layout and mood kept")
-    fields = {"subject_definitions": "\n".join(subj_lines),
-              "summary": summary,
-              "retention_analysis": "\n".join(ret_lines),
-              "detailed_description": compose_description(prompt)}
-    if _s(prompt.get("soundscape")):
-        fields["overall_soundscape"] = _s(prompt.get("soundscape"))
-    fields["non_diegetic_music"] = _s(prompt.get("non_diegetic_music")) or "N/A"
-    return fields
-
-
-def compile_segment(prompt_raw, *, seconds=5.0, frames=None, has_start=False,
-                    has_end=False, mode=None, frame_anchors=()):
-    """结构化 prompt -> {mode, fields, prompt_text, warnings, diagnostics}。
-
-    mode：None/非法=自动判定；合法五模式之一=手动覆写（字段集与校验按该模式，
-    对齐指令行仍按 has_start/has_end 实际生成）。
-
-    frames：本段长的**帧数**（17k+5 网格）。给了就由它换算对齐句的 S.SS
-    （frames_to_seconds），与实跑的采样长度严格一致；不给才回落到 seconds。
-    frame_anchors：混合模式下首尾帧锚已占用的官方标签（见 compose_reference）。
-    """
-    prompt = clean_prompt(prompt_raw)
-    auto = detect_mode(prompt, has_start=has_start, has_end=has_end)
-    mode = mode if mode in VALID_MODES else auto
-    warnings, diagnostics = [], {}
-    if mode != auto:
-        warnings.append({"code": "W_MODE_OVERRIDE",
-                         "message": f"手动模式 {mode}（自动判定为 {auto}）"})
-    dur = frames_to_seconds(frames) if frames else float(seconds or 5.0)
-    n_shots = len(prompt.get("shots") or [])
-    kf_lines = alignment_lines(mode, dur, has_start, has_end, n_shots)
-    if mode == "Ref2VA":
-        fields = compose_reference(prompt, duration=dur, frame_anchors=frame_anchors)
-    else:
-        fields = compose_base(prompt, keyframe_lines=kf_lines)
-    override = prompt.get("override_text")
-    if isinstance(override, str) and override.strip():
-        parsed, order, preamble = parse_override(override)
-        if parsed:
-            fields = parsed
-            text = serialize_fields(parsed, order)
-        else:
-            fields = {"integrated_multimodal_description": override.strip()}
-            text = override.strip()
-        if preamble:
-            warnings.append({"code": "W_OVERRIDE_PREAMBLE", "message": "覆盖文本首行不是官方字段"})
-    else:
-        text = serialize_fields(fields)
-    miss = [i + 2 for i, s in enumerate((prompt.get("shots") or [])[1:])
-            if s.get("start_seconds") is None]
-    if miss:
-        diagnostics["shot_times_missing"] = miss
-    return {"mode": mode, "duration": float(seconds or 5.0), "fields": fields,
-            "prompt_text": text, "warnings": warnings, "diagnostics": diagnostics,
-            "override": bool(isinstance(override, str) and override.strip())}
 
 
 def parse_override(text):
@@ -530,14 +174,6 @@ def serialize_fields(fields, order=None):
     return "\n".join(lines)
 
 
-def _used_labels(*texts):
-    out = set()
-    for t in texts:
-        for m in _LABEL_RE.finditer(str(t or "")):
-            out.add(f"<{m.group(1).capitalize()} {m.group(2)}>")
-    return out
-
-
 def validate_compiled(compiled):
     """校验 compile_segment 结果。errors 阻提交，warnings 仅提示。"""
     errors, warnings = [], []
@@ -556,8 +192,11 @@ def validate_compiled(compiled):
     expected = REF_FIELDS if is_ref else BASE_FIELDS
     if compiled.get("override"):
         parsed, order, preamble = parse_override(text)
-        if preamble:
-            err("E_OVERRIDE_PREAMBLE", "覆盖文本首行不是官方字段")
+        # 前置的关键帧对齐指令**合法**：官方格式本来就长成「指令句 + 空行 + 三字段」，
+        # 结构化链路与后端实跑注入产出的都是这种形态。只有既非字段头、
+        # 也非对齐句的前置内容才判错（那才是模型在正文前写的废话）。
+        if preamble and not _ALIGN_HEAD_RE.match(re.sub(r"\s+", " ", preamble).strip()):
+            err("E_OVERRIDE_PREAMBLE", "覆盖文本首行既不是官方字段头、也不是关键帧对齐指令")
         if not order:
             err("E_OVERRIDE_FIELDS", "覆盖文本缺少官方字段头")
         bad = [k for k in order if k not in expected]
@@ -595,8 +234,238 @@ def validate_compiled(compiled):
             err("E_SHOT_TIME", "Shot 时间戳须递增")
         if times and duration and max(times) > duration + 1e-6:
             err("E_SHOT_OVERFLOW", "Shot 时间戳超出时长")
-    if mode in ("I2VA", "FL2VA") and not _KF_RE.search(desc):
+    # 对齐指令在**字段之外**（官方格式：指令句 + 空行 + 三字段），所以必须查整段文本。
+    # 查主字段值 desc 会对正确格式永远误报「缺少首帧指令行」。
+    if mode in ("I2VA", "FL2VA") and not _KF_RE.search(text):
         err("E_KF_LINE", "缺少官方首帧指令行")
     for w in compiled.get("warnings") or []:
         warnings.append(w)
+    return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+
+# ============================================================================
+# 优化链路：确定性收尾 + 语义校验
+#
+# 结构化提示词下线后，原本「只能靠表单做」的活分两类：
+#   A 类（写作）→ 由规则文件 + 本节的语义校验接管
+#   B 类（计算）→ 由 finalize_optimized 用已有函数确定性地做，**不许 LLM 写**
+#     · 关键帧对齐指令：S.SS 必须由段长**帧数**换算，与 nodes.py 实跑同口径
+#     · [Shot 1] 不许带时间戳
+# ============================================================================
+
+# 优化链路的 task 可能是 HYBRID（首尾帧锚 + 参考素材的混合模式），官方模式名里没有它 —— 归 Ref2VA：
+# 官方六段式本来就能同时承载帧锚与参考素材（见 detect_mode 的说明）。
+_MODE_ALIAS = {"HYBRID": "Ref2VA"}
+
+
+def _norm_mode(mode):
+    s = str(mode or "T2VA").upper()
+    return _MODE_ALIAS.get(s, s if s in VALID_MODES else "T2VA")
+
+
+# 对齐指令的宽容识别：模型可能把 em dash 写成 - 或 –，也可能只写半句。
+# 只匹配**句首**用于剥离；整句合法性归 validate_compiled 的 E_ALIGN 系。
+_ALIGN_HEAD_RE = re.compile(
+    r"^(?:For the target video, at \d+(?:\.\d+)? seconds into the target video,"
+    r"|How the reference pictures align with the target video\b)", re.I)
+
+_NO_CUTS = "One continuous shot with no cuts."
+
+# ---- 语义检查词表（对齐 h3_prompt_expander/validate.py，只留不依赖意图 IR 的部分）----
+_ABSTRACT_WORDS = ("cinematic", "beautiful", "epic", "masterpiece", "8k",
+                   "氛围感", "大片感")
+_CN_NEG_RE = re.compile(r"(不要|别|没有|无(?!字幕|水印)|禁止|不得)")
+_EN_NEG_ALLOW = ("does not look at the camera", "do not look at the camera",
+                 "one continuous shot with no cuts", "lips remain completely closed",
+                 "lips remain closed", "no further", "no cuts", "without overtaking")
+_EN_NEG_RE = re.compile(r"\b(don't|do not|does not|never| no | without |nothing)\b", re.I)
+_FREEZE_RE = re.compile(
+    r"nothing (about|in) .* changes|stays? (still|where|put)|remains? unchanged"
+    r"|什么都不变|保持静止不动", re.I)
+_QUOTED_RE = re.compile(r'"([^"]+)"')
+# 屏显载体判据：引号前 60 字符内出现这些词，才认为双引号是「画面里的字」而非误用的对白
+_SCREEN_CTX_RE = re.compile(r"(reading|read|sign|neon|subtitle|screen|写着|招牌|屏幕|霓虹)")
+
+
+def _strip_align_block(text):
+    """剥掉正文最前面的关键帧对齐指令块（连同其后空行）。
+
+    只识别**句首**，不校验整句 —— 整句合法性由 validate_compiled 判定。
+    没识别到就原样返回，绝不吞掉正文。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return t
+    head, sep, tail = t.partition("\n\n")
+    if sep and _ALIGN_HEAD_RE.match(re.sub(r"\s+", " ", head).strip()):
+        return tail.strip()
+    lines = t.splitlines()
+    if lines and _ALIGN_HEAD_RE.match(re.sub(r"\s+", " ", lines[0]).strip()):
+        return "\n".join(lines[1:]).strip()
+    return t
+
+
+def finalize_optimized(text, *, mode, seconds=None, frames=None,
+                       has_start=False, has_end=False):
+    """LLM 产出的官方格式文本 → 确定性收尾，返回 {mode, duration, text, fields, actions, warnings}。
+
+    只做 LLM 算不准或会漏的确定性动作（全部复用已有函数，无新算法）：
+
+    1. 剥掉模型自己写的对齐指令（宽容识别句首）—— 它算不出正确的 S.SS。
+    2. `[Shot 1]` 去掉时间戳（官方硬要求；validate_compiled 会以 E_SHOT1_TS 拦下）。
+    3. 单镜段补 `One continuous shot with no cuts.`。
+    4. 按 mode 重新注入对齐指令，`S.SS` 由段长**帧数**换算（`frames_to_seconds`），
+       与 `nodes.py` 实跑注入严格同口径。
+
+    **时间戳递增与超时长不自动修**：那是猜。交给 `validate_text` 报错，让人决定。
+    """
+    actions, warnings = [], []
+    m = _norm_mode(mode)
+    dur = frames_to_seconds(frames) if frames else float(seconds or 5.0)
+    raw = str(text or "").strip()
+    if not raw:
+        warnings.append({"code": "W_EMPTY", "message": "优化结果为空，无法收尾"})
+        return {"mode": m, "duration": dur, "text": "", "fields": {},
+                "actions": actions, "warnings": warnings}
+
+    body = _strip_align_block(raw)
+    if body != raw:
+        actions.append("strip_alignment")
+
+    fields, order, preamble = parse_override(body)
+    main_key = REF_MAIN_FIELD if m == "Ref2VA" else BASE_MAIN_FIELD
+    if not fields:
+        fields, order = {main_key: body}, [main_key]
+        warnings.append({"code": "W_NO_FIELD_HEADER",
+                         "message": "正文没有官方字段头（如 integrated_multimodal_description:），"
+                                    "已按单字段正文处理"})
+    elif preamble:
+        # 首个字段头之前的内容既不是字段、也不是对齐句（对齐句上一步已剥掉）→
+        # 模型自己写的废话。别让它跟着进模型。
+        actions.append("drop_preamble")
+    desc = _strip_align_block(str(fields.get(main_key) or "").strip())
+
+    shots = list(_SHOT_RE.finditer(desc))
+    if shots and shots[0].group(2) is not None:
+        s0 = shots[0]
+        tail = desc[s0.end():].lstrip()
+        if tail.startswith(","):
+            tail = tail[1:].lstrip()
+        desc = (desc[:s0.start()] + "[Shot 1] " + tail).strip()
+        shots = list(_SHOT_RE.finditer(desc))
+        actions.append("drop_shot1_timestamp")
+
+    if len(shots) == 1 and _NO_CUTS.lower() not in desc.lower():
+        desc = desc.rstrip() + " " + _NO_CUTS
+        actions.append("add_no_cuts")
+
+    fields[main_key] = desc
+    out = serialize_fields(fields, order)
+    # 对齐指令是**字段之外**的第一块（官方格式：指令句 + 空行 + 三字段）。
+    # 拼进主字段值里会被当成正文，校验时还会被误判成 E_OVERRIDE_PREAMBLE。
+    kf = alignment_lines(m, dur, has_start, has_end, max(1, len(shots)))
+    if kf:
+        out = "\n".join(kf) + "\n\n" + out
+        actions.append("inject_alignment")
+    return {"mode": m, "duration": dur, "text": out,
+            "fields": fields, "actions": actions, "warnings": warnings}
+
+
+def validate_text(text, mode, seconds, *, source_text="", frames=None):
+    """官方格式文本校验 = 结构检查（validate_compiled）+ 语义检查。
+
+    语义检查搬自 `tools/h3_prompt_expander/validate.py` 中**只看最终文本、
+    不依赖意图 IR** 的那一段：双引号归属、否定堆叠、裸抽象词、全镜静止句、
+    节拍密度、长度密度。
+
+    `source_text` 传用户原始输入，用于「引号原文必须逐字保留」——
+    validate.py 原版依赖 intent.must_keep_quotes，这里改为当场从原稿抽取，
+    于是优化链路不需要任何意图结构化中间态。
+    """
+    m = _norm_mode(mode)
+    dur = frames_to_seconds(frames) if frames else float(seconds or 5.0)
+    txt = str(text or "")
+    parsed, order, _preamble = parse_override(txt)
+    base = validate_compiled({"mode": m, "duration": dur, "fields": parsed,
+                              "prompt_text": txt, "warnings": [], "diagnostics": {},
+                              "override": True})
+    errors, warnings = list(base["errors"]), list(base["warnings"])
+
+    def err(code, msg):
+        errors.append({"code": code, "message": msg})
+
+    def warn(code, msg):
+        warnings.append({"code": code, "message": msg})
+
+    is_ref = (m == "Ref2VA")
+    desc = _strip_align_block(str(parsed.get(REF_MAIN_FIELD if is_ref else BASE_MAIN_FIELD) or ""))
+    if not desc:
+        return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+    for mm in _D_TAG_RE.finditer(desc):
+        if not mm.group(1).strip():
+            err("E_D_LANG", "发现 <d> 缺语言标签，应为 <d>[Chinese] ...</d>")
+        if not mm.group(2).strip():
+            err("E_D_EMPTY", "发现空 <d></d>，逐字台词丢失")
+
+    for mm in _QUOTED_RE.finditer(desc):
+        q = mm.group(1)
+        if not re.search(r"[\u4e00-\u9fff]", q):
+            continue
+        if not _SCREEN_CTX_RE.search(desc[max(0, mm.start() - 60):mm.start()]):
+            warn("W_QUOTE_ZH",
+                 f"中文被双引号包裹 {q[:20]!r}…：疑似对白误用引号，会被烧成画面字幕；"
+                 "对白请改 <d>[Chinese] …</d>")
+    if _SPEAKER_RE.search(desc) and not _D_TAG_RE.search(desc) \
+            and re.search(r"[\"“”].{2,}[\"“”]", desc):
+        warn("W_DIALOG_QUOTED",
+             "检测到说话人 ID 但台词疑似写在引号里：对白进双引号会被烧成字幕，请移入 <d>")
+
+    if re.search(r"</d>\s*[^.]*?(swallow|吞咽|closes (his|her) mouth|闭嘴)", desc, re.I):
+        warn("W_MOUTH_CONFLICT", "台词后紧跟吞咽/闭嘴类动作：发声跨度内的口部动作请移出")
+
+    low = desc.lower()
+    for w in _ABSTRACT_WORDS:
+        if w in low:
+            warn("W_ABSTRACT", f"抽象词 {w!r} 裸用无效，请翻译成可见的光 / 镜 / 动作")
+            break
+    if _CN_NEG_RE.search(desc):
+        warn("W_NEG_CN", "中文否定（不要 / 别 / 没有 / 无…）：实测会反向生成，请转正向描述")
+    tmp = desc
+    for allow in _EN_NEG_ALLOW:
+        tmp = tmp.replace(allow, " ")
+    if _EN_NEG_RE.search(tmp):
+        warn("W_NEG_EN", "英文含否定（don't / no / without / nothing）：易反向生成，请转正向描述")
+    if _FREEZE_RE.search(desc):
+        err("E_FREEZE", "含 nothing changes / 保持静止不动类全镜静止句：会外溢冻住整镜，"
+                        "停顿请交给剪辑（Shot A 收动作停止，Shot B 从反应开始）")
+
+    words_en = len(re.findall(r"[A-Za-z']+", desc))
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", desc))
+    words = words_en + int(cjk * 0.6)
+    if words:
+        if is_ref:
+            scale, (lo, hi), code, label = dur / 10.0, (200, 700), "W_REF_LENGTH", "detailed_description"
+        else:
+            scale, (lo, hi), code, label = dur / 5.0, (20, 260), "W_LENGTH", "description"
+        if not (lo * scale <= words <= hi * scale):
+            detail = f"英文 {words_en} 词" + (f" + 中文 {cjk} 字" if cjk else "")
+            warn(code, f"{label} 约 {words} 词（{detail}），建议 {dur:g}s 落在 "
+                       f"{int(lo * scale)}-{int(hi * scale)} 词；过短太空、过长必 rush")
+
+    parts = _SHOT_RE.split(desc)
+    for i in range(1, len(parts), 5):
+        body = parts[i + 4] if i + 4 < len(parts) else ""
+        n_sent = len([s for s in re.split(r"[.!?。！？]+", body) if s.strip()])
+        if n_sent > 4:
+            warn("W_BEAT_DENSE",
+                 f"Shot {parts[i]} 约 {n_sent} 句，单镜 >4 句易被抹平成平均运动，建议拆镜")
+
+    for q in re.findall(r"[\"“]([^\"”]{1,60})[\"”]", str(source_text or "")):
+        q = q.strip()
+        if q and q not in txt:
+            warn("W_QUOTE_LOST",
+                 f"用户原文的引号内容未出现在产出里：{q[:30]!r}…"
+                 "（对白应进 <d>，屏显应保留原文）")
+
     return {"ok": not errors, "errors": errors, "warnings": warnings}

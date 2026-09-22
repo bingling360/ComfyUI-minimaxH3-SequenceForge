@@ -153,7 +153,6 @@
     { dir, copy_from: copyFrom || "" }),
     savePrompts: (dir, prompts, segments, base_revision) =>
       _json("POST", "/h3chain/save_prompts", { dir, prompts, segments, base_revision }),
-    compilePreview: (payload) => _json("POST", "/h3chain/compile", payload),
     saveAssets: (dir, assets, base_revision) =>
       _json("POST", "/h3chain/assets", { dir, assets, base_revision }),
     assetCheck: (assets, segments, dir) => _json("POST", "/h3chain/asset_check", { assets, segments, dir }),

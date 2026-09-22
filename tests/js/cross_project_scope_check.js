@@ -113,7 +113,6 @@ function ok(cond, msg) {
      */
     const REGISTRY = {
         MP_BODY_KEYS: { scope: "const" },
-        H3_SECTION_KEYS: { scope: "const" },
         _refTpl: { scope: "dir", key: "tplKey" },
         _cardPainters: { scope: "ui" },
         miniBox: { scope: "ui" },
@@ -129,7 +128,6 @@ function ok(cond, msg) {
         _segTab: { scope: "dir", key: `}|seg` },
         _taPending: { scope: "derived" },     // 同上：切换前被 flush 掉，队列必为空
         _uiGen: { scope: "derived" },
-        _v2Open: { scope: "dir", key: "v2Key(" },
         _optBefore: { scope: "dir", key: "optKey(" },
         _optAfter: { scope: "dir", key: "optKey(" },
         _optShown: { scope: "dir", key: "optKey(" },

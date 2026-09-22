@@ -4,7 +4,7 @@
     python -m pytest tests/test_rework_v2.py -q
 
 覆盖：M1 manifest/revision/原子写，M2 资产Hub/总量不限/单段上限，
-M2.5 提示词编译校验迁移，M3 latent切片/策略/trim参数校验，
+M2.5 提示词收尾/校验（结构化已下线），M3 latent切片/策略/trim参数校验，
 M4 单入口/新模块存在，routes 16路由双挂载（aiohttp stub），
 expander 离线 validate。trim 真编码与 Comfy 节点执行需在 Comfy 内验。
 """
@@ -248,38 +248,52 @@ def test_nodes_wiring():
     assert "_resolve_anchor_latent" in src
 
 
-# ---- M2.5 ----
-def test_prompts_t2va_ref(prompts):
-    p = prompts.default_prompt()
-    p.update({"medium_style": "Live-action", "environment": "a bakery",
-              "characters": "a baker", "soundscape": "Shutters scrape.",
-              "non_diegetic_music": ""})
-    p["shots"] = [{"index": 1, "start_seconds": None, "description": "he opens shutters",
-                   "camera_move": "Push In", "camera_amplitude": "small", "camera_speed": "slow",
-                   "dialogues": [], "screen_texts": [], "diegetic_music": "", "ref_usage": []}]
-    c = prompts.compile_segment(p, seconds=5.0)
-    assert c["mode"] == "T2VA" and prompts.validate_compiled(c)["ok"] is True
-    assert "non_diegetic_music: N/A" in c["prompt_text"]
-    p2 = prompts.default_prompt()
-    p2["references"] = [{"label": "<Picture 1>", "note": "first frame"}]
-    p2["subjects"] = [{"definition": "the baker"}]
-    p2["retention"] = [{"label": "<Picture 1>", "marker": "fully_preserved", "shots": [], "note": ""},
-                       {"label": "<Subject 1>", "marker": "fully_preserved", "shots": [], "note": ""}]
-    c2 = prompts.compile_segment(p2, seconds=6.0)
-    assert c2["mode"] == "Ref2VA" and prompts.validate_compiled(c2)["ok"] is True
-    old = {"scene_prompt": "教室", "character_prompt": "少女", "prompt": "她写字", "refs": ["角色1"]}
-    assert prompts.migrate_legacy_seg(old)["environment"] == "教室"
+# ---- M2.5（结构化下线后：保留的是确定性收尾 + 格式校验）----
+def test_prompts_finalize_optimized(prompts):
+    """LLM 算不准的活由后端做：剥自写对齐句 / [Shot 1] 去时间戳 / 单镜补 no cuts /
+    按**帧数**重算对齐句（5 秒段是 124 帧 = 5.17s，不是 5.00）。"""
+    assert prompts.frames_to_seconds(124) == 5.17
+    raw = ("For the target video, at 0.00 seconds into the target video, <Picture 1> "
+           "(from [Shot 1]) is fully referenced.\n\n"
+           "integrated_multimodal_description: [Shot 1] At 00:00.000, 她推开木门。\n\n"
+           "overall_soundscape: 门轴吱呀。\n\nnon_diegetic_music: N/A")
+    r = prompts.finalize_optimized(raw, mode="I2VA", frames=124, has_start=True)
+    assert r["actions"] == ["strip_alignment", "drop_shot1_timestamp",
+                            "add_no_cuts", "inject_alignment"]
+    # 对齐句在**字段之外**（官方格式：指令句 + 空行 + 三字段）
+    assert r["text"].startswith("For the target video, at 0.00 seconds")
+    assert "\n\nintegrated_multimodal_description:" in r["text"]
+    assert prompts.validate_text(r["text"], "I2VA", None, frames=124)["ok"] is True
+    # T2VA 不注入对齐句
+    t2 = prompts.finalize_optimized(
+        "integrated_multimodal_description: [Shot 1] 空镜。\n\nnon_diegetic_music: N/A",
+        mode="T2VA", frames=124)
+    assert "inject_alignment" not in t2["actions"]
+    assert "For the target video" not in t2["text"]
+
+
+def test_prompts_validate_text_semantics(prompts):
+    """语义检查：双引号里的中文疑似对白烧字幕；裸抽象词/否定要报出来。"""
+    bad = ('integrated_multimodal_description: [Shot 1] cinematic 画面，女孩说"跟上我"，'
+           "不要拍她的脸。\n\nnon_diegetic_music: N/A")
+    v = prompts.validate_text(bad, "T2VA", 5.0, source_text='女孩说"跟上我"')
+    codes = {w["code"] for w in v["warnings"]}
+    assert {"W_QUOTE_ZH", "W_ABSTRACT", "W_NEG_CN"} <= codes
+    # 前置废话（既非字段头、也非对齐句）必须拦下
+    v2 = prompts.validate_text(
+        "模型废话。\n\nintegrated_multimodal_description: [Shot 1] 空镜。\n\n"
+        "non_diegetic_music: N/A", "T2VA", 5.0)
+    assert "E_OVERRIDE_PREAMBLE" in {e["code"] for e in v2["errors"]}
 
 
 def test_prompts_passthrough(projects):
     m = projects.create_project("t_pv")
     m2 = projects.save_prompts("t_pv", ["p1"], [{
         "scene_prompt": "s", "character_prompt": "c", "seconds": 5,
-        "refs": [], "prompt_v2": {"environment": "E", "shots": [{"description": "d"}]},
+        "refs": [],
         "latent_save": {"mode": "range", "start_f": 0, "end_f": 48, "tail_f": 0}}],
         base_revision=m["revision"])
     sf = m2["seg_fields"][0]
-    assert sf["prompt_v2"]["environment"] == "E"
     assert sf["latent_save"] == {"mode": "range", "start_f": 0, "end_f": 48, "tail_f": 0,
                                  "split_av": False, "save_seg": True, "save_all": True}
 
@@ -397,7 +411,7 @@ def test_v2_section_wired():
     for f in sorted(os.listdir(os.path.join(ROOT, "web"))):
         if f.endswith(".js"):
             web_all += open(os.path.join(ROOT, "web", f), encoding="utf-8").read()
-    for ep in ["compilePreview", "saveAssets", "assetCheck", "latent_slice", "trim"]:
+    for ep in ["saveAssets", "assetCheck", "latent_slice", "trim"]:
         assert ep in d or ep.replace("_", "/") in d or ep in web_all
 
 
@@ -423,124 +437,55 @@ def test_expander_offline():
     assert r.returncode == 0 and json.loads(r.stdout)["ok"] is True
 
 
-# ---- 5.1 prompt_v2 分组表单 ----
-def test_v2_group_form_wired():
+# ---- 结构化提示词下线守卫（2026-09-22）----
+#
+# 结构化提示词（prompt_v2 逐镜表单 / 运镜下拉 / 屏显列表 / 预编译 + 编译预览）
+# 已整体下线：正文是唯一真相，编辑与「只能靠表单做」的那些活改由 AI 提示词优化承担
+# （规则注入 + prompts.finalize_optimized 确定性收尾 + prompts.validate_text 语义校验）。
+#
+# 原来那批「逐镜表单能渲染 / 分组能写回」的正向断言随功能一起删了。这里改成
+# **反向守卫** —— 防止它被误加回来，同时钉住「删过头」（保留项必须还在）。
+def test_structured_prompt_fully_removed():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     p = open(os.path.join(ROOT, "web", "h3_prompts.js"), encoding="utf-8").read()
-    # helper 存在且挂载
-    for sym in ["ensurePromptV2", "hasPromptV2", "detectMode", "CAMERA_MOVES",
-                "CAMERA_AMPS", "CAMERA_SPEEDS", "RETENTION_MARKERS"]:
-        assert sym in p, sym
-    # 数据链路：默认/还原/归一/落盘/签名全部透存 prompt_v2（防洗掉）
-    assert "prompt_v2: null" in d
-    assert "prompt_v2: (s.prompt_v2" in d or "prompt_v2: (raw.prompt_v2" in d
-    assert "prompt_v2: (s.prompt_v2" in d
-    assert "prompt_v2: (s.prompt_v2" in d and "latent_save" in d
-    assert "JSON.stringify(s.prompt_v2)" in d
-    assert "function renderPromptV2Panel(body, node, data, segIdx)" in d or \
-        "function renderPromptV2Panel(" in d
-    # 结构化**只**在弹窗里渲染（页内不再预渲染一份 —— 同一份 prompt_v2 渲染两处，
-    # 改哪边都容易让人以为另一边才是真相）
-    assert "renderPromptV2Panel(bodyBox, node, data, idx)" in d
-    assert "paneV2" not in d, "页内 paneV2 应已随「结构化」迁进弹窗一起删掉"
-    assert "function setPromptV2Field(node, idx, mutate" in d
-    assert "function debouncePromptV2Write" in d
-    assert "function getSegPromptV2" in d
-    # 各组标题**必须写官方字段名**（用户明说"一定要符合 h3 官方提示词 skill 的格式"）：
-    # 六段式 ①subject_definitions ②summary ③retention_analysis ④detailed_description
-    # ⑤overall_soundscape ⑥non_diegetic_music；三段式 ④=integrated_multimodal_description。
-    # 画面设定已并进 ④ 一组（它们编译出去是同一个官方字段，分成两组看着像官方有两个）。
-    # 源码覆盖已迁出到主框结果区。
-    for g in ["subject_definitions", "summary", "retention_analysis",
-              "detailed_description", "integrated_multimodal_description",
-              "overall_soundscape", "non_diegetic_music"]:
-        assert g in d, f"结构化组标题缺官方字段名 {g}"
-        assert g in d, g
-    assert "高级 · 源码覆盖" not in d, "源码覆盖应已移除"
-    assert "源码覆盖 · 直接改写最终结果" not in d, "源码覆盖应已彻底移除"
-    assert "清除覆盖" in d, "残留 override_text 应可一键清除"
-    # 模式改为按本段数据自动判定（不再给手动下拉），符号保留供兼容；编译仍透传 mode
-    for sym in ["V2_MODES", "effV2Mode", "defaultV2Mode", "setV2Mode",
-                "v2InstrPreview", "v2mode", "assignV2FromText"]:
-        assert sym in d or sym in p, sym
-    # 具象化精简：画面合并为 visual 单框；每镜低频项收进「更多」
-    for sym in ["pv0.visual", '"visual"', "更多 · 换镜时间"]:
-        assert sym in d, sym
-    # 三框合一：段卡只剩**一个**提示词框（意图 / 剧本 已从 UI 撤下）
-    for sym in ["提示词（最终进模型）", "✨ AI扩写+优化", "✨ 提示词优化", "引用素材"]:
-        assert sym in d, sym
-    for old in ["① 中文意图（不进模型 · 可用 @素材）", "② 剧本（扩写产物 · 可手工改）",
-                "③ 结果（最终进模型）", "① 意图", "② 剧本", "③ 结果"]:
-        assert old not in d, f"旧三框文案应已下线：{old}"
-    assert "gMore.append(gMoreBody)" in d, "镜头「更多」内容没挂进 details"
-    # 复位后开合状态要记下来（否则加对白/重建会被 details 默认收起打断）
-    assert "const _v2Open = new Map();" in d, "缺 details 开合记忆"
-    assert 'function v2Details(key, cls, summaryHtml, defOpen)' in d, "缺 v2Details 工厂"
-    # b17b003 起 _v2Open 的 key 统一过 v2Key()（前缀项目目录，该口径由
-    # tests/js/cross_project_scope_check.js 守卫）→ v2Details 里形参 key 先算成局部 k
-    assert "_v2Open.set(k, g.open)" in d, "toggle 未记录开合"
-    # 组 key：官方六段的前三段拆成 sub/sum/ret 三组（不再塞在一个 ref 里），
-    # 素材调度单独成组（它不是官方字段）；「画面」组（pic）已并入整体描述组。
-    for k in ["v2${segIdx}", "shot${segIdx}", "snd${segIdx}", "sub${segIdx}",
-              "sum${segIdx}", "ret${segIdx}", "sched${segIdx}",
-              "more${segIdx}_${si}"]:
-        assert k in d, k
-    assert "pic${segIdx}" not in d, "画面组应已并入整体描述组"
-    assert "ref${segIdx}" not in d, "旧的「参考」大组应已拆成官方前三段"
-    # 挂载顺序 = 官方字段顺序（在函数末尾统一 append，不是想到哪挂到哪）
-    assert "vbody.append(gSub, gSum, gRet, gShot, gSnd, gSched);" in d
-    # 重建只在会丢东西时才问（否则 confirm 抢焦点导致输入框卡住）
-    assert "hasNote" in d and "按当前素材调度重建引用列表" in d, "重建应改为条件确认"
-    # 模式必须按本段数据自动判定，不能写死
-    for m in ['"T2VA"', '"I2VA"', '"L2VA"', '"FL2VA"']:
-        assert "return " + m + ";" in d, "defaultV2Mode 缺分支 " + m
-    assert "未检测到首帧/尾帧图" in d, "无锚时应给说明而非报错"
-    assert "需要首帧图＋尾帧图" not in d, "旧的强制文案应移除"
-    # 官方引用**由素材调度派生**（不再手填标签）：参考组渲染时现算 want，
-    # pv.references 里只存用户写的说明（note），改勾选不用同步、也不会打架。
-    # 早先这里断言过一个 syncV2RefsFromSchedule() —— 那个函数会把已写的 note
-    # 一起抹掉，最后没做（改为「↻ 按素材调度重建」显式按钮 + 有说明时确认），
-    # 断言因此改钉现在这套口径。
-    assert "function v2RefsFromSchedule(" in d
-    assert "const want = v2RefsFromSchedule(data.ds, segIdx);" in d
-    assert "按素材调度重建" in d and "已写的说明会清空" in d, "缺显式重建入口/提示"
-    for t in ["<Picture ", "<Video ", "<Audio "]:
-        assert t in d, t
-    # 中文显示 ⇄ 英文存储：运镜/说话人/语言/任务类型映射齐全
-    for sym in ["V2_CAM_ZH", "V2_AMP_ZH", "V2_SPD_ZH", "V2_TASK_ZH", "V2_MARKER_ZH",
-                "zhSpeaker", "enSpeaker", "zhLang", "enLang", "zhTasks", "enTasks", "mkMapSel"]:
-        assert sym in d, sym
-    # 校验入口：编译预览+模式徽
-    assert "编译预览+校验" in d and "detectMode" in d
-    # 5.3 最小接线：AI扩写复制命令行
-    assert "AI扩写" in d and "h3_prompt_expander" in d
-    # 焦点守卫：v2 输入聚焦不重建（防丢焦）
-    assert "input:focus, select:focus" in d
+    gone_front = ["openStructuredModal", "renderPromptV2Panel", "setPromptV2Field",
+                  "v2Details", "v2InstrPreview", "splitH3Sections", "applyH3TextToSeg",
+                  "applyRefAnchorToV2", "assignV2FromText", "V2_MODES", "effV2Mode",
+                  "getSegPromptV2", "debouncePromptV2Write", "_v2Open", "compilePreview"]
+    for g in gone_front:
+        assert g not in d, f"前端结构化遗留：{g}"
+    gone_helper = ["defaultPromptV2", "defaultShot", "ensurePromptV2", "hasPromptV2",
+                   "migrateLegacySeg", "detectMode", "compilePayload",
+                   "CAMERA_MOVES", "CAMERA_AMPS", "CAMERA_SPEEDS", "RETENTION_MARKERS"]
+    for g in gone_helper:
+        assert g not in p, f"h3_prompts 结构化遗留：{g}"
+    # 后端：编译预览路由与 prompt_v2 透存都不许回来
+    r = open(os.path.join(ROOT, "routes.py"), encoding="utf-8").read()
+    assert "compile_prompt" not in r and '"/h3chain/compile"' not in r
+    assert "compilePreview" not in open(os.path.join(ROOT, "web/h3_api.js"), encoding="utf-8").read()
+    pr = open(os.path.join(ROOT, "prompts.py"), encoding="utf-8").read()
+    for g in ["compile_segment", "clean_prompt", "default_prompt", "migrate_legacy_seg",
+              "compose_description", "compose_reference"]:
+        assert g not in pr, f"prompts.py 结构化遗留：{g}"
 
 
-def test_prompts_full_groups(prompts):
-    pv = prompts.default_prompt()
-    pv.update({"intent_zh": "雨夜独行", "medium_style": "Live-action",
-               "composition": "medium shot", "environment": "rainy alley",
-               "lighting": "neon", "characters": "a woman", "props": "umbrella",
-               "soundscape": "Rain falls.", "non_diegetic_music": "N/A"})
-    pv["shots"] = [
-        {"index": 1, "start_seconds": None, "description": "she opens umbrella",
-         "camera_move": "Push In", "camera_amplitude": "small", "camera_speed": "slow",
-         "dialogues": [{"speaker": "S1", "language": "Chinese", "text": "走吧",
-                        "delivery": "", "voiceover": False}],
-         "screen_texts": ["OPEN 24H"], "diegetic_music": "", "ref_usage": []},
-        {"index": 2, "start_seconds": 2.5, "description": "she walks away",
-         "camera_move": "Tracking Shot", "camera_amplitude": "", "camera_speed": "",
-         "dialogues": [], "screen_texts": [], "diegetic_music": "", "ref_usage": []},
-    ]
-    c = prompts.compile_segment(pv, seconds=5.0)
-    assert c["mode"] == "T2VA"
-    assert prompts.validate_compiled(c)["ok"] is True
-    # 非法运镜词被清洗为空，不炸链
-    pv["shots"][0]["camera_move"] = "乱写"
-    assert prompts.clean_prompt(pv)["shots"][0]["camera_move"] == ""
-
+def test_structured_removal_kept_the_right_things():
+    """删过头检查：与结构化**无关**的东西一个都不许少。"""
+    d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    p = open(os.path.join(ROOT, "web", "h3_prompts.js"), encoding="utf-8").read()
+    for kept in ["defaultV2Mode", "v2InstrLines", "segAlignSeconds", "framesToSeconds",
+                 "mkAlignPreview", "v2RefsFromSchedule", "segHasFrames"]:
+        assert kept in d, f"前端误删保留项：{kept}"
+    for kept in ["paintOptbar", "optToggle", "optRestoreMaps", "stripAlignmentLines"]:
+        assert kept in d, f"优化链路误删：{kept}"
+    for kept in ["marksToText", "textToMarks", "markPairs", "cleanMark", "nextMarkSeq",
+                 "defaultLatentSave", "cleanLatentSave"]:
+        assert kept in p, f"h3_prompts 误删保留项：{kept}"
+    pr = open(os.path.join(ROOT, "prompts.py"), encoding="utf-8").read()
+    for kept in ["frames_to_seconds", "alignment_lines", "L2VA_HEAD", "FL2VA_HEAD",
+                 "parse_override", "serialize_fields", "validate_compiled", "detect_mode",
+                 "finalize_optimized", "validate_text"]:
+        assert kept in pr, f"prompts.py 误删保留项：{kept}"
 
 # ---- 切换式段卡 + 自研优化后端 ----
 def test_optimizer_backend():
@@ -593,13 +538,12 @@ def test_segment_tabs_and_optimizer_ui():
     # 段片瘦身：无大 thumb 网格，全屏入口保留
     assert "segMediaInfo" in d and "openSegViewer" in d and "h3d-viewer" in d
     assert "▶ 预览" in d
-    assert "grid-template-columns:minmax(0,1fr)" in d
-    # 结构化已收进工具条弹窗（不再是独立 tab、也不再是页内切换）
-    assert "⇄ 结构化提示词" in d and "function openStructuredModal(" in d
-    assert "_segStructView" not in d, "页内切换的视图记忆应随弹窗化一起删掉"
+    # 结构化提示词已整体下线（2026-09-22）：源码里不许再有它的入口
+    assert "openStructuredModal" not in d and "renderPromptV2Panel" not in d
+    assert "_segStructView" not in d
     assert "从具象化同步" not in d and "同步到具象化" not in d, "旧的双向同步按钮应已下线"
     assert "function applyAiToV2(" not in d, "旧 applyAiToV2（整段塞进 shots[0]）应已删除"
-    assert "function applyH3TextToSeg(" in d and "function splitH3Sections(" in d
+    assert "applyH3TextToSeg" not in d and "splitH3Sections" not in d
     # AI优化条（自研后端）
     for sym in ["paintOptbar", "runOptForSegment", "openOptSettings", "opt_hist",
                 "optimizer-config", "/h3chain/optimize"]:

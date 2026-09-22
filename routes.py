@@ -52,7 +52,6 @@ ROUTES = [
     ("POST", "/h3chain/optimize_multi_stream"),
     ("POST", "/h3chain/create_project"),
     ("POST", "/h3chain/save_prompts"),
-    ("POST", "/h3chain/compile"),
     ("POST", "/h3chain/latent_slice"),
     ("POST", "/h3chain/latent_delete"),
     ("POST", "/h3chain/trim"),
@@ -1408,40 +1407,6 @@ def add_routes(routes):
         except Exception as e:
             return _err(f"校验失败：{e}", code="VALIDATE_FAILED", status=500)
 
-    async def compile_prompt(request):
-        """结构化 prompt 编译预览（不落盘）：返回官方英文 + 校验，供段卡分组调用。"""
-        try:
-            data = await request.json()
-        except Exception:
-            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
-        try:
-            from . import prompts as _prompts
-        except ImportError:
-            import prompts as _prompts
-        prompt = data.get("prompt")
-        if prompt is None and isinstance(data.get("segment"), dict):
-            seg = data["segment"]
-            prompt = seg.get("prompt_v2") or _prompts.migrate_legacy_seg(seg)
-        try:
-            seconds = float(data.get("seconds") or 5.0)
-        except (TypeError, ValueError):
-            seconds = 5.0
-        has_start = bool(data.get("has_start"))
-        has_end = bool(data.get("has_end"))
-        mode = data.get("mode")
-        mode = mode if isinstance(mode, str) and mode else None
-        try:
-            compiled = _prompts.compile_segment(prompt, seconds=seconds,
-                                                has_start=has_start, has_end=has_end,
-                                                mode=mode)
-            verdict = _prompts.validate_compiled(compiled)
-        except Exception as e:
-            return _err(f"编译失败：{e}", code="COMPILE_FAILED", status=400)
-        status = 200 if verdict["ok"] else 422
-        return web.json_response({"ok": verdict["ok"], "compiled": compiled,
-                                  "errors": verdict["errors"],
-                                  "warnings": verdict["warnings"]}, status=status)
-
     async def move_media(request):
         """库间互调：assets <-> finals 搬家 + manifest 引用改写。生成中 423。"""
         try:
@@ -2605,7 +2570,6 @@ def add_routes(routes):
         ("POST", "/h3chain/expand_validate", expand_validate),
         ("POST", "/h3chain/create_project", create_project),
         ("POST", "/h3chain/save_prompts", save_prompts),
-        ("POST", "/h3chain/compile", compile_prompt),
         ("POST", "/h3chain/latent_slice", latent_slice),
         ("POST", "/h3chain/latent_delete", latent_delete),
         ("POST", "/h3chain/trim", trim),

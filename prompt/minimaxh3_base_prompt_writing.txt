@@ -22,25 +22,56 @@ Field names are English and verbatim. Separate fields with one blank line.
 
 - Must start with `[Shot 1]`, no timestamp on it; no title or preamble before it.
 - Later shots: `[Shot N] At MM:SS.mmm, ...`, strictly increasing and within duration.
-- One camera move per shot; write it as a natural clause with type, amplitude, speed.
+- One camera move per shot; write it as a natural clause with type, amplitude, speed
+  — never as a tag stacked at the end of the sentence.
+- **Camera vocabulary (English, verbatim; do not invent `dolly` / `crane` / `drift`)**:
+  `Zoom In` / `Zoom Out` / `Push In` / `Pull Out` / `Pan Left` / `Pan Right` /
+  `Truck Left` / `Truck Right` / `Tilt Up` / `Tilt Down` / `Pedestal Up` / `Pedestal Down` /
+  `Arc Shot` / `Tracking Shot` / `Static Shot` / `Shake Slightly` / `Shake Strongly` /
+  `POV` / `Roll Clockwise` / `Roll Counterclockwise`
+- **Amplitude**: `with small amplitude` / `with large amplitude`.
+  **Speed**: `at slow speed` / `at fast speed`. Medium amplitude and normal speed are
+  usually omitted — writing them turns "normal" into "deliberate".
+- `Zoom In` (lens only, camera static) and `Push In` (camera moves forward) are not
+  interchangeable.
+- If only distance or angle changes slightly, use a camera move — do not cut.
+- **On-screen text** (signs, subtitles, neon, pages, screens) goes inside English double
+  quotes, untranslated.
+  - **Double quotes are for on-screen text only**: spoken words always go in `<d>`.
+    Dialogue wrapped in double quotes gets burned into the picture as subtitles.
+  - Always name the **carrier**: `A red neon sign above the doorway reads "营业中"` —
+    not `The on-screen text "营业中" is visible`, which leaves the model guessing where
+    those characters should live.
 - Dialogue: `(S1) says in a warm voice: <d>[English] I get off at the next stop.</d>`
   — speaker identity and delivery stay outside `<d>`; only language tag plus the
   verbatim line goes inside. Only speaking characters get `(S1)`/`(S2)`.
 - Voiceover: `says in an off-screen voiceover` plus a statement that lips stay closed.
 - Dialogue across cuts uses `<scenetrans>`; cut off by the ending uses `<cutoff>`.
 - No conflicting mouth action right after a line.
+- Single-shot segments (no cuts at all) end with `One continuous shot with no cuts.`
 
 ## 2. Keyframe alignment (I2VA / FL2VA / L2VA only)
 
-The alignment instruction must be the **first line** of the final prompt, followed by
-a blank line before the three fields. Copy the official sentence verbatim, replacing
-only the shot number N and the seconds S.SS (exactly two decimals):
+> ⚠ **Do not write this section yourself.** The alignment instruction is generated and
+> injected by the **backend** — placed as the first line of the final prompt, followed by a
+> blank line before the three fields. The timestamp `S.SS` must be derived from the
+> segment's **frame count** (a 5-second segment is actually 124 frames = 5.17s, **not 5.00**),
+> so hand-writing it is always wrong.
+>
+> Never emit any of these sentences. If one appears in your body text, the backend judges
+> the segment as already-complete official format and passes it through, displacing the line
+> it was supposed to inject:
+> - `For the target video, at 0.00 seconds…`
+> - `How the reference pictures align with the target video…`
+>
+> The three templates below only show **what the backend will inject**, so you understand the
+> context (e.g. the last shot number N follows from your shot count):
 
 - I2VA: `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.`
 - FL2VA: `How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.`
 - L2VA: `How the reference pictures align with the target video — <Picture 1> (from [Shot N]) aligns with the S.SS-second mark of the target video.`
 
-T2VA has no alignment line.
+T2VA and Ref2VA have no alignment line.
 
 ## 3. Density
 

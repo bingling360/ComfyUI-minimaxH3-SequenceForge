@@ -461,9 +461,12 @@ def test_library_entry_and_old_gone():
 
 def test_explicit_ref_binding():
     d = _read("h3_director.js")
-    # 勾选即在正文补可见 @标签（取消不删）
+    # 勾选即在正文补可见 @标签（取消不删）。
+    # 原断言钉的是结构化面板里那句 chip 提示文案 —— 面板已整体下线，
+    # 这里改为钉**功能本身**（提示文案没了不代表能力没了）。
     assert "ds.prompts[idx] = cur" in d
-    assert "勾选自动在正文补 @标签" in d or "正文自动补 @标签" in d
+    assert "function addSegmentRef(" in d
+    assert "`@${label}`" in d, "勾选应把 @标签 补进正文"
 
 
 def test_switch_race_guards():

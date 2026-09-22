@@ -163,15 +163,12 @@ def test_anchor_mode_source_points():
     # 引用语 = 常驻「锚定方式」模式（选方式 → 点素材 → 按方式写入正文）
     assert "const _refTpl = new Map()" in d
     assert "const REF_TPL_DEFAULT = 0" in d
-    # 三栏引用互不串味：主框引用条**不再**写具象化（具象化引用归它自己的参考组管）
-    assert "applyRefAnchorToV2(node, it.idx, a.label, tplDef || [], roles)" not in d
+    # 三栏引用互不串味：主框引用条只写正文，不再往结构化里存第二份
+    assert "applyRefAnchorToV2" not in d
     assert "const refBars = []" in d          # 意图/剧本/结果 各一条
     assert "gate: true" in d                  # 只有「③ 结果」那条进模型
-    assert "function applyRefAnchorToV2(node, idx, label, tplDef, roles)" in d
     # 模板带官方 retention 标记与角色句
     assert '"fully_preserved"' in d and '"partially_preserved"' in d and '"weak_reference"' in d
-    # 只在已有具象化结构时写 v2（不把三字段段切成六字段）
-    assert "if (!pv || typeof pv !== \"object\") return false;" in d
     # 裸引用模板仍在，且**只此一档**：原「无」与它插入的正文完全一样，已合并掉
     assert "裸引用（不加描述）" in d
     assert "锚定方式：无" not in d
@@ -346,23 +343,18 @@ def test_master_prompt_single_box_modal():
     assert "【段${i + 1}】" in d
 
 
-def test_structured_modal_replaces_v2_tab():
-    """具象化从常驻 tab 变成「⇄ 结构化提示词」弹窗（B05，源码点）。"""
+def test_seg_card_tabs_are_prompt_and_anchor_only():
+    """段卡 tab 只剩 提示词 / 锚定设置 —— 结构化提示词已整体下线（源码点）。"""
     d = _src()
-    assert "function openStructuredModal(node, data, idx, ta)" in d
-    assert "⇄ 结构化提示词" in d
-    # tab 只剩 提示词 / 锚定设置
     assert 'const tabs = [["main", "提示词"], ["set", "锚定设置"]];' in d
     assert '"v2", "具象化"' not in d
     # 老记忆值回落，避免所有 pane 都被藏掉
     assert "if (!tabKeys.includes(curTab)) curTab = \"main\";" in d
-    # 弹窗里复用同一个渲染器 + 文本→结构化那条腿
-    i = d.index("function openStructuredModal(")
-    block = d[i:i + 2600]
-    assert "renderPromptV2Panel(bodyBox, node, data, idx)" in block
-    # 文本→结构走 applyH3TextToSeg（按官方字段切块 + 按 [Shot N] 切镜）。
-    # 旧的 applyAiToV2 把整段塞进 shots[0].description，多镜段一切就只剩第一镜。
-    assert "applyH3TextToSeg(node, idx, text)" in block
+    # 逐镜表单、弹窗入口、文本→结构解析腿都已删干净
+    assert "openStructuredModal" not in d
+    assert "renderPromptV2Panel" not in d
+    assert "applyH3TextToSeg" not in d
+    assert "splitH3Sections" not in d
 
 
 def test_director_js_module_syntax():
@@ -383,39 +375,3 @@ def test_director_js_module_syntax():
         if os.path.exists(tmp):
             os.remove(tmp)
 
-
-def test_director_js_module_syntax():
-    """前端 JS 按 **ES module** 解析必须无错（浏览器就是这么加载的）。
-
-    回归：曾在段卡作用域里重复声明 const liveAssets ——  按
-    **script** 解析放过了这个早期错误，浏览器按 module 解析直接 SyntaxError，
-    整个导演台（连左侧入口）都不会出现。所以校验必须走 .mjs / module 模式。
-    """
-    if not NODE:
-        pytest.skip('"未找到 node"')
-    tmp = os.path.join(ROOT, '_h3_module_syntax_check.mjs')
-    try:
-        shutil.copyfile(DIRECTOR, tmp)
-        r = subprocess.run([NODE, '--check', tmp], capture_output=True, text=True, timeout=60)
-        assert r.returncode == 0, r.stdout + chr(10) + r.stderr
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-
-
-def test_v2_mode_detection_runtime_jsdom():
-    '''jsdom 真跑具象化模式判定：前端 defaultV2Mode 必须与后端 detect_mode 同口径。
-
-    这条是「未启用具象化就漏判成 T2VA」的回归闸：段没有 prompt_v2 时，后端
-    compilePayload 会 migrateLegacySeg 把 seg.refs 迁成 references → Ref2VA，
-    前端若只读 seg.prompt_v2（null）就会判 T2VA，两边打架（多报
-    W_MODE_OVERRIDE + 模板选错）。修法：前端直接复用 H3Prompts.detectMode，
-    入参也走 ensurePromptV2。
-    '''
-    nm = os.path.join(ROOT, "node_modules")
-    if not os.path.isdir(os.path.join(nm, "jsdom")):
-        pytest.skip("未安装 jsdom（repo/node_modules 缺失）")
-    script = os.path.join(ROOT, "tests", "js", "v2_mode_check.js")
-    env = dict(os.environ, NODE_PATH=nm)
-    r = subprocess.run([NODE, script], capture_output=True, text=True, timeout=90, env=env)
-    assert r.returncode == 0, r.stdout + chr(10) + r.stderr

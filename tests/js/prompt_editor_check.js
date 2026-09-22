@@ -92,7 +92,6 @@ const code = [
     extractFn("addSegmentRef"),
     extractFn("removeSegmentRef"),
     extractFn("applyPromptEdit"),
-    extractFn("applyRefAnchorToV2"),
 ].join("\n");
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { pretendToBeVisual: true });
@@ -118,7 +117,7 @@ const alert = (m) => { throw new Error("alert: " + m); };
 const make = new Function("window", "document", "Event", "alert", "getDs", "setDs",
     "cancelPromptWrite", "schedulePromptFlush", "scheduleRefresh", "setLed",
     code + "\nreturn { createPromptEditor, canAddRef, addSegmentRef, removeSegmentRef," +
-    " applyPromptEdit, applyRefAnchorToV2, syncRefsFromText, refsFromText, refCount," +
+    " applyPromptEdit, syncRefsFromText, refsFromText, refCount," +
     " REF_TEMPLATES, KIND_ICON, thumbSig };");
 const M = make(window, window.document, window.Event, alert, getDs, setDs,
     cancelPromptWrite, schedulePromptFlush, scheduleRefresh, setLed);
@@ -176,7 +175,6 @@ try {
     ok(!!m, "模板句式应含 @别名");
     if (m) ta.insertTag(a.label, m[1], m[3]); else ta.insertText(phrase);
     M.applyPromptEdit(node, 0, ta);
-    M.applyRefAnchorToV2(node, 0, a.label, tplDef, "");
 } catch (e) { threw = e; }
 ok(!threw, `chip 点击链路抛错：${threw && threw.message}`);
 ok(ta.value.includes("场景以 @阿依 为准"), `锚定方式句式未写入：${ta.value}`);

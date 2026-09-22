@@ -921,10 +921,7 @@ _SEG_STR_FIELDS = ("scene_prompt", "character_prompt", "soundscape", "music")
 
 
 def _clean_seg_field(raw) -> dict | None:
-    """前端分段字段白名单清洗：未知键剔除、类型收敛（防脏 JSON 膨胀 manifest）。
-
-    M2.5：透存 prompt_v2（具象化结构，经 prompts.clean_prompt 收敛，失败则丢弃该键不炸链）。
-    """
+    """前端分段字段白名单清洗：未知键剔除、类型收敛（防脏 JSON 膨胀 manifest）。"""
     if not isinstance(raw, dict):
         return None
     out = {k: (str(raw[k]) if isinstance(raw.get(k), str) else "") for k in _SEG_STR_FIELDS}
@@ -968,20 +965,6 @@ def _clean_seg_field(raw) -> dict | None:
     fr = raw.get("frame_refs")
     out["frame_refs"] = [str(x) for x in fr if isinstance(x, (str, int))][:4] \
         if isinstance(fr, list) else None
-    pv = raw.get("prompt_v2")
-    if isinstance(pv, dict):
-        try:
-            from . import prompts as _prompts
-        except ImportError:
-            import prompts as _prompts
-        try:
-            out["prompt_v2"] = _prompts.clean_prompt(pv)
-        except Exception:
-            pass
-    # v2 手动模式（null=跟随导演台）：白名单透存，未知值归 null
-    vm = raw.get("v2mode")
-    out["v2mode"] = vm if isinstance(vm, str) and vm in (
-        "T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA") else None
     # M3：每段 latent 保存策略透存 {mode: all|range|tail|off, start_f, end_f, tail_f,
     # split_av, save_seg, save_all}；latent 引用策略 {on, frames, video, audio}
     # （null=跟随全局，默认尾部 N 帧钉下段首）。

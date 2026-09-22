@@ -2069,6 +2069,7 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
     if diff is None:
         return 0, "取不到 diffusion_model"
     n = 0
+    skipped = 0
     for m in diff.modules():
         for name in targets:
             sub = getattr(m, name, None)
@@ -2079,8 +2080,11 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
                 continue
             orig = sub.forward
             if not _ff_chunk_selfcheck(sub, orig, ct):
-                return n, (f"{name} 分块自测不通过（模块里含跨 token 操作，"
-                           "不是纯逐行 FFN）——本次不装，输出保持原样")
+                # 自测不过就跳过**这一个**，不提前 return：别的模块可能是干净的。
+                # 半装本身不破坏正确性（每个装上的都自测过、彼此等价），
+                # 但报告必须说清「装了几个 / 跳了几个」，别让用户以为全没生效。
+                skipped += 1
+                continue
             plan = perf.plan_ff_chunks  # 纯函数，零 torch 依赖
 
             def _fwd(x, *a, __orig=orig, __ct=ct, __plan=plan, **k):
@@ -2101,6 +2105,11 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
             except Exception:
                 pass
             n += 1
+    if skipped and not n:
+        return 0, (f"{skipped} 个 Linear 分块自测全部不通过（模块里含跨 token 操作，"
+                   "不是纯逐行 FFN）——本次不装，输出保持原样")
+    if skipped:
+        return n, f"{skipped} 个 Linear 自测不通过已跳过（其余 {n} 个已装）"
     return n, ""
 
 

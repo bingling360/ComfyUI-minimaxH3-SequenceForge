@@ -2025,7 +2025,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _ff_n, _ff_why = upscale.install_ff_chunking(模型, _ff_tokens)
                 if _ff_n:
                     report.append(f"性能：FFN 分块已启用（{_ff_n} 个 Linear，"
-                                  f"每块 {_ff_tokens} token · 数学等价，画质零损失）")
+                                  f"每块 {_ff_tokens} token · 数学等价，画质零损失）"
+                                  + (f"；{_ff_why}" if _ff_why else ""))
                 elif _ff_why:
                     report.append(f"性能：FFN 分块未启用（{_ff_why}）")
                 if 二采模型 is not None and _up_model is not 模型:

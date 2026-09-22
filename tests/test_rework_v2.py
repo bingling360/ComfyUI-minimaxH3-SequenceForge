@@ -107,7 +107,8 @@ def library():
 def routes(projects, library):
     return _load_top("routes", os.path.join(ROOT, "routes.py"),
                      [("from . import projects", "import projects"),
-                      ("from . import library as h3lib", "import library as h3lib"),
+("from . import library as h3lib", "import library as h3lib"),
+                      ("from . import perf", "import perf"),
                       ("from . import asset_hub", "import asset_hub"),
                       ("from . import prompts as _prompts", "import prompts as _prompts")])
 

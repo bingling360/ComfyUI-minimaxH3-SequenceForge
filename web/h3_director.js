@@ -3879,6 +3879,141 @@ const OPT_PROVIDERS = {
     custom: { label: "自定义", url: "", model: "", protocol: "openai" },
 };
 
+/* ---- ⚙ 性能优化设置（**全局**、跨项目）----
+ *
+ * 真源在后端 perf.py：DEFAULT_PERF / PERF_TYPES / parse_state / apply_runtime。
+ * 前端**不自己算档位**（既有的铁律：参数单一真源），只做三件事：
+ *   ① 显示后端给的只读诊断行（显存 / 内存 / swap / R_v / R_m / 档位 / 平台）
+ *   ② 渲染开关，改动立刻 POST 回后端并在进程内应用
+ *   ③ 把**未接线**的键明确标出来（灰掉 + 写「接线中」）
+ *
+ * 为什么要标「接线中」：列出一个勾了却没用的开关比不给开关更糟 ——
+ * 用户会以为生效了，转头拿"改了没变化"来报 bug。
+ */
+const H3_PERF_FIELDS = [
+    { key: "upcast_attention", label: "Upcast Attention", kind: "tri",
+      hint: "attention 强制走 fp32：更稳但更吃显存、更慢。小显存卡通常关；auto = 跟随启动参数" },
+    { key: "index_mode", label: "素材库索引失效口径", kind: "sel",
+      opts: [["fingerprint", "目录指纹（推荐）"], ["ttl", "固定 3 秒过期"]],
+      hint: "指纹：没增删文件就一直复用，翻页不再重建索引（1200 条目实测省掉 1895ms）；ttl：老行为，遇到「新素材不显示」可退回" },
+    { key: "thumb_on_import", label: "入库即生成缩略图", kind: "bool",
+      hint: "关掉则退回「首次浏览时才生成」—— 会为每张大图付一次全解码峰值（6000×4000 JPEG 实测 193 MB，且 RSS 涨上去不易回落）" },
+    { key: "thumb_max_mp", label: "缩略图源图上限（百万像素）", kind: "num",
+      hint: "超过就跳过解码，前端回落类型图标 —— 挡住超大图的解码尖峰" },
+    { key: "vram_shuffle", label: "精化前腾挪强度", kind: "sel", wired: false,
+      opts: [["auto", "跟随（当前实现）"], ["off", "不腾挪"], ["soft", "只卸放大网络"], ["full", "全卸驻留模型"]],
+      hint: "24GB 卡上全卸疑似净亏、但 32GB 卡上有过 OOM 实测才加的它 —— 换卡前只做 A/B，不改默认" },
+    { key: "blocks_to_swap", label: "块交换 blockswap（0–50）", kind: "num", wired: false,
+      hint: "H3 = 50 个 double block；PCIe 带宽是硬约束，需先测「搬一块 vs 算一块」" },
+    { key: "ff_chunk_tokens", label: "FFN 分块 Chunk FeedForward", kind: "num", wired: false,
+      hint: "按 token 切块算 MLP，数学等价、零画质损失；主干 OOM 正崩在 FFN 上" },
+];
+
+async function paintPerfPane(pane) {
+    const A = window.H3Api;
+    const say = (msg) => {
+        const box = el("div", "h3d-setrow");
+        box.append(el("span", "h3d-secs-hint", msg));
+        pane.replaceChildren(box);
+    };
+    if (!A || !A.perfGet) { say("性能设置接口不可用（请更新插件）"); return; }
+    say("读取中…");
+    let body;
+    try { body = (await A.perfGet()).body; }
+    catch (e) { say("读取性能设置失败：" + ((e && e.message) || e)); return; }
+    if (!body || !body.ok) { say("读取性能设置失败"); return; }
+    const draft = Object.assign({}, body.data || {});
+    const wired = new Set(body.wired || []);
+    pane.replaceChildren();
+
+    /* 只读诊断：机器现状 + 当前真正生效的值（后端量，前端不猜） */
+    const secDiag = el("div", "h3d-setsec");
+    secDiag.append(el("div", "h3d-setsec-title", "当前机器（只读）"));
+    const drow = el("div", "h3d-setrow");
+    drow.append(el("span", "h3d-secs-hint",
+        String(body.report || "").replace(/^\[H3性能\]\s*/, "") || "未探明"));
+    secDiag.append(drow);
+    if (body.upcast) {
+        const urow = el("div", "h3d-setrow");
+        urow.append(el("span", "h3d-secs-hint",
+            "Upcast Attention 当前生效：" + (body.upcast.effective ? "开" : "关")
+            + "（启动参数 force=" + (body.upcast.cli_force_upcast ? "1" : "0")
+            + " / dont=" + (body.upcast.cli_dont_upcast ? "1" : "0") + "）"));
+        secDiag.append(urow);
+    }
+    pane.append(secDiag);
+
+    /* 开关区 */
+    const secSet = el("div", "h3d-setsec");
+    secSet.append(el("div", "h3d-setsec-title", "性能开关（全局，改完立即生效）"));
+    const status = el("span", "h3d-secs-hint", "");
+    const push = async () => {
+        status.textContent = "保存中…";
+        try {
+            const r = await A.perfSet(draft);
+            const b = r && r.body;
+            if (!b || !b.ok) { status.textContent = "保存失败"; return; }
+            const ap = b.applied || {};
+            status.textContent = "已应用 · upcast="
+                + (ap.upcast_attention === true ? "开" : ap.upcast_attention === false ? "关" : "跟随")
+                + " · 索引=" + (ap.index_mode || "?")
+                + " · 入库缩略图=" + (ap.thumb_on_import ? "开" : "关");
+        } catch (e) {
+            status.textContent = "保存失败：" + ((e && e.message) || e);
+        }
+    };
+    for (const f of H3_PERF_FIELDS) {
+        const row = el("div", "h3d-refrow");
+        const on = f.wired === false ? false : wired.has(f.key);
+        const lab = el("label", null, f.label + (on ? "" : " · 接线中"));
+        lab.style.color = on ? "" : "var(--h3d-muted)";
+        lab.style.opacity = on ? "" : "0.6";
+        row.append(lab);
+        let ctl = null;
+        if (f.kind === "tri") {
+            ctl = document.createElement("select");
+            for (const [v, txt] of [["auto", "跟随启动参数"], ["true", "强制开"], ["false", "强制关"]]) {
+                ctl.append(new Option(txt, v));
+            }
+            ctl.value = draft[f.key] === true ? "true" : draft[f.key] === false ? "false" : "auto";
+        } else if (f.kind === "sel") {
+            ctl = document.createElement("select");
+            for (const [v, txt] of (f.opts || [])) ctl.append(new Option(txt, v));
+            ctl.value = String(draft[f.key] ?? (f.opts && f.opts[0][0]) ?? "");
+        } else if (f.kind === "bool") {
+            ctl = document.createElement("input");
+            ctl.type = "checkbox";
+            ctl.checked = !!draft[f.key];
+        } else {
+            ctl = document.createElement("input");
+            ctl.type = "number";
+            ctl.value = String(draft[f.key] ?? 0);
+            ctl.style.width = "72px";
+        }
+        ctl.disabled = !on;
+        ctl.onchange = () => {
+            if (f.kind === "tri") {
+                const v = ctl.value;
+                draft[f.key] = v === "true" ? true : v === "false" ? false : "auto";
+            } else if (f.kind === "bool") {
+                draft[f.key] = ctl.checked;
+            } else if (f.kind === "num") {
+                draft[f.key] = Number(ctl.value) || 0;
+            } else {
+                draft[f.key] = ctl.value;
+            }
+            if (on) push();
+        };
+        row.append(ctl);
+        if (f.hint) row.append(el("span", "h3d-secs-hint", f.hint));
+        secSet.append(row);
+    }
+    const statusRow = el("div", "h3d-setrow");
+    statusRow.append(status);
+    secSet.append(statusRow);
+    pane.append(secSet);
+}
+
 /* 提示词优化设置面板（结构对齐参考项目，请求仍走自研 /h3chain 后端）。
  * Key 随导演台状态保存，分享前请清空。 */
 async function openOptSettings(node, onSaved) {
@@ -7283,6 +7418,27 @@ function buildCards(data) {
                 optBar.append(bOptSet, el("span", "h3d-secs-hint",
                     "全链共用：服务商 / 输出语言 / 规则文件（本段参数在「锚定设置」页）"));
                 body.append(optBar);
+            }
+            /* ⚙ 性能优化也放**三页之外**的公共区：它是**机器级**设置（这台卡多大、
+             * 内存多少），跟本段的锚定参数不是一回事，也不是项目数据 ——
+             * 展开时才拉后端（避免每张段卡渲染都发一次请求）。 */
+            if (node && window.H3Api && window.H3Api.perfGet) {
+                const perfBar = el("div", "h3d-optsetbar");
+                const bPerf = el("button", "h3d-btn", "⚙ 性能优化");
+                bPerf.type = "button";
+                bPerf.title = "性能优化设置（Upcast Attention / 素材库索引 / 缩略图 / 分块）——"
+                    + "全局共用，不是本段设置";
+                const perfPane = el("div", "h3d-setsec");
+                perfPane.style.display = "none";
+                let perfLoaded = false;
+                bPerf.onclick = async () => {
+                    if (perfPane.style.display !== "none") { perfPane.style.display = "none"; return; }
+                    perfPane.style.display = "";
+                    if (!perfLoaded) { perfLoaded = true; await paintPerfPane(perfPane); }
+                };
+                perfBar.append(bPerf, el("span", "h3d-secs-hint",
+                    "全局：显存 / 内存 / 素材库 / 分块（不是本段设置）"));
+                body.append(perfBar, perfPane);
             }
             /* 三栏各自独立的引用条：意图 / 剧本 / 结果 各一条，谁也不改谁。
              * 唯一的引用条直接进模型（ds.prompts + seg.refs，走官方 9/3/3）；

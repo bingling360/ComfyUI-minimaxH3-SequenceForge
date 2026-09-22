@@ -211,6 +211,11 @@
      * （前端据此画「第 i/N 段」的整条进度）。 */
     optimizeMultiStream: (payload, onEvent, opts) =>
       _postStream("/h3chain/optimize_multi_stream", payload, onEvent, opts),
+    /* ---- 性能设置（全局，跨项目）----
+     * 真源在后端 perf.py：DEFAULT_PERF / parse_state / apply_runtime。
+     * 前端不自己算档位，只做开关 + 显示后端给的只读诊断。 */
+    perfGet: () => _call("/h3chain/perf"),
+    perfSet: (perf) => _json("POST", "/h3chain/perf", { perf: perf || {} }),
     /* ---- 素材库（Library）：一个浏览器 + 四个 scope ---- */
     libList: (p) => _call("/h3chain/lib_list?" + _qs(p)),
     libItem: (p) => _call("/h3chain/lib_item?" + _qs(p)),

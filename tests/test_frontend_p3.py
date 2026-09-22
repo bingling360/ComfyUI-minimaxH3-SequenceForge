@@ -94,7 +94,8 @@ def routes(projects, store, checkpoint):
                       ("from . import transcode_queue", "import transcode_queue"),
                       ("from . import checkpoint as _ckpt", "import checkpoint as _ckpt"),
                       ("from . import prompts as _prompts", "import prompts as _prompts"),
-                      ("from . import library as h3lib", "import library as h3lib")])
+("from . import library as h3lib", "import library as h3lib"),
+                      ("from . import perf", "import perf")])
 
 
 class _Router:

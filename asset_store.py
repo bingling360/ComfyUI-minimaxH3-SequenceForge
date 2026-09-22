@@ -365,6 +365,33 @@ def save_library(root: str, manifest: dict) -> dict:
     return manifest
 
 
+def _prewarm_thumb(dest_abs, asset_id, kind):
+    """入库即生成缩略图（`library.THUMB_ON_IMPORT`）：把全尺寸解码从浏览期搬到入库期。
+
+    为什么：见 `library.make_thumb` 的实测 —— 6000x4000 JPEG 单张解码峰值 193 MB，
+    攒到「首次浏览时才生成」会让 RSS 阶梯式上涨且不易回落（用户报的「素材多了内存涨」）。
+    放到入库时算一次，之后浏览全程只是读磁盘上的小 JPEG。
+    代价是上传多花一点时间，所以给 `THUMB_ON_IMPORT` 开关。
+
+    延迟 import：library 依赖 asset_store（scan_scope 里 import 它），
+    顶层互相 import 会成环。失败一律静默 —— 缩略图缺失前端会回落类型图标。
+    """
+    if kind != "image":
+        return ""
+    try:
+        import importlib
+        mod = f"{__package__}.library" if __package__ else "library"
+        lib = importlib.import_module(mod)
+    except Exception:
+        return ""
+    try:
+        if not getattr(lib, "THUMB_ON_IMPORT", False):
+            return ""
+        return lib.make_thumb(dest_abs, None, str(asset_id), "image")
+    except Exception:
+        return ""
+
+
 def register_content(root: str, src_path: str, kind, tags=None, desc="",
                      orig_name=None) -> dict:
     """文件入库全局库：sha256 内容寻址拷贝 + manifest 登记（秒传：同 sha 直接返回）。
@@ -429,6 +456,7 @@ def register_content(root: str, src_path: str, kind, tags=None, desc="",
              "desc": str(desc or "")[:500], "created_at": now, "updated_at": now}
     manifest["assets"].append(entry)
     save_library(root, manifest)
+    _prewarm_thumb(dest, aid, kind)
     return entry
 
 

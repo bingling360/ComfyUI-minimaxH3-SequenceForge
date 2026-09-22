@@ -462,6 +462,14 @@
     return t;
   }
 
+  /* 瓦片上除了缩略图/视频之外要留住的东西：类型图标 + 角色角标 + 星级。
+   * replaceChildren 会一并抹掉，每次「加载 / 卸载」都要把它们带回来。 */
+  function tileKeepers(d) {
+    return [...d.children].filter((n) => n.classList && (
+      n.classList.contains("h3l-ico") || n.classList.contains("h3l-role")
+      || n.classList.contains("h3l-star")));
+  }
+
   function renderGrid() {
     if (io) io.disconnect();
     S.grid.replaceChildren();
@@ -470,28 +478,36 @@
         S.q ? "没有匹配的素材" : "这里还没有素材：把文件拖进来，或用「上传」按钮"));
       return;
     }
-    // 懒加载：缩略图进入视野才发请求（图片走服务端缩略图，视频只解码首帧）
+    /* 懒加载 **+ 离屏卸载**：进视野才发请求，出视野就把 img/video 摘掉。
+     *
+     * 为什么必须卸载：浏览器会把解码后的位图常驻（256px 缩略图约 260KB，
+     * 视频 <video> 还要拖着一段已缓冲的原文件）。而「加载更多」是 append 模式
+     * —— S.items 只增不减，翻十页就是 600 张常驻，浏览器内存一路涨不下��，
+     * 这正是「素材一多就卡」的前端那一半。
+     *
+     * 卸载只摘 img/video，瓦片 DOM、data-* 、勾选状态全保留，滚回去会重新加载。 */
     io = new IntersectionObserver((entries) => {
       for (const en of entries) {
-        if (!en.isIntersecting) continue;
         const d = en.target;
-        io.unobserve(d);
+        const keep = tileKeepers(d);
+        if (!en.isIntersecting) {
+          if (d.querySelector("img,video")) d.replaceChildren(...keep);
+          continue;
+        }
+        // 已加载就别重复发请求（滚动抖动会连续触发）；失败过的也不再重试
+        if (d.querySelector("img,video") || d.dataset.thumbFail === "1") continue;
         const kind = d.dataset.kind;
-        // 角标（角色标注）是建瓦片时就挂上的，replaceChildren 会一并抹掉 —— 留住
-        const badges = [...d.children].filter(
-          (n) => n.classList && (n.classList.contains("h3l-role")
-            || n.classList.contains("h3l-star")));
         if (kind === "image") {
           const im = document.createElement("img");
           im.loading = "lazy";
           im.src = d.dataset.thumb;
-          im.onerror = () => { im.remove(); };
-          d.replaceChildren(im, ...badges);
+          im.onerror = () => { im.remove(); d.dataset.thumbFail = "1"; };
+          d.replaceChildren(im, ...keep);
         } else if (kind === "video") {
           const v = document.createElement("video");
           v.muted = true; v.preload = "metadata"; v.src = d.dataset.src;
-          v.onerror = () => v.remove();
-          d.replaceChildren(v, ...badges);
+          v.onerror = () => { v.remove(); d.dataset.thumbFail = "1"; };
+          d.replaceChildren(v, ...keep);
         }
       }
     }, { root: S.grid, rootMargin: "240px" });

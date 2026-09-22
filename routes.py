@@ -32,6 +32,7 @@ from aiohttp import web
 from folder_paths import get_output_directory
 
 from . import library as h3lib
+from . import perf
 from . import projects
 
 _registered = False
@@ -84,6 +85,8 @@ ROUTES = [
     ("POST", "/h3chain/optimize_multi"),
     ("POST", "/h3chain/vram_cleanup"),
     ("POST", "/h3chain/expand_validate"),
+    ("GET", "/h3chain/perf"),
+    ("POST", "/h3chain/perf"),
     ("GET", "/h3chain/lib_list"),
     ("GET", "/h3chain/lib_item"),
     ("GET", "/h3chain/lib_thumb"),
@@ -1535,7 +1538,9 @@ def add_routes(routes):
     async def lib_thumb(request):
         q = request.query
         dir_name = str(q.get("dir") or "")
-        it = _find_item(dir_name, str(q.get("id") or ""))
+        # 缩略图只需要 scope/file/linked 三个字段来定位文件 —— 走 find_by_id 快路径，不再为每张缩略图
+        # 跑一遍 _indexed() 的全量管线（见 library.find_by_id 的实测表）。
+        it = h3lib.find_by_id(dir_name, str(q.get("id") or ""))
         if it is None:
             return _err("素材不存在", code="NOT_FOUND", status=404)
         src = h3lib.resolve_item_path(it, dir_name)
@@ -1551,7 +1556,9 @@ def add_routes(routes):
         """原文件流：默认 inline（预览用）；`download=1` 带 attachment 头触发另存为。"""
         q = request.query
         dir_name = str(q.get("dir") or "")
-        it = _find_item(dir_name, str(q.get("id") or ""))
+        # 原图流同样只需要定位文件 —— 走 find_by_id 快路径，不再为每次请求
+        # 跑一遍 _indexed() 的全量管线（见 library.find_by_id 的实测表）。
+        it = h3lib.find_by_id(dir_name, str(q.get("id") or ""))
         if it is None:
             return _err("素材不存在", code="NOT_FOUND", status=404)
         src = h3lib.resolve_item_path(it, dir_name)
@@ -1562,6 +1569,40 @@ def add_routes(routes):
             return web.FileResponse(src, headers={
                 "Content-Disposition": f'attachment; filename="{fn}"'})
         return web.FileResponse(src)
+
+    async def perf_get(request):
+        """性能设置：读全局设置 + 硬件探测 + 当前生效值（面板的唯一数据来源）。"""
+        table = perf.load_settings()
+        hw = None
+        try:
+            hw = perf.probe_hardware()
+        except Exception:
+            hw = None
+        return web.json_response({
+            "ok": True, "data": table,
+            "applied": perf.apply_runtime(table),
+            "wired": list(perf.WIRED_KEYS),
+            "hw": hw,
+            "report": perf.report_line(hw) if isinstance(hw, dict) else "",
+            "upcast": perf.upcast_attention_state(),
+        })
+
+    async def perf_set(request):
+        """性能设置：写全局设置并立即应用到当前进程。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        raw = (data or {}).get("perf")
+        if not isinstance(raw, dict):
+            return _err("缺少 perf 对象", code="BAD_REQUEST", status=400)
+        table = perf.save_settings(raw)
+        if table is None:
+            return _err("无法写入性能设置（用户目录不可用）", code="NO_DIR", status=500)
+        return web.json_response({"ok": True, "data": table,
+                                  "applied": perf.apply_runtime(table),
+                                  "wired": list(perf.WIRED_KEYS),
+                                  "upcast": perf.upcast_attention_state()})
 
     async def lib_status(request):
         dir_name = str(request.query.get("dir") or "")
@@ -2527,6 +2568,8 @@ def add_routes(routes):
 
     handlers = [
         ("GET", "/h3chain/ping", ping),
+        ("GET", "/h3chain/perf", perf_get),
+        ("POST", "/h3chain/perf", perf_set),
         ("GET", "/h3chain/lib_list", lib_list),
         ("GET", "/h3chain/lib_item", lib_item),
         ("GET", "/h3chain/lib_thumb", lib_thumb),

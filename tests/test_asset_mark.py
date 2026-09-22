@@ -89,7 +89,8 @@ def routes(projects, store, checkpoint):
                       ("from . import asset_hub", "import asset_hub"),
                       ("from . import asset_store", "import asset_store"),
                       ("from . import prompts as _prompts", "import prompts as _prompts"),
-                      ("from . import library as h3lib", "import library as h3lib")])
+("from . import library as h3lib", "import library as h3lib"),
+                      ("from . import perf", "import perf")])
 
 
 # ---- 标注原语 ----

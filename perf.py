@@ -105,9 +105,24 @@ DEFAULT_PERF = {
     "guard_offload_target": True,
     "offload_guard_ratio": DEFAULT_GUARD_RATIO,
 
+    # ComfyUI 运行时开关（**节点端适配，不动启动参数**）
+    "upcast_attention": "auto",   # auto=跟随启动参数；True/False=强制开/关
+    "vram_shuffle": "auto",       # 精化前腾挪强度：auto / off / soft / full（接线中）
+
+    # 素材库
+    "index_mode": "fingerprint",  # fingerprint（目录指纹）/ ttl（3 秒硬过期）
+    "thumb_on_import": True,      # 入库即生成缩略图
+    "thumb_max_mp": 40,           # 缩略图源图解码上限（百万像素）
+
     # 诊断
     "probe": False,
 }
+
+# 本轮**已接线**的键（改了立刻生效）。其余键先落盘保存，面板上标「接线中」，
+# 免得用户以为勾了就有用 —— 列出未接线的开关是最容易挨骂的一种坑。
+WIRED_KEYS = (
+    "upcast_attention", "index_mode", "thumb_on_import", "thumb_max_mp",
+)
 
 # 自动策略表（§7）—— 只列两场景有差异的项，其余沿用 DEFAULT_PERF。
 # ⚠ 这是**建议值不是强制值**：面板必须允许逐项覆盖（resolve_perf 的 overrides）。
@@ -170,6 +185,13 @@ PERF_TYPES = {
     # 磁盘 / swap 守卫
     "guard_offload_target": (bool,),
     "offload_guard_ratio": (int, float),
+    # ComfyUI 运行时开关
+    "upcast_attention": (bool, "auto"),
+    "vram_shuffle": (str,),
+    # 素材库
+    "index_mode": (str,),
+    "thumb_on_import": (bool,),
+    "thumb_max_mp": (int, float),
     # 诊断
     "probe": (bool,),
 }
@@ -449,6 +471,155 @@ def report_line(hw, profile=None):
             f" · R_m {'?' if rm is None else f'{rm:.2f}'}"
             f" · 档位 {PROFILE_LABELS.get(prof, prof)}"
             f" · 平台 {hw.get('os') or '?'}")
+
+
+# ============================ 运行时控制（会改进程状态） ============================
+
+# 启动时的 upcast attention 原值，"auto" 靠它还原（运行时改过之后就读不到原值了）
+_UPCAST_BOOT = {}
+
+
+def upcast_attention_state():
+    """当前 upcast attention 的实际状态（只读镜像）；量不到 → None。
+
+    ComfyUI 把它当**模块级常量**用（comfy/ldm/modules/attention.py:78）：
+        FORCE_UPCAST_ATTENTION_DTYPE = model_management.force_upcast_attention_dtype()
+        get_attn_precision(): if args.dont_upcast_attention: return None
+    所以运行时改这两处即可生效 —— 不需要重启、不需要动启动参数。
+    """
+    try:
+        from comfy import cli_args  # type: ignore
+        import comfy.ldm.modules.attention as attn  # type: ignore
+        a = cli_args.args
+        forced = bool(getattr(a, "force_upcast_attention", False))
+        dont = bool(getattr(a, "dont_upcast_attention", False))
+        cur = getattr(attn, "FORCE_UPCAST_ATTENTION_DTYPE", None)
+        return {"cli_force_upcast": forced, "cli_dont_upcast": dont,
+                "module_dtype": None if cur is None else str(cur),
+                "effective": bool(cur) and not dont}
+    except Exception:
+        return None
+
+
+def apply_upcast_attention(value):
+    """运行时开关 upcast attention（不动启动参数）——见 upcast_attention_state 的机制说明。
+
+    value：`True` / `False` / `"auto"`（还原到进程启动时的设定）。
+    返回实际生效值；环境不支持返回 None。
+
+    取舍：开着（fp32 attention）在某些卡上更稳（老 macOS 有黑图 bug），
+    代价是显存与耗时都上去；12 GB 这类小卡通常关掉更划算。
+    **这是收益/代价都真实存在的选项，所以交给用户选，不替他决定。**
+    """
+    global _UPCAST_BOOT
+    try:
+        from comfy import cli_args  # type: ignore
+        import comfy.ldm.modules.attention as attn  # type: ignore
+        import comfy.model_management as mm  # type: ignore
+    except Exception:
+        return None
+    a = cli_args.args
+    if not _UPCAST_BOOT:
+        _UPCAST_BOOT = {"force": bool(getattr(a, "force_upcast_attention", False)),
+                        "dont": bool(getattr(a, "dont_upcast_attention", False))}
+    if value in (None, "auto"):
+        b = _UPCAST_BOOT
+        setattr(a, "force_upcast_attention", b["force"])
+        setattr(a, "dont_upcast_attention", b["dont"])
+        attn.FORCE_UPCAST_ATTENTION_DTYPE = mm.force_upcast_attention_dtype()
+        return None if attn.FORCE_UPCAST_ATTENTION_DTYPE is None else True
+    if bool(value):
+        setattr(a, "dont_upcast_attention", False)
+        setattr(a, "force_upcast_attention", True)
+        attn.FORCE_UPCAST_ATTENTION_DTYPE = mm.force_upcast_attention_dtype()
+        return True
+    setattr(a, "dont_upcast_attention", True)
+    attn.FORCE_UPCAST_ATTENTION_DTYPE = None
+    return False
+
+
+def apply_runtime(table):
+    """把 perf 表里**已接线**的项应用到当前进程 -> {键: 实际生效值}。
+
+    只动 WIRED_KEYS 里的键；其余键只落盘不生效（面板标「接线中」）。
+    单项失败不影响其它项（返回里该键为 None）。
+    """
+    t = dict(table or {})
+    out = {}
+    out["upcast_attention"] = apply_upcast_attention(t.get("upcast_attention", "auto"))
+    try:
+        try:
+            from . import library  # type: ignore
+        except ImportError:
+            import library  # type: ignore
+        out["index_mode"] = library.set_index_mode(t.get("index_mode", "fingerprint"))
+        out["thumb_on_import"] = library.set_thumb_on_import(
+            t.get("thumb_on_import", True))
+        try:
+            mp = float(t.get("thumb_max_mp") or 0)
+            if mp > 0:
+                library.THUMB_MAX_PIXELS = int(mp * 1000000)
+        except (TypeError, ValueError):
+            pass
+        out["thumb_max_mp"] = library.THUMB_MAX_PIXELS / 1000000.0
+    except Exception:
+        pass
+    return out
+
+
+# ============================ 全局性能设置（跨项目落盘） ============================
+
+def settings_path():
+    """全局性能设置文件：<user>/minimax_h3/perf.json（与素材库同级，跨项目共用）。
+
+    性能设置是**机器相关**的（这台卡多大、内存多少），不是项目数据 ——
+    所以放全局而不是项目 manifest，换项目不该丢。
+    """
+    try:
+        try:
+            from . import asset_store  # type: ignore
+        except ImportError:
+            import asset_store  # type: ignore
+        root = ""
+        try:
+            root = asset_store.try_library_root() or ""
+        except Exception:
+            root = ""
+        if not root:
+            return ""
+        return os.path.join(os.path.dirname(root), "perf.json")
+    except Exception:
+        return ""
+
+
+def load_settings():
+    """读全局性能设置；读不到给一份默认副本。"""
+    p = settings_path()
+    if not p or not os.path.isfile(p):
+        return dict(DEFAULT_PERF)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return dict(DEFAULT_PERF)
+    return parse_state(raw)
+
+
+def save_settings(table):
+    """写全局性能设置（原子写）；路径不可用时返回 None。"""
+    p = settings_path()
+    if not p:
+        return None
+    clean = parse_state(dict(table or {}))
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".part"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(clean, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, p)
+    except Exception:
+        return None
+    return clean
 
 
 # ============================ 探测（best-effort，绝不抛） ============================

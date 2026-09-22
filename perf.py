@@ -97,6 +97,26 @@ DEFAULT_PERF = {
     "frames_to_cpu": "auto",
     "max_upscale_scale": 0,        # 0 = 不限
 
+    # 显存：分块（按画质风险递增排列：FFN=无 → 时序=低 → 空间 tile=中高）
+    "ff_chunk_tokens": 0,          # 0 = 关；>0 = 每块 token 数（数学等价，零画质损失）
+    "attn_backend": "auto",        # auto / sdpa / sage / flash（auto = 沿用 ComfyUI 选定）
+    "upscale_temporal_chunk": True,   # 放大网络 3D 时序分块（内部已实现，此前硬编码为开）
+    "upscale_chunk_frames": 32,       # 放大网络时序分块帧数（接线中：网络只收开关，不收帧数）
+    "upscale_overlap": 5,             # 放大网络时序分块重叠帧（同上）
+    "refine_temporal_chunk": 0,       # 精化时序分块帧数（接线中：需 overlap≥8 latent token）
+    "refine_temporal_overlap": 8,     # 精化时序重叠帧
+    "refine_tile": "off",             # 精化空间分块 off / 2x2 / 3x3（实验：切断全局注意力）
+    "refine_tile_overlap": 16,        # 精化空间重叠像素
+
+    # 显存：峰值与自救
+    "oom_autoretry": True,         # 主干采样 OOM 自救（卸载 + 回收后原参重试一次）
+    "act_peak_probe": True,        # 量 LoRA / bypass 前向的**激活**峰值（权重 ComfyUI 已算到）
+    "keep_upscaler_resident": False,  # 放大网络整链只搬一次（别每段搬上搬下）
+
+    # 内存：成片合成
+    "final_mode": "auto",          # auto=能拼就拼 / stream=强制流式 / memory=强制内存帧
+    "frames_dtype": "float32",     # float32 / uint8（帧存内存 ×¼）
+
     # 内存
     "unload_upscaler_cache": "auto",
     "cond_cache_size": "auto",
@@ -104,6 +124,11 @@ DEFAULT_PERF = {
     # 磁盘 / swap 守卫（场景 A 必备）
     "guard_offload_target": True,
     "offload_guard_ratio": DEFAULT_GUARD_RATIO,
+    "guard_action": "warn",        # warn=只报 / block=critical 时禁止全卸
+
+    # 编码（耗时收益有限：557 帧实测只要 13s，主要省 CPU 占用）
+    "encoder": "auto",             # auto / libx264 / h264_nvenc / hevc_nvenc
+    "nvenc_cq": 20,                # NVENC 恒定质量（对应 x264 的 crf）
 
     # ComfyUI 运行时开关（**节点端适配，不动启动参数**）
     "upcast_attention": "auto",   # auto=跟随启动参数；True/False=强制开/关
@@ -122,6 +147,10 @@ DEFAULT_PERF = {
 # 免得用户以为勾了就有用 —— 列出未接线的开关是最容易挨骂的一种坑。
 WIRED_KEYS = (
     "upcast_attention", "index_mode", "thumb_on_import", "thumb_max_mp",
+    # 2026-09-23 第二批：显存自救 / 分块 / 成片内存 / 编码
+    "oom_autoretry", "act_peak_probe", "ff_chunk_tokens", "attn_backend",
+    "upscale_temporal_chunk", "keep_upscaler_resident", "vram_shuffle",
+    "final_mode", "frames_dtype", "guard_action", "encoder", "nvenc_cq",
 )
 
 # 自动策略表（§7）—— 只列两场景有差异的项，其余沿用 DEFAULT_PERF。
@@ -179,12 +208,33 @@ PERF_TYPES = {
     "decode_chunk_frames": (int,),
     "frames_to_cpu": (bool, "auto"),
     "max_upscale_scale": (int, float),
+    # 显存：分块
+    "ff_chunk_tokens": (int,),
+    "attn_backend": (str,),
+    "upscale_temporal_chunk": (bool,),
+    "upscale_chunk_frames": (int,),
+    "upscale_overlap": (int,),
+    "refine_temporal_chunk": (int,),
+    "refine_temporal_overlap": (int,),
+    "refine_tile": (str,),
+    "refine_tile_overlap": (int,),
+    # 显存：峰值与自救
+    "oom_autoretry": (bool,),
+    "act_peak_probe": (bool,),
+    "keep_upscaler_resident": (bool,),
+    # 内存：成片合成
+    "final_mode": (str,),
+    "frames_dtype": (str,),
     # 内存
     "unload_upscaler_cache": (bool, "auto"),
     "cond_cache_size": (int, "auto"),
     # 磁盘 / swap 守卫
     "guard_offload_target": (bool,),
     "offload_guard_ratio": (int, float),
+    "guard_action": (str,),
+    # 编码
+    "encoder": (str,),
+    "nvenc_cq": (int,),
     # ComfyUI 运行时开关
     "upcast_attention": (bool, "auto"),
     "vram_shuffle": (str,),
@@ -402,6 +452,138 @@ def resolve_auto(value, profile, cloud_value, local_value):
     return cloud_value if profile == PROFILE_CLOUD else local_value
 
 
+def guard_allows_unload(hw, action="warn", ratio=DEFAULT_GUARD_RATIO):
+    """落盘守卫**接行为**：critical 且 action="block" 时禁止全卸。
+
+    `offload_guard()` 只报数不改行为，这里才是「守卫说不能卸 → 调用方真的别卸」
+    的那一环。为什么需要它：D4 里 Linux 无 swap 的机器上，一次
+    `unload_all_models()` 会把几十 GB 权重瞬间推给内存，OS 收不下就是
+    **OOM killer SIGKILL**——连 except 都跑不到。与其崩，不如不卸。
+
+    返回 (allowed, guard_dict)；guard_dict 同 `offload_guard()`。
+    """
+    g = offload_guard(hw, ratio)
+    if str(action or "warn").lower() == "block" and g.get("level") == "critical":
+        return False, g
+    return True, g
+
+
+# ---- 编码档位 ----
+#
+# 诚实结论（见 docs/性能优化设置_规划_2026-09-22.md §C 组）：**编码不是瓶颈**
+# ——557 帧实测只要 13 秒。NVENC 的真实收益是 CPU 占用（x264 会打满核数×1.5
+# 个线程），不是耗时、更不是内存（帧最终仍要落 CPU 进编码器）。故默认 auto
+# = 沿用 libx264，NVENC 交给用户按自己的机器选。
+ENCODERS = ("auto", "libx264", "h264_nvenc", "hevc_nvenc")
+_NVENC = ("h264_nvenc", "hevc_nvenc")
+
+
+def resolve_encoder(name, cq=20, crf=20):
+    """编码器名 + 质量档 -> (codec, options_片段)；不认识的都回落 libx264。
+
+    纯函数：NVENC 用 `cq`（恒定质量，语义对应 x264 的 crf），x264 用 `crf`。
+    两者**不是**同一个旋钮（NVENC 不认 crf、x264 不认 cq），传错就是静默忽略
+    质量档——所以这里显式分流，而不是把 crf 原样塞给 NVENC。
+    """
+    n = str(name or "auto").strip().lower()
+    if n in ("", "auto", "x264", "libx264"):
+        return "libx264", {"crf": str(int(crf))}
+    if n in _NVENC:
+        return n, {"cq": str(int(cq))}
+    return "libx264", {"crf": str(int(crf))}
+
+
+# ---- FFN 分块 ----
+
+def plan_ff_chunks(tokens, chunk_tokens):
+    """把 `tokens` 个 token 按 `chunk_tokens` 切块 -> 边界列表 [[s,e), ...]。
+
+    chunk_tokens<=0 / 非法 -> **单块**（等价于不分块）；tokens<=0 -> []。
+    纯函数，零 torch 依赖：接线端（upscale/nodes）只拿边界，自己切片。
+
+    为什么分块能救 OOM：主干 OOM 实测崩在 FFN 的 `F.linear(x, down)`（rank256
+    中间张量）+ `F.linear(…, up)`（满 hidden 输出），**单次请求 6.13GB**。
+    这两步沿 token 维完全可分离 —— 切块后每块的中间张量降到 1/n，
+    数学结果与不分块逐位相同（**唯一**的有代价项只是 GPU 利用率略降）。
+    """
+    try:
+        n = int(tokens)
+        c = int(chunk_tokens)
+    except (TypeError, ValueError):
+        return [(0, 0)]
+    if n <= 0:
+        return []
+    if c <= 0:
+        return [(0, n)]
+    out = []
+    for s in range(0, n, c):
+        out.append((s, min(n, s + c)))
+    return out
+
+
+# ---- OOM 自救 ----
+
+def is_oom_error(exc):
+    """是不是显存不足（duck-typed，**不 import torch**，故本模块仍零依赖）。
+
+    判类型名（torch.OutOfMemoryError）而不是 isinstance(torch.OutOfMemoryError)——
+    后者会逼 perf.py 依赖 torch，破坏「纯函数、可在无 GPU 环境单测」的前提。
+    兜底看消息：CUDA / ROCm / MPS 的 OOM 文案都含 "out of memory"，
+    cuBLAS 那一路是 "CUBLAS_STATUS_ALLOC_FAILED"（它不走 torch 的 OOM 类型）。
+    """
+    if exc is None:
+        return False
+    try:
+        if type(exc).__name__ in ("OutOfMemoryError", "OutOfMemoryException"):
+            return True
+    except Exception:
+        pass
+    msg = str(getattr(exc, "args", exc) or exc) or ""
+    low = msg.lower()
+    return ("out of memory" in low
+            or "cublas_status_alloc_failed" in low
+            or "cudnn_status_alloc_failed" in low
+            or "mps backend out of memory" in low)
+
+
+def oom_retry(fn, cleanup=None, tries=2, on_retry=None):
+    """OOM 自救：捕获 OOM → `cleanup()` → **原参**重试；仍 OOM 才上抛最后一次。
+
+    返回 `(结果, 自救次数)`——自救次数 0 = 一次过，>0 = 真的救回来了一次
+    （这个数字是要打进报告的：它能证明「这段是靠自救活下来的」）。
+
+    为什么必须**原参**重试（不改步数/画布/帧数）：自救的目的是确认「这次 OOM
+    是显存碎片/残留引用导致的偶发，还是规格真的超了」。降规格重试能救活的
+    那次会掩盖后者，用户下次换个段照样炸，且不知道是自己规格开大了。
+    救不回来时由调用方给可行动的中文报错（降画布/降帧数），那才是正解。
+
+    `cleanup` 由调用方给（各腾挪点的卸载口径不同：有的全卸、有的只卸放大网络），
+    本模块因此不必知道 comfy 的存在。cleanup 自己抛不算故障（吞掉继续）。
+    """
+    n = max(1, int(tries or 1))
+    last = None
+    for i in range(n):
+        try:
+            return fn(), i
+        except Exception as e:              # 只拦 OOM，其余原样上抛
+            if not is_oom_error(e):
+                raise
+            last = e
+            if i + 1 >= n:
+                break
+            if on_retry is not None:
+                try:
+                    on_retry(i + 1, e)
+                except Exception:
+                    pass
+            if cleanup is not None:
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+    raise last
+
+
 def parse_state(raw):
     """归一化前端/存档里读到的 perf 片段（阶段 1 面板写回同一入口）。
 
@@ -538,6 +720,66 @@ def apply_upcast_attention(value):
     return False
 
 
+def attn_backend_state():
+    """当前 attention 后端名（只读镜像）；量不到 → None。"""
+    try:
+        import comfy.ldm.modules.attention as attn  # type: ignore
+        fn = getattr(attn, "optimized_attention", None)
+        name = getattr(fn, "__name__", None)
+        return {"current": name or None}
+    except Exception:
+        return None
+
+
+_ATTN_BOOT = {}
+
+
+def apply_attn_backend(name):
+    """运行时切 attention 后端（"auto" = 还原到进程启动时的那个）。
+
+    返回实际生效的函数名；环境里没有该后端 → **None 且保持现状**。
+
+    ⚠ 为什么「换不了就别换」而不是报错：SageAttention 在 30 系上有失败报告
+    （部分 head dim / dtype 组合没有内核），换过去若它在前向里抛，整段就没了。
+    拿不到候选函数就原地不动，比把 `optimized_attention` 置成 None 安全得多
+    ——置空等于让所有 attention 走最慢的 fallback 或直接崩。
+    """
+    n = str(name or "auto").strip().lower()
+    try:
+        import comfy.ldm.modules.attention as attn  # type: ignore
+    except Exception:
+        return None
+    global _ATTN_BOOT
+    if not _ATTN_BOOT:
+        _ATTN_BOOT["fn"] = getattr(attn, "optimized_attention", None)
+    if n in ("", "auto"):
+        fn = _ATTN_BOOT.get("fn")
+        if fn is None:
+            return None
+        attn.optimized_attention = fn
+        return getattr(fn, "__name__", None)
+    cand = None
+    for attr in ("attention_" + n, n + "_attention", n):
+        c = getattr(attn, attr, None)
+        if callable(c):
+            cand = c
+            break
+    if cand is None:
+        return None
+    attn.optimized_attention = cand
+    return getattr(cand, "__name__", None)
+
+
+# 渲染期消费的键：改了不立刻动进程状态，而是在下一次渲染时由 nodes/upscale
+# 读 `load_settings()` 生效。面板把它们算作「已接线」，但 apply_runtime 只能
+# 回声存下来的值——这点必须在 UI 上说清，否则用户会以为点了没反应。
+RUNTIME_LATER_KEYS = (
+    "oom_autoretry", "act_peak_probe", "ff_chunk_tokens",
+    "upscale_temporal_chunk", "keep_upscaler_resident", "vram_shuffle",
+    "final_mode", "frames_dtype", "guard_action", "nvenc_cq",
+)
+
+
 def apply_runtime(table):
     """把 perf 表里**已接线**的项应用到当前进程 -> {键: 实际生效值}。
 
@@ -547,6 +789,19 @@ def apply_runtime(table):
     t = dict(table or {})
     out = {}
     out["upcast_attention"] = apply_upcast_attention(t.get("upcast_attention", "auto"))
+    out["attn_backend"] = apply_attn_backend(t.get("attn_backend", "auto"))
+    # 编码器：写进 media 的进程级默认（下一次编码生效；正在跑的编码不受影响）
+    try:
+        try:
+            from . import media  # type: ignore
+        except ImportError:
+            import media  # type: ignore
+        out["encoder"] = media.set_encoder(t.get("encoder", "auto"),
+                                           t.get("nvenc_cq", 20))
+    except Exception:
+        out["encoder"] = None
+    for k in RUNTIME_LATER_KEYS:
+        out[k] = t.get(k)
     try:
         try:
             from . import library  # type: ignore
@@ -603,6 +858,31 @@ def load_settings():
     except Exception:
         return dict(DEFAULT_PERF)
     return parse_state(raw)
+
+
+# 渲染路径读设置的缓存：按 mtime 失效。
+#
+# 为什么需要它：一批设置（oom_autoretry / frames_dtype / final_mode / vram_shuffle…）
+# 是**渲染期**消费的，段循环里每段都会问一次。每段读一次 JSON 不算贵，但段数
+# 一多就是几十次无谓的磁盘 IO，而且中途用户在面板改了设置也应当立刻被看到
+# ——mtime 变了就重读，两件事都满足。
+_SETTINGS_CACHE = {"mtime": None, "table": None}
+
+
+def current_settings(refresh=False):
+    """渲染路径读设置（带 mtime 缓存）；返回**副本**，调用方改它不污染缓存。"""
+    p = settings_path()
+    try:
+        mt = os.path.getmtime(p) if (p and os.path.isfile(p)) else None
+    except OSError:
+        mt = None
+    if (not refresh and _SETTINGS_CACHE["table"] is not None
+            and _SETTINGS_CACHE["mtime"] == mt):
+        return dict(_SETTINGS_CACHE["table"])
+    t = load_settings()
+    _SETTINGS_CACHE["mtime"] = mt
+    _SETTINGS_CACHE["table"] = dict(t)
+    return dict(t)
 
 
 def save_settings(table):
@@ -1168,6 +1448,109 @@ def weight_bytes(obj):
         return total or None
     except Exception:
         return None
+
+
+def _tensor_bytes(t):
+    """单个张量的字节数（duck-typed）；不是张量 → 0。"""
+    n = getattr(t, "numel", None)
+    es = getattr(t, "element_size", None)
+    if callable(n) and callable(es):
+        try:
+            return int(n()) * int(es())
+        except Exception:
+            return 0
+    return 0
+
+
+def _patch_bytes(patch, _seen=None):
+    """一条 LoRA patch 里的张量字节合计。
+
+    ComfyUI 的 `ModelPatcher.patches[key]` 是「补丁列表」，单层结构随来源变
+    （LoRA 是 `(strength, weights_dict, ...)`，DoRA/Wildcard 又不同），
+    所以这里**递归展开**容器直到撞见张量，而不是硬编码某一层下标——
+    硬编码下标在换一个补丁来源时就会静默算成 0，比不算更糟。
+    """
+    seen = set() if _seen is None else _seen
+    stack = [patch]
+    total = 0
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, (str, bytes, int, float, bool)) or cur is None:
+            continue
+        if id(cur) in seen:      # 补丁结构里可能有共享引用，防环也防重复计数
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, (list, tuple)):
+            stack.extend(cur)
+        else:
+            total += _tensor_bytes(cur)
+    return total
+
+
+def probe_lora_footprint(model):
+    """LoRA 权重账：**ComfyUI 算得到**的那部分（duck-typed，不 import torch）。
+
+    与 `weight_bytes(model)`（它优先 `model_size()`，把 patches 也算进去了）
+    交叉验证用：`model_size − 裸模型` 应当 ≈ 这里的 `lora_weight_gb`。
+    两边对不上说明有补丁没走 `patches`（比如自定义 adapter），值得报出来。
+
+    ⚠ 它**算不到** bypass 型 adapter 的**前向激活**——那才是真凶（D2 里单次
+    6.13GB）。激活只能靠 `watch_vram_peak()` 在第一步采样时实测，见
+    `lora_account_line()` 把两半账拼成一行。
+
+    返回 {"patch_groups", "patch_count", "lora_weight_gb"}；没有 patches 时
+    给全 0（不是 None——调用方要的是「没挂 LoRA」这个结论，不是「量不到」）。
+    """
+    patches = getattr(model, "patches", None)
+    if not isinstance(patches, dict) or not patches:
+        return {"patch_groups": 0, "patch_count": 0, "lora_weight_gb": 0.0}
+    total = 0
+    count = 0
+    for v in patches.values():
+        items = v if isinstance(v, (list, tuple)) else [v]
+        count += len(items)
+        for one in items:
+            total += _patch_bytes(one)
+    return {"patch_groups": len(patches), "patch_count": count,
+            "lora_weight_gb": round(total / GB, 2)}
+
+
+def suggest_act_reserve(act_peak_gb, safety=1.2):
+    """按实测激活峰值给「该给激活留多少空」的建议（GB）；量不到 → None。"""
+    try:
+        p = float(act_peak_gb)
+    except (TypeError, ValueError):
+        return None
+    if p <= 0:
+        return None
+    return round(p * float(safety or 1.2), 1)
+
+
+def lora_account_line(lora_weight_gb, patch_count, act_peak_gb=None, safety=1.2):
+    """把「LoRA 账」拼成一行（权重 + 实测激活 + 建议留空）。
+
+    `权重 +12.4GB（50 patches）· 实测单步激活峰值 6.1GB · 建议留空 ≥7.3GB`
+
+    为什么这一行必须存在：官方的 `model_size()` 只算权重，而 bypass adapter
+    的激活**不在任何账上**。用户看到「模型 31.7GB / 卡 23.5GB → 每步重读
+    9.3GB」会以为只是慢，实际是随时可能 OOM。把两半账写在一行，
+    「留空该留多少」才第一次有了数字依据。
+    """
+    try:
+        w = float(lora_weight_gb)
+    except (TypeError, ValueError):
+        w = 0.0
+    bits = [f"权重 +{w:.1f}GB（{int(patch_count or 0)} patches）"]
+    if act_peak_gb:
+        bits.append(f"实测单步激活峰值 {float(act_peak_gb):.1f}GB")
+        res = suggest_act_reserve(act_peak_gb, safety)
+        if res:
+            bits.append(f"建议留空 ≥{res:.1f}GB")
+    else:
+        bits.append("激活峰值未实测（开 act_peak_probe 后首次采样可得）")
+    return "LoRA 账：" + " · ".join(bits)
 
 
 @contextlib.contextmanager

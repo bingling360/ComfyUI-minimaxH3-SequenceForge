@@ -444,6 +444,116 @@ def _autosave_final(root, frames, wav, sample_rate, fps=24, crf=20, preset="very
         return None, err
 
 
+def _vram_used_gb():
+    """当前**设备级**显存占用（GB）；量不到 → None。
+
+    用 `mem_get_info`（total − free）而不是 `torch.cuda.memory_allocated()`：
+    后者只统计 torch 的 caching allocator，量不到 aimdo / DynamicVRAM 的权重池
+    ——在 24GB 卡跑 32GB 模型时它会报 0.43GB 这种假象（既有口径，见 perf 模块）。
+    """
+    try:
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            return float(total - free) / (1024.0 ** 3)
+    except Exception:
+        pass
+    return None
+
+
+def _vram_oom_cleanup():
+    """OOM 自救的腾挪动作：卸载驻留模型 → 回收 Python 残留 → 归还缓存块。
+
+    ⚠ 顺序不能反：`gc.collect()` 必须在 `empty_cache()` **之前**——引用还挂着
+    的 CUDA 块，empty_cache 收不回去（这正是「多段链后段比首段更容易 OOM」
+    的根因之一）。与 upscale 那套腾挪点同口径。
+    """
+    try:
+        import comfy.model_management as _mm
+
+        _mm.unload_all_models()
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _frames_to_uint8(frames_f):
+    """[N,H,W,3] float 0-1 -> uint8（帧存内存 ×¼）。"""
+    return frames_f.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+
+
+def _build_chain_images(parts, height, width, uint8=False):
+    """全链帧分片 -> 单张 [N,H,W,3] float32 IMAGE（**预分配 + 逐段填充**）。
+
+    为什么不用 `torch.cat`：cat 会新开一整块连续缓冲，而 `parts` 里的分片还
+    全被引用着 → 峰值 = **2× 全链帧**（D3 实测：8 段 ×107 帧 1312×736 时
+    9.9GB 变 19.8GB，再叠 31.7GB 常驻权重就是悬崖）。
+
+    预分配输出 + 逐段 `copy_` 的峰值是「输出 + 一个分片」。单看这一改只是
+    把 2× 变成 (1 + 1段/全链)×，真正的量级差在 `uint8` 分片：分片只占 ¼，
+    于是峰值 ≈ **1.25×** 而不是 2×。
+    """
+    n = sum(int(f.shape[0]) for f in parts)
+    if n <= 0 or not parts:
+        return torch.zeros(1, height, width, 3)
+    h, w = int(parts[0].shape[1]), int(parts[0].shape[2])
+    out = torch.empty((n, h, w, 3), dtype=torch.float32)
+    i = 0
+    for f in parts:
+        k = int(f.shape[0])
+        if not k:
+            continue
+        if uint8:
+            src = f.to(torch.float32)
+            src.div_(255.0)
+        else:
+            src = f          # 已 float32 且 0-1：直接 copy_，不做原地除法
+        out[i:i + k].copy_(src)
+        i += k
+    return out
+
+
+def _stream_final_basic(root, videos, skip_slots, crf=20, preset="veryfast",
+                        aq_mode=None, dither=False):
+    """基础分辨率成片：直接流式拼接分段 mp4 —— **全程不碰内存帧**。
+
+    返回 (path|None, error|None)。这是 D3 的正解：NLE 从不把整条时间线的
+    全分辨率 RGB 帧同时放在内存里，它们用「渲染结果落盘 + 流式拼接」。
+    `media.concat_av_mp4` 已经是流式的（帧不进 Python 累积，峰值≈单帧），
+    本函数只负责两个前置判据：分段齐不齐、文件在不在盘。
+
+    ⚠ 别指望 GPU 编码救内存：帧最终仍要落 CPU 侧进编码器。实测 557 帧编码
+    只要 13 秒——**编码从来不是瓶颈，内存才是**。
+    """
+    from . import media
+    try:
+        from . import checkpoint as _ckpt
+    except ImportError:
+        import checkpoint as _ckpt
+    skip = {int(s) for s in (skip_slots or [])}
+    srcs = []
+    for i, rel in enumerate(videos or []):
+        if i in skip:
+            continue
+        if not rel:
+            return None, f"段 {i + 1} 无分段 mp4（未开自动存档？）"
+        p = _ckpt.resolve_project_file(root, rel)
+        if not os.path.isfile(p):
+            return None, f"段 {i + 1} 的分段 mp4 缺失（{rel}）"
+        srcs.append(p)
+    if not srcs:
+        return None, "没有可拼接的分段 mp4"
+    out_name = f"final_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    out_path = os.path.join(_ckpt.finals_dir(root), out_name)
+    if media.concat_av_mp4(srcs, out_path, crf=crf, preset=preset,
+                           aq_mode=aq_mode, dither=dither):
+        return out_path, None
+    return None, media.last_error
+
+
 def _encode_audio_latent(audio_vae, audio, tokens):
     """AUDIO dict -> [1,32,2,T] latent，裁到与画面等长的 token 数。
 
@@ -953,6 +1063,24 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # P4g：画布「资产包」输入已删除（H3AssetBundle 一并下线）——素材唯一来源是
         # ds.ref_assets（导演台前端 poolFromManifest 写入）。
         ds_used = bool(ds)
+        # ---- 性能设置（**渲染期**消费的那一批）----
+        # 与 ds.perf 分开：性能设置是**机器相关**的（这台卡多大、内存多少），
+        # 全局落盘、跨项目共用，不进导演台状态。整链读一次（mtime 缓存），别每段读盘。
+        _pf = perf.current_settings()
+        _oom_autoretry = bool(_pf.get("oom_autoretry", True))
+        _act_peak_probe = bool(_pf.get("act_peak_probe", True))
+        _frames_uint8 = str(_pf.get("frames_dtype") or "float32").lower() == "uint8"
+        _final_mode = str(_pf.get("final_mode") or "auto").lower()
+        _act_first = [True]   # 激活峰值只在首段采样时量一次
+        # LoRA 权重的那一半账：ComfyUI 的 `model_size()` 把 patches 算进去了，
+        # 这里独立再算一遍是为了**交叉验证**（两边对不上说明有补丁没走 patches）。
+        try:
+            _lf0 = perf.probe_lora_footprint(模型)
+            if _lf0["patch_count"]:
+                print(f"[H3性能] {perf.lora_account_line(_lf0['lora_weight_gb'], _lf0['patch_count'])}",
+                      flush=True)
+        except Exception:
+            pass
         # ---- 内联转码任务（资产库"转latent"）：ds.transcode_jobs 非空则只跑转码，
         # 不跑链、不耗种子。任务由资产库面板写入 ds，提交即自动排队执行；
         # 队列中断在任务间隙生效（见 run_transcode_job 的 _interrupted）。
@@ -1318,6 +1446,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 分辨率整链运行（报告注明），不让每段反复撞同一个错。关闭时 up_cfg=None
         from . import upscale
         up_cfg = upscale.parse_state(ds)
+        if up_cfg:
+            # 性能设置 -> 二采 cfg（**只加不进指纹的键**：_hash_params 只认
+            # _PARAM_KEYS + 条件项，新增键不会让既有高清记录失效重做）。
+            # ① 放大网络 3D 时序分块：此前硬编码为开，这里把它变成可调开关
+            #    （关掉才会进指纹——那确实改变了输出的分块口径）。
+            up_cfg["chunk"] = bool(_pf.get("upscale_temporal_chunk", True))
+            # ② 放大网络别每段搬上搬下：整链只搬一次（日志里每段 3.7–8s × 8 段
+            #    ≈ 40–60s 纯腾挪）。默认 False = 沿用现状（每段卸）。
+            up_cfg["keep_upscaler_resident"] = bool(_pf.get("keep_upscaler_resident", False))
         up_net = None
         _up_err = None
         if up_cfg:
@@ -1804,6 +1941,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 只打一次，避免每段刷屏。
         _reload_logged = [False]
         _perf_logged = [False]
+        # 落盘守卫**接行为**：critical 且 guard_action=block → 禁止二采精化前的全卸
+        # （Linux 无 swap 时一次全卸就是 OOM killer SIGKILL，连 except 都跑不到）。
+        _guard_block = False
         # 阶段 0：硬件判据一行流（只在本次运行打一次）。
         # 放这儿而不是插件导入时：UNET / TE 的真实体量**只有拿到模型才算得出**，
         # 而 R_v / R_m 全靠它俩。量不到就显示 "?"，不编数字。
@@ -1818,6 +1958,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _guard_msg = _gd["message"] if not _gd["ok"] else ""
                 if _guard_msg:
                     print(f"[H3性能] 落盘守卫：{_guard_msg}", flush=True)
+                # 接行为：把「不能卸」这个结论交给二采（upscale.render_latent）
+                if str(_pf.get("guard_action") or "warn").lower() == "block":
+                    _allowed, _gd2 = perf.guard_allows_unload(_hw, "block")
+                    _guard_block = not _allowed
+                    if _guard_block:
+                        print("[H3性能] 落盘守卫=block：本次运行的二采精化前全卸已禁用"
+                              "（无 swap 机器上全卸会被 OOM killer 杀掉）", flush=True)
                 # 余量策略：0.35 起 DynamicVRAM 会把显存吃到接近 100%，
                 # 二采这种「同卡再插一段高清采样」最先炸——先把根因说清楚
                 _hr_msg = perf.vram_headroom_advice(_hw, _hw.get("vram_policy")) or ""
@@ -1865,6 +2012,28 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"关闭自动按序生成：{len(_off_pos)} 段跳过执行不进成片（段 {'、'.join(_off_pos)}；"
                           "随时恢复零成本）")
         if up_cfg:
+            # ③ 落盘守卫接行为 + ④ 精化前腾挪强度（vram_shuffle）——都是「不进
+            # 指纹」的行为开关，交给 upscale.render_latent 消费。
+            up_cfg["guard_block"] = bool(_guard_block)
+            up_cfg["vram_shuffle"] = str(_pf.get("vram_shuffle") or "auto")
+        # FFN 分块（ff_chunk_tokens>0）：主干 OOM 正崩在 FFN 的 LoRA bypass 上
+        # （单次 6.13GB）。按 token 切块算 MLP，**数学等价、零画质损失**；
+        # 装之前先自测，不通过就整段不装（默认关，见 upscale.install_ff_chunking）。
+        _ff_tokens = int(_pf.get("ff_chunk_tokens") or 0)
+        if _ff_tokens > 0:
+            try:
+                _ff_n, _ff_why = upscale.install_ff_chunking(模型, _ff_tokens)
+                if _ff_n:
+                    report.append(f"性能：FFN 分块已启用（{_ff_n} 个 Linear，"
+                                  f"每块 {_ff_tokens} token · 数学等价，画质零损失）")
+                elif _ff_why:
+                    report.append(f"性能：FFN 分块未启用（{_ff_why}）")
+                if 二采模型 is not None and _up_model is not 模型:
+                    _ff_n2, _ = upscale.install_ff_chunking(_up_model, _ff_tokens)
+                    if _ff_n2:
+                        report.append(f"性能：二采模型同样装上 FFN 分块（{_ff_n2} 个 Linear）")
+            except Exception:
+                pass
             _tb = float(up_cfg.get("time_bias") or 0.0)
             _mix = float(up_cfg.get("mix") or 0.0)
             _sh = float(up_cfg.get("shift") or 0.0)
@@ -2733,7 +2902,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seam_metrics_rows.append(None)
             # 双列表共享同一份 CPU 帧（全程只读），长链累积内存减半
             _cf = pframes.cpu()
-            all_frames.append(_cf)
+            all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
             seg_frames.append(_cf)
             seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
             all_wav = pwav.cpu()
@@ -3063,14 +3232,78 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         aug_start = 1.0 - aug if aug > 0 else 0.999
                         restore_step_aug = step_cond_noise_guard(
                             模型.model.diffusion_model, aug_start, 0.0, fade_ratio)
-                    try:
-                        t0 = time.perf_counter()
+                    def _sample_once():
                         # 初始 latent 是官方空 latent（段首内容由引导桥 cond 承载），
                         # 与旧版逐字节一致
-                        sampled = _sigmas_adapter.ksampler_with_sigmas(
+                        return _sigmas_adapter.ksampler_with_sigmas(
                             模型, cur_seed, 步数, CFG,
                             采样器, 调度器, cond, negative, _sampling_latent,
                             sigmas=自定义Sigmas, denoise=1.0)[0]
+
+                    def _sample_rescue():
+                        """主干采样 + OOM 自救。返回 (结果, 自救次数)。
+
+                        为什么必须**原参**重试（不改步数/画布/帧数）：自救是要分清
+                        「这次 OOM 是碎片/残留导致的一次性偶发」还是「规格真的超了」。
+                        降规格重试能救活的那一次会把后者盖住——用户下一段照样炸，
+                        而且不知道是自己规格开大了。救不回来时给可行动的中文报错，
+                        那才是正解（改画布/改帧数/关 LoRA）。
+
+                        为什么 ComfyUI 自己的 `Got an OOM, unloading all loaded
+                        models` 救不回来：它救的是**权重**，而 bypass 型 LoRA 的
+                        前向**激活**不在它的账上（日志3 实测：torch 报只分配了
+                        13.48GiB，但 CUDA 只剩 23.69MiB——中间 ~10GB 是权重池）。
+                        所以这里自己再腾一次。
+                        """
+                        if not _oom_autoretry:
+                            return _sample_once(), 0
+
+                        def _on_retry(i, e):
+                            print(f"[H3性能] 段{g + 1} 主干采样显存不足（第 {i} 次）——"
+                                  "自动卸载驻留模型 + 回收残留引用 + empty_cache 后原参重试…",
+                                  flush=True)
+
+                        try:
+                            return perf.oom_retry(_sample_once, cleanup=_vram_oom_cleanup,
+                                                  tries=2, on_retry=_on_retry)
+                        except Exception as _oe:
+                            if not perf.is_oom_error(_oe):
+                                raise
+                            raise RuntimeError(
+                                f"段{g + 1} 主干采样显存不足（已自动卸载驻留模型、回收残留引用并"
+                                "empty_cache 后**原参**重试仍失败）：峰值由 画布×帧数 决定"
+                                "（步数只影响耗时）——请缩短该段帧数或降低画布，或关闭 LoRA /"
+                                "降低放大倍率。本段未产出，已落盘的分段不受影响。") from _oe
+
+                    try:
+                        t0 = time.perf_counter()
+                        # 首段采样顺带量一次**激活峰值**：LoRA 权重 ComfyUI 自己算得到
+                        # （进了 model_size），但 bypass adapter 的前向激活不在任何账上
+                        # ——那正是主干 OOM 的真凶（单次 6.13GB）。区间设备级峰值
+                        # 减采样前基线 = 采样引入的显存增量（激活 + 回载权重）。
+                        if _act_peak_probe and _act_first[0] and not replay:
+                            _act_first[0] = False
+                            _base_v = _vram_used_gb()
+                            with perf.watch_vram_peak() as _w:
+                                sampled, _resc = _sample_rescue()
+                            _peak_v = _w["peak"]
+                            if _peak_v is not None and _base_v is not None:
+                                _act = max(0.0, _peak_v - _base_v)
+                                try:
+                                    _lf = perf.probe_lora_footprint(模型)
+                                    print(f"[H3性能] {perf.lora_account_line(_lf['lora_weight_gb'], _lf['patch_count'], _act)}",
+                                          flush=True)
+                                    perf.emit({"kind": "lora_account", "seg": g + 1,
+                                               "lora_weight_gb": _lf["lora_weight_gb"],
+                                               "patches": _lf["patch_count"],
+                                               "act_peak_gb": round(_act, 2)})
+                                except Exception:
+                                    pass
+                        else:
+                            sampled, _resc = _sample_rescue()
+                        if _resc:
+                            report.append(f"段{g + 1} 主干采样 OOM：已自动腾挪并原参重试成功"
+                                          "（参数与产物均无降级）")
                     finally:
                         restore_audio_rows()
                         restore_video_rows()
@@ -3157,7 +3390,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seam_metrics_rows.append(z_row if ((item_i > 0 or off) and not seg_unlink[i]) else None)
 
             _cf = frames.cpu()
-            all_frames.append(_cf)
+            # 帧存 uint8（内存 ×¼）：全链帧 tensor 是内存峰值的大头（D3：
+            # 8 段 ×107 帧 1312×736 = 9.9GB）。接缝测量用的是同一份 float 帧
+            # （prev_tail_* / metrics），不受影响——uint8 只进「等拼成片」的那一份。
+            all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
             seg_frames.append(_cf)
             seg_wav = wav.cpu()
             seg_wavs.append({"waveform": seg_wav, "sample_rate": sample_rate})
@@ -3330,7 +3566,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                    "report": "\n".join(report), "updated_at": time.time()})
 
         if all_frames:
-            images = torch.cat(all_frames, dim=0)
+            images = _build_chain_images(all_frames, height, width, _frames_uint8)
         else:
             # 全禁用链：无帧可拼——单帧黑场占位保下游节点不崩，报告说明（无成片内容）
             images = torch.zeros(1, height, width, 3)
@@ -3351,9 +3587,24 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     report.append("重摇：本次为部分重做（审片中段），跳过自动成片——"
                                   "剩余段全部确认后运行一次自动重拼全片，或用合并导出")
                 else:
-                    final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate,
-                                                   crf=_bcrf, preset=_bpreset, aq_mode=_baq,
-                                                   dither=_bdith)
+                    # 基础分辨率成片优先走**流式拼接分段 mp4**：全程不碰全链内存帧。
+                    # 这是 D3 的正解（NLE 从不把整条时间线的 RGB 帧同时放内存里），
+                    # 也是二采高清路径早就在用的同一套（upscale.try_final）。
+                    final_name, enc_err = None, None
+                    if _final_mode in ("auto", "stream"):
+                        final_name, enc_err = _stream_final_basic(
+                            root, videos, _off_slots, crf=_bcrf, preset=_bpreset,
+                            aq_mode=_baq, dither=_bdith)
+                        if final_name:
+                            report.append("成片：流式拼接分段 mp4（未经全链内存帧，"
+                                          "内存峰值不随段数翻倍）")
+                        elif _final_mode == "stream":
+                            report.append(f"成片：final_mode=stream 但分段 mp4 不齐"
+                                          f"（{enc_err}）——回退内存帧编码")
+                    if final_name is None:
+                        final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate,
+                                                       crf=_bcrf, preset=_bpreset, aq_mode=_baq,
+                                                       dither=_bdith)
                     if final_name:
                         try:
                             _frel = os.path.relpath(final_name, root).replace("\\", "/")

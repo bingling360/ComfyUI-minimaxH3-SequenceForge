@@ -3891,22 +3891,59 @@ const OPT_PROVIDERS = {
  * 用户会以为生效了，转头拿"改了没变化"来报 bug。
  */
 const H3_PERF_FIELDS = [
-    { key: "upcast_attention", label: "Upcast Attention", kind: "tri",
+    /* ---- 显存：自救与探测 ---- */
+    { key: "oom_autoretry", label: "主干采样 OOM 自救", kind: "bool", group: "显存 · 自救",
+      hint: "主干采样撞 OOM 时自动卸载驻留模型 + 回收残留后**原参**重试一次（参数与产物都不降级）。救不回来会给可行动的中文报错。ComfyUI 自己那次自救救的是权重，救不到 LoRA 的激活" },
+    { key: "act_peak_probe", label: "量 LoRA 激活峰值", kind: "bool", group: "显存 · 自救",
+      hint: "首段采样时采设备级显存峰值 → 打出「LoRA 账：权重 +X GB（N patches）· 实测单步激活峰值 Y GB · 建议留空 ≥Z GB」。权重那半 ComfyUI 自己算得到，激活那半只有实测才看得见" },
+    /* ---- 显存：分块 ---- */
+    { key: "ff_chunk_tokens", label: "FFN 分块 Chunk FeedForward", kind: "num", group: "显存 · 分块",
+      hint: "0=关。按 token 切块算 MLP —— 主干 OOM 正崩在 FFN（单次请求 6.13GB）。**数学等价、零画质损失**；装之前会先自测，不一致就不装" },
+    { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "显存 · 分块",
+      opts: [["auto", "跟随 ComfyUI（推荐）"], ["sdpa", "sdpa"], ["sage", "SageAttention"], ["flash", "FlashAttention"]],
+      hint: "auto = 不动。Sage 在 30 系上有失败报告；环境里拿不到该后端时会保持现状而不是置空" },
+    { key: "upscale_temporal_chunk", label: "放大网络 3D 时序分块", kind: "bool", group: "显存 · 分块",
+      hint: "此前硬编码为开，现在可调。关掉会改变二采输出的分块口径（因此会进指纹、触发既有高清段重做）" },
+    { key: "keep_upscaler_resident", label: "放大网络整链只搬一次", kind: "bool", group: "显存 · 分块",
+      hint: "默认关（每段卸）。实测每段「为把 659MB 放大网络搬上卡而全卸」耗时 6.3/8.0/6.4/5.7/6.7/3.7s —— 8 段约 40–60s 纯腾挪" },
+    { key: "refine_temporal_chunk", label: "精化时序分块（帧）", kind: "num", wired: false, group: "显存 · 分块",
+      hint: "接线中：时间注意力跨块会造成接缝闪烁，需 overlap≥8 latent token 并配合接缝医生，先留位" },
+    { key: "refine_tile", label: "精化空间分块（实验）", kind: "sel", wired: false, group: "显存 · 分块",
+      opts: [["off", "关（推荐）"], ["2x2", "2×2 tile"], ["3x3", "3×3 tile"]],
+      hint: "接线中且**有画质风险**——全局注意力被切断会导致色调/构图不一致，默认关" },
+    /* ---- 显存：腾挪 ---- */
+    { key: "vram_shuffle", label: "精化前腾挪强度", kind: "sel", group: "显存 · 腾挪",
+      opts: [["auto", "跟随（= 全卸，现状）"], ["off", "不腾挪"], ["soft", "只卸放大网络"], ["full", "全卸驻留模型"]],
+      hint: "24GB 卡上全卸疑似净亏（RSS 4.98→36.96GB），但 32GB 卡上有过 OOM 实测才加的它 —— 换卡前只做 A/B，auto 不改默认" },
+    { key: "blocks_to_swap", label: "块交换 blockswap（0–50）", kind: "num", wired: false, group: "显存 · 腾挪",
+      hint: "接线中：H3 = 50 个 double block；PCIe 带宽是硬约束，需先测「搬一块 vs 算一块」" },
+    /* ---- 内存：成片 ---- */
+    { key: "final_mode", label: "成片合成方式", kind: "sel", group: "内存 · 成片",
+      opts: [["auto", "能拼就拼（推荐）"], ["stream", "强制流式拼接"], ["memory", "强制内存帧编码"]],
+      hint: "stream = 用分段 mp4 流式拼接，**全程不碰全链内存帧**（NLE 的一贯做法）；auto 在分段齐全时自动走 stream" },
+    { key: "frames_dtype", label: "全链帧存储精度", kind: "sel", group: "内存 · 成片",
+      opts: [["float32", "float32（现状）"], ["uint8", "uint8（内存 ×¼）"]],
+      hint: "uint8：帧存内存降到 ¼，且成片改为预分配逐段填充 —— 峰值从 2× 全链帧降到约 1.25×。输出的 IMAGE 仍是 float32" },
+    { key: "guard_action", label: "落盘守卫行为", kind: "sel", group: "内存 · 成片",
+      opts: [["warn", "只报告"], ["block", "critical 时禁止全卸"]],
+      hint: "block：判定会挤到 swap 时跳过二采精化前的全卸 —— Linux 无 swap 机器上全卸不是变慢，是进程被 OOM killer 直接杀掉" },
+    /* ---- 编码 ---- */
+    { key: "encoder", label: "编码器", kind: "sel", group: "编码",
+      opts: [["auto", "libx264（推荐）"], ["libx264", "libx264"], ["h264_nvenc", "H.264 NVENC"], ["hevc_nvenc", "H.265 NVENC"]],
+      hint: "诚实评估：557 帧编码只要 13 秒，**编码不是瓶颈**。NVENC 的真实收益是 CPU 占用（x264 会起核数×1.5 个线程），不是耗时也不是内存" },
+    { key: "nvenc_cq", label: "NVENC 质量档 cq", kind: "num", group: "编码",
+      hint: "对应 x264 的 crf（越小越清晰）。NVENC 不认 crf，两者必须分开传" },
+    /* ---- 运行时开关 ---- */
+    { key: "upcast_attention", label: "Upcast Attention", kind: "tri", group: "运行时开关",
       hint: "attention 强制走 fp32：更稳但更吃显存、更慢。小显存卡通常关；auto = 跟随启动参数" },
-    { key: "index_mode", label: "素材库索引失效口径", kind: "sel",
+    /* ---- 素材库 ---- */
+    { key: "index_mode", label: "素材库索引失效口径", kind: "sel", group: "素材库",
       opts: [["fingerprint", "目录指纹（推荐）"], ["ttl", "固定 3 秒过期"]],
       hint: "指纹：没增删文件就一直复用，翻页不再重建索引（1200 条目实测省掉 1895ms）；ttl：老行为，遇到「新素材不显示」可退回" },
-    { key: "thumb_on_import", label: "入库即生成缩略图", kind: "bool",
+    { key: "thumb_on_import", label: "入库即生成缩略图", kind: "bool", group: "素材库",
       hint: "关掉则退回「首次浏览时才生成」—— 会为每张大图付一次全解码峰值（6000×4000 JPEG 实测 193 MB，且 RSS 涨上去不易回落）" },
-    { key: "thumb_max_mp", label: "缩略图源图上限（百万像素）", kind: "num",
+    { key: "thumb_max_mp", label: "缩略图源图上限（百万像素）", kind: "num", group: "素材库",
       hint: "超过就跳过解码，前端回落类型图标 —— 挡住超大图的解码尖峰" },
-    { key: "vram_shuffle", label: "精化前腾挪强度", kind: "sel", wired: false,
-      opts: [["auto", "跟随（当前实现）"], ["off", "不腾挪"], ["soft", "只卸放大网络"], ["full", "全卸驻留模型"]],
-      hint: "24GB 卡上全卸疑似净亏、但 32GB 卡上有过 OOM 实测才加的它 —— 换卡前只做 A/B，不改默认" },
-    { key: "blocks_to_swap", label: "块交换 blockswap（0–50）", kind: "num", wired: false,
-      hint: "H3 = 50 个 double block；PCIe 带宽是硬约束，需先测「搬一块 vs 算一块」" },
-    { key: "ff_chunk_tokens", label: "FFN 分块 Chunk FeedForward", kind: "num", wired: false,
-      hint: "按 token 切块算 MLP，数学等价、零画质损失；主干 OOM 正崩在 FFN 上" },
 ];
 
 async function paintPerfPane(pane) {
@@ -3945,7 +3982,10 @@ async function paintPerfPane(pane) {
 
     /* 开关区 */
     const secSet = el("div", "h3d-setsec");
-    secSet.append(el("div", "h3d-setsec-title", "性能开关（全局，改完立即生效）"));
+    secSet.append(el("div", "h3d-setsec-title", "性能开关（全局，跨项目）"));
+    secSet.append(el("div", "h3d-setrow", el("span", "h3d-secs-hint",
+        "Upcast / 编码器 / 素材库那几项改完立即生效；「显存·内存」那几项在下一次渲染生效；"
+        + "标「接线中」的项只保存、还不生效。")));
     const status = el("span", "h3d-secs-hint", "");
     const push = async () => {
         status.textContent = "保存中…";
@@ -3954,15 +3994,23 @@ async function paintPerfPane(pane) {
             const b = r && r.body;
             if (!b || !b.ok) { status.textContent = "保存失败"; return; }
             const ap = b.applied || {};
-            status.textContent = "已应用 · upcast="
-                + (ap.upcast_attention === true ? "开" : ap.upcast_attention === false ? "关" : "跟随")
-                + " · 索引=" + (ap.index_mode || "?")
-                + " · 入库缩略图=" + (ap.thumb_on_import ? "开" : "关");
+            const fmt = (v) => v === true ? "开" : v === false ? "关" : (v === "auto" ? "跟随" : String(v ?? "?"));
+            status.textContent = "已应用 · upcast=" + fmt(ap.upcast_attention)
+                + " · 编码器=" + fmt(ap.encoder)
+                + " · 成片=" + fmt(ap.final_mode)
+                + " · 帧精度=" + fmt(ap.frames_dtype)
+                + " · OOM自救=" + fmt(ap.oom_autoretry)
+                + "（其余项为下一次渲染生效）";
         } catch (e) {
             status.textContent = "保存失败：" + ((e && e.message) || e);
         }
     };
+    let curGroup = null;
     for (const f of H3_PERF_FIELDS) {
+        if (f.group && f.group !== curGroup) {
+            curGroup = f.group;
+            secSet.append(el("div", "h3d-setsec-title", f.group));
+        }
         const row = el("div", "h3d-refrow");
         const on = f.wired === false ? false : wired.has(f.key);
         const lab = el("label", null, f.label + (on ? "" : " · 接线中"));
@@ -8173,7 +8221,7 @@ function renderParamsZone(sec, data) {
      * 与链参数同层，折叠状态由 foldSection 记住（_foldState），跟其余栏一致。
      * 展开时才拉后端：renderParamsZone 会随参数改动重建，不能每次都发请求。 */
     const perfBox = foldSection("param-perf", false,
-        "<summary>⚡ 性能优化（Upcast Attention / 素材库 / 分块）</summary>");
+        "<summary>⚡ 性能优化（OOM 自救 / 分块 / 成片内存 / 编码）</summary>");
     const perfBody = el("div");
     perfBox.append(perfBody);
     let perfLoaded = false;

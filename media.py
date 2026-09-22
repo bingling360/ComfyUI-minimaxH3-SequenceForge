@@ -10,6 +10,58 @@ from fractions import Fraction
 
 last_error = None
 
+# ---- 编码器（性能优化设置 `encoder` / `nvenc_cq`）----
+#
+# 诚实结论：**编码不是瓶颈**——557 帧实测只要 13 秒。NVENC 的真实收益是
+# CPU 占用（libx264 默认会起 核数×1.5 个线程，跑起来整机卡），既不是耗时
+# 也不是内存（帧最终仍要落 CPU 侧进编码器）。所以它默认 auto = libx264，
+# 换不换交给用户按自己的机器选。
+ENCODER = "libx264"      # 进程级生效值（由 perf.apply_runtime 写入）
+ENCODER_CQ = 20          # NVENC 专用质量档（x264 用 crf，两者不是同一个旋钮）
+
+
+def set_encoder(name, cq=20):
+    """设置进程级编码器；返回实际生效的 codec 名（不认识的回落 libx264）。"""
+    global ENCODER, ENCODER_CQ
+    try:
+        from . import perf  # type: ignore
+    except ImportError:
+        try:
+            import perf  # type: ignore
+        except Exception:
+            perf = None
+    codec = "libx264"
+    if perf is not None:
+        codec = perf.resolve_encoder(name, cq=cq)[0]
+    else:
+        n = str(name or "auto").strip().lower()
+        if n in ("h264_nvenc", "hevc_nvenc"):
+            codec = n
+    ENCODER = codec
+    try:
+        ENCODER_CQ = int(cq)
+    except (TypeError, ValueError):
+        ENCODER_CQ = 20
+    return ENCODER
+
+
+def _video_stream_options(crf, preset, threads, aq_mode):
+    """视频流 codec + options（编码器分流在此，两个入口共用）。
+
+    NVENC 不认 `crf`（静默忽略 → 质量档整个失效）、也不认 `preset` 里的
+    x264 档名（veryfast/medium 会被当成 NVENC 的 p1..p7 之外的非法值），
+    所以走 NVENC 时只给 `cq` + `preset=p4`（NVENC 的中档，对应 x264 的
+    medium 量级），x264 那套 crf/preset/aq-mode 原样保留。
+    """
+    if ENCODER in ("h264_nvenc", "hevc_nvenc"):
+        return ENCODER, {"cq": str(int(ENCODER_CQ)), "preset": "p4"}
+    options = {"crf": str(int(crf)), "preset": str(preset),
+               "threads": str(max(1, int(threads)))}
+    if aq_mode:
+        options["aq-mode"] = str(int(aq_mode))
+    return "libx264", options
+
+
 # 4×4 Bayer 有序抖动矩阵（0-15）：标准 magic-square 排列，16 档阈值均布
 _BAYER4 = (
     (0, 8, 2, 10),
@@ -96,13 +148,10 @@ def save_av_mp4(path, frames, wav, sample_rate, fps=24, crf=20, threads=4,
         # ValueError: Could not determine output format —— 必须显式指定
         container = av.open(tmp, mode="w", format="mp4")
         try:
-            vstream = container.add_stream("libx264", rate=fps)
+            _codec, options = _video_stream_options(crf, preset, threads, aq_mode)
+            vstream = container.add_stream(_codec, rate=fps)
             vstream.width, vstream.height = w, h
             vstream.pix_fmt = "yuv420p"
-            options = {"crf": str(int(crf)), "preset": str(preset),
-                       "threads": str(max(1, int(threads)))}
-            if aq_mode:
-                options["aq-mode"] = str(int(aq_mode))
             vstream.options = options
             astream = container.add_stream("aac", rate=int(sample_rate), layout=layout)
             v_pts = a_pts = 0   # 显式时间戳计数：视频帧号 / 音频样点数（编码器时基）
@@ -310,13 +359,10 @@ def concat_av_mp4(sources, out_path, width=None, height=None, fps=24, crf=20, th
 
         container = av.open(tmp, mode="w", format="mp4")
         try:
-            vstream = container.add_stream("libx264", rate=fps)
+            _codec, options = _video_stream_options(crf, preset, threads, aq_mode)
+            vstream = container.add_stream(_codec, rate=fps)
             vstream.width, vstream.height = w, h
             vstream.pix_fmt = "yuv420p"
-            options = {"crf": str(int(crf)), "preset": str(preset),
-                       "threads": str(max(1, int(threads)))}
-            if aq_mode:
-                options["aq-mode"] = str(int(aq_mode))
             vstream.options = options
             astream = container.add_stream("aac", rate=base_rate, layout=base_layout)
             v_pts = a_pts = 0   # 全局单调时间戳：视频帧号 / 音频样点数（跨段连续）
@@ -534,13 +580,11 @@ def trim_av_mp4(src_path, out_path, start_s, end_s, fps=24, crf=20,
                 tb = 0.0
             out = av.open(tmp, mode="w", format="mp4")
             try:
-                vo = out.add_stream("libx264", rate=out_fps)
+                _codec, _opts = _video_stream_options(crf, preset, 4, aq_mode)
+                vo = out.add_stream(_codec, rate=out_fps)
                 vo.width, vo.height = vw, vh
                 vo.pix_fmt = "yuv420p"
-                vo.options = {"crf": str(int(crf)), "preset": str(preset),
-                              "threads": "4"}
-                if aq_mode:
-                    vo.options["aq-mode"] = str(int(aq_mode))
+                vo.options = _opts
                 ao = out.add_stream(
                     "aac", rate=int(sr),
                     layout="stereo" if au_ch0 >= 2 else "mono")

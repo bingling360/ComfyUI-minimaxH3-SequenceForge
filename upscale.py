@@ -1676,7 +1676,31 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 判据：同一段重跑，比 69s 短且不 OOM 才算赢。32GB 卡上的既有 OOM 实测
     # 仍然有效——换卡前不要凭这台 24GB 的数据改默认行为。
     _t_unload = time.perf_counter()
-    comfy.model_management.unload_all_models()
+    # 腾挪强度（性能设置 `vram_shuffle`）：这是「节点端适配」替代启动参数
+    # `--vram-headroom` 的那一档——0.35 把显存吃到 ~100% 是官方有意拉高 H3
+    # 利用率，我们不给启动参数建议，只在自己要腾挪时按用户的卡选强度。
+    #   off  = 不卸（只回收残留 + 归还缓存块）
+    #   soft = 只卸放大网络（它是裸 nn.Module，ComfyUI 的账看不见它）
+    #   full/auto = 全卸驻留模型（现状，32GB 卡上有过 OOM 实测才加的）
+    # ⚠ auto 沿用 full：24GB 卡上疑似净亏（RSS 4.98→36.96GB），但换卡前只做
+    # A/B 不改默认——这条待办见 docs/性能优化_下一轮计划_2026-09-23.md §3。
+    _shuffle = str(cfg.get("vram_shuffle") or "auto").lower()
+    _blocked = bool(cfg.get("guard_block"))
+    if _blocked and _shuffle in ("auto", "full"):
+        # 落盘守卫=block 且判定 critical：全卸会把权重挤出到 swap，Linux 无
+        # swap 时不是变慢而是**进程被 SIGKILL**。宁可不卸，也不冒这个险。
+        _shuffle = "off"
+        print(f"[H3二采] 段{seg_no}：落盘守卫判定 critical —— 本次跳过全卸"
+              "（无 swap 机器上全卸会被 OOM killer 杀掉）", flush=True)
+    if _shuffle == "soft" and net is not None:
+        try:
+            from . import upscale_net
+            upscale_net.force_unload(net)
+        except Exception:
+            pass
+    elif _shuffle in ("", "auto", "full"):
+        comfy.model_management.unload_all_models()
+    # off：什么都不卸，只回收残留引用 + 归还空闲缓存块
     gc.collect()
     torch.cuda.empty_cache()
     _tmark("unload", _t_unload)   # 卸载本身花了多久（腾挪的分子成本）
@@ -1985,6 +2009,101 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     return up_out_v, tw, th, seed, bridged, hf_gain, retried
 
 
+def _ff_chunk_selfcheck(sub, orig, chunk_tokens):
+    """分块前后是否**逐位一致**（装之前必须自测，不通过就别装）。
+
+    `nn.Linear` 沿行（token）可分离是**数学事实**，但 `fc1` / `fc2` 上可能挂着
+    bypass adapter（HyperFlow 的 `F.linear(F.linear(x, down), up)`）、
+    LayerNorm、甚至第三方补丁——只要里面掺了任何**跨 token** 的操作，切块
+    就不再等价。与其赌，不如拿一份比 chunk 更大的随机输入跑一遍对比。
+    """
+    try:
+        w = getattr(sub, "weight", None)
+        if w is None or getattr(w, "dim", lambda: 0)() < 2:
+            return False
+        inf = int(w.shape[1])
+        rows = max(int(chunk_tokens) + 1, 4)
+        x = torch.randn((rows, inf), device=w.device, dtype=w.dtype)
+        a = orig(x)
+        if not torch.is_tensor(a):
+            return False
+        parts = [orig(x[s:e]) for s, e in perf.plan_ff_chunks(rows, chunk_tokens)]
+        b = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        if a.shape != b.shape:
+            return False
+        return bool(torch.allclose(a.detach().float(), b.detach().float(),
+                                   atol=1e-4, rtol=1e-3))
+    except Exception:
+        return False
+
+
+def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
+    """给 FFN 的 `fc1`/`fc2` 装 token 分块。返回 (安装数, 跳过原因)。
+
+    为什么它能救 OOM：主干 OOM 实测崩在 FFN 里 —— `F.linear(F.linear(x, down), up)`
+    **单次请求 6.13GB**（D2，占 24GB 卡的 26%）。`nn.Linear` 沿 token（行）
+    完全可分离：切块逐块算再拼回，结果与不分块**逐位相同**，是本项目少有的
+    「零画质损失」优化（这也是它排在分块清单第一位的原因）。
+
+    ⚠ 两道保险，缺一不可：
+      1. **装前自测**（`_ff_chunk_selfcheck`）：不一致就整段不装，宁可这次
+         不生效，也不能悄悄改输出；
+      2. **默认关**（`ff_chunk_tokens=0`）：只有用户显式开才装。
+    """
+    try:
+        ct = int(chunk_tokens or 0)
+    except (TypeError, ValueError):
+        return 0, "ff_chunk_tokens 不是整数"
+    if ct <= 0:
+        return 0, ""
+    diff = None
+    for path in ("model.diffusion_model", "diffusion_model"):
+        obj = model
+        try:
+            for p in path.split("."):
+                obj = getattr(obj, p)
+            diff = obj
+            break
+        except Exception:
+            continue
+    if diff is None:
+        return 0, "取不到 diffusion_model"
+    n = 0
+    for m in diff.modules():
+        for name in targets:
+            sub = getattr(m, name, None)
+            if sub is None or not hasattr(sub, "forward"):
+                continue
+            if getattr(sub, "_h3_ff_chunk", 0) == ct:
+                n += 1
+                continue
+            orig = sub.forward
+            if not _ff_chunk_selfcheck(sub, orig, ct):
+                return n, (f"{name} 分块自测不通过（模块里含跨 token 操作，"
+                           "不是纯逐行 FFN）——本次不装，输出保持原样")
+            plan = perf.plan_ff_chunks  # 纯函数，零 torch 依赖
+
+            def _fwd(x, *a, __orig=orig, __ct=ct, __plan=plan, **k):
+                try:
+                    if not torch.is_tensor(x) or x.dim() < 2 or int(x.shape[0]) <= __ct:
+                        return __orig(x, *a, **k)
+                except Exception:
+                    return __orig(x, *a, **k)
+                outs = [__orig(x[s:e], *a, **k)
+                        for s, e in __plan(int(x.shape[0]), __ct)]
+                return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+            # 赋**普通函数**（不是 MethodType）：nn.Module.__call__ 取 `self.forward`
+            # 后直接 `forward_call(*args)`，普通函数正好只收业务参数。
+            sub.forward = _fwd
+            try:
+                sub._h3_ff_chunk = ct
+            except Exception:
+                pass
+            n += 1
+    return n, ""
+
+
 def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    root, g, video_t, audio_t, kind, idx,
                    seg_prompts, seg_label_orders, pool_tensors, refs,
@@ -2184,7 +2303,12 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   f"高清解码 {_timing.get('decode', 0.0):.0f}s · "
                   f"编码落盘 {_timing.get('store', 0.0):.0f}s")
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
-    if net is not None and cfg.get("force_unload"):
+    # keep_upscaler_resident（性能设置）：放大网络整链只搬一次，别每段搬上搬下。
+    # 日志里每段一条「为把放大网络 659MB 搬上卡，全卸腾挪耗时 X s」：
+    # 6.3 / 8.0 / 6.4 / 5.7 / 6.7 / 3.7 s —— 8 段 ≈ 40–60s **纯腾挪**，换来的
+    # 只是把 659MB 送下卡。默认关（沿用现状），让用户按自己的卡决定。
+    if net is not None and cfg.get("force_unload") \
+            and not cfg.get("keep_upscaler_resident"):
         # 强制卸载：把放大网络从缓存里删掉 + soft_empty_cache（下段重新从磁盘加载，
         # 换取最大显存/内存头寸——多段链后段比首段更易 OOM 的主因即 CPU 侧权重副本）
         from . import upscale_net

@@ -152,3 +152,177 @@ def test_thumb_max_pixels_constant_reasonable():
     """缩略图源图上限要存在且量级合理（几十 MP 量级，不是 0 也不是无限大）。"""
     assert hasattr(L, "THUMB_MAX_PIXELS")
     assert 5_000_000 <= L.THUMB_MAX_PIXELS <= 200_000_000
+
+
+# ------------------------------------------------- 2026-09-23 第二批：显存/内存/编码
+
+def test_oom_retry_rescues_once_then_gives_up():
+    """OOM 自救：救得回来就救，救不回来必须**原样上抛**且不超过设定次数。
+
+    这三条是自救的全部契约：① 非 OOM 一次都不重试（别把参数错误也吞了）；
+    ② OOM 时先 cleanup 再原参重试；③ 仍失败就抛（不无限重试、不降规格）。
+    """
+    calls = {"n": 0}
+    cleaned = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 6.13 GiB")
+        return "ok"
+
+    out, rescued = perf.oom_retry(flaky, cleanup=lambda: cleaned.__setitem__("n", cleaned["n"] + 1),
+                                  tries=2)
+    assert out == "ok"
+    assert rescued == 1, "自救次数必须是 1（报告要靠它说明「这段是靠自救活下来的」）"
+    assert cleaned["n"] == 1, "重试前必须先腾挪"
+
+    # 非 OOM：一次都不重试
+    calls["n"] = 0
+
+    def bad():
+        calls["n"] += 1
+        raise ValueError("参数不合法")
+
+    with pytest.raises(ValueError):
+        perf.oom_retry(bad, cleanup=lambda: cleaned.__setitem__("n", cleaned["n"] + 1), tries=3)
+    assert calls["n"] == 1
+
+    # 一直 OOM：只试 tries 次，最后抛出原始 OOM
+    def always_oom():
+        raise RuntimeError("CUDA out of memory")
+
+    with pytest.raises(RuntimeError):
+        perf.oom_retry(always_oom, cleanup=None, tries=2)
+
+
+def test_is_oom_error_covers_common_shapes():
+    """判断 OOM 只认类型名与消息（**不 import torch**，保住本模块零依赖）。"""
+    assert perf.is_oom_error(RuntimeError("CUDA out of memory. Tried to allocate"))
+    assert perf.is_oom_error(RuntimeError("CUBLAS_STATUS_ALLOC_FAILED"))
+    assert not perf.is_oom_error(RuntimeError("shape mismatch"))
+    assert not perf.is_oom_error(None)
+    # torch.OutOfMemoryError 走类型名分支（这里造一个同名类，避免依赖 torch）
+    OOM = type("OutOfMemoryError", (RuntimeError,), {})
+    assert perf.is_oom_error(OOM("x"))
+
+
+def test_plan_ff_chunks_boundaries():
+    """FFN 分块的边界口径：0/负数=关（单块）、切得尽、切不尽都要对。"""
+    assert perf.plan_ff_chunks(0, 4) == []
+    assert perf.plan_ff_chunks(-3, 4) == []
+    assert perf.plan_ff_chunks(10, 0) == [(0, 10)], "0 = 关，必须等价于不分块"
+    assert perf.plan_ff_chunks(10, 4) == [(0, 4), (4, 8), (8, 10)]
+    assert perf.plan_ff_chunks(8, 4) == [(0, 4), (4, 8)]
+    assert perf.plan_ff_chunks(3, 100) == [(0, 3)]
+    assert perf.plan_ff_chunks("x", 4) == [(0, 0)]
+
+
+def test_guard_allows_unload_blocks_on_critical():
+    """落盘守卫接行为：只有 critical + block 才**禁止**全卸。
+
+    这条守的是 D4：Linux 无 swap 的机器上，一次 unload 就是 OOM killer
+    SIGKILL——连 except 都跑不到，所以必须在动手前拦住。
+    """
+    hw = {"ram_total_gb": 60.0, "ram_avail_gb": 31.0, "swap_total_gb": 0.0,
+          "swap_free_gb": 0.0, "disk_free_gb": 60.0,
+          "unet_gb": 67.5, "te_gb": 0.0}
+    allowed, g = perf.guard_allows_unload(hw, "warn")
+    assert g["level"] == "critical" and allowed is True, "warn 只报不改行为"
+    allowed, g = perf.guard_allows_unload(hw, "block")
+    assert g["level"] == "critical" and allowed is False, "critical + block 必须禁止全卸"
+    # 富余的机器：block 也不拦
+    rich = dict(hw, ram_avail_gb=500.0, swap_total_gb=64.0, swap_free_gb=64.0)
+    assert perf.guard_allows_unload(rich, "block")[0] is True
+
+
+def test_resolve_encoder_does_not_mix_knobs():
+    """NVENC 认 cq、x264 认 crf —— 传错就是静默丢质量档，所以必须显式分流。"""
+    assert perf.resolve_encoder("auto", cq=18, crf=20) == ("libx264", {"crf": "20"})
+    assert perf.resolve_encoder("", cq=18) == ("libx264", {"crf": "20"})
+    codec, opts = perf.resolve_encoder("h264_nvenc", cq=18, crf=20)
+    assert codec == "h264_nvenc" and opts == {"cq": "18"}
+    assert "crf" not in opts
+    codec, opts = perf.resolve_encoder("hevc_nvenc", cq=21)
+    assert codec == "hevc_nvenc" and opts == {"cq": "21"}
+    # 不认识的回落 libx264，不能把未知 codec 塞给 PyAV
+    assert perf.resolve_encoder("libvpx", crf=20) == ("libx264", {"crf": "20"})
+
+
+def test_probe_lora_footprint_counts_patch_tensors():
+    """LoRA 权重账：从 patches 里累加张量字节（结构随来源变，必须递归展开）。"""
+    class FakeT:
+        def __init__(self, n, es):
+            self._n, self._es = n, es
+
+        def numel(self):
+            return self._n
+
+        def element_size(self):
+            return self._es
+
+    class FakePatcher:
+        patches = {
+            "a": [(1.0, {"w": FakeT(1024, 2)}, None)],
+            "b": [(0.5, {"w": FakeT(2048, 2)})],
+        }
+
+    got = perf.probe_lora_footprint(FakePatcher())
+    assert got["patch_groups"] == 2
+    assert got["patch_count"] == 2
+    assert got["lora_weight_gb"] == round(6144 / (1024 ** 3), 2)
+
+    # 没挂 LoRA：给全 0（调用方要的是「没挂」这个结论，不是「量不到」）
+    assert perf.probe_lora_footprint(object()) == {
+        "patch_groups": 0, "patch_count": 0, "lora_weight_gb": 0.0}
+    assert perf.probe_lora_footprint(None)["patch_count"] == 0
+
+
+def test_lora_account_line_names_both_halves():
+    """那一行必须同时有「权重」和「实测激活」——只报权重就是 D2 的错误复现。"""
+    line = perf.lora_account_line(12.4, 50, 6.13)
+    assert "权重 +12.4GB" in line and "50 patches" in line
+    assert "激活峰值 6.1GB" in line and "建议留空" in line
+    no_act = perf.lora_account_line(12.4, 50, None)
+    assert "未实测" in no_act
+    assert perf.suggest_act_reserve(6.13) == 7.4
+    assert perf.suggest_act_reserve(None) is None
+    assert perf.suggest_act_reserve(0) is None
+
+
+def test_media_encoder_switch_keeps_x264_default():
+    """编码器开关：默认与不认识的值都必须落回 libx264（现状兼容）。"""
+    import media
+    assert media.set_encoder("auto") == "libx264"
+    codec, opts = media._video_stream_options(20, "veryfast", 4, 3)
+    assert codec == "libx264" and opts["crf"] == "20" and opts["aq-mode"] == "3"
+    assert media.set_encoder("h264_nvenc", 18) == "h264_nvenc"
+    codec, opts = media._video_stream_options(20, "veryfast", 4, 3)
+    assert codec == "h264_nvenc"
+    assert opts == {"cq": "18", "preset": "p4"}, "NVENC 不能收 crf / x264 的 preset / aq-mode"
+    assert media.set_encoder("libvpx") == "libx264", "未知编码器必须回落，别塞给 PyAV"
+    media.set_encoder("auto")
+
+
+def test_new_wired_keys_are_all_declared():
+    """本轮新接线的键必须同时在 DEFAULT_PERF / PERF_TYPES / WIRED_KEYS 里。"""
+    for k in ("oom_autoretry", "act_peak_probe", "ff_chunk_tokens", "attn_backend",
+              "upscale_temporal_chunk", "keep_upscaler_resident", "final_mode",
+              "frames_dtype", "guard_action", "encoder", "nvenc_cq"):
+        assert k in perf.DEFAULT_PERF, k
+        assert k in perf.PERF_TYPES, k
+        assert k in perf.WIRED_KEYS, k
+
+
+def test_apply_runtime_echoes_late_keys():
+    """渲染期消费的键：apply_runtime 要把存下来的值回声出去（面板靠它显示状态）。"""
+    t = perf.parse_state({"frames_dtype": "uint8", "final_mode": "stream",
+                          "oom_autoretry": False, "encoder": "auto"})
+    out = perf.apply_runtime(t)
+    assert out["frames_dtype"] == "uint8"
+    assert out["final_mode"] == "stream"
+    assert out["oom_autoretry"] is False
+    assert "encoder" in out
+    # 还原
+    perf.apply_runtime(perf.parse_state({"frames_dtype": "float32",
+                                         "final_mode": "auto", "oom_autoretry": True}))

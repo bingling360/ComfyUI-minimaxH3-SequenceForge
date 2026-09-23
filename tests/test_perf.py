@@ -186,10 +186,8 @@ def test_resolve_perf_cloud_matches_plan_table():
     assert p["blocks_to_swap"] == 0
     # blocks_prefetch 不在档位表里（官方默认即开，场景 A 全常驻时它本来就是空转）
     assert p["blocks_prefetch"] is True
-    assert p["unload_unet_seg"] is False
-    assert p["max_upscale_scale"] == 4.0
-    assert p["cond_cache_size"] == 32
-    assert p["guard_offload_target"] is True   # 场景 A 的关键项
+    # 档位表瘦身（2026-09-23）：原本 8 项，6 项零消费端 + 1 项旋钮空转都被删除，
+    # 现在场景 A 与 B 的唯一差异就是上面那条「逼不逼官方换块」。
 
 
 def test_resolve_perf_local_matches_plan_table():
@@ -197,10 +195,6 @@ def test_resolve_perf_local_matches_plan_table():
     assert p["profile"] == perf.PROFILE_LOCAL
     assert p["blocks_to_swap"] == 25
     assert p["blocks_prefetch"] is True
-    assert p["unload_unet_seg"] is True
-    assert p["max_upscale_scale"] == 1.5
-    assert p["cond_cache_size"] == 8
-    assert p["frames_to_cpu"] is True
 
 
 def test_resolve_perf_returns_full_contract():
@@ -212,10 +206,10 @@ def test_resolve_perf_returns_full_contract():
 def test_resolve_perf_overrides_win():
     """用户逐项覆盖必须压过场景表（计划 §7：这张表是建议值，不是强制值）。"""
     p = perf.resolve_perf("auto", CLOUD, {"blocks_to_swap": 10,
-                                          "cond_cache_size": 4})
+                                          "ff_chunk_tokens": 2048})
     assert p["blocks_to_swap"] == 10
-    assert p["cond_cache_size"] == 4
-    assert p["max_upscale_scale"] == 4.0    # 未覆盖的仍跟随场景
+    assert p["ff_chunk_tokens"] == 2048
+    assert p["blocks_prefetch"] is True     # 未覆盖的仍走 DEFAULT_PERF
 
 
 def test_resolve_perf_ignores_unknown_and_none():
@@ -255,45 +249,44 @@ def test_resolve_auto_follows_profile():
 # ---- parse_state：类型校验 ----
 
 def test_parse_state_accepts_int_for_auto_defaulted_field():
-    """回归守卫：`cond_cache_size` 默认是字符串 "auto"，但整数 8 必须收下。
+    """回归守卫：默认值是字符串 "auto" 的字段，也必须收下真实取值。
 
-    早先按默认值类型反推，得出「只收 str」，于是前端写回的 8 被当成非法值丢掉
-    —— 自动档字段永远改不动。
+    早先按默认值类型反推，得出「只收 str」，于是前端写回的布尔值被当成非法值丢掉
+    —— 自动档字段永远改不动。（`upcast_attention` 是三态字段里唯一还带 "auto" 的。）
     """
-    assert perf.parse_state({"cond_cache_size": 8})["cond_cache_size"] == 8
-    assert perf.parse_state({"frames_to_cpu": True})["frames_to_cpu"] is True
-    assert perf.parse_state({"unload_upscaler_cache": "auto"})["unload_upscaler_cache"] == "auto"
+    assert perf.parse_state({"upcast_attention": True})["upcast_attention"] is True
+    assert perf.parse_state(
+        {"upcast_attention": "auto"})["upcast_attention"] == "auto"
 
 
 def test_parse_state_accepts_float_for_numeric_field():
     """(int, float) 字段收到 1.5 不能被 int 分支吞掉。"""
-    assert perf.parse_state({"max_upscale_scale": 1.5})["max_upscale_scale"] == 1.5
     assert perf.parse_state({"offload_guard_ratio": 1.3})["offload_guard_ratio"] == 1.3
-    assert perf.parse_state({"max_upscale_scale": 4})["max_upscale_scale"] == 4
+    assert perf.parse_state({"offload_guard_ratio": 2})["offload_guard_ratio"] == 2
 
 
 def test_parse_state_normalizes_integral_float_to_int():
     """JSON 里的 8.0 就是 8（避免 8.0 一路带到需要 int 的地方）。"""
-    out = perf.parse_state({"cond_cache_size": 8.0})
-    assert out["cond_cache_size"] == 8
-    assert isinstance(out["cond_cache_size"], int)
+    out = perf.parse_state({"x264_crf": 8.0, "blocks_to_swap": 12.0})
+    assert out["x264_crf"] == 8 and isinstance(out["x264_crf"], int)
+    assert out["blocks_to_swap"] == 12 and isinstance(out["blocks_to_swap"], int)
 
 
 def test_parse_state_rejects_wrong_types():
     """类型不对 → 丢弃该项回落到默认，不做猜测式强转。"""
     d = perf.DEFAULT_PERF
     out = perf.parse_state({"blocks_to_swap": "x", "profile": 5,
-                            "blocks_prefetch": 0, "probe": "yes"})
+                            "blocks_prefetch": 0, "encode_hq": "yes"})
     assert out["blocks_to_swap"] == d["blocks_to_swap"]
     assert out["profile"] == d["profile"]
     assert out["blocks_prefetch"] == d["blocks_prefetch"]   # 0 不是 bool → 丢弃回落
-    assert out["probe"] == d["probe"]
+    assert out["encode_hq"] == d["encode_hq"]
 
 
 def test_parse_state_keeps_false():
     """False 是合法值，不能被当成「没填」跳过。"""
     assert perf.parse_state({"blocks_prefetch": False})["blocks_prefetch"] is False
-    assert perf.parse_state({"guard_offload_target": False})["guard_offload_target"] is False
+    assert perf.parse_state({"encode_hq": False})["encode_hq"] is False
 
 
 def test_parse_state_drops_unknown_keys_and_none():
@@ -944,33 +937,18 @@ def test_all_chunk_switches_off_by_default():
     assert perf.DEFAULT_PERF["upscale_temporal_chunk"] is True
 
 
-def test_chunk_switches_and_params_are_all_wired_or_explicitly_unwired():
-    """每个分块参数键，必须在「已接线」或「未接线（有理由）」名单里，不能两头不沾。
+def test_chunk_switches_and_params_are_in_the_table():
+    """每个分块键（开关与参数）都必须在 DEFAULT_PERF 里有值、有类型。
 
-    两头不沾 = 面板上既不生效也不标「接线中」，用户勾了以为有用 —— 这是最坑的一种。
+    ⚠「它到底有没有人读」**不在这里验** —— 那是
+    `test_perf_settings.py::test_no_key_in_default_perf_is_unread` 的 AST 判据，
+    覆盖全部键、且不靠人工名单。原先这里比对的是一套「已接线 / 未接线」名单，
+    那套三态机制已于 2026-09-23 连根删除（名单必然过期）。
     """
-    wired = set(perf.WIRED_KEYS)
-    unwired = set(perf.UNWIRED_KEYS)
     for _, params in CHUNK_PAIRS:
         for p in params:
             assert p in perf.DEFAULT_PERF, f"{p} 不在 DEFAULT_PERF"
-            assert p in wired or p in unwired, f"{p} 既没接线也没进未接线名单"
-
-
-def test_chunk_switch_and_param_do_not_overlap_in_wiring():
-    """开关与参数不能一个接线一个没有——那会让参数永远改不动或永远改得动。
-
-    （`refine_tile_on` 与其参数曾整组在未接线名单，tile 接线后已整组转入 WIRED，
-    故此处不再需要例外分支。）
-    """
-    wired = set(perf.WIRED_KEYS)
-    for sw, params in CHUNK_PAIRS:
-        sw_wired = sw in wired
-        for p in params:
-            p_wired = p in wired
-            assert sw_wired == p_wired, (
-                f"{sw}({'已接线' if sw_wired else '未接线'}) 与 {p}"
-                f"({'已接线' if p_wired else '未接线'}) 不一致")
+            assert p in perf.PERF_TYPES, f"{p} 没有类型声明（parse_state 会丢掉它）"
 
 
 def test_chunk_param_defaults_are_sane():
@@ -1006,90 +984,48 @@ def test_decode_chunk_is_gone_for_good():
             assert k not in tbl, f"{k} 又出现在档位表里了"
 
 
-def test_profile_driven_keys_are_derived_from_profile_table():
-    """PROFILE_DRIVEN_KEYS 必须是三张档位表的**并集**，不能手写。
+def test_profile_table_keys_are_real_and_known():
+    """档位表里的键必须是 DEFAULT_PERF 里的真键（不然是写了没人认的名字）。
 
-    为什么要有这张表：面板判「这项到底生不生效」原先只有二分（在 WIRED_KEYS /
-    不在），于是 `unload_upscaler_cache` 这类「由档位表填值、auto 档下确实生效」
-    的键被画成灰色的「接线中」—— 把在用的开关说成没用。
+    ★ 档位表曾经有 8 项，其中 6 项（`unload_unet_seg` / `unload_before_decode` /
+    `frames_to_cpu` / `max_upscale_scale` / `unload_upscaler_cache` /
+    `guard_offload_target`）**全仓没有任何读取方** —— 档位表里写着值、跑起来什么都
+    不改，是「这条策略已生效」的假承诺，已连根删除。
+    「每个键都有读取方」由 `test_perf_settings.py::test_no_key_in_default_perf_is_unread`
+    统一守（AST 扫全仓），这里只管档位表与主表的口径一致。
     """
     union = set()
     for tbl in perf.PROFILE_TABLE.values():
         union |= set(tbl)
-    assert set(perf.PROFILE_DRIVEN_KEYS) == union, "档位名单与档位表并集不一致"
-    # 并集里必须真的有内容（三张表都空的话上面那条会「通过」但其实没烤到）
-    assert len(union) >= 8, f"档位表并集太小：{sorted(union)}"
-    # ★ 回归守卫：**不能**拿 PROFILE_CLOUD 这类名字去迭代 ——
-    # 它们是字符串常量（'cloud'），迭代得到单字符 'c','l','o','u','d'。
-    # 这个 bug 真的犯过：名单变成 ('a','c','d','l','m','o','s','t','u')。
-    assert not set(perf.PROFILE_DRIVEN_KEYS) <= set("cloudlocalcustom"), (
-        "档位名单退化成了单字符集合 —— 十有八九是拿 PROFILE_CLOUD 这类字符串常量迭代了")
-    for k in perf.PROFILE_DRIVEN_KEYS:
-        assert len(k) > 3 and "_" in k or k.isidentifier(), f"档位键形状可疑：{k!r}"
+    # 瘦身到只剩 `blocks_to_swap` 之后，这里也真的只剩一项 —— 但"有内容"仍要验，
+    # 否则三张表全空时上面那条会「通过」而其实什么都没烤到。
+    assert len(union) >= 1, f"档位表并集太小：{sorted(union)}"
+    unknown = union - set(perf.DEFAULT_PERF)
+    assert not unknown, f"档位表里有 DEFAULT_PERF 里没有的键：{sorted(unknown)}"
 
 
-def test_profile_driven_keys_match_frontend_stub():
-    """前端守卫用的桩名单必须与后端**值**一致（跨语言文本比对在 JS 侧做不了）。
+def test_blocks_to_swap_minus_one_is_the_follow_profile_sentinel():
+    """`blocks_to_swap = -1` = 「跟随档位」（**不是** 0 —— 0 会被读成「一块都不换」）。
 
-    JS 侧只能扒字面量，而 `PROFILE_DRIVEN_KEYS` 是推导式、源码无键名字面量 ——
-    所以这条归 Python：真 import 后逐一比对 tests/js/perf_modal_check.js 的桩。
+    面板的「跟随档位」提示现在**按这个值**显示（前端字段表的 `autoWhen: -1`），
+    不再依赖后端名单 —— 名单已随三态机制删除。
     """
-    import re
-    p = os.path.join(ROOT, "tests", "js", "perf_modal_check.js")
-    with open(p, "r", encoding="utf-8") as f:
-        js = f.read()
-    m = re.search(r"const UNWIRED_STUB = \[(.*?)\];", js, re.S)
-    assert m, "perf_modal_check.js 里找不到 UNWIRED_STUB"
-    stub = re.findall(r'"([a-z_]+)"', m.group(1))
-    assert sorted(stub) == sorted(perf.UNWIRED_KEYS), (
-        "JS 桩的 UNWIRED_STUB 与 perf.UNWIRED_KEYS 不一致 —— 改了后端要同步那个桩"
-        f"\n桩：{sorted(stub)}\n后端：{sorted(perf.UNWIRED_KEYS)}")
-    # 桩里的档位名单（若存在）也必须与后端一致
-    m2 = re.search(r"const PROFILE_DRIVEN_STUB = \[(.*?)\];", js, re.S)
-    if m2:
-        stub2 = re.findall(r'"([a-z_]+)"', m2.group(1))
-        assert sorted(stub2) == sorted(perf.PROFILE_DRIVEN_KEYS), (
-            "JS 桩的 PROFILE_DRIVEN_STUB 与 perf.PROFILE_DRIVEN_KEYS 不一致")
-
-
-def test_unwired_table_is_empty_and_kept():
-    """块交换接线（2026-09-23）后**未接线名单为空** —— 空表本身是被钉住的事实。
-
-    两条都要：① 表存在（`perf_get`/`perf_set` 与前端都读它，删了接口会缺字段）；
-    ② 它是空的（前端「接线中」那一态因此不再渲染）。空 ≠ 机制没了：下次加未接线
-    字段就往这里加，前端不用动。
-    """
-    assert hasattr(perf, "UNWIRED_KEYS"), "UNWIRED_KEYS 整个删了 —— 它是接口契约"
-    assert perf.UNWIRED_KEYS == (), (
-        f"未接线名单该是空的（块交换已接线），实际 {sorted(perf.UNWIRED_KEYS)}")
-
-
-def test_blocks_to_swap_is_wired_and_profile_driven():
-    """`blocks_to_swap` 是 wired ∩ profile_driven：机制已接线，但默认值 -1 的语义就是
-    「跟随档位」→ 面板照旧显示「跟随档位」而不是「已接线」。"""
-    assert "blocks_to_swap" in perf.WIRED_KEYS
-    assert "blocks_to_swap" in perf.PROFILE_DRIVEN_KEYS
     assert perf.DEFAULT_PERF["blocks_to_swap"] == -1
 
 
-def test_wired_and_unwired_never_overlap():
-    """同一键不许同时进「已接线」与「未接线」—— 那是自相矛盾的判据。"""
-    assert not (set(perf.WIRED_KEYS) & set(perf.UNWIRED_KEYS))
+def test_three_state_lists_are_gone_for_good():
+    """三态名单（`WIRED_KEYS` / `UNWIRED_KEYS` / `PROFILE_DRIVEN_KEYS`）不许回潮。
 
-
-def test_every_field_key_is_classified():
-    """DEFAULT_PERF 里的每个键都要能被三态之一判到，不能两头不沾。
-
-    例外是纯内部键（`profile` / `preset` / `probe` 这类由 resolve_perf 消费、
-    不进面板的）—— 它们本来就不该出现在面板上，所以不要求进任何名单。
+    2026-09-23 用户拍板连根删除，理由：名单是**人工维护的**、必然说谎 ——
+    「未接线」那一态早已恒空，而同一张名单曾把 10 个没人读的键当「内部键」放行，
+    让「没有未接线字段」这句话变成假的。
+    判据改为**代码事实**：键有读取方才算接线
+    （`test_perf_settings.py::test_no_key_in_default_perf_is_unread` 用 AST 扫全仓）。
     """
-    panel = set(perf.WIRED_KEYS) | set(perf.UNWIRED_KEYS) | set(perf.PROFILE_DRIVEN_KEYS)
-    internal = {"profile", "preset", "probe", "cond_cache_size",
-                "offload_guard_ratio", "guard_offload_target", "frames_to_cpu",
-                "max_upscale_scale", "unload_unet_seg", "unload_before_decode",
-                "unload_upscaler_cache"}
-    stray = set(perf.DEFAULT_PERF) - panel - internal
-    assert not stray, f"这些键既不在面板三态里、也不在内部键白名单：{sorted(stray)}"
+    for name in ("WIRED_KEYS", "UNWIRED_KEYS", "PROFILE_DRIVEN_KEYS"):
+        assert not hasattr(perf, name), (
+            f"perf.{name} 又出现了 —— 三态名单已删除，别再引入人工「接线名单」；"
+            "要么给键加消费端，要么别加键")
 
 
 def test_plan_ff_chunks_boundaries():

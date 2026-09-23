@@ -16,7 +16,7 @@ last_error = None
 #   · `encoder` 选实现：libx264（CPU 软编，压缩效率高，但默认起 核数×1.5 个线程，
 #     长链编码时整机 CPU 吃满）/ h264_nvenc / hevc_nvenc（GPU 硬件编，几乎不占 CPU，
 #     代价是同画质需要更高码率）→ 见 resolve_encoder。
-#   · `encode_profile` 只管 preset（编码速度档）+ 8bit 暗部抖动，两边通用。
+#   · `encode_hq`（开关）只管 preset（编码速度档）+ 暗部 aq + 8bit 抖动，两边通用。
 #
 # 质量数值**跟编码器换含义**：x264 认 `crf`、NVENC 认 `cq`，互不认识。
 # 传错的一侧会被 ffmpeg 静默忽略（不报错，质量档直接失效），所以这两个值分开存、
@@ -73,13 +73,19 @@ def _video_stream_options(crf, preset, threads, aq_mode):
     所以走 NVENC 时只给 `cq` + `preset=p4`（NVENC 的中档，对应 x264 的
     medium 量级），x264 那套 crf/preset/aq-mode 原样保留。
 
-    ⚠ `crf` 入参是「调用方按 encode_profile 查表拿到的默认值」；只要用户
-      在性能设置里动过 x264 质量档，就以进程级 `ENCODER_CRF` 为准（面板那个
-      数值才是用户输入的真相，档位表的 crf 只是它的出厂默认）。
+    ⚠ `crf` 入参是**调用方解析好的真值**（`upscale.resolve_encode_quad` 拿
+      `perf.x264_crf` 算出来的那一个）；只有入参缺失/非法时才退回进程级
+      `ENCODER_CRF`（apply_runtime 写进去的兜底）。
+      2026-09-23 本轮修正：这里以前**只认** `ENCODER_CRF`、把入参整个丢掉 ——
+      调用方算得再对都不生效，是「有真值却不用」的一处静默失效。
     """
     if ENCODER in ("h264_nvenc", "hevc_nvenc"):
         return ENCODER, {"cq": str(int(ENCODER_CQ)), "preset": "p4"}
-    options = {"crf": str(int(ENCODER_CRF)), "preset": str(preset),
+    try:
+        _crf = int(crf)
+    except (TypeError, ValueError):
+        _crf = int(ENCODER_CRF)
+    options = {"crf": str(_crf), "preset": str(preset),
                "threads": str(max(1, int(threads)))}
     if aq_mode:
         options["aq-mode"] = str(int(aq_mode))

@@ -39,40 +39,30 @@ from . import perf
 
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
-ENCODE_PROFILES = ("标准", "高清", "极致")
-# 编码档 → (crf 默认值, preset, aq-mode, 抖动)。
-# ⚠ **crf 只是本档的默认值**：真值由 perf 的 `x264_crf` 给（见 `resolve_encode_quad`），
-# 档位本身只定 preset + 抖动。这样「画质档」与「crf 数值」是两个独立旋钮 ——
-# 用户可以在「高清」档上把 crf 再往下压，而不必新造一个档。
-# 「标准」= 现状（crf20 veryfast 无抖动，兼容）；「高清/极致」为抗糊抗条纹档——
-# veryfast 比 medium 率失真差约 5-15%（编码层二次模糊），crf 20→16/13 保高清
-# 细节；aq-mode=3 暗部自适应量化（保暗场细节）；Bayer 抖动打散 8bit 量化
-# ——平滑渐变区的横向色带（条纹主源）。
+# 编码画质开关（原「标准 / 高清 / 极致」三档，2026-09-23 本轮压成**一个开关**，
+# 用户拍板）：
+#   关（默认）= 现状口径：veryfast · 无 aq · 无抖动
+#   开         = medium preset（率失真比 veryfast 好约 5–15%，编码层的二次模糊更少）
+#                + aq-mode 3（暗部自适应量化，保暗场细节）
+#                + Bayer 有序抖动（打散 8bit 量化台阶 → 平滑渐变区的横向色带）
+#
+# 为什么砍掉「极致」档：crf 由 `perf.x264_crf` 独立接管之后，「极致」与「高清」
+# **只差 preset 速度档**（slow vs medium），不值得单列一档。crf 与 preset / 抖动
+# 是**两个正交旋钮** —— 想要极致档的画质，把 crf 往下压就是了。
 _ENCODE_SETTINGS = {
-    "标准": (20, "veryfast", None, False),
-    "高清": (16, "medium", 3, True),
-    "极致": (13, "slow", 3, True),
+    False: ("veryfast", None, False),
+    True: ("medium", 3, True),
 }
-# ⚠ **已确认的现状（2026-09-23，本轮不改，如实标注）**：上面这三个 crf 数字目前
-#   **取不到** —— `perf.x264_crf` 默认就是 20 且恒有值，`resolve_encode_quad` 见到
-#   非 None 就覆盖；而 `media._video_stream_options` 的 x264 分支连入参 crf 都不看，
-#   只认进程级 `ENCODER_CRF`（= perf.x264_crf）。所以切「高清 / 极致」当前只改
-#   preset + 暗部抖动，crf 仍是面板上那个数（与旧版「一采编码=高清 → crf16」相比
-#   画质偏弱）。要恢复「档位自带 crf」，得把 `x264_crf` 默认改成 "auto"、由
-#   `apply_runtime` 按档位解析（本轮未做）。
 
 
-def resolve_encode_quad(profile, x264_crf=None):
-    """(画质档, crf 覆盖值) -> (crf, preset, aq_mode, dither)。
+def resolve_encode_quad(hq=False, x264_crf=None):
+    """(画质开关, crf) -> (crf, preset, aq_mode, dither)。
 
-    `x264_crf` 给了有效整数就用它，否则用档位默认 —— 这是「crf 与画质档分开」
-    的落地点：档位管 preset + 抖动，crf 可以单独调。
-
-    ⚠ 当前 `x264_crf` 恒有值（`perf.DEFAULT_PERF` 给 20）→ 档位那三个 crf 实际
-    取不到，详见 `_ENCODE_SETTINGS` 上方的现状说明（本轮先如实标注，未改行为）。
+    `hq` 只管 preset + aq + 抖动；crf **只**由 `x264_crf` 给（缺省 20）。
+    两者正交：「切档位」不会再悄悄改 crf，改 crf 也不会动档位。
     """
-    crf, preset, aq, dither = _ENCODE_SETTINGS.get(
-        str(profile or "标准"), _ENCODE_SETTINGS["标准"])
+    preset, aq, dither = _ENCODE_SETTINGS[bool(hq)]
+    crf = 20
     try:
         if x264_crf is not None:
             crf = int(x264_crf)
@@ -196,7 +186,7 @@ def parse_state(ds):
         # 这三项是**机器级**设置，与作品无关：
         #   · 时序分块 `chunk`        -> perf.upscale_temporal_chunk（+ 帧数 / overlap）
         #   · 强制卸载 `force_unload` -> perf.keep_upscaler_resident（取反面；另有余量档）
-        #   · 编码档 `encode`         -> perf.encode_profile（与 encoder / nvenc_cq 并排）
+        #   · 编码画质开关 `encode_hq` -> perf.encode_hq（与 encoder / x264_crf 并排）
         # 它们以前随项目存档走，导致「同一台卡换个项目就得重设」，且关掉分块会进
         # 二采指纹、把既有高清段判失效重做 —— 那是拿显存手段当画质手段。
         # 运行时由 nodes.py 把 perf 的值合并进 up_cfg（见该处注释）。
@@ -548,10 +538,11 @@ def _hash_params(cfg):
         keys["sharpen"] = cfg["sharpen"]
     if cfg.get("pixel_sharpen"):
         keys["pixel_sharpen"] = cfg["pixel_sharpen"]
-    # 编码档位仍是「非标准才进指纹」——因为它改变输出内容（crf / preset / 抖动）。
-    # 真源从 up.parse_state 换成 perf.encode_profile，但语义不变。
-    if cfg.get("encode") and cfg["encode"] != "标准":
-        keys["encode"] = cfg["encode"]
+    # 画质开关「开了才进指纹」—— 它改变输出内容（preset + 暗部 aq + 抖动），
+    # 与旧「非标准档才进指纹」语义等价。真源从 up.parse_state 换成 perf.encode_hq。
+    # crf 不进指纹：它由 perf.x264_crf 单独给，且本来就不随项目存档走。
+    if cfg.get("encode_hq"):
+        keys["encode_hq"] = True
     # ⛔ `chunk` / `force_unload` **不再进指纹**（2026-09-23）：它们已迁到机器级
     # 性能设置，不再随项目存档走。以前「关掉分块」会把既有高清段全部判失效重做 ——
     # 那是拿显存手段当画质手段，代价还不小。分块口径变化对输出只有数值噪声级影响，
@@ -2752,8 +2743,8 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 像素域清晰度度量（抗糊 N6）：跨参数可比的绝对清晰度锚点（记录用，
     # 不进指纹）；HQ 编码档（抗糊 N5）解析成具体参数透传编码层
     sharp = round(pixel_sharpness(frames), 2)
-    _enc = str(cfg.get("encode") or "标准")
-    _ecrf, _epreset, _eaq, _edith = resolve_encode_quad(_enc, cfg.get("x264_crf"))
+    _ehq = bool(cfg.get("encode_hq"))
+    _ecrf, _epreset, _eaq, _edith = resolve_encode_quad(_ehq, cfg.get("x264_crf"))
     if not checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
                                        fresh=True, crf=_ecrf, preset=_epreset,
                                        aq_mode=_eaq, dither=_edith):
@@ -2778,7 +2769,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _sigmas = cascade_sigmas(_sig, _passes, float(cfg.get("decay") or 0.5))
     _sig_str = "/".join(f"{s:g}" for s in _sigmas)
     _shp = float(cfg.get("sharpen") or 0.0)
-    _enc = str(cfg.get("encode") or "标准")
+    _ehq = bool(cfg.get("encode_hq"))
     _sam = str(cfg.get("sampler") or "").strip()
     _sch = str(cfg.get("scheduler") or "").strip()
     _kind = "—"
@@ -2799,7 +2790,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   + (f" · STG{_stg:g}(b{_stgb})" if _stg > 0 else "")
                   + (f" · 锐化{_shp:g}" if _shp > 0 else "")
                   + (f" · 像素锐{_psp:g}" if _psp > 0 else "")
-                  + (f" · {_enc}编码" if _enc != "标准" else "")
+                  + (" · 高清编码档" if _ehq else "")
                   + ((f" · {(_sam + '/' + _sch).rstrip('/')}")
                      if (_sam or _sch) else "")
                   + (" · 重试取优" if retried else "")
@@ -2969,7 +2960,7 @@ def try_final(root, cfg, report, skip_slots=None):
     # concat 退回首源画幅（首个带记录源优先排在前时两者一致）
     target_wh = media.probe_video_size(sources[first_rec]) if first_rec >= 0 else None
     _crf, _preset, _aq, _dither = resolve_encode_quad(
-        str(cfg.get("encode") or "标准"), cfg.get("x264_crf"))
+        cfg.get("encode_hq"), cfg.get("x264_crf"))
     if media.concat_av_mp4(sources, os.path.join(checkpoint.finals_dir(root), out_name),
                            width=target_wh[0] if target_wh else None,
                            height=target_wh[1] if target_wh else None,

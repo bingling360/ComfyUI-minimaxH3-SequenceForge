@@ -2603,8 +2603,9 @@ const REDO_MODES = [
     ["无锚", "完全自由发挥：两端硬切（独立镜头式重摇）"],
 ];
 const UP_PRECISIONS = ["fp32", "fp16", "bf16"];
-/* 编码档位（标准/高清/极致）的选项表已迁到 perf 字段表的 `encode_profile`；
-   后端真源仍是 `upscale.ENCODE_PROFILES`（crf + preset + 抖动四元组）。 */
+/* 编码画质档已从三档「标准/高清/极致」压成开关 `encode_hq`（2026-09-23）——
+   后端真源 `upscale._ENCODE_SETTINGS`（preset + aq + 抖动），crf 另由 `x264_crf`
+   独立给。选项表已不存在，面板也不该再造一个。 */
 /* 放大目标尺寸模式（与后端 upscale.py SIZE_MODES 同表） */
 const UP_SIZE_MODES = ["倍率", "目标尺寸", "百万像素"];
 
@@ -3900,13 +3901,14 @@ const OPT_PROVIDERS = {
 /* ---- ⚡ 性能优化设置（**全局**、跨项目）----
  *
  * 真源在后端 perf.py：DEFAULT_PERF / PERF_TYPES / parse_state / apply_runtime。
- * 前端**不自己算档位**（既有的铁律：参数单一真源），只做三件事：
+ * 前端**不自己算档位**（既有的铁律：参数单一真源），只做两件事：
  *   ① 显示后端给的只读诊断（显存 / 内存 / swap / R_v / R_m / 档位 / 平台）
  *   ② 渲染开关，改完点「保存并应用」一次性 POST 回后端并在进程内应用
- *   ③ 把**未接线**的键明确标出来（灰掉 + 写「接线中」）
  *
- * 为什么要标「接线中」：列出一个勾了却没用的开关比不给开关更糟 ——
- * 用户会以为生效了，转头拿"改了没变化"来报 bug。
+ * ⛔ 这里原本还有第三件事：按后端名单把字段标成「接线中」（灰掉）或「跟随档位」。
+ * 2026-09-23 连根删除：名单是**人工维护的**、必然说谎，而「未接线」那一态早已恒空。
+ * 现在「这个键有没有用」由代码事实决定（有没有人读它，后端有 AST 测试守着），
+ * 面板一律直接渲染；需要提示的地方用**字段属性 + 当前值**表达（见字段表的 `autoWhen`）。
  *
  * ═══ 分类轴 = 处理链阶段（2026-09-23 重构）═══
  *
@@ -3965,7 +3967,8 @@ const H3_PERF_FIELDS = [
           + "⚠ 本项接的是 **ComfyUI 官方**的块级流动（DynamicVRAM 的 vbar 换入 + 官方 block 循环里的预取队列），"
           + "插件**不自己搬权重**：手工搬会与官方按需换入抢同一批参数、并打坏 LoRA 的权重账。"
           + "开关的作用是把下面「交换块数」折算成**显存预留**交给 aimdo —— 抬高预留 = 逼官方把更多块换出去" },
-    { key: "blocks_to_swap", label: "　　交换块数（0–50）", kind: "num", enable: "blocks_swap_on", group: "一采采样 · 权重流动",
+    { key: "blocks_to_swap", label: "　　交换块数（0–50）", kind: "num", enable: "blocks_swap_on",
+      autoWhen: -1, group: "一采采样 · 权重流动",
       hint: "放出多少块到 CPU，等价于「多留出 N × 每块大小 的显存」。参考：16GB→19–25 块；12GB→31–38；8GB→44–50。"
           + "-1 = 跟随档位（按本机**真实 UNET 体量**反解，只有渲染开始拿到模型时才算得准）。"
           + "⚠ 会被**夹取**：预留不可能超过显存总量，超过「显存一半」的部分会被夹掉并在报告行里说明" },
@@ -3989,11 +3992,6 @@ const H3_PERF_FIELDS = [
       hint: "**默认开，延续现状口径**：段间把放大网络留在缓存里，下段零加载。"
           + "关掉 = 每段二采收尾**强制卸载**（把网络从缓存里删掉 + soft_empty_cache，下段重新从磁盘加载 ~1s），"
           + "换来的是 CPU 侧那 ~659MB 权重副本 —— 多段链「后段比首段更易 OOM」时才需要关" },
-    { key: "unload_upscaler_cache", label: "段间清掉放大网络缓存", kind: "tri", group: "放大网络 · 常驻",
-      hint: "内存紧时开：每段结束后把放大网络从缓存里彻底删掉（下段重新从磁盘加载，每段约 1s）。"
-          + "⚠ 它与上面「段间保留」是**同一件事的两面**，而上头那个开关才是当前真正生效的 —— "
-          + "本项后端暂无消费端，改它不改变行为" },
-
     /* ═══ ④ 精化二采 ═══ */
     { key: "refine_temporal_on", label: "精化时序分块", kind: "bool", group: "精化二采 · 分块",
       hint: "把高清 latent 沿时间切段，**每段独立跑 N 步去噪**。⚠ 与放大网络那个时序分块有本质区别："
@@ -4043,20 +4041,21 @@ const H3_PERF_FIELDS = [
           + "两者**都不省显存**（帧最终仍要落 CPU 侧进编码器）。" },
     { key: "x264_crf", label: "libx264 质量档 crf", kind: "num", group: "成片与编码 · 编码",
       showWhen: { key: "encoder", values: ["libx264"] },
-      hint: "x264 恒定质量（**越小越清晰**，常用 13–23：20 标准 / 16 高清 / 13 极致）。"
-          + "与「画质档位」**分开**：档位管 preset + 抖动，crf 在这里单独调。"
-          + "⚠ 切「画质档位」**不会**自动改这里的数值 —— 想要高清档的 crf16 就手动填 16" },
+      hint: "x264 恒定质量（**越小越清晰**，常用 13–23；默认 20）。"
+          + "与下面「高清编码档」**正交**：那个开关管 preset + 抗条纹抖动，crf 在这里单独调 —— "
+          + "想要更高画质直接把这里压到 16 / 13（不必再找已取消的「极致」档）。"
+          + "本值就是 x264 唯一的质量真源，改完立即对后续编码生效" },
     { key: "nvenc_cq", label: "NVENC 质量档 cq", kind: "num", group: "成片与编码 · 编码",
       showWhen: { key: "encoder", values: ["h264_nvenc", "hevc_nvenc"] },
       hint: "NVENC 恒定质量（**越小越清晰**，语义对应 x264 的 crf）。"
           + "**NVENC 不认 crf**，两者必须分开传，否则 NVENC 会静默丢掉质量档。"
           + "因 NVENC 压缩效率略低，同画质可比 crf 再调低 2–4。" },
-    { key: "encode_profile", label: "画质档位（preset + 抗条纹）", kind: "sel", group: "成片与编码 · 编码",
-      opts: [["标准", "标准（veryfast · 现状兼容）"], ["高清", "高清（medium + 暗部自适应 + 抖动）"],
-             ["极致", "极致（slow + 同上 · 编码明显变慢）"]],
-      hint: "管的是**编码器速度档 + 8bit 暗部抖动**（消解渐变色带 / 天空横向条纹）；"
-          + "**crf / cq 数值在上面对应控件里单独调**。原在右栏二采「编码档位」，"
-          + "现统一收进此处。非标准档会进二采指纹（换了档 → 既有高清段判失效重做）" },
+    { key: "encode_hq", label: "高清编码档（preset + 抗条纹）", kind: "bool", group: "成片与编码 · 编码",
+      hint: "**开**：medium preset（veryfast 的率失真差约 5–15%，是编码层的二次模糊）"
+          + "+ aq-mode 3（暗部自适应量化，保暗场细节）+ Bayer 抖动（打散 8bit 量化台阶，"
+          + "消解渐变色带 / 天空横向条纹）。**关**（默认）= 现状 veryfast 无抖动。"
+          + "⚠ 与 crf / cq **正交** —— 本开关只管 preset + 抖动，质量数值在上面单独调，"
+          + "两边互不覆盖。开了会进二采指纹（换了档 → 既有高清段判失效重做）" },
 
     /* ═══ ⑥ 通用与机器 ═══ */
     { key: "oom_autoretry", label: "主干采样 OOM 自救", kind: "bool", group: "通用与机器 · 自救",
@@ -4126,19 +4125,7 @@ async function openPerfSettings() {
     if (!info || !info.ok) { fail("读取性能设置失败"); return; }
 
     const draft = Object.assign({}, info.data || {});
-    /* 三态（判据的**唯一真源在后端**，前端不自己维护名单）：
-     *   unwired        —— 后端有字段、无实现，标「接线中」+ 灰
-     *   profile_driven —— 由 profile 档位表填值，**自动档下确实生效**，
-     *                     不标「接线中」、不灰（以前被误画成灰，等于把在用的
-     *                     开关说成没用 —— 与「列一个没用的开关」同样有害）
-     *   其余           —— 已接线
-     * ⚠ 顺序不能改：unwired 优先（本表已空 —— 块交换接线后没有未接线项了）。
-     * `blocks_to_swap` 是 wired ∩ profile_driven：执行机制已接线，但默认值 -1
-     * 的含义就是「跟随档位」，所以照旧显示「跟随档位」而不是「已接线」。 */
-    const unwired = new Set(info.unwired || []);
-    const profileDriven = new Set(info.profile_driven || []);
-    const fieldState = (k) => unwired.has(k) ? "unwired"
-        : profileDriven.has(k) ? "auto" : "wired";
+    /* 没有「判态」这一步了（三态名单已于 2026-09-23 连根删除，见文件头注释）。 */
     body.replaceChildren();
 
     /* 只读诊断：机器现状 + 当前真正生效的值（后端量，前端不猜） */
@@ -4199,14 +4186,17 @@ async function openPerfSettings() {
                 group.append(host);
             }
             for (const f of sub.fields) {
-                const state = fieldState(f.key);
-                const on = state !== "unwired";
                 const row = el("div", "h3d-perf-row");
                 const top = el("div", "h3d-perf-top");
-                const lab = el("label", null,
-                    f.label + (state === "unwired" ? " · 接线中"
-                        : state === "auto" ? " · 跟随档位" : ""));
-                if (!on) { lab.style.color = "var(--h3d-muted)"; lab.style.opacity = "0.6"; }
+                /* 「跟随档位」按**当前值**提示，不再依赖后端名单：字段表里标了
+                 * `autoWhen` 的项，值等于那个哨兵（如 blocks_to_swap 的 -1）时在
+                 * label 后加一句 —— 这样提示永远与用户眼前的值一致，不会过期。 */
+                const lab = el("label", null, "");
+                const syncFollow = () => {
+                    const fl = f.autoWhen != null
+                        && Number(draft[f.key]) === Number(f.autoWhen);
+                    lab.textContent = f.label + (fl ? " · 跟随档位" : "");
+                };
                 let ctl;
                 if (f.kind === "tri") {
                     ctl = document.createElement("select");
@@ -4233,7 +4223,6 @@ async function openPerfSettings() {
                  * 一个阶段一个总开关，下面挂「开多大」的参数，层级一眼可见。
                  * 初始灰/亮在整棵树建完后统一收尾（见本函数末尾），因为字段表里
                  * 参数可能排在它的开关之前。 */
-                ctl.disabled = !on;
                 if (f.kind === "tri") {
                     ctl.onchange = () => {
                         const v = ctl.value;
@@ -4249,18 +4238,20 @@ async function openPerfSettings() {
                         for (const ownedKey of owned) {
                             const oc = document.querySelector(
                                 '[data-h3perf-key="' + ownedKey + '"]');
-                            if (oc) oc.disabled = !ctl.checked || oc.dataset.h3perfLocked === "1";
+                            if (oc) oc.disabled = !ctl.checked;
                         }
                     };
                 } else if (f.kind === "num") {
-                    ctl.onchange = () => { draft[f.key] = Number(ctl.value) || 0; };
+                    ctl.onchange = () => {
+                        draft[f.key] = Number(ctl.value) || 0;
+                        syncFollow();     // 数值一改，「跟随档位」提示跟着变
+                    };
                 } else {
                     ctl.onchange = () => { draft[f.key] = ctl.value; };
                 }
                 /* 反向联动：开关一动，把它名下的参数一起亮 / 灰。用 data 属性登记，
                  * 让参数行在 render 时能反查宿主开关（见 gate 那段）。 */
                 ctl.dataset.h3perfKey = f.key;
-                if (!on) ctl.dataset.h3perfLocked = "1";
                 /* 按值显隐：登记「本行归属哪个宿主字段、什么值下才显示」。
                  * 为什么用 data 属性而不是现在就判：字段表里 crf 排在 encoder 之前，
                  * 建行时宿主的 select 还没建出来 → querySelector 落空、初始态会判错。
@@ -4269,6 +4260,7 @@ async function openPerfSettings() {
                     row.dataset.h3perfShowKey = f.showWhen.key;
                     row.dataset.h3perfShowVals = (f.showWhen.values || []).join("\u0001");
                 }
+                syncFollow();
                 top.append(lab, ctl);
                 row.append(top);
                 if (f.hint) {
@@ -4290,8 +4282,7 @@ async function openPerfSettings() {
         const gate = body.querySelector('[data-h3perf-key="' + f.enable + '"]');
         const child = body.querySelector('[data-h3perf-key="' + f.key + '"]');
         if (!gate || !child) continue;
-        /* 未接线的字段已被标 locked，保持灰，别被这里点亮 */
-        child.disabled = !gate.checked || child.dataset.h3perfLocked === "1";
+        child.disabled = !gate.checked;
     }
 
     /* 按值显隐收尾（同 enable 两件套，必须整棵树建完后做）。
@@ -4331,9 +4322,10 @@ async function openPerfSettings() {
                 + " · 成片=" + fmt(ap.final_mode)
                 + " · 帧精度=" + fmt(ap.frames_dtype)
                 + " · OOM自救=" + fmt(ap.oom_autoretry)
-                /* 三态别混成两态：面板打开/保存时拿不到 UNET 体量 → 算不出目标、本次
-                 * 不写（见 perf.apply_blockswap 的守卫），此时说「关」是假话 —— 它是
-                 * 「等渲染时按真实体量生效」。 */
+                /* ⚠ 这里是**块交换自己的三种情形**（开 / 关 / 待渲染生效），与已删的
+                 * 面板三态名单无关：面板打开或保存时拿不到 UNET 体量 → 算不出目标、
+                 * 本次不写（见 perf.apply_blockswap 的守卫），此时说「关」是假话 ——
+                 * 它其实是「等渲染时按真实体量生效」。 */
                 + " · 块交换=" + (ap.blockswap
                     ? (ap.blockswap.applied
                         ? (ap.blockswap.blocks + "块/" + ap.blockswap.path)

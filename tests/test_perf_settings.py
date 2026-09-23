@@ -20,13 +20,14 @@ import perf  # noqa: E402
 
 # ---------------------------------------------------------------- 契约
 
-def test_wired_keys_are_known_fields():
-    """WIRED_KEYS 里的每个键都必须是 DEFAULT_PERF / PERF_TYPES 的已知字段。
+def test_runtime_later_keys_are_known_fields():
+    """RUNTIME_LATER_KEYS（渲染期消费、面板只回声）里的键必须是已知字段。
 
-    WIRED_KEYS 是「改了立刻生效」的清单，前端拿它决定哪些开关可点。
-    里面混进一个契约里没有的键 = 前端点亮了一个后端根本不认的开关。
+    混进一个契约里没有的键 = 面板显示一个后端根本不认的状态。
+    （原先这条查的是 `WIRED_KEYS` —— 那份「已接线名单」已随三态机制连根删除。）
     """
-    for k in perf.WIRED_KEYS:
+    assert perf.RUNTIME_LATER_KEYS, "渲染期键名单是空的？至少分块与成片那几个该在"
+    for k in perf.RUNTIME_LATER_KEYS:
         assert k in perf.DEFAULT_PERF, f"{k} 不在 DEFAULT_PERF"
         assert k in perf.PERF_TYPES, f"{k} 不在 PERF_TYPES"
 
@@ -304,14 +305,19 @@ def test_media_encoder_switch_keeps_x264_default():
     media.set_encoder("auto")
 
 
-def test_new_wired_keys_are_all_declared():
-    """本轮新接线的键必须同时在 DEFAULT_PERF / PERF_TYPES / WIRED_KEYS 里。"""
+def test_new_keys_are_declared():
+    """新增的键必须同时在 DEFAULT_PERF / PERF_TYPES 里声明。
+
+    （曾经还要求同步一份「已接线名单」`WIRED_KEYS` —— 那份名单已随三态机制删除。
+    「这个键有没有人读」改由 `test_no_key_in_default_perf_is_unread` 的 AST 判据守，
+    它比人工名单可靠：名单会过期，读取方不会。）
+    """
     for k in ("oom_autoretry", "act_peak_probe", "ff_chunk_tokens", "attn_backend",
               "upscale_temporal_chunk", "keep_upscaler_resident", "final_mode",
-              "frames_dtype", "guard_action", "encoder", "nvenc_cq"):
+              "frames_dtype", "guard_action", "encoder", "nvenc_cq",
+              "encode_hq", "offload_guard_ratio"):
         assert k in perf.DEFAULT_PERF, k
         assert k in perf.PERF_TYPES, k
-        assert k in perf.WIRED_KEYS, k
 
 
 def test_apply_runtime_echoes_late_keys():
@@ -366,7 +372,7 @@ def test_unload_gate_reads_only_resident_key():
     `upscale.render_segment` 收尾处仍写着
         `if net is not None and cfg.get("force_unload") and not cfg.get("keep_...")`
     → 正面条件恒 None → 分支**永假** → `upscale_net.force_unload()` 成了不可达
-    代码，而新开关在 WIRED_KEYS / 面板字段表里标着「已接线」。这条把「不许再读
+    代码，而新开关在面板字段表里标着「已接线」。这条把「不许再读
     旧键」钉死，免得下一次重构又写回来。
     """
     with open(os.path.join(ROOT, "upscale.py"), encoding="utf-8") as f:
@@ -375,3 +381,139 @@ def test_unload_gate_reads_only_resident_key():
         "force_unload 已无写入端（键已退场），读它只会得到恒假条件"
     assert "keep_upscaler_resident" in keys, \
         "强制卸载的正面条件必须是 keep_upscaler_resident（当前无人消费它）"
+
+
+# ------------------------------------- 遗留修补（2026-09-23 第二轮审查）
+
+def test_no_key_in_default_perf_is_unread():
+    """★ 根治类守卫：DEFAULT_PERF 里的每个键都必须有**真实读取方**。
+
+    本轮审查抓到的本类问题：表里有 10 个键全仓零读取 ——
+    `unload_unet_seg` / `unload_before_decode` / `frames_to_cpu` / `max_upscale_scale` /
+    `guard_offload_target` / `preset` / `probe` / `unload_upscaler_cache`
+    （前端还摆着控件，勾了没用）+ `cond_cache_size` / `offload_guard_ratio`
+    （消费端早就收这个入参，调用方却一直没传）。
+    它们让「没有未接线字段」这句话（当时由 `UNWIRED_KEYS = ()` 声称）变成假话，也让读代码的人
+    以为这些功能存在。静态挡在这里：**新加键必须同时给出读取方**，否则测试红。
+
+    ⚠ 需要保持这份模块清单覆盖所有真实消费点；漏掉一个文件会误报「没人读」。
+    """
+    import ast
+    import glob
+
+    read = set()
+    for p in glob.glob(os.path.join(ROOT, "*.py")):
+        with open(p, encoding="utf-8") as f:
+            src = f.read()
+        read |= _get_call_keys(src)
+        # 下标式读取 `cfg["k"]` 也算消费端（apply_blockswap 那类写法）
+        for n in ast.walk(ast.parse(src)):
+            if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) \
+                    and isinstance(n.slice.value, str):
+                read.add(n.slice.value)
+    missing = sorted(k for k in perf.DEFAULT_PERF if k not in read)
+    assert not missing, (
+        f"这些键在 DEFAULT_PERF 里、但全仓没有任何读取方（改了不会有任何效果）：{missing}\n"
+        "要么给它加消费端（有人读它），要么删掉 —— 别留只有名字的键。")
+
+
+@pytest.mark.parametrize("dead", [
+    "preset", "probe",
+    "unload_unet_seg", "unload_before_decode", "frames_to_cpu",
+    "max_upscale_scale", "guard_offload_target", "unload_upscaler_cache",
+    "encode_profile",
+    # `cond_cache_size` 是**另一种**死法：有人读、值也传下去了，但那个旋钮对真实
+    # 调用路径毫无作用（官方节点固定给 tokenize 传 list → 缓存全部旁路、命中恒 0，
+    # 容量 1/8/32 结果逐字相同）—— 实测见 cond_cache.py 顶部说明。
+    # 判据升级：**有人读 ≠ 旋钮有效**。
+    "cond_cache_size",
+])
+def test_removed_dead_keys_stay_removed(dead):
+    """被本轮删掉的死键不许回来。
+
+    各自理由（详见 perf.py 对应位置的注释）：
+      · `preset` / `probe` —— 从未落地，全仓零消费
+      · `unload_unet_seg` / `unload_before_decode` / `frames_to_cpu` /
+        `max_upscale_scale` —— 从未实现；同类诉求已有真实现
+        （`vram_shuffle` / `final_mode` / `frames_dtype`）
+      · `guard_offload_target` —— 与 `guard_action` 语义重叠且零消费
+      · `unload_upscaler_cache` —— 与 `keep_upscaler_resident` 同一件事的两面，
+        而只有后者有消费端（前端曾摆着这个勾了没用的三方开关）
+      · `encode_profile` —— 三档已压成开关 `encode_hq`（crf 改由 `x264_crf` 独立给）
+    """
+    assert dead not in perf.DEFAULT_PERF
+    assert dead not in perf.PERF_TYPES
+    for tbl in perf.PROFILE_TABLE.values():
+        assert dead not in tbl, f"{dead} 又回到档位表里了"
+
+
+def test_encode_hq_is_a_two_state_switch():
+    """编码画质档 = 开关（原「标准/高清/极致」三档压成一档）。
+
+    用户拍板（2026-09-23）：crf 与 preset/抖动**分开** —— 档位只留「开不开抗糊/
+    抗条纹」，crf 由 `x264_crf` 单独调。所以真值表必须**恰好两态**。
+    """
+    import ast
+    assert perf.DEFAULT_PERF["encode_hq"] is False
+    assert perf.PERF_TYPES["encode_hq"] == (bool,)
+    with open(os.path.join(ROOT, "upscale.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    settings = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_ENCODE_SETTINGS" for t in n.targets):
+            settings = n.value
+    assert isinstance(settings, ast.Dict), "找不到 upscale._ENCODE_SETTINGS 字面量表"
+    keys = [k.value for k in settings.keys]
+    assert sorted(keys, key=str) == [False, True], (
+        f"编码档必须恰好两态（关 / 开），实际 {keys} —— 三档已经被砍掉了，别加回来")
+
+
+def test_x264_encoder_uses_caller_crf():
+    """media 的 x264 分支必须**用调用方给的 crf**。
+
+    以前这里只认进程级 `ENCODER_CRF`、把入参整个丢掉（`resolve_encode_quad`
+    按 `perf.x264_crf` 算好的值再对也不生效）—— 典型的「有真值却不用」静默失效。
+    """
+    import media
+    old_enc, old_crf = media.ENCODER, media.ENCODER_CRF
+    try:
+        media.ENCODER, media.ENCODER_CRF = "libx264", 20
+        _codec, opts = media._video_stream_options(16, "medium", 4, 3)
+        assert opts["crf"] == "16", "入参 crf 被忽略（又回到只认 ENCODER_CRF）"
+        assert opts["preset"] == "medium" and opts["aq-mode"] == "3"
+        # 入参缺失 / 非法 → 退回进程级兜底，不许抛异常
+        for bad in (None, "auto", "", "x"):
+            _c, o2 = media._video_stream_options(bad, "veryfast", 4, None)
+            assert o2["crf"] == "20", f"入参 {bad!r} 时没退回进程级兜底"
+        # NVENC 仍走 cq、不看 crf（两个旋钮不串味）
+        media.ENCODER = "h264_nvenc"
+        _c, o3 = media._video_stream_options(16, "medium", 4, 3)
+        assert "crf" not in o3 and o3["cq"] == "20"
+    finally:
+        media.ENCODER, media.ENCODER_CRF = old_enc, old_crf
+
+
+def test_guard_ratio_is_passed_and_cond_knob_stays_out():
+    """`offload_guard_ratio` 必须真的传下去；`cond_cache_size` 不许接回来。
+
+    前者：`perf.offload_guard(hw, ratio)` / `perf.guard_allows_unload(hw, action, ratio)`
+    的签名本来就收 ratio，nodes.py 以前没传 → 系数恒等于常量 1.2，键改了不生效。
+
+    后者：`cond_cache_size` 走的是另一种死法 —— 有人读、值也传到了
+    `CachedClipProxy(capacity=…)`，但**那个旋钮对真实路径毫无作用**（官方 H3 节点
+    固定给 tokenize 传 list → cond 缓存全部旁路、命中恒 0，容量 1/8/32 结果逐字相同，
+    实测见 cond_cache.py 顶部）。所以它被删了，且**不许再传回来**。
+    教训：判据不能停在「有人读」。
+    """
+    with open(os.path.join(ROOT, "nodes.py"), encoding="utf-8") as f:
+        src = f.read()
+    assert "offload_guard(_hw, _gratio)" in src, "落盘守卫没把 offload_guard_ratio 传进去"
+    assert 'guard_allows_unload(_hw, "block", _gratio)' in src, \
+        "guard_allows_unload 没把 offload_guard_ratio 传进去"
+    # ⚠ 用 AST 判「有没有读这个键」，不能用裸字符串 —— 源码注释里写着
+    # 「cond_cache_size 已删除」，字符串匹配会把注释算进来对着正确代码报红
+    # （这正是本仓库 `_get_call_keys` 存在的原因）。
+    keys = _get_call_keys(src)
+    assert "cond_cache_size" not in keys, \
+        "cond_cache_size 已删（实测该旋钮对真实路径无效），别再把它接回来"

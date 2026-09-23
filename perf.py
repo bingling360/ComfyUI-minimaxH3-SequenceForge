@@ -79,9 +79,8 @@ DEFAULT_GUARD_RATIO = 1.2
 #
 # 键名与前端一致；"auto" 表示跟随 profile（真源在 resolve_perf，不在前端）。
 DEFAULT_PERF = {
-    # 场景
+    # 场景（档位名由 resolve_perf 解析，本键是「用户选的那一档」）
     "profile": "auto",
-    "preset": "auto",
 
     # 显存：权重流动（块交换）
     #
@@ -104,12 +103,14 @@ DEFAULT_PERF = {
     "blocks_prefetch": True,       # 官方块级预取（官方深度固定 1 块，只能开关）
 
     # 显存：常驻
-    "unload_unet_seg": "auto",
-    "unload_before_decode": "auto",
-
-    # 显存：峰值
-    "frames_to_cpu": "auto",
-    "max_upscale_scale": 0,        # 0 = 不限
+    #
+    # ⛔ 2026-09-23 本轮**连根删除** 4 个从未实现的显存策略键（`unload_unet_seg` /
+    # `unload_before_decode` / `frames_to_cpu` / `max_upscale_scale`）：它们只出现在
+    # DEFAULT_PERF / PROFILE_TABLE / PERF_TYPES 三张表里，全仓零消费端 —— 属于
+    # 「声明了没实现」的假能力。同类诉求现在都有真实现：段间腾挪 `vram_shuffle`、
+    # 成片内存 `final_mode` / `frames_dtype`、卸载时机由 ComfyUI 按需换入决定。
+    # **别再往这里加回来**：要在某个阶段省显存，走真实的消费端（有 `*_on` 开关的
+    # 分块 / 块交换），不要新造一个只有名字的键。
 
     # 显存：分块（按画质风险递增排列：FFN=无 → 头分块=无 → 时序=低 → 空间 tile=中高）
     #
@@ -152,11 +153,34 @@ DEFAULT_PERF = {
     "frames_dtype": "float32",     # float32 / uint8（帧存内存 ×¼）
 
     # 内存
-    "unload_upscaler_cache": "auto",
-    "cond_cache_size": "auto",
+    #
+    # ⛔ `unload_upscaler_cache` 已**连根删除**（2026-09-23 本轮）：它与
+    # `keep_upscaler_resident` 是同一件事的两面（取反），而**只有后者有消费端**
+    # （upscale.render_segment 收尾）。留着就是面板上一个勾了没用的三方开关
+    # （tri：auto/on/off），比不给更糟。**别再往这里加回来**。
+    #
+    # ⛔ `cond_cache_size`（cond 文本编码缓存的 LRU 条数）**删除了**。
+    #   注意它跟上面那批「没人读的键」不是同一种问题 —— nodes 确实读它、值确实传到了
+    #   `CachedClipProxy(capacity=…)`，但**那个旋钮对真实调用路径毫无作用**：
+    #   · cond 缓存的键要求「tokenize 的额外参数可哈希」，而官方 MiniMax H3 节点
+    #     固定传一个 list（i2v 传 `images=`、ref2va 传 `minimax_ref_items=`，**空表也算**）
+    #     → `_misc_key` 返回 None → 全部旁路，命中恒为 0；
+    #   · 实测（3 段 × 一采+二采，2026-09-23）：带任何 list 参数时 cap=1/8/32 的
+    #     TE 真前向次数**逐字相同**（6 / 6 / 6），只有无参调用才进缓存。
+    #   · 且带图/带参考时，一采与二采的视觉输入本就不同（画幅不同）→ 本就不该复用。
+    #   **别再把它当「内存旋钮」加回来**。
+    #   ⚠ 补充（2026-09-24）：cond_cache 的键已改成**类型白名单归一化**，空表参数
+    #   现在能命中（无首帧图、无参考素材的段每段省 1 次文本编码器前向），见
+    #   cond_cache.py 顶部实测表。但**容量仍然不需要做成旋钮**：同一段的一采/二采
+    #   在段循环里紧邻，容量 ≥2 就够；跨段复用要的也只是几十条，构造默认 32 覆盖得住。
+    #   等真出现「提示词多到互相挤掉」的实测再说。
 
     # 磁盘 / swap 守卫（场景 A 必备）
-    "guard_offload_target": True,
+    #
+    # ⛔ `guard_offload_target` 已连根删除（2026-09-23 本轮）：语义与 `guard_action`
+    # 重叠（都在说「守卫判不过时要不要真拦」）且从未有消费端，属假开关。
+    # `offload_guard_ratio` 则**接线了**：offload_guard / guard_allows_unload 本来就
+    # 收 ratio 入参，以前 nodes 没传 → 键改了不生效；现在按它传。
     "offload_guard_ratio": DEFAULT_GUARD_RATIO,
     "guard_action": "warn",        # warn=只报 / block=critical 时禁止全卸
 
@@ -165,103 +189,73 @@ DEFAULT_PERF = {
     #   encoder=*_nvenc     -> 读 `nvenc_cq`（NVENC 的恒定质量，语义对应 crf）
     # 两者**不是同一个旋钮**：NVENC 不认 crf、x264 不认 cq，传错会被静默忽略
     # （质量档整个失效），所以后端按 encoder 显式分流（见 media._video_stream_options）。
-    # `encode_profile` 只管**另外两样**：preset（编码速度档）+ 8bit 暗部抖动。
-    # 真源：`upscale.ENCODE_PROFILES` / `_ENCODE_SETTINGS`。
+    #
+    # ★ `encode_hq`（2026-09-23 本轮，用户拍板）把原三档「标准 / 高清 / 极致」压成
+    #   **一个开关**：
+    #     关（默认）= 旧「标准」：veryfast · 无 aq · 无抖动
+    #     开         = 旧「高清」：medium · aq-mode 3（暗部自适应）· Bayer 抖动
+    #   「极致」（slow）删除 —— crf 被 `x264_crf` 独立接管后，它与「高清」**只差
+    #   preset 速度档**，不值得单列。crf / cq 与 preset / 抖动是**两个正交旋钮**：
+    #   档位只定后者，前者在上面的质量数值里单独调（面板也不再声称「切档位会带着
+    #   改 crf」—— 它本来就不该带着改）。
+    #   真源：`upscale._ENCODE_SETTINGS` / `resolve_encode_quad`。
     "encoder": "libx264",          # libx264 / h264_nvenc / hevc_nvenc（不再有假 auto）
-    "x264_crf": 20,                # x264 恒定质量（20 标准 / 16 高清 / 13 极致）
+    "x264_crf": 20,                # x264 恒定质量（越小越清晰，常用 13–23）
     "nvenc_cq": 20,                # NVENC 恒定质量（对应 x264 的 crf）
-    "encode_profile": "标准",       # 标准 / 高清 / 极致（**只管 preset + 抖动**）
+    "encode_hq": False,            # 高清编码档：medium preset + 暗部 aq + 抖动
 
     # ComfyUI 运行时开关（**节点端适配，不动启动参数**）
     "upcast_attention": "auto",   # auto=跟随启动参数；True/False=强制开/关
-    "vram_shuffle": "auto",       # 精化前腾挪强度：auto / off / soft / full（接线中）
+    "vram_shuffle": "auto",       # 精化前腾挪强度：auto / off / soft / full
 
     # 素材库
     "index_mode": "fingerprint",  # fingerprint（目录指纹）/ ttl（3 秒硬过期）
     "thumb_on_import": True,      # 入库即生成缩略图
     "thumb_max_mp": 40,           # 缩略图源图解码上限（百万像素）
 
-    # 诊断
-    "probe": False,
+    # ⛔ `probe` 已连根删除（2026-09-23 本轮）：全仓零读取方，前端也无字段，
+    # 属「名字在表里、功能不存在」。诊断走专门的工具（tools/ 下独立 runner）
+    # 与 verbose 环境变量（如 H3_LLM_VERBOSE），不要塞回 perf 表。
 }
 
-# 本轮**已接线**的键（改了立刻生效）。其余键先落盘保存，面板上标「接线中」，
-# 免得用户以为勾了就有用 —— 列出未接线的开关是最容易挨骂的一种坑。
-WIRED_KEYS = (
-    "upcast_attention", "index_mode", "thumb_on_import", "thumb_max_mp",
-    # 2026-09-23 第二批：显存自救 / 分块 / 成片内存 / 编码
-    "oom_autoretry", "act_peak_probe", "attn_backend",
-    "upscale_temporal_chunk", "keep_upscaler_resident", "vram_shuffle",
-    "final_mode", "frames_dtype", "guard_action", "encoder", "nvenc_cq",
-    # 2026-09-23 第三批：分块「开关 + 参数」两件套 + 编码档位合并
-    "ff_chunk_on", "ff_chunk_tokens", "ff_chunk_min_tokens",
-    "encode_profile", "x264_crf",
-    # 2026-09-23 第四批：注意力头分块 / 放大网络参数透传 / VAE 解码
-    "attn_head_on", "attn_head_chunks",
-    "upscale_chunk_frames", "upscale_overlap",
-    # 2026-09-23 第五批：精化二采时序分块
-    "refine_temporal_on", "refine_temporal_chunk", "refine_temporal_overlap",
-    # 2026-09-23 第六批：精化空间 tile（H/W 网格切块 + 二维羽化融合）
-    "refine_tile_on", "refine_tile", "refine_tile_overlap", "refine_tile_feather",
-    # 2026-09-23 第七批：块交换（接线到**官方**块级权重流动，不自己搬权重）
-    "blocks_swap_on", "blocks_to_swap", "blocks_prefetch",
-)
-
-# 尚未接线的键（面板标「接线中」+ 灰掉）——**必须逐个能说出理由**：
-# ★ 2026-09-23 第七批后 **本表为空**：块交换是最后 4 项里活下来的 3 项（`non_blocking`
-#   已删 —— 官方恒 non_blocking=True 且锁页内存是 aimdo 的硬前提，关不掉，留着就是假
-#   开关），全部接线完毕，清单清空。
-# 清空 ≠ 拆掉机制：这是「有没有假开关」的**显式契约**（perf_get / perf_set 都回它，
-# 前端按 unwired > profile_driven > wired 判态），也是下一次加新字段时的落点。
-# 空表的含义是「当前没有任何声称未接线的字段」——测试里钉了这条（别把表删了又当没这回事）。
-UNWIRED_KEYS = ()
+# ⛔ **三态名单连根删除**（2026-09-23，用户拍板）：
+#   `WIRED_KEYS`（已接线）/ `UNWIRED_KEYS`（未接线，面板标「接线中」+ 灰）/
+#   `PROFILE_DRIVEN_KEYS`（由档位表填值，面板标「跟随档位」）三个名单全部删掉，
+#   连带 `perf_get` / `perf_set` 的返回字段与前端那套判态、徽章、灰化分支。
+#
+# 为什么删：名单是**人工维护的**，因此必然说谎 ——
+#   · 第七批接线完成后 `UNWIRED_KEYS` 恒为空，「接线中」那一态再没有对象，
+#     却留下整套判态机制与接口字段（用户原话：「这三态拿来干嘛的，没有给我删掉」）；
+#   · 更糟的是同一套名单曾把 10 个「表里有值、全仓没人读」的键当成「纯内部键」
+#     放行，让「没有未接线字段」这句话变成假的。
+#
+# 判据从此**只剩代码事实**：一个键有没有用，看有没有人读它 ——
+# `tests/test_perf_settings.py::test_no_key_in_default_perf_is_unread` 用 AST
+# 扫全仓来钉这件事（比人工名单强，且不会过期）。
+# 面板侧：字段表里每一项都直接渲染成可点，没有灰化/徽章分支；「跟随档位」这类
+# 提示改由**字段自己的属性 + 当前值**表达（前端字段表的 `autoWhen`）。
+# **别再引入任何「接线名单」**：要么有人读这个键，要么别加它。
 
 # 自动策略表（§7）—— 只列两场景有差异的项，其余沿用 DEFAULT_PERF。
 # ⚠ 这是**建议值不是强制值**：面板必须允许逐项覆盖（resolve_perf 的 overrides）。
+#
+# ★ 2026-09-23 本轮**瘦身到只剩一项**：原先 8 项里的 6 项（`unload_unet_seg` /
+#   `unload_before_decode` / `frames_to_cpu` / `max_upscale_scale` /
+#   `unload_upscaler_cache` / `guard_offload_target`）**从没有消费端**；
+#   第 7 项 `cond_cache_size` 有消费端但**旋钮空转**（见 DEFAULT_PERF 里的实测说明）。
+#   档位表里写着值、跑起来什么都不改，是「这条策略已生效」的假承诺 —— 已全部删除。
+#   现在只剩 `blocks_to_swap` 一项，它**按真实 UNET 体量反解**、由 apply_blockswap 消费。
 PROFILE_TABLE = {
     PROFILE_CLOUD: {
+        # 云端显存给得足：不逼官方换块（0 = 不干预）
         "blocks_to_swap": 0,
-        "unload_unet_seg": False,
-        "unload_before_decode": "auto",   # 跟随 _up_swap
-        "frames_to_cpu": False,
-        "max_upscale_scale": 4.0,
-        "unload_upscaler_cache": False,
-        "cond_cache_size": 32,
-        "guard_offload_target": True,     # 场景 A 的**关键**项（无 swap 会 OOM kill）
     },
     PROFILE_LOCAL: {
+        # 本机小显存：按真实 UNET 体量反解块数（-1 语义由 apply_blockswap 消费）
         "blocks_to_swap": 25,
-        "unload_unet_seg": True,
-        "unload_before_decode": "auto",
-        "frames_to_cpu": True,
-        "max_upscale_scale": 1.5,
-        "unload_upscaler_cache": True,
-        "cond_cache_size": 8,
-        "guard_offload_target": True,
     },
     PROFILE_CUSTOM: {},   # 全沿用 DEFAULT_PERF，等用户逐项覆盖
 }
-
-# 由 `profile` 档位表驱动的键 —— **不是「没接线」，是「自动档下由档位表填值」**。
-#
-# 为什么要有这个名单：面板原先只有二分（在 WIRED_KEYS = 已接线 / 其余 = 接线中），
-# 结果 `unload_upscaler_cache` 这类键被画成灰色的「接线中」——可它在 PROFILE_TABLE
-# 里有明确取值（场景 A=关、场景 B=开），`profile=auto` 时**确实生效**。
-# 把在用的开关标成没用，与「列出一个没用的开关」是同一个错误的两个方向。
-#
-# 判定顺序（前端照此实现）：unwired > profile_driven > wired。
-# `blocks_to_swap` 同时出现在 PROFILE_TABLE 与 WIRED_KEYS 里，这是**故意的**：
-# 值 -1 = 跟随档位（档位表给 0 / 25，公式 suggest_blocks 再按真实体量覆盖），
-# 而执行机制已接线（apply_blockswap）。面板按「unwired > profile_driven > wired」
-# 判态 → 它显示「跟随档位」而不是「接线中」，正如它现在的行为。
-#
-# ⚠ 遍历的是 `PROFILE_TABLE`（dict），**不是** `PROFILE_CLOUD` 那几个名字 ——
-# 那三个是**字符串常量**（'cloud' / 'local' / 'custom'），拿它们迭代会得到
-# 单字符 'c','l','o','u','d'（2026-09-23 踩过，单测直接把它钉死了）。
-# 也必须定义在 PROFILE_TABLE **之后**。
-PROFILE_DRIVEN_KEYS = tuple(sorted({
-    k for tbl in PROFILE_TABLE.values() for k in tbl
-}))
 
 _AUTO_KEYS = tuple(k for k, v in DEFAULT_PERF.items() if v == "auto")
 
@@ -274,17 +268,10 @@ _AUTO_KEYS = tuple(k for k, v in DEFAULT_PERF.items() if v == "auto")
 PERF_TYPES = {
     # 场景
     "profile": (str,),
-    "preset": (str,),
     # 显存：权重流动（块交换）
     "blocks_swap_on": (bool,),
     "blocks_to_swap": (int,),
     "blocks_prefetch": (bool,),
-    # 显存：常驻
-    "unload_unet_seg": (bool, "auto"),
-    "unload_before_decode": (bool, "auto"),
-    # 显存：峰值
-    "frames_to_cpu": (bool, "auto"),
-    "max_upscale_scale": (int, float),
     # 显存：分块（每类 = 开关 + 参数两件套）
     "ff_chunk_on": (bool,),
     "ff_chunk_tokens": (int,),
@@ -309,18 +296,14 @@ PERF_TYPES = {
     # 内存：成片合成
     "final_mode": (str,),
     "frames_dtype": (str,),
-    # 内存
-    "unload_upscaler_cache": (bool, "auto"),
-    "cond_cache_size": (int, "auto"),
     # 磁盘 / swap 守卫
-    "guard_offload_target": (bool,),
     "offload_guard_ratio": (int, float),
     "guard_action": (str,),
     # 编码（两个维度：实现 / 质量档；质量档随 encoder 换含义，crf 与 cq 分开存）
     "encoder": (str,),
     "x264_crf": (int,),
     "nvenc_cq": (int,),
-    "encode_profile": (str,),
+    "encode_hq": (bool,),
     # ComfyUI 运行时开关
     "upcast_attention": (bool, "auto"),
     "vram_shuffle": (str,),
@@ -328,8 +311,6 @@ PERF_TYPES = {
     "index_mode": (str,),
     "thumb_on_import": (bool,),
     "thumb_max_mp": (int, float),
-    # 诊断
-    "probe": (bool,),
 }
 
 
@@ -1369,15 +1350,20 @@ RUNTIME_LATER_KEYS = (
     "refine_tile_on", "refine_tile", "refine_tile_overlap", "refine_tile_feather",
     "blocks_swap_on", "blocks_to_swap", "blocks_prefetch",
     "keep_upscaler_resident", "vram_shuffle",
-    "final_mode", "frames_dtype", "guard_action", "nvenc_cq", "encode_profile",
+    "final_mode", "frames_dtype", "guard_action", "nvenc_cq", "encode_hq",
     "x264_crf",
+    # 遗留修补（本轮）：守卫系数在 perf.probe_hardware 之后算守卫时才被读到。
+    "offload_guard_ratio",
 )
 
 
 def apply_runtime(table):
-    """把 perf 表里**已接线**的项应用到当前进程 -> {键: 实际生效值}。
+    """把 perf 表里能**立刻作用到进程**的项应用上去 -> {键: 实际生效值}。
 
-    只动 WIRED_KEYS 里的键；其余键只落盘不生效（面板标「接线中」）。
+    分两半：能立刻改的（upcast / attention 后端 / 编码器与 crf / 素材库索引 /
+    块交换的显存预留）在这里直接调；**渲染期才消费**的（各种分块、成片格式、
+    守卫系数、cond 容量…）只把值**回声**出去，下一次渲染时由 nodes / upscale
+    读 `load_settings()` 生效（名单见 `RUNTIME_LATER_KEYS`）。
     单项失败不影响其它项（返回里该键为 None）。
     """
     t = dict(table or {})

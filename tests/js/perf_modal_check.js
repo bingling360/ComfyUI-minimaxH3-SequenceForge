@@ -45,11 +45,10 @@ const GROUPS = [...new Set([...BLOCK.matchAll(/group: "([^"]+)"/g)].map((m) => m
 /* 未接线项：字段上带 wired: false。当前是**零** —— 前端已经把 37 项全画出来，
  * 后端的 wired 名单再决定哪几项真生效。所以这里不数 false，改数「谁没进 wired 名单」，
  * 由测试用桩数据的 wired 名单驱动（见「未接线项灰掉」用例）。 */
-/* 未接线名单**不从前端源码推**（前端已不维护它，判据真源在后端 perf.UNWIRED_KEYS），
- * 这里用与桩数据一致的副本，并断言它与后端 perf.py 的 UNWIRED_KEYS 逐字相同。
- * ⚠ 档位名单（PROFILE_DRIVEN_KEYS）在这里**不备副本**：它是推导式、源码无字面量，
- *   跨语言比对归 Python 侧（tests/test_perf.py）。 */
-const UNWIRED_STUB = [];   /* 2026-09-23 块交换接线后：未接线名单为空 */
+/* ⛔「未接线名单」的三态机制已于 2026-09-23 **连根删除**（后端三个名单 + 接口字段
+ * + 前端判态与徽章全没了）。这里不再备任何副本，改为**反向守卫**：
+ * 见下面「三态名单不许回潮」用例 —— 谁把 WIRED_KEYS / UNWIRED_KEYS /
+ * PROFILE_DRIVEN_KEYS 或「接线中」徽章写回来，直接挂。 */
 /* key -> label（从字段表正则取，供「按标签找行」用） */
 const LABELS = {};
 for (const m of BLOCK.matchAll(/(?:^|\n)\s*\{ key: "([^"]+)",\s*label: "([^"]+)"/g)) LABELS[m[1]] = m[2];
@@ -97,31 +96,26 @@ async function t(name, fn) {
         }
     });
 
-    await t("桩名单与后端 perf.py 逐字一致（判据真源在后端，不许前端自己维护）", () => {
+    await t("三态名单不许回潮（后端无名单、前端无判态、无「接线中」徽章）", () => {
+        /* 2026-09-23 用户拍板：三态（已接线 / 接线中 / 跟随档位）连根删除。
+         * 理由是那套名单人工维护、必然说谎 —— 「未接线」态早已恒空，而同一张名单
+         * 曾把 10 个没人读的键当「内部键」放行。判据改为代码事实（有读取方），
+         * 由 `tests/test_perf_settings.py::test_no_key_in_default_perf_is_unread` 守。 */
         const py = fs.readFileSync(path.join(ROOT, "perf.py"), "utf8");
-        /* 只对 UNWIRED_KEYS 做跨语言比对 —— 它是**字面量元组**，源码里有键名。
-         *
-         * `PROFILE_DRIVEN_KEYS` **不在这里比**：它是 `tuple(sorted({k for tbl in
-         * (PROFILE_CLOUD, PROFILE_LOCAL, PROFILE_CUSTOM) for k in tbl}))` 推导出来的，
-         * 源码里根本没有键名字面量 —— 拿正则去源码里扒必然扒到 0 个。
-         * 那条断言归 `tests/test_perf.py::test_profile_driven_keys_match_stub`
-         * （Python 侧能真 import，比对的是**值**而不是文本）。 */
-        const i = py.indexOf("UNWIRED_KEYS = ");
-        assert.ok(i >= 0, "perf.py 里找不到 UNWIRED_KEYS");
-        const open = py.indexOf("(", i);
-        let depth = 0, j = open;
-        for (; j < py.length; j++) {
-            if (py[j] === "(") depth++;
-            else if (py[j] === ")") { depth--; if (depth === 0) break; }
+        for (const name of ["WIRED_KEYS", "UNWIRED_KEYS", "PROFILE_DRIVEN_KEYS"]) {
+            assert.ok(py.indexOf(name + " =") < 0,
+                "perf.py 里又出现了 " + name + " —— 三态名单已删除，别再引入人工接线名单");
         }
-        const pyUnwired = [...py.slice(open, j).matchAll(/"([a-z_]+)"/g)].map((m) => m[1]).sort();
-        /* 块交换接线（2026-09-23）后本表**空**。这条不再是「条数阈值」而是「空表也是
-         * 一个必须同步的事实」：后端若新增未接线字段而忘了同步桩，下面就会挂。
-         * （原先的 `length >= 4` 阈值随批次单调下降，已经到 0 —— 阈值写法在此失效。） */
-        assert.deepStrictEqual(pyUnwired, [],
-            "UNWIRED_KEYS 该是空的（块交换已接线）；若刚加了未接线字段，请一并更新这里");
-        assert.deepStrictEqual(UNWIRED_STUB.slice().sort(), pyUnwired,
-            "桩的未接线名单与 perf.UNWIRED_KEYS 不一致 —— 改了后端要同步这里");
+        const routes = fs.readFileSync(path.join(ROOT, "routes.py"), "utf8");
+        for (const field of ['"wired"', '"unwired"', '"profile_driven"']) {
+            assert.ok(routes.indexOf(field + ":") < 0,
+                "routes.py 的 perf 接口又回 " + field + " 了");
+        }
+        /* 前端：判态函数与徽章文案都不该再出现（「接线中」只在文件头的历史说明里） */
+        assert.ok(SRC.indexOf("fieldState") < 0, "前端判态函数 fieldState 又回来了");
+        const badge = SRC.split("\n").filter((l) => l.indexOf("接线中") >= 0
+            && l.trimStart().indexOf("*") !== 0 && l.trimStart().indexOf("//") !== 0);
+        assert.deepStrictEqual(badge, [], "前端又出现「接线中」徽章：" + badge.join(" | "));
     });
 
     await t("一个渲染主人：右栏不再有 param-perf / paintPerfPane", () => {
@@ -161,26 +155,14 @@ async function t(name, fn) {
                 return { body: {
                     ok: true,
                     data: { ff_chunk_tokens: 4096, oom_autoretry: true, encoder: "h264_nvenc",
-                            x264_crf: 20, nvenc_cq: 18,
-                            unload_upscaler_cache: true, blocks_to_swap: 25,
-                            blocks_prefetch: true },
-                    wired: ["oom_autoretry", "ff_chunk_tokens", "encoder", "frames_dtype",
-                            "ff_chunk_on", "upscale_temporal_chunk", "upscale_chunk_frames",
-                            "upscale_overlap"],
-                    /* 三态的第二、三态（真源在后端 perf.py）：
-                     *   unwired        = UNWIRED_KEYS，面板标「接线中」+ 灰
-                     *   profile_driven = PROFILE_DRIVEN_KEYS，面板标「跟随档位」+ 不灰
-                     * ⚠ 这两张名单必须由**桩数据**提供，前端不自己维护 —— 这正是
-                     * 「把在用的开关误标成没用」那个 bug 的回归守卫（见下面单独用例）。 */
-                    unwired: [],
+                            x264_crf: 20, nvenc_cq: 18, encode_hq: false,
+                            blocks_to_swap: 25, blocks_prefetch: true },
+                    /* 三态名单（wired / unwired / profile_driven）已随机制一起删除，
+                     * 接口不再回它们 —— 桩数据里也不该再出现（见上面的回潮守卫）。 */
                     /* 块交换的现状（后端 probe，前端只显示）：面板诊断区读它 */
                     applied: { blockswap: { on: false, path: "aimdo", blocks: 0,
                         applied: true, headroom_gb: 0.0, clamped: false,
                         note: "关闭 → 已恢复进程启动时的预留（0.00GB）" } },
-                    profile_driven: ["blocks_to_swap", "cond_cache_size", "frames_to_cpu",
-                                     "guard_offload_target", "max_upscale_scale",
-                                     "unload_before_decode", "unload_unet_seg",
-                                     "unload_upscaler_cache"],
                     report: "[H3性能] 显存 24.0GB / 内存 64GB / swap 0.0GB\n档位：balanced",
                     upcast: { effective: false, cli_force_upcast: 0, cli_dont_upcast: 1 },
                 } };
@@ -284,34 +266,44 @@ async function t(name, fn) {
         assert.ok(txt.indexOf("0.00GB") >= 0, "该带上当前显存预留读数");
     });
 
-    await t("没有未接线项：全表不出现「接线中」，接线项可点", () => {
+    await t("全表不出现「接线中」徽章（三态机制已删，不该有任何一行灰着）", () => {
         const rows = [...overlay.querySelectorAll(".h3d-perf-row")];
-        /* 块交换接线后 UNWIRED 为空 —— 面板不该再有任何一行标「接线中」。
-         * 这条同时防「后端清空、前端桩没清」和「有人把字段又标回未接线」。 */
         for (const r of rows) {
             assert.ok(r.textContent.indexOf("接线中") < 0,
                 "不该再出现「接线中」：" + r.textContent.slice(0, 48));
         }
+        /* 每个字段表条目都渲染成可操作的行；两件套参数除外（由宿主开关决定灰亮，
+         * 上面已有专门用例）。这里只钉「有过一整套灰化机制」这件事已经消失。 */
         const alive = rows.find((r) => r.textContent.indexOf("主干采样 OOM 自救") >= 0);
-        assert.ok(alive && !alive.querySelector("input").disabled, "已接线项被误灰");
-        /* 块交换总开关原先在未接线名单里（灰的），现在必须可点 */
+        assert.ok(alive && !alive.querySelector("input").disabled, "普通项被误灰");
         const master = rows.find((r) => r.textContent.indexOf(labelOf("blocks_swap_on")) >= 0);
         assert.ok(master, "找不到块交换总开关行");
-        assert.strictEqual(master.querySelector("input").disabled, false,
-            "块交换已接线，总开关不该还是灰的");
+        assert.strictEqual(master.querySelector("input").disabled, false, "总开关不该是灰的");
     });
 
-    /* ★ 回归守卫：「跟随档位」的键**不许**被标成「接线中」。（见上面 openPerfSettings
-     * 里三态判定的注释 —— 这是修掉「把在用的开关说成没用」的那个 bug 的钉子。） */
-    await t("「跟随档位」的键不标「接线中」、不灰（旧二分会误标）", () => {
+    /* ★ 「跟随档位」现在按**当前值**提示（字段表的 `autoWhen`），不再依赖后端名单 ——
+     * 名单已被删除（人工维护的名单必然说谎）。这条钉两个方向：具体值不提示、
+     * 哨兵值提示、且改回具体值提示要消失（可逆、且不用重开弹窗）。 */
+    await t("「跟随档位」提示跟随数值本身（哨兵 -1 才显示，改回去就消失）", () => {
         const rows = [...overlay.querySelectorAll(".h3d-perf-row")];
-        const probe = "段间清掉放大网络缓存";   // unload_upscaler_cache 的 label
-        const row = rows.find((r) => r.textContent.indexOf(probe) >= 0);
-        assert.ok(row, "找不到「段间清掉放大网络缓存」行");
-        assert.ok(row.textContent.indexOf("接线中") < 0,
-            "由档位表驱动的项被误标成「接线中」：" + row.textContent.slice(0, 60));
-        assert.ok(row.textContent.indexOf("跟随档位") >= 0, "该标「跟随档位」");
-        assert.ok(!row.querySelector("input,select").disabled, "跟随档位的项不该灰");
+        const row = rows.find((r) => r.textContent.indexOf(labelOf("blocks_to_swap")) >= 0);
+        assert.ok(row, "找不到「交换块数」行");
+        const lab = row.querySelector(".h3d-perf-top label");
+        const input = row.querySelector("input");
+        assert.ok(lab && input, "行结构变了");
+        // 桩数据给的是 25（具体块数）→ 不提示
+        assert.ok(lab.textContent.indexOf("跟随档位") < 0,
+            "25 是具体块数，不该标「跟随档位」：" + lab.textContent);
+        // 改成 -1（哨兵）→ 当场提示
+        input.value = "-1";
+        input.dispatchEvent(new w.Event("change"));
+        assert.ok(lab.textContent.indexOf("跟随档位") >= 0,
+            "-1 是「跟随档位」哨兵，label 该跟着值提示：" + lab.textContent);
+        // 再改回桩里的原值（25）→ 提示消失，且后面的用例仍能读到「不清零」的原值
+        input.value = "25";
+        input.dispatchEvent(new w.Event("change"));
+        assert.ok(lab.textContent.indexOf("跟随档位") < 0,
+            "改回具体块数后提示该消失：" + lab.textContent);
     });
 
     await t("块交换两件套：总开关默认关 → 交换块数灰；拨开后当场亮（不清零）", () => {

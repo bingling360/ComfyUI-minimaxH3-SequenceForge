@@ -1459,9 +1459,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # ⚠ 消费端在 upscale.render_segment 收尾处，条件只认这一个键
             # （旧键 `force_unload` 已随项目存档退场，别再写回 cfg）。
             up_cfg["keep_upscaler_resident"] = bool(_pf.get("keep_upscaler_resident", True))
-            # 编码档位（preset + 暗部抖动）与 crf 数值**分开**：
-            # 档位管「哪套 preset/抖动」，crf 单独给（面板上按编码器显隐）。
-            up_cfg["encode"] = str(_pf.get("encode_profile") or "标准")
+            # 编码画质开关（preset + 暗部 aq + 抖动）与 crf 数值**分开**：
+            # 开关管「哪套 preset/抖动」，crf 单独给（面板上按编码器显隐）。
+            # 两者正交 —— 开关不会带着改 crf，改 crf 也不会动开关。
+            up_cfg["encode_hq"] = bool(_pf.get("encode_hq", False))
             up_cfg["x264_crf"] = _pf.get("x264_crf")
             # 精化二采分块（机器级，不进指纹）：时序切段 / 空间 tile。
             # 值从 perf 直下 —— upscale.parse_state 不再解析它们（见那里的注释）。
@@ -1493,15 +1494,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if up_net is not None:
                 up_net.cpu()
 
-        # 一采编码：与二采**同一真源**（perf 的 `encode_profile` + `x264_crf`）。
+        # 一采编码：与二采**同一真源**（perf 的 `encode_hq` + `x264_crf`）。
         # 原先节点上有个「一采编码」下拉，与性能设置里的「画质档位」是同一张表 ——
         # 两个入口改同一个旋钮，已删除（2026-09-23）。二采开启时其高清产物同名覆盖，
         # 本档只作用于二采未覆盖的段与基础成片。
-        _benc = str(_pf.get("encode_profile") or "标准")
-        if _benc not in upscale.ENCODE_PROFILES:
-            _benc = "标准"
+        _bhq = bool(_pf.get("encode_hq", False))
         _bcrf, _bpreset, _baq, _bdith = upscale.resolve_encode_quad(
-            _benc, _pf.get("x264_crf"))
+            _bhq, _pf.get("x264_crf"))
 
         # 执行序列 = 提示词段按序排列。段类型只剩两种：prompt 段（本条）与 prologue
         # 序章（链首已有视频，走节点接线，不在这个列表里）。
@@ -1910,6 +1909,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # cond 文本编码缓存代理：一采/二采/重摇全链共用同一实例——TE 的
         # tokenize+encode 只依赖提示词文本，同一段提示词（含二采高清条件重建、
         # negative 空串）只前向一次；参考图/视频的 VAE 编码与画布其他节点不受影响
+        # ⚠ 容量用构造默认（32），**不再从 perf 读**：`cond_cache_size` 已删除。
+        # 原因不是没人读（确实有人读），而是实测证明那个旋钮对真实路径毫无作用 ——
+        # 官方 H3 节点固定给 tokenize 传一个 list 参数，而缓存的键要求参数可哈希，
+        # 于是全部旁路、命中恒为 0，容量 1/8/32 结果逐字相同（见 perf.py 同名注释）。
         from .cond_cache import CachedClipProxy
         clip = CachedClipProxy(clip)
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
@@ -1974,13 +1977,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                           te_bytes=perf.weight_bytes(clip))
                 _line = perf.report_line(_hw)
                 print(_line, flush=True)
-                _gd = perf.offload_guard(_hw)
+                # 守卫系数按 perf 的 `offload_guard_ratio` 走。遗留修补（2026-09-23）：
+                # `offload_guard` / `guard_allows_unload` 的签名**本来就收 ratio**，
+                # 这里却一直没传 → 键改了不生效，系数恒等于常量 1.2。
+                try:
+                    _gratio = float(_pf.get("offload_guard_ratio"))
+                except (TypeError, ValueError):
+                    _gratio = perf.DEFAULT_GUARD_RATIO
+                _gd = perf.offload_guard(_hw, _gratio)
                 _guard_msg = _gd["message"] if not _gd["ok"] else ""
                 if _guard_msg:
                     print(f"[H3性能] 落盘守卫：{_guard_msg}", flush=True)
                 # 接行为：把「不能卸」这个结论交给二采（upscale.render_latent）
                 if str(_pf.get("guard_action") or "warn").lower() == "block":
-                    _allowed, _gd2 = perf.guard_allows_unload(_hw, "block")
+                    _allowed, _gd2 = perf.guard_allows_unload(_hw, "block", _gratio)
                     _guard_block = not _allowed
                     if _guard_block:
                         print("[H3性能] 落盘守卫=block：本次运行的二采精化前全卸已禁用"
@@ -2131,7 +2141,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                                float(up_cfg.get("decay") or 0.5))
             _shp = float(up_cfg.get("sharpen") or 0.0)
             _psp = float(up_cfg.get("pixel_sharpen") or 0.0)
-            _enc = str(up_cfg.get("encode") or "标准")
+            _ehq = bool(up_cfg.get("encode_hq"))
             _sam = str(up_cfg.get("sampler") or "").strip()
             _sch = str(up_cfg.get("scheduler") or "").strip()
             report.append(f"潜空间放大二采：{up_cfg['mode']} · {up_cfg['arch']} {up_cfg['scale']:g}× · "
@@ -2145,15 +2155,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           + (f" · STG引导 {_stg:g}(块{_stgb})" if _stg > 0 else "")
                           + (f" · latent锐化 {_shp:g}" if _shp > 0 else "")
                           + (f" · 像素锐化 {_psp:g}" if _psp > 0 else "")
-                          + (f" · {_enc}编码" if _enc != "标准" else "")
+                          + (" · 高清编码档" if _ehq else "")
                           + (f" · 独立采样 {_sam}/{_sch}".rstrip("/")
                              if (_sam or _sch) else "")
                           + (" · 增益重试" if up_cfg.get("retry") is True else "")
                           + "——每段采样定稿后立即渲染高清，分段视频与成片直接保存二采结果")
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")
-        if _benc != "标准":
-            report.append(f"编码：{_benc}(crf{_bcrf}/{_bpreset})"
+        if _bhq:
+            report.append(f"编码：高清档({_bpreset} · crf{_bcrf})"
                           f"（来自 ⚡ 性能优化设置）——二采未覆盖的段与基础成片按此档落盘")
         if str(宽高比) != "自定义":
             report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")

@@ -7,42 +7,115 @@ encode 结果：二采与重复提示词段直接命中，参考图/视频的 VA
 属性全部透传原 clip，行为零变化。
 
 只在 H3SeamlessChainSampler.execute 入口包一层（插件内部调用链生效），
-ComfyUI 画布其他节点不受影响。缓存返回共享 cond 对象：ComfyUI 的
-conditioning_set_values / _apply_guide 等均为写时复制，不会原地改动
-cond，共享安全。tokenize 每次照常执行（纯 CPU、微秒级），缓存只在
-encode 层命中。
+ComfyUI 画布其他节点不受影响。tokenize 每次照常执行（纯 CPU、微秒级），
+缓存只在 encode 层命中。**命中返回的一定是独立副本**（见 `_copy_cond`）——
+不依赖调用方"写时复制"的自觉：cond 的 extra dict 与其中嵌套的 list/dict
+都会复制，张量共享。
+
+═══ 键的边界（2026-09-24 修；这一节就是安全性的全部）═══
+
+**旧实现**要求「tokenize 的额外参数**整体**可哈希」，而官方 MiniMax H3 节点固定
+传一个 list（i2v 的 `images=`、ref2va 的 `minimax_ref_items=`）—— **空表也传**
+（`hash([])` 抛 TypeError）→ 全部旁路、**命中恒为 0**。
+
+**现在**改成类型白名单归一化（`_norm`）：只放行 None / bool / int / float / str /
+bytes，以及由它们递归组成的 list / tuple / dict；其余（张量、任意对象）一律返回
+None = 该次调用**不进缓存**。于是：
+
+    images=[]                     → 可归一化 → **能命中**（这就是修复目标）
+    images=[张量]                 → 含张量 → 旁路（**必须**旁路：一采与二采的图被
+                                    `_resize` 到不同画幅、视觉 token 数不同，cond 真的不同）
+    minimax_ref_items=[{…张量…}]  → 旁路；纯标量项（如 `{"type": "audio"}`）→ 能命中
+    自定义对象                    → 旁路。**不能用 hash() 放行**：默认对象哈希基于
+                                   id，对象回收后新对象可能复用同一 id → 两个内容不同
+                                   的对象算出同一个键 → **错误命中**，返回上一段的 cond
+
+标量带类型名（`("bool", True)` vs `("int", 1)`）是为了挡住 `True == 1` 这类跨类型
+相等 —— 否则 `{"flag": True}` 与 `{"flag": 1}` 会算出同一个键。
+
+**实测**（同一份代码、只把键判定换成旧/新两版；假 clip 复刻官方调用形态，
+3 段 × 一采+二采 = 6 次 encode 请求，数字 = 文本编码器真前向次数）：
+
+    调用形态                                     旧键   新键
+    无额外参数（负向空串）                         3      3     （本来就命中，未变）
+    官方 i2v    images=[]（无首帧图 / 续拍段）      6      3  ★ 每段省 1 次
+    官方 ref2va minimax_ref_items=[纯标量项]        6      3  ★ 每段省 1 次
+    官方 i2v    images=[张量]（挂了首帧图）         6      6     本该旁路
+    官方 ref2va minimax_ref_items=[{…张量…}]        6      6     本该旁路
+
+也就是：**无首帧图、无参考素材**的段（独立镜头、续拍段），二采那次不再重算文本
+编码器；挂了首帧图或参考素材的段仍然旁路（正确行为 —— 它们的输入真的不同）。
+
+═══ 与 latent 锚定的关系（2026-09-24 复核）═══
+
+上段尾帧桥 / 尾锚 / 首帧头锚都是在 **encode 之后**通过
+`conditioning_set_values(cond, {"minimax_keyframes": …})` 注入的（nodes.py 的
+`_inject_keyframes`），**不进缓存键**。所以同一段提示词的多次 encode 可以共享一个
+纯文本 cond 原件，各自贴各自的锚。
+
+⚠ 前提是每方都拿到**独立副本** —— 见 `_copy_meta`：extra dict 里嵌套的 list/dict
+也必须复制。旧的浅拷贝让 `minimax_keyframes` 这个 list 在缓存原件与所有副本之间
+共享，谁原地 append 谁就污染其它段（实测：一采贴的锚会跑进二采的 cond 里）。
+张量一律共享（`copy.deepcopy` 会把张量也复制一份，显存直接爆，**不能用**）。
 """
 
 
-def _hashable(v):
-    try:
-        hash(v)
-    except TypeError:
-        return False
-    return True
+# 标量白名单：类型 -> 键里用的类型名。
+# 为什么带类型名：Python 里 `True == 1`、`1 == 1.0` 都成立，若直接把值塞进键，
+# `{"flag": True}` 与 `{"flag": 1}` 会算出同一个键 → 错误命中。
+# 只认**精确类型**（`type(v) in ...`）：子类（IntEnum 之类）不在白名单 → 旁路。
+# 宁可少命中，也不冒「把不认识的东西当标量」的险。
+_SCALARS = {bool: "b", int: "i", float: "f", str: "s", bytes: "y"}
+
+
+def _norm(v, _depth=0):
+    """值 -> 「可安全比较的键」；不可归一化返回 None（该次调用不进缓存）。
+
+    放行：None / bool / int / float / str / bytes，及由它们**递归组成**的
+    list / tuple / dict。其余（张量、任意对象、子类）一律 None → 旁路，
+    理由见文件头「键的边界」一节（尤其是「不能用 hash() 放行」那条）。
+
+    深度上限：递归到 12 层就放弃（返回 None = 不缓存）。它挡的是**自引用结构**
+    （`a = []; a.append(a)`）—— 没有这条会直接 RecursionError 冒到渲染链上。
+    缓存层是性能优化，**任何情况下都不该成为崩溃源**。
+    """
+    if _depth > 12:
+        return None
+    if v is None:
+        return ("n",)
+    t = type(v)
+    if t in _SCALARS:
+        return (_SCALARS[t], v)
+    if isinstance(v, (list, tuple)):
+        parts = []
+        for x in v:
+            n = _norm(x, _depth + 1)
+            if n is None:
+                return None
+            parts.append(n)
+        return ("q", tuple(parts))
+    if isinstance(v, dict):
+        if not all(isinstance(k, str) for k in v):
+            return None      # 非 str 键不拿 repr 兜底：对象 repr 可能含 id → 不稳定；
+                             # 也顺带挡住 `sorted()` 在混合类型键上抛 TypeError
+        parts = []
+        for k in sorted(v):  # 键序无关：{a,b} 与 {b,a} 必须算出同一个键
+            n = _norm(v[k], _depth + 1)
+            if n is None:
+                return None
+            parts.append((k, n))
+        return ("m", tuple(parts))
+    return None
 
 
 def _text_key(text):
-    """提示词 -> 可哈希缓存键；不可哈希（罕见复合输入）返回 None 走旁路。"""
-    if isinstance(text, str):
-        return text
-    if _hashable(text):
-        return text
-    try:
-        key = repr(text)
-        hash(key)
-        return key
-    except Exception:
-        return None
+    """提示词 -> 缓存键；不可归一化返回 None（旁路）。"""
+    return _norm(text)
 
 
 def _misc_key(args, kwargs):
-    """encode 额外位置/关键字参数 -> 可哈希键；含不可哈希项返回 None（不缓存）。"""
-    items = list(args) + sorted(kwargs.items(), key=lambda kv: kv[0])
-    for v in items:
-        if not _hashable(v):
-            return None
-    return tuple(items) if items else ()
+    """额外位置/关键字参数 -> 缓存键；含不可归一化项返回 None（不缓存）。"""
+    return _norm((tuple(args), dict(kwargs)))
 
 
 class CachedClipProxy:
@@ -109,11 +182,33 @@ class CachedClipProxy:
         return cond
 
 
+def _copy_meta(v):
+    """递归复制**容器**、共享**张量**。
+
+    为什么不用 `copy.deepcopy`：cond 里最大的对象是张量，deepcopy 会把它们各复制
+    一份（显存直接爆）。这里只重建 dict / list / tuple 这三层结构，张量与其它对象
+    原样返回 —— 结构是小的（keyframes 列表等），张量是大的，正好各取所需。
+    """
+    if isinstance(v, dict):
+        return {k: _copy_meta(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_copy_meta(x) for x in v]
+    if isinstance(v, tuple):
+        return tuple(_copy_meta(x) for x in v)
+    return v
+
+
 def _copy_cond(cond):
-    """cond 浅拷贝（list 与 extra dict 复制、张量共享）：命中返回副本，防
-    下游在 cond 上原地写字段污染缓存（ComfyUI 惯例是写时复制，此处兜底）。"""
+    """cond 副本：外层结构 + extra dict **及其嵌套容器**都复制，张量共享。
+
+    为什么必须复制到嵌套层：`minimax_keyframes` 是 extra dict 里的一个 **list**。
+    浅拷贝（只 `dict(t[1])`）会让缓存原件与每一份副本共享同一个 list —— 谁往里面
+    append，其它段拿到的 cond 就跟着变（实测：一采贴的锚会跑进二采的 cond）。
+    ComfyUI 惯例虽是写时复制（`conditioning_set_values` 返回新对象），但那是调用方
+    的自觉；缓存层不该把正确性寄托在别人的写法上。
+    """
     try:
-        return [(t[0], dict(t[1])) if isinstance(t, tuple) and len(t) == 2
-                and isinstance(t[1], dict) else t for t in cond]
+        return [(t[0], _copy_meta(t[1])) if isinstance(t, tuple) and len(t) == 2
+                and isinstance(t[1], dict) else _copy_meta(t) for t in cond]
     except TypeError:
         return cond

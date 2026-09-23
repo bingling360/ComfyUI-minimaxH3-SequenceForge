@@ -12,7 +12,11 @@
  *
  * 本守卫钉死两条：
  *   A. 当前布局（含插件自带默认工作流）**一位都不许动**；
- *   B. 真旧布局（35 值 / 极老数字首项）仍要能迁到 31 值，且补齐尾部新控件。
+ *   B. 真旧布局（35 值 / 31 值 / 极老数字首项）仍要能迁到 30 值，尾部新控件补齐。
+ *
+ * 2026-09-23：主节点又少了一位 —— 「一采编码」控件删除（画质档位改由 ⚡ 性能优化
+ *   弹窗的 encode_profile 管，节点上留一份是「一张表两处入口」，两处会打架）。
+ *   于是当前布局 31 → 30 值，老 31 值存档需要 `splice(28, 1)` 摘掉那一格。
  *
  * 用法：node tests/js/widget_layout_migrate_check.js
  *      （pytest 侧由 tests/test_js_checks.py 统一收集）
@@ -34,7 +38,7 @@ w.eval(fs.readFileSync(path.join(ROOT, "web", "h3_default_workflow.js"), "utf8")
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const samplerOf = (wf) => wf.nodes.find((n) => n.type === "H3SeamlessChainSampler");
-const CUR = 31;   // 30 控件 + 种子 control 1 位
+const CUR = 30;   // 29 控件 + 种子 control 1 位
 
 console.log("\n== 主节点 widgets_values 布局迁移 ==");
 
@@ -47,7 +51,7 @@ t("迁移入口与判据都在（外层是函数声明，jsdom 间接 eval 里�
     assert.strictEqual(typeof w.isCurrentWidgetLayout, "function");
 });
 
-t("默认工作流本身是当前布局（31 值 / 首项宽高比 / 第 27 位导演台状态）", () => {
+t("默认工作流本身是当前布局（30 值 / 首项宽高比 / 第 27 位导演台状态）", () => {
     const wv = samplerOf(clone(w.H3_DEFAULT_WORKFLOW)).widgets_values;
     assert.strictEqual(wv.length, CUR, "默认工作流控件值数应为 " + CUR);
     assert.strictEqual(typeof wv[0], "string", "首项应是宽高比字符串");
@@ -81,16 +85,23 @@ t("迁移后关键位语义仍对齐（任何一位串位都会红）", () => {
     assert.strictEqual(wv[24], "关闭", "递减锚定");
     assert.strictEqual(wv[25], "文生视频", "生成模式");
     assert.strictEqual(wv[26], "开启", "自动成片");
-    assert.strictEqual(wv[28], "高清", "一采编码");
-    assert.strictEqual(wv[29], "match", "参考图像尺寸");
-    assert.strictEqual(wv[30], 1.0, "响度对齐强度");
+    assert.strictEqual(wv[28], "match", "参考图像尺寸");
+    assert.strictEqual(wv[29], 1.0, "响度对齐强度");
 });
 
-t("判据：当前 31 值 / 上一版 29 值 → 视为当前，不重排", () => {
+t("判据：当前 30 值 / 上一版 29 值 → 视为当前，不重排", () => {
     const cur = samplerOf(clone(w.H3_DEFAULT_WORKFLOW)).widgets_values;
     assert.strictEqual(w.isCurrentWidgetLayout(cur), true);
     // 29 值只缺末尾两个后加控件，ComfyUI 会用控件默认值补齐 match / 1.0，无需重排
     assert.strictEqual(w.isCurrentWidgetLayout(cur.slice(0, 29)), true);
+});
+
+t("判据：老 31 值存档（含已删的「一采编码」）→ 视为旧，需摘掉那一格", () => {
+    const cur = samplerOf(clone(w.H3_DEFAULT_WORKFLOW)).widgets_values;
+    const old31 = cur.slice();
+    old31.splice(28, 0, "高清");      // 老布局第 28 位是「一采编码」
+    assert.strictEqual(old31.length, 31);
+    assert.strictEqual(w.isCurrentWidgetLayout(old31), false, "老 31 值必须判为旧布局");
 });
 
 t("判据：被旧版改坏又被存下的 31 值存档（第 27 位是数字）也按当前处理", () => {
@@ -111,7 +122,7 @@ t("判据：35 值陈旧布局 / 极老数字首项 → 视为旧，需迁移", 
     assert.strictEqual(w.isCurrentWidgetLayout(wv25), false);
 });
 
-t("★ 旧 35 值布局仍能迁到 31 值，且尾部补上两个新控件", () => {
+t("★ 旧 35 值布局仍能迁到 30 值，且尾部补上两个新控件", () => {
     const wv35 = new Array(35).fill(0);
     wv35[0] = "16:9";
     wv35[1] = 0.5;
@@ -128,9 +139,18 @@ t("★ 旧 35 值布局仍能迁到 31 值，且尾部补上两个新控件", ()
     assert.strictEqual(out[25], "文生视频", "生成模式来自旧 33 位");
     assert.strictEqual(out[26], "开启", "自动成片");
     assert.strictEqual(out[27], '{"mode":"文生视频"}', "导演台状态来自旧 34 位");
-    assert.strictEqual(out[28], "标准", "一采编码");
-    assert.strictEqual(out[29], "match", "参考图像尺寸");
-    assert.strictEqual(out[30], 1.0, "响度对齐强度");
+    assert.strictEqual(out[28], "match", "参考图像尺寸（已删的一采编码不再占位）");
+    assert.strictEqual(out[29], 1.0, "响度对齐强度");
+});
+
+t("★ 老 31 值布局迁到 30 值：只摘掉第 28 位「一采编码」，其余逐位等价", () => {
+    const cur = samplerOf(clone(w.H3_DEFAULT_WORKFLOW)).widgets_values;
+    const old31 = cur.slice();
+    old31.splice(28, 0, "高清");
+    const graph = { nodes: [{ type: "H3SeamlessChainSampler", widgets_values: old31 }] };
+    w.migrateGraphWidgets(graph);
+    const out = graph.nodes[0].widgets_values;
+    assert.deepStrictEqual(out, cur, "老 31 值迁移后应与当前 30 值逐位相同");
 });
 
 t("非主节点/空值不被误伤", () => {

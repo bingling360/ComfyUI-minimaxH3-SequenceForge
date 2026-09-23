@@ -29,7 +29,10 @@ from einops import rearrange
 
 LATENT_UPSCALE_FOLDER = "latent_upscale_models"
 _FOLDER_REGISTERED = False
-_TEMPORAL_CHUNK = 32     # 3D 时序分块的帧数（上游同款常量，3d.py:264）
+_TEMPORAL_CHUNK = 32     # 3D 时序分块帧数的**内建默认**（上游同款常量，3d.py:264）。
+                         # 运行时真源是导演台性能设置 perf.upscale_chunk_frames，
+                         # 由 upscale.upscale_video 透传到 forward(chunk_frames=...)；
+                         # 只有该值为 0/None 时才落回这个常量。
 
 LATENTS_MEAN = [
     0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
@@ -374,14 +377,21 @@ class LatentResizer3D(nn.Module):
         self.norm_out = normalization(channels)
         self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
 
-    def forward(self, x, scale=None, target_size=None, enable_chunking=True):
-        """放大前向：长段按时序分块（chunk=32）跑，块间 overlap 线性融合。
+    def forward(self, x, scale=None, target_size=None, enable_chunking=True,
+                chunk_frames=None, overlap_frames=None):
+        """放大前向：长段按时序分块跑，块间 overlap 线性融合。
 
         分块动机（上游同款，3d.py:244-311）：3D 卷积的激活随 T 线性增长，长段
         一次性前向容易爆显存；且末端帧缺右侧上下文会闪（end-frame flickering）。
         分块后每块左右各带 overlap 帧的上下文（overlap = 时序卷积核 tk），只取
         中间有效区、块间用线性权重叠加融合——首块左侧与末块右侧不 ramp（那里
         没有邻居可融）。enable_chunking=False 或 T<=chunk 时退化为整段单次前向。
+
+        参数（2026-09-23 从模块常量改成可传参，由导演台性能设置下发）：
+        - chunk_frames=None/0 -> 用 _TEMPORAL_CHUNK（32，上游同款默认）
+        - overlap_frames=None/0 -> 自动取时序卷积核宽 tk
+        overlap 只增不减：显式给的值小于 tk 时钳到 tk —— 低于卷积核宽的 overlap
+        会让块边缘帧看不到落在邻块里的卷积输入，接缝会闪。
         """
         if target_size is not None:
             size = target_size
@@ -397,7 +407,18 @@ class LatentResizer3D(nn.Module):
             if isinstance(b, TemporalConv3D):
                 tk = b.dwconv.weight.shape[2]
                 break
-        overlap, chunk = tk, _TEMPORAL_CHUNK
+        try:
+            chunk = int(chunk_frames or 0)
+        except (TypeError, ValueError):
+            chunk = 0
+        if chunk <= 0:
+            chunk = _TEMPORAL_CHUNK
+        try:
+            overlap = int(overlap_frames or 0)
+        except (TypeError, ValueError):
+            overlap = 0
+        if overlap < tk:
+            overlap = tk
         if not enable_chunking or T <= chunk:
             return self._forward_seg(x, scale, size)
         n_blocks = (T + chunk - 1) // chunk

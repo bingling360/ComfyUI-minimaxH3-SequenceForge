@@ -63,9 +63,11 @@ def _assert_frozen(wf):
                 assert i["link"] in link_ids
     assert wf["last_node_id"] >= max(nodes) and wf["last_link_id"] >= max(link_ids)
     # 主链不断：模型/VAE/CLIP/报告预览都在
-    # 31 = 原 29 + 「参考图像尺寸」「响度对齐强度」（新控件恒加在 widgets_values **末尾**）
+    # 30 = 原 29 + 「参考图像尺寸」「响度对齐强度」- 「一采编码」
+    #   （2026-09-23 删「一采编码」：画质档位改由 ⚡ 性能优化弹窗的 encode_profile 管，
+    #    节点上再留一份 = 一张表两处入口，两处会打架。新控件仍恒加在末尾。）
     _wv = sampler.get("widgets_values", [])
-    assert len(_wv) == 31
+    assert len(_wv) == 30
     assert _wv[-2:] == ["match", 1.0], _wv[-2:]
     assert any(L[5] == "MODEL" for L in wf["links"])
     # P4b 全冻结：无任何画布外联（提示词/素材全走导演台状态）
@@ -157,7 +159,7 @@ MAIN_WIDGET_ORDER = [
     "步数", "CFG", "采样器", "调度器", "自动存档", "存档目录", "桥帧门控",
     "清晰度阈值", "回退上限", "锚定加噪", "审片模式", "自动保存", "重跑起始段",
     "接缝重摇", "重摇阈值", "重摇上限", "递减锚定", "生成模式", "自动成片",
-    "导演台状态", "一采编码",
+    "导演台状态",
     # —— 以下两个是后加的控件，**顺序只能在末尾**（中间插入会让其后所有参数静默串位）
     "参考图像尺寸", "响度对齐强度",
 ]

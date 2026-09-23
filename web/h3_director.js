@@ -1613,15 +1613,15 @@ function remapOldWidgetValues(wv) {
     ];
 }
 
-/* 旧版工作流 widget 布局迁移到当前 31 值 schema。
- * 当前后端 define_schema 共 31 个控件值（30 控件 + 种子 control 占 1 位）。
+/* 旧版工作流 widget 布局迁移到当前 30 值 schema。
+ * 当前后端 define_schema 共 30 个控件值（29 控件 + 种子 control 占 1 位）。
  * 第二阶段提交 7435084 剔除了 8 个接缝/精修控件（接缝处理/混合帧数/精修强度/
  * 精修窗口/智能切镜/切镜最多丢帧/全链丢弃预算/自适应精修）并新增「自动成片」，
  * 旧 35 值布局因此中段错位、缺自动成片；更早的「导演台时代」极老工作流为 25 值。
- * 下面统一把这两种旧布局直接映射到当前 31 值：
+ * 下面统一把这两种旧布局直接映射到当前 30 值：
  * 头部 0..16 位与当前一致，中段已删控件取当前默认值，自动成片插在生成模式前，
  * 生成模式/导演台状态从尾部取，缺失尾部按默认值补齐
- * （「一采编码」恒补标准，「参考图像尺寸」「响度对齐强度」恒补 match / 1.0）。
+ * （「参考图像尺寸」「响度对齐强度」恒补 match / 1.0）。
  *
  * ⚠ 2026-09-20 修：旧判据是 `wv.length !== CUR_WIDGET_COUNT`，而 CUR_WIDGET_COUNT
  * 是手写常数 —— 1148ae3 把控件从 29 值加到 31 值时忘了同步它，于是**完全正确的
@@ -1629,21 +1629,28 @@ function remapOldWidgetValues(wv) {
  * 锚定加噪收到"分段"、审片模式收到 0、重摇上限收到导演台状态 JSON…
  * 现改为按「值形态」识别，长度漂移不再致病。 */
 const V35_WIDGET_COUNT = 35;   // 第二阶段剔除控件后、未加自动成片的陈旧布局
-const CUR_WIDGET_COUNT = 31;   // 当前 schema 控件值总数（仅供日志/断言，判据不依赖它）
+const V31_WIDGET_COUNT = 31;   // 「一采编码」还在时的上一版布局（2026-09-23 前）
+const CUR_WIDGET_COUNT = 30;   // 当前 schema 控件值总数（仅供日志/断言，判据不依赖它）
+// ⚠ 2026-09-23：「一采编码」控件已删（编码档位统一收进 ⚡ 性能优化设置），
+// 布局 31 → 30 值。删除点在 idx28，**其后只有 参考图像尺寸(29) / 响度对齐强度(30)**，
+// 前移到 28 / 29 —— 故 `wv[27]`（导演台状态）位置不变，形态判据仍然成立。
 
 /* 当前布局判据：长度精确等于当前值数，或第 0 位（宽高比）与第 27 位
  * （导演台状态）都是字符串。这两条能覆盖全部历史布局：
- *   当前 31 值 / 上一版 29 值 → true（29 值只缺末尾两个控件，ComfyUI 会用控件默认值
+ *   当前 30 值 / 上一版 29 值 → true（29 值只缺末尾两个控件，ComfyUI 会用控件默认值
  *                              补齐 match / 1.0，恰是所需，无需重排）
  *   35 值陈旧布局 → 第 27 位是数字「重摇上限」→ false
  *   极老 25 值布局 → 第 0 位是数字「宽度」→ false
  * 刻意不比较长度：控件增删会让长度漂移，忘了同步常数就会误迁移正确工作流。 */
 function isCurrentWidgetLayout(wv) {
     if (!Array.isArray(wv)) return false;
-    // 长度恰好等于当前值数 → 必然逐位对齐（历史布局是 25 / 29 / 35，撞不上）。
+    // 长度恰好等于当前值数 → 必然逐位对齐（历史布局是 25 / 29 / 31 / 35，撞不上）。
     // 这一条还兜住「已被旧版迁移层改坏、又被用户存进 ComfyUI 的工作流」：
-    // 那种存档长度仍是 31，但第 27 位是数字 1.0，靠形态判据会被再迁一次。
+    // 那种存档长度仍是当前值数，但第 27 位是数字 1.0，靠形态判据会被再迁一次。
     if (wv.length === CUR_WIDGET_COUNT && typeof wv[0] === "string") return true;
+    // ⚠ 上一版 31 值布局（含已删的「一采编码」）**长度与形态都像当前布局**，
+    // 但多一位 → 必须交给迁移层砍掉 idx28，否则整体右移一位、参数全错。
+    if (wv.length === V31_WIDGET_COUNT) return false;
     // 否则看跨版本稳定的两个位置：宽高比（0）与导演台状态（27）都应是字符串
     return typeof wv[0] === "string" && typeof wv[27] === "string";
 }
@@ -1659,11 +1666,21 @@ const V35_PICK = {
     genmode: 33, ds: 34,                            // 生成模式, 导演台状态
 };
 
-/* 旧布局 wv → 当前 31 值布局。头部 0..16 原样；中段 8 个控件从 V35 对应位取
- * （更老布局这些位不存在则取 CUR_MID_DEFAULTS）；自动成片固定 "开启"；
- * 生成模式/导演台状态取尾部（35 值取末两位，更老布局取最后两元素）；
- * 末尾两个后加控件（参考图像尺寸 / 响度对齐强度）恒补 match / 1.0。 */
+/* 旧布局 wv → 当前 30 值布局。两条路径：
+ *   · 31 值（上一版，含已删的「一采编码」，2026-09-23 前）→ **只砍 idx28**，
+ *     其余位原样。它整体只差这一个控件，不该走下面的 V35 重建路径（那会
+ *     从 V35 下标取中段，31 值布局的下标与 V35 不同 → 取错）。
+ *   · 35/25 值等更老布局 → 头部 0..16 原样；中段 8 个从 V35 对应位取
+ *     （更老布局这些位不存在则取 CUR_MID_DEFAULTS）；自动成片固定 "开启"；
+ *     生成模式/导演台状态取尾部；末尾两个后加控件恒补 match / 1.0。 */
 function remapOldWidgetValuesToCurrent(wv) {
+    // ---- 路径 A：31 值（只少「一采编码」）----
+    if (wv.length === V31_WIDGET_COUNT) {
+        const out = wv.slice(0, V31_WIDGET_COUNT);
+        out.splice(28, 1);          // 删「一采编码」；29/30 自动前移到 28/29
+        return out;
+    }
+    // ---- 路径 B：更老布局（35 / 25 值等）----
     const head = wv.slice(0, 17);                    // 宽高比…回退上限（0..16）
     const pick = (i) => (i < wv.length ? wv[i] : undefined);
     const body = [
@@ -1681,9 +1698,8 @@ function remapOldWidgetValuesToCurrent(wv) {
         (tailGen !== undefined ? tailGen : "文生视频"),  // 生成模式（idx25）
         "开启",                                         // 自动成片（新增控件，恒开启，idx26）
         (tailDs !== undefined ? tailDs : ""),           // 导演台状态（应为 JSON 字符串，idx27）
-        "标准",                                          // 一采编码（新增控件，恒标准，idx28）
-        "match",                                        // 参考图像尺寸（新增控件，恒 match，idx29）
-        1.0,                                            // 响度对齐强度（新增控件，恒 1.0，idx30）
+        "match",                                        // 参考图像尺寸（idx28；原 29，一采编码已删）
+        1.0,                                            // 响度对齐强度（idx29；原 30）
     ];
 }
 
@@ -1741,11 +1757,11 @@ function defaultUpscale() {
              denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16",
              time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0,
              stg: 0.0, stg_block: 25, passes: 1, decay: 0.5,
-             sharpen: 0.0, pixel_sharpen: 0.0, encode: "标准",
-             /* 3D 时序分块：默认开（省显存 + 治末端闪烁），关掉才进二采指纹 */
-             chunk: true,
-             /* 设备：自动（默认）/ cuda / rocm / cpu；强制卸载默认关 */
-             device: "auto", force_unload: false,
+             sharpen: 0.0, pixel_sharpen: 0.0,
+             /* 3D 时序分块（`chunk`）与放大网络强制卸载（`force_unload`）**已迁到
+              * 性能优化设置**（机器级、全局），项目存档里不再有这两个键 —— 见该字段表
+              * 「放大网络 · 分块 / 常驻」两组。别再往这里加回来。 */
+             device: "auto",
              sampler: "", scheduler: "", retry: false, retry_target: 0.15,
              include: [] };
 }
@@ -1965,11 +1981,12 @@ function getDs(node) {
             decay: upNum(upRaw.decay, 0.5, 0.2, 0.8),
             sharpen: upNum(upRaw.sharpen, 0.0, 0.0, 1.0),
             pixel_sharpen: upNum(upRaw.pixel_sharpen, 0.0, 0.0, 1.0),
-            encode: UP_ENCODES.includes(upRaw.encode) ? upRaw.encode : "标准",
-            /* 3D 时序分块：旧 JSON 缺键 = 开（对齐后端「默认开」） */
-            chunk: upRaw.chunk !== false,
+            /* 时序分块 / 强制卸载 / 编码档位都不在这里读了：
+             *   前两者（`chunk` / `force_unload`）迁到性能优化设置（机器级、全局）；
+             *   编码档位（`encode`）同在性能设置里，与 encoder / nvenc_cq 并排。
+             * 项目存档里不再保留这三个键 —— 分块是显存手段、编码档是编码手段，
+             * 都该跟着机器走，而不是跟着作品走。 */
             device: ["", "auto", "cuda", "rocm", "cpu"].includes(upRaw.device) ? upRaw.device : "auto",
-            force_unload: upRaw.force_unload === true,
             sampler: typeof upRaw.sampler === "string" ? upRaw.sampler.trim() : "",
             scheduler: typeof upRaw.scheduler === "string" ? upRaw.scheduler.trim() : "",
             retry: upRaw.retry === true,
@@ -2586,7 +2603,8 @@ const REDO_MODES = [
     ["无锚", "完全自由发挥：两端硬切（独立镜头式重摇）"],
 ];
 const UP_PRECISIONS = ["fp32", "fp16", "bf16"];
-const UP_ENCODES = ["标准", "高清", "极致"];
+/* 编码档位（标准/高清/极致）的选项表已迁到 perf 字段表的 `encode_profile`；
+   后端真源仍是 `upscale.ENCODE_PROFILES`（crf + preset + 抖动四元组）。 */
 /* 放大目标尺寸模式（与后端 upscale.py SIZE_MODES 同表） */
 const UP_SIZE_MODES = ["倍率", "目标尺寸", "百万像素"];
 
@@ -3879,120 +3897,433 @@ const OPT_PROVIDERS = {
     custom: { label: "自定义", url: "", model: "", protocol: "openai" },
 };
 
-/* ---- ⚙ 性能优化设置（**全局**、跨项目）----
+/* ---- ⚡ 性能优化设置（**全局**、跨项目）----
  *
  * 真源在后端 perf.py：DEFAULT_PERF / PERF_TYPES / parse_state / apply_runtime。
  * 前端**不自己算档位**（既有的铁律：参数单一真源），只做三件事：
- *   ① 显示后端给的只读诊断行（显存 / 内存 / swap / R_v / R_m / 档位 / 平台）
- *   ② 渲染开关，改动立刻 POST 回后端并在进程内应用
+ *   ① 显示后端给的只读诊断（显存 / 内存 / swap / R_v / R_m / 档位 / 平台）
+ *   ② 渲染开关，改完点「保存并应用」一次性 POST 回后端并在进程内应用
  *   ③ 把**未接线**的键明确标出来（灰掉 + 写「接线中」）
  *
  * 为什么要标「接线中」：列出一个勾了却没用的开关比不给开关更糟 ——
  * 用户会以为生效了，转头拿"改了没变化"来报 bug。
+ *
+ * ═══ 分类轴 = 处理链阶段（2026-09-23 重构）═══
+ *
+ * 旧分类是「显存 / 内存 / 编码 / 运行时开关 / 素材库」——**按资源类型**分。
+ * 这正是「同一件事散在两个组里、找不着」的根源：分块明明全在压显存，却因为
+ * 「一采的、放大的、精化的」分散在三个地方，用户想找「我现在卡在哪一段」时
+ * 无从下手。改成按**处理阶段**分，与用户脑子里的模型一致。
+ *
+ * 一级阶段：一采采样 → VAE 解码 → 放大网络 → 精化二采 → 成片与编码 → 通用与机器
+ * 二级用途：分块 / 注意力 / 权重流动 / 自救 …
+ *
+ * 每条一级标题带 stage 元信息：
+ *   stageWhen —— 生效时机徽章（立即 / 下次渲染）
+ *   stageNote —— 一句话说清这一段在干什么（用户不必猜）
+ *
+ * 控件形态统一为「启用开关 + 参数」两件套（见 enable 字段）：
+ *   分块类字段一律配一个独立开关，关掉时参数控件 disabled 但**不清零** ——
+ *   以前三种形态混用（0=关的数值 / bool 勾选 / 下拉即开关），用户看不出
+ *   「这个分块到底开没开」。
  */
+
+/* 阶段元信息表：一级标题 -> { 说明, 生效时机 }。
+ * 为什么不写在字段的 group 里：那时 6 个阶段会重复出现 30 次，改一处要改 30 行。 */
+const H3_PERF_STAGES = {
+    "一采采样": { when: "下次渲染", note: "主干扩散采样：UNET 权重流动 + FFN / 注意力的显存峰值" },
+    "放大网络": { when: "下次渲染", note: "潜空间神经放大（T 不变，只放大 H/W）+ 网络的加载常驻" },
+    "精化二采": { when: "下次渲染", note: "在高清 latent 上低步数重采样：细节增益与接缝的主要来源" },
+    "成片与编码": { when: "混合", note: "全链帧合成与 mp4 编码；编码器改动**立即生效**" },
+    "通用与机器": { when: "混合", note: "跨阶段：OOM 自救、运行时开关、素材库" },
+};
+
 const H3_PERF_FIELDS = [
-    /* ---- 显存：自救与探测 ---- */
-    { key: "oom_autoretry", label: "主干采样 OOM 自救", kind: "bool", group: "显存 · 自救",
-      hint: "主干采样撞 OOM 时自动卸载驻留模型 + 回收残留后**原参**重试一次（参数与产物都不降级）。救不回来会给可行动的中文报错。ComfyUI 自己那次自救救的是权重，救不到 LoRA 的激活" },
-    { key: "act_peak_probe", label: "量 LoRA 激活峰值", kind: "bool", group: "显存 · 自救",
-      hint: "首段采样时采设备级显存峰值 → 打出「LoRA 账：权重 +X GB（N patches）· 实测单步激活峰值 Y GB · 建议留空 ≥Z GB」。权重那半 ComfyUI 自己算得到，激活那半只有实测才看得见" },
-    /* ---- 显存：分块 ---- */
-    { key: "ff_chunk_tokens", label: "FFN 分块 Chunk FeedForward", kind: "num", group: "显存 · 分块",
-      hint: "0=关。按 token 切块算 MLP —— 主干 OOM 正崩在 FFN（单次请求 6.13GB）。**数学等价、零画质损失**；装之前会先自测，不一致就不装" },
-    { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "显存 · 分块",
+    /* ═══ ① 一采采样 ═══ */
+    { key: "ff_chunk_on", label: "FFN 分块（Chunk FeedForward）", kind: "bool", group: "一采采样 · 分块",
+      hint: "按 token 切块算 MLP —— **主干 OOM 正崩在这里**（HyperFlow bypass 单次请求 6.13GB，占 24GB 卡的 26%）。"
+          + "`nn.Linear` 沿 token 行可分离，所以**数学等价、零画质损失**，是本项目唯一无损的分块。装之前会先自测，不一致就不装" },
+    { key: "ff_chunk_tokens", label: "　　每块 token 数", kind: "num", enable: "ff_chunk_on", group: "一采采样 · 分块",
+      hint: "切成多大一块。**越小越省显存、开销略增**。太小则 kernel 启动开销占主导；太大则起不到压峰作用。"
+          + "建议从 4096 起，还 OOM 就减半。⚠ 本项目单位是「每块的 token 数」，与 KJNodes 的「切成几份」不是同一口径" },
+    { key: "ff_chunk_min_tokens", label: "　　低于多少 token 不切", kind: "num", enable: "ff_chunk_on", group: "一采采样 · 分块",
+      hint: "短序列切块只增加开销、省不了多少。序列 token 数低于此值就整段直通（对齐 KJNodes 的 seq_threshold，其默认 4096）" },
+    { key: "attn_head_on", label: "注意力头分块（Low VRAM Attention）", kind: "bool", group: "一采采样 · 注意力",
+      hint: "小显存卡的主要手段之一。**head 之间独立 → 精确、无损**。装之前会自测（拿小输入跑"
+          + "「分组 vs 整段」对比），不一致就不装 —— 依赖 ComfyUI 内部结构，装不上会静默跳过并保持原样，不会让渲染失败" },
+    { key: "attn_head_chunks", label: "　　切成几组头", kind: "num", enable: "attn_head_on", group: "一采采样 · 注意力",
+      hint: "把注意力按 head 分组逐组算：kernel 内部的临时量（int8 q/k 副本、fp32 累加器）按组数缩小。"
+          + "同时会在 qkv 之后立刻释放 normed hidden、out_proj 之前释放融合的 qkv buffer —— "
+          + "**这两处才是它真正省显存的地方**（分组本身是次要的）。1=关，建议 4，上限 = 头数。移植自 KJNodes MiniMaxLowVRAMAttention" },
+    { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "一采采样 · 注意力",
       opts: [["auto", "跟随 ComfyUI（推荐）"], ["sdpa", "sdpa"], ["sage", "SageAttention"], ["flash", "FlashAttention"]],
       hint: "auto = 不动。Sage 在 30 系上有失败报告；环境里拿不到该后端时会保持现状而不是置空" },
-    { key: "upscale_temporal_chunk", label: "放大网络 3D 时序分块", kind: "bool", group: "显存 · 分块",
-      hint: "此前硬编码为开，现在可调。关掉会改变二采输出的分块口径（因此会进指纹、触发既有高清段重做）" },
-    { key: "keep_upscaler_resident", label: "放大网络整链只搬一次", kind: "bool", group: "显存 · 分块",
-      hint: "默认关（每段卸）。实测每段「为把 659MB 放大网络搬上卡而全卸」耗时 6.3/8.0/6.4/5.7/6.7/3.7s —— 8 段约 40–60s 纯腾挪" },
-    { key: "refine_temporal_chunk", label: "精化时序分块（帧）", kind: "num", wired: false, group: "显存 · 分块",
-      hint: "接线中：时间注意力跨块会造成接缝闪烁，需 overlap≥8 latent token 并配合接缝医生，先留位" },
-    { key: "refine_tile", label: "精化空间分块（实验）", kind: "sel", wired: false, group: "显存 · 分块",
-      opts: [["off", "关（推荐）"], ["2x2", "2×2 tile"], ["3x3", "3×3 tile"]],
-      hint: "接线中且**有画质风险**——全局注意力被切断会导致色调/构图不一致，默认关" },
-    /* ---- 显存：腾挪 ---- */
-    { key: "vram_shuffle", label: "精化前腾挪强度", kind: "sel", group: "显存 · 腾挪",
-      opts: [["auto", "跟随（= 全卸，现状）"], ["off", "不腾挪"], ["soft", "只卸放大网络"], ["full", "全卸驻留模型"]],
-      hint: "24GB 卡上全卸疑似净亏（RSS 4.98→36.96GB），但 32GB 卡上有过 OOM 实测才加的它 —— 换卡前只做 A/B，auto 不改默认" },
-    { key: "blocks_to_swap", label: "块交换 blockswap（0–50）", kind: "num", wired: false, group: "显存 · 腾挪",
-      hint: "接线中：H3 = 50 个 double block；PCIe 带宽是硬约束，需先测「搬一块 vs 算一块」" },
-    /* ---- 内存：成片 ---- */
-    { key: "final_mode", label: "成片合成方式", kind: "sel", group: "内存 · 成片",
+    { key: "blocks_swap_on", label: "块交换（Blockswap）", kind: "bool", group: "一采采样 · 权重流动",
+      hint: "**显存装不下时的活路**：让 block 权重在 GPU / CPU 之间流动起来。"
+          + "H3 = 50 个 double block，每块 ≈ 0.4GB —— 6GB 卡只放得下约 13 块，靠它才能跑起来。"
+          + "**它换的是显存、代价是时间**（每块每次前向都要来回搬一趟），装得下（≥24GB 卡）就别开。"
+          + "⚠ 本项接的是 **ComfyUI 官方**的块级流动（DynamicVRAM 的 vbar 换入 + 官方 block 循环里的预取队列），"
+          + "插件**不自己搬权重**：手工搬会与官方按需换入抢同一批参数、并打坏 LoRA 的权重账。"
+          + "开关的作用是把下面「交换块数」折算成**显存预留**交给 aimdo —— 抬高预留 = 逼官方把更多块换出去" },
+    { key: "blocks_to_swap", label: "　　交换块数（0–50）", kind: "num", enable: "blocks_swap_on", group: "一采采样 · 权重流动",
+      hint: "放出多少块到 CPU，等价于「多留出 N × 每块大小 的显存」。参考：16GB→19–25 块；12GB→31–38；8GB→44–50。"
+          + "-1 = 跟随档位（按本机**真实 UNET 体量**反解，只有渲染开始拿到模型时才算得准）。"
+          + "⚠ 会被**夹取**：预留不可能超过显存总量，超过「显存一半」的部分会被夹掉并在报告行里说明" },
+    { key: "blocks_prefetch", label: "　　块级预取", kind: "bool", group: "一采采样 · 权重流动",
+      hint: "提前把下一块搬上来，用搬运的空闲时间盖住一部分开销（**本项独立生效，不受总开关影响**"
+          + " —— 官方那套块级流动不管总开关开不开都在跑）。"
+          + "⚠ 只能是开关：官方预取队列的深度写死为「提前 1 块」，**没有「预取 N 块」这个旋钮**。"
+          + "关掉 = 少占一块显存、更慢；关的是预取（lookahead），不是块级流动本身" },
+
+    /* ═══ ② 放大网络 ═══ */
+    { key: "upscale_temporal_chunk", label: "放大网络 3D 时序分块", kind: "bool", group: "放大网络 · 分块",
+      hint: "长段按时序切块前向：3D 卷积的激活随 T 线性增长，长段一次性前向容易爆；且末端帧缺右侧上下文会闪。"
+          + "切块后每块左右各带 overlap 帧上下文、只取中间有效区、块间线性融合。**关闭会改变输出口径 → 进指纹、触发既有高清段重做**" },
+    { key: "upscale_chunk_frames", label: "　　每块帧数", kind: "num", enable: "upscale_temporal_chunk", group: "放大网络 · 分块",
+      hint: "每块多少帧（默认 32）。越小越省显存，但重叠部分的重复计算占比越高（实跑 T=107 分 4 块时约 +37% 计算量）。"
+          + "⚠ 调小会**真的丢上下文**吗？不会 —— overlap 是独立参数、不受此值影响" },
+    { key: "upscale_overlap", label: "　　块间重叠帧（只增不减）", kind: "num", enable: "upscale_temporal_chunk", group: "放大网络 · 分块",
+      hint: "**它等于时序卷积核宽度，是「跨块上下文完整性」的保证** —— 小于核宽就会真的丢信息。"
+          + "所以本项目只允许往大调，调小无效（会被夹回核宽）。默认自动取核宽（实跑 5）。调大更保险、代价是重复计算" },
+    { key: "keep_upscaler_resident", label: "放大网络段间保留（不强制卸载）", kind: "bool", group: "放大网络 · 常驻",
+      hint: "**默认开，延续现状口径**：段间把放大网络留在缓存里，下段零加载。"
+          + "关掉 = 每段二采收尾**强制卸载**（把网络从缓存里删掉 + soft_empty_cache，下段重新从磁盘加载 ~1s），"
+          + "换来的是 CPU 侧那 ~659MB 权重副本 —— 多段链「后段比首段更易 OOM」时才需要关" },
+    { key: "unload_upscaler_cache", label: "段间清掉放大网络缓存", kind: "tri", group: "放大网络 · 常驻",
+      hint: "内存紧时开：每段结束后把放大网络从缓存里彻底删掉（下段重新从磁盘加载，每段约 1s）。"
+          + "⚠ 它与上面「段间保留」是**同一件事的两面**，而上头那个开关才是当前真正生效的 —— "
+          + "本项后端暂无消费端，改它不改变行为" },
+
+    /* ═══ ④ 精化二采 ═══ */
+    { key: "refine_temporal_on", label: "精化时序分块", kind: "bool", group: "精化二采 · 分块",
+      hint: "把高清 latent 沿时间切段，**每段独立跑 N 步去噪**。⚠ 与放大网络那个时序分块有本质区别："
+          + "那个是纯前馈（一次 forward，切开算再融合即可）；这个是**扩散采样循环**，段与段之间没有注意力交互 → "
+          + "接缝两侧各自收敛到不同局部解 → **接缝逐帧闪烁**（不是一条静止的缝）。必须配合接缝医生" },
+    { key: "refine_temporal_chunk", label: "　　每段帧数", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
+      hint: "0=关。每段多少帧。越小越省显存，接缝也越多。建议先给 16–24（一段 5 秒 ≈ 120 帧 → 5–8 段）" },
+    { key: "refine_temporal_overlap", label: "　　段间重叠（latent token）", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
+      hint: "**单位是 latent token，不是像素**（与下面空间那个 overlap 不是一个量纲）。至少 8，不够会明显闪烁。"
+          + "视频模型的 latent 时间压缩比通常为 4 或 8，所以 8 个 latent token 约等于 32–64 帧" },
+    { key: "refine_tile_on", label: "精化空间分块（tile）", kind: "bool", group: "精化二采 · 分块",
+      hint: "本阶段总开关。**关掉时下面的切块档位与全部 tile 参数灰掉但保留数值**，下次开还按原值跑。"
+          + "把高清画布按 H/W 切成网格、逐块独立去噪 —— **这是全清单里画质风险最高的一项**："
+          + "H3 靠全局注意力维持整幅画面的色调 / 光照 / 构图一致，切开后每块只看得见自己那块 → 块边界出现竖缝 + 色调不一致。"
+          + "视频比图像严重得多（块边会在**帧间抖动**，因为每块独立去噪、噪声轨迹不同）。"
+          + "5 秒 1080p 精化画布的激活是这段链条里最大的一笔，只有逼到墙角才建议开" },
+    { key: "refine_tile", label: "　　切块档位", kind: "sel", enable: "refine_tile_on", group: "精化二采 · 分块",
+      opts: [["off", "关（0 块，等同不开）"], ["2x2", "2×2（4 块）"], ["3x3", "3×3（9 块）"],
+             ["4x4", "4×4（16 块，风险最高）"], ["2x1", "横向 2 条（2 块）"], ["1x2", "竖向 2 条（2 块）"]],
+      hint: "切成几块（总开关决定「做不做」，这里决定「切多细」）。"
+          + "⚠ 档位越大越省显存但越容易崩：**2×2 是每块仍有 1/4 画幅的极限**，3×3 起全局构图基本断裂。" },
+    { key: "refine_tile_overlap", label: "　　块间重叠（像素）", kind: "num", enable: "refine_tile_on", group: "精化二采 · 分块",
+      hint: "缓解竖缝的第一手段。建议 32–64；太小缝明显，太大会吃掉省下的显存收益。注意单位是**像素**" },
+    { key: "refine_tile_feather", label: "　　接缝羽化宽度（像素）", kind: "num", enable: "refine_tile_on", group: "精化二采 · 分块",
+      hint: "块间融合的渐变带宽度（线性 ramp）。**只靠 overlap 会有硬边**，羽化把过渡抹开。建议取 overlap 的一半到等宽" },
+    { key: "vram_shuffle", label: "精化前腾挪强度", kind: "sel", group: "精化二采 · 腾挪",
+      opts: [["auto", "跟随档位（小显存=全卸）"], ["off", "不腾挪"], ["soft", "只卸放大网络"], ["full", "全卸驻留模型"]],
+      hint: "精化前把显存腾出来。24GB 卡上全卸疑似净亏（RSS 4.98→36.96GB），但 32GB 卡上有过 OOM 实测才加的它 —— 换卡前只做 A/B" },
+
+    /* ═══ ⑤ 成片与编码 ═══ */
+    { key: "final_mode", label: "成片合成方式", kind: "sel", group: "成片与编码 · 合成",
       opts: [["auto", "能拼就拼（推荐）"], ["stream", "强制流式拼接"], ["memory", "强制内存帧编码"]],
       hint: "stream = 用分段 mp4 流式拼接，**全程不碰全链内存帧**（NLE 的一贯做法）；auto 在分段齐全时自动走 stream" },
-    { key: "frames_dtype", label: "全链帧存储精度", kind: "sel", group: "内存 · 成片",
+    { key: "frames_dtype", label: "全链帧存储精度", kind: "sel", group: "成片与编码 · 合成",
       opts: [["float32", "float32（现状）"], ["uint8", "uint8（内存 ×¼）"]],
-      hint: "uint8：帧存内存降到 ¼，且成片改为预分配逐段填充 —— 峰值从 2× 全链帧降到约 1.25×。输出的 IMAGE 仍是 float32" },
-    { key: "guard_action", label: "落盘守卫行为", kind: "sel", group: "内存 · 成片",
+      hint: "uint8：帧存内存降到 ¼，且成片改为预分配逐段填充 —— 峰值从 2× 全链帧降到约 1.25×。输出的 IMAGE 仍是 float32。**内存紧就开**" },
+    { key: "guard_action", label: "落盘守卫行为", kind: "sel", group: "成片与编码 · 合成",
       opts: [["warn", "只报告"], ["block", "critical 时禁止全卸"]],
       hint: "block：判定会挤到 swap 时跳过二采精化前的全卸 —— Linux 无 swap 机器上全卸不是变慢，是进程被 OOM killer 直接杀掉" },
-    /* ---- 编码 ---- */
-    { key: "encoder", label: "编码器", kind: "sel", group: "编码",
-      opts: [["auto", "libx264（推荐）"], ["libx264", "libx264"], ["h264_nvenc", "H.264 NVENC"], ["hevc_nvenc", "H.265 NVENC"]],
-      hint: "诚实评估：557 帧编码只要 13 秒，**编码不是瓶颈**。NVENC 的真实收益是 CPU 占用（x264 会起核数×1.5 个线程），不是耗时也不是内存" },
-    { key: "nvenc_cq", label: "NVENC 质量档 cq", kind: "num", group: "编码",
-      hint: "对应 x264 的 crf（越小越清晰）。NVENC 不认 crf，两者必须分开传" },
-    /* ---- 运行时开关 ---- */
-    { key: "upcast_attention", label: "Upcast Attention", kind: "tri", group: "运行时开关",
-      hint: "attention 强制走 fp32：更稳但更吃显存、更慢。小显存卡通常关；auto = 跟随启动参数" },
-    /* ---- 素材库 ---- */
-    { key: "index_mode", label: "素材库索引失效口径", kind: "sel", group: "素材库",
+    { key: "encoder", label: "编码器实现", kind: "sel", group: "成片与编码 · 编码",
+      opts: [["libx264", "libx264（CPU）"], ["h264_nvenc", "H.264 NVENC（GPU）"], ["hevc_nvenc", "H.265 NVENC（GPU）"]],
+      hint: "**用哪个编码器实现**，与下面「画质档位」正交、可任意组合。"
+          + "**libx264（CPU）**：压缩效率更高（同码率画质更好），代价是**长片时把 CPU 吃满**"
+          + "（起 核数×1.5 个线程，跑链时整机卡）。"
+          + "**NVENC（GPU）**：显卡专用硬件，几乎不占 CPU、长片编码更快；"
+          + "代价是**同画质需要更高码率**（压缩效率略低于 x264，用下面 cq 调低补偿）。"
+          + "两者**都不省显存**（帧最终仍要落 CPU 侧进编码器）。" },
+    { key: "x264_crf", label: "libx264 质量档 crf", kind: "num", group: "成片与编码 · 编码",
+      showWhen: { key: "encoder", values: ["libx264"] },
+      hint: "x264 恒定质量（**越小越清晰**，常用 13–23：20 标准 / 16 高清 / 13 极致）。"
+          + "与「画质档位」**分开**：档位管 preset + 抖动，crf 在这里单独调。"
+          + "⚠ 切「画质档位」**不会**自动改这里的数值 —— 想要高清档的 crf16 就手动填 16" },
+    { key: "nvenc_cq", label: "NVENC 质量档 cq", kind: "num", group: "成片与编码 · 编码",
+      showWhen: { key: "encoder", values: ["h264_nvenc", "hevc_nvenc"] },
+      hint: "NVENC 恒定质量（**越小越清晰**，语义对应 x264 的 crf）。"
+          + "**NVENC 不认 crf**，两者必须分开传，否则 NVENC 会静默丢掉质量档。"
+          + "因 NVENC 压缩效率略低，同画质可比 crf 再调低 2–4。" },
+    { key: "encode_profile", label: "画质档位（preset + 抗条纹）", kind: "sel", group: "成片与编码 · 编码",
+      opts: [["标准", "标准（veryfast · 现状兼容）"], ["高清", "高清（medium + 暗部自适应 + 抖动）"],
+             ["极致", "极致（slow + 同上 · 编码明显变慢）"]],
+      hint: "管的是**编码器速度档 + 8bit 暗部抖动**（消解渐变色带 / 天空横向条纹）；"
+          + "**crf / cq 数值在上面对应控件里单独调**。原在右栏二采「编码档位」，"
+          + "现统一收进此处。非标准档会进二采指纹（换了档 → 既有高清段判失效重做）" },
+
+    /* ═══ ⑥ 通用与机器 ═══ */
+    { key: "oom_autoretry", label: "主干采样 OOM 自救", kind: "bool", group: "通用与机器 · 自救",
+      hint: "跨阶段。主干采样撞 OOM 时自动卸载驻留模型 + 回收残留后**原参**重试一次（参数与产物都不降级）。"
+          + "救不回来会给可行动的中文报错。ComfyUI 自己那次自救救的是权重，救不到 LoRA 的激活" },
+    { key: "act_peak_probe", label: "量 LoRA 激活峰值", kind: "bool", group: "通用与机器 · 自救",
+      hint: "首段采样时采设备级显存峰值 → 打出「LoRA 账：权重 +X GB（N patches）· 实测单步激活峰值 Y GB · 建议留空 ≥Z GB」。"
+          + "权重那半 ComfyUI 自己算得到，激活那半只有实测才看得见" },
+    { key: "upcast_attention", label: "Upcast Attention", kind: "tri", group: "通用与机器 · 运行时",
+      hint: "attention 强制走 fp32：更稳但更吃显存、更慢。**小显存卡通常关**；auto = 跟随启动参数。改动立即生效" },
+    { key: "index_mode", label: "素材库索引失效口径", kind: "sel", group: "通用与机器 · 素材库",
       opts: [["fingerprint", "目录指纹（推荐）"], ["ttl", "固定 3 秒过期"]],
       hint: "指纹：没增删文件就一直复用，翻页不再重建索引（1200 条目实测省掉 1895ms）；ttl：老行为，遇到「新素材不显示」可退回" },
-    { key: "thumb_on_import", label: "入库即生成缩略图", kind: "bool", group: "素材库",
+    { key: "thumb_on_import", label: "入库即生成缩略图", kind: "bool", group: "通用与机器 · 素材库",
       hint: "关掉则退回「首次浏览时才生成」—— 会为每张大图付一次全解码峰值（6000×4000 JPEG 实测 193 MB，且 RSS 涨上去不易回落）" },
-    { key: "thumb_max_mp", label: "缩略图源图上限（百万像素）", kind: "num", group: "素材库",
+    { key: "thumb_max_mp", label: "缩略图源图上限（百万像素）", kind: "num", group: "通用与机器 · 素材库",
       hint: "超过就跳过解码，前端回落类型图标 —— 挡住超大图的解码尖峰" },
 ];
 
-async function paintPerfPane(pane) {
+/* 性能优化弹窗（顶栏「⚡ 性能优化」入口）。
+ *
+ * 为什么是弹窗：性能项有 20 条、每条都带一段解释，右栏的宽度装不下
+ * 「控件 + 说明」，两者挤一行等于把说明吞掉 —— 这正是用户报的「信息展现不全」。
+ * 弹窗里一律两行式：第一行 label + 控件，第二行说明全文换行。
+ *
+ * 保存语义：改动先进 draft，点「保存并应用」一次性 POST（原实现是勾一下发一次
+ * 请求，误触无法收回）。读不到配置时保存按钮直接禁用 —— 列一排勾选却存不下去，
+ * 比直说读不到更糟。 */
+async function openPerfSettings() {
+    if (document.querySelector(".h3d-perf-overlay")) return;
     const A = window.H3Api;
-    const say = (msg) => {
-        const box = el("div", "h3d-setrow");
-        box.append(el("span", "h3d-secs-hint", msg));
-        pane.replaceChildren(box);
+    const overlay = el("div", "h3d-opt-overlay h3d-perf-overlay");
+    const dialog = el("div", "h3d-opt-dialog h3d-perf-dialog");
+    overlay.append(dialog);
+    dialog.append(el("div", "h3d-opt-title", "⚡ 性能优化 · 功能设置"));
+    dialog.append(el("div", "h3d-opt-sub",
+        "机器级设置（这台卡多大、内存多少）——<b>全局生效、跨项目共用</b>，"
+        + "存 &lt;user&gt;/minimax_h3/perf.json。改完点「保存并应用」："
+        + "Upcast / 编码器 / 素材库那几项立即生效，显存·内存那几项在下一次渲染生效。"));
+    /* 正文（可滚）与底栏（固定）分开：底栏在滚动区**外**，改完随手就能点保存，
+     * 不用先滚到底把按钮找出来。回执行也跟着底栏走，保存完立刻可见。 */
+    const body = el("div", "h3d-perf-body");
+    const foot = el("div", "h3d-perf-foot");
+    dialog.append(body, foot);
+    const status = el("div", "h3d-perf-status", "");
+    const actions = el("div", "h3d-opt-actions");
+    const cancel = el("button", "h3d-btn", "关闭");
+    const save = el("button", "h3d-btn h3d-opt-save", "保存并应用");
+    save.disabled = true;
+    actions.append(cancel, save);
+    foot.append(status, actions);
+    const close = () => overlay.remove();
+    cancel.onclick = close;
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) close(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+    document.body.append(overlay);
+
+    const fail = (msg) => {
+        body.replaceChildren(el("div", "h3d-perf-hint", msg));
+        save.disabled = true;
     };
-    if (!A || !A.perfGet) { say("性能设置接口不可用（请更新插件）"); return; }
-    say("读取中…");
-    let body;
-    try { body = (await A.perfGet()).body; }
-    catch (e) { say("读取性能设置失败：" + ((e && e.message) || e)); return; }
-    if (!body || !body.ok) { say("读取性能设置失败"); return; }
-    const draft = Object.assign({}, body.data || {});
-    const wired = new Set(body.wired || []);
-    pane.replaceChildren();
+    if (!A || !A.perfGet) { fail("性能设置接口不可用（请更新插件）"); return; }
+    body.append(el("div", "h3d-perf-hint", "读取中…"));
+    let info;
+    try { info = (await A.perfGet()).body; }
+    catch (e) { fail("读取性能设置失败：" + ((e && e.message) || e)); return; }
+    if (!info || !info.ok) { fail("读取性能设置失败"); return; }
+
+    const draft = Object.assign({}, info.data || {});
+    /* 三态（判据的**唯一真源在后端**，前端不自己维护名单）：
+     *   unwired        —— 后端有字段、无实现，标「接线中」+ 灰
+     *   profile_driven —— 由 profile 档位表填值，**自动档下确实生效**，
+     *                     不标「接线中」、不灰（以前被误画成灰，等于把在用的
+     *                     开关说成没用 —— 与「列一个没用的开关」同样有害）
+     *   其余           —— 已接线
+     * ⚠ 顺序不能改：unwired 优先（本表已空 —— 块交换接线后没有未接线项了）。
+     * `blocks_to_swap` 是 wired ∩ profile_driven：执行机制已接线，但默认值 -1
+     * 的含义就是「跟随档位」，所以照旧显示「跟随档位」而不是「已接线」。 */
+    const unwired = new Set(info.unwired || []);
+    const profileDriven = new Set(info.profile_driven || []);
+    const fieldState = (k) => unwired.has(k) ? "unwired"
+        : profileDriven.has(k) ? "auto" : "wired";
+    body.replaceChildren();
 
     /* 只读诊断：机器现状 + 当前真正生效的值（后端量，前端不猜） */
-    const secDiag = el("div", "h3d-setsec");
-    secDiag.append(el("div", "h3d-setsec-title", "当前机器（只读）"));
-    const drow = el("div", "h3d-setrow");
-    drow.append(el("span", "h3d-secs-hint",
-        String(body.report || "").replace(/^\[H3性能\]\s*/, "") || "未探明"));
-    secDiag.append(drow);
-    if (body.upcast) {
-        const urow = el("div", "h3d-setrow");
-        urow.append(el("span", "h3d-secs-hint",
-            "Upcast Attention 当前生效：" + (body.upcast.effective ? "开" : "关")
-            + "（启动参数 force=" + (body.upcast.cli_force_upcast ? "1" : "0")
-            + " / dont=" + (body.upcast.cli_dont_upcast ? "1" : "0") + "）"));
-        secDiag.append(urow);
+    const diag = el("div", "h3d-perf-diag");
+    diag.append(el("div", "h3d-setsec-title", "当前机器（只读）"));
+    diag.append(el("pre", null,
+        escapeHtml(String(info.report || "").replace(/^\[H3性能\]\s*/, "") || "未探明")));
+    if (info.upcast) {
+        diag.append(el("pre", null,
+            "Upcast Attention 当前生效：" + (info.upcast.effective ? "开" : "关")
+            + "（启动参数 force=" + (info.upcast.cli_force_upcast ? "1" : "0")
+            + " / dont=" + (info.upcast.cli_dont_upcast ? "1" : "0") + "）"));
     }
-    pane.append(secDiag);
+    /* 块级权重流动的**现状**（后端探，前端不算）。机制在 ComfyUI 那边，所以「这台
+     * 机器到底有没有在块级流动」必须如实摆出来 —— 有 DynamicVRAM 的机器上它本来
+     * 就在跑，用户不需要勾任何开关；没 DynamicVRAM 的机器则要靠 ComfyUI 自己的按
+     * 模块流动。两者都不是本插件提供的，不能让人以为是。 */
+    const bsAp = (info.applied || {}).blockswap;
+    if (bsAp) {
+        const _bsGb = (v) => (v == null ? "?" : Number(v).toFixed(2) + "GB");
+        diag.append(el("pre", null,
+            (bsAp.path === "aimdo"
+                ? "块级权重流动：DynamicVRAM 在线（官方块级预取 + vbar 换入），当前显存预留 "
+                  + _bsGb(bsAp.headroom_gb)
+                : "块级权重流动：本机无 DynamicVRAM → 装不下时由 ComfyUI 自己按模块流动（粒度≈block）")
+            + (bsAp.note ? "\n" + bsAp.note : "")));
+    }
+    body.append(diag);
 
-    /* 开关区 */
-    const secSet = el("div", "h3d-setsec");
-    secSet.append(el("div", "h3d-setsec-title", "性能开关（全局，跨项目）"));
-    secSet.append(el("div", "h3d-setrow", el("span", "h3d-secs-hint",
-        "Upcast / 编码器 / 素材库那几项改完立即生效；「显存·内存」那几项在下一次渲染生效；"
-        + "标「接线中」的项只保存、还不生效。")));
-    const status = el("span", "h3d-secs-hint", "");
-    const push = async () => {
-        status.textContent = "保存中…";
+    /* 分类树：group 形如「显存 · 自救」→ 一级「显存」+ 二级「自救」；不含「 · 」的
+     * （编码 / 运行时开关 / 素材库）本身就是一级。
+     * 为什么两级都做成可折叠：19 条带说明的字段一屏放不下，能按大分类把无关的几组
+     * 收起来（只想调素材库时把显存那 8 项合上），找东西就不必一路滚。
+     * 折叠态交给 foldSection 统一记忆（_foldState）—— 弹窗每次打开都整块重建，
+     * 不记忆的话收起的分组会当场弹回来，跟右栏那几栏一个道理。 */
+    const tree = [];
+    for (const f of H3_PERF_FIELDS) {
+        const parts = String(f.group || "其他").split(" · ");
+        let head = tree.find((g) => g.name === parts[0]);
+        if (!head) { head = { name: parts[0], subs: [] }; tree.push(head); }
+        const subName = parts[1] || "";
+        let sub = head.subs.find((s) => s.name === subName);
+        if (!sub) { sub = { name: subName, fields: [] }; head.subs.push(sub); }
+        sub.fields.push(f);
+    }
+    for (const head of tree) {
+        const total = head.subs.reduce((a, s) => a + s.fields.length, 0);
+        const group = foldSection("perf-g-" + head.name, true,
+            "<summary>" + escapeHtml(head.name) + "<small>" + total + " 项</small></summary>");
+        group.classList.add("h3d-perf-group");
+        body.append(group);
+        for (const sub of head.subs) {
+            let host = group;
+            if (sub.name) {
+                host = foldSection("perf-s-" + head.name + "-" + sub.name, true,
+                    "<summary>" + escapeHtml(sub.name) + "</summary>");
+                host.classList.add("h3d-perf-sub");
+                group.append(host);
+            }
+            for (const f of sub.fields) {
+                const state = fieldState(f.key);
+                const on = state !== "unwired";
+                const row = el("div", "h3d-perf-row");
+                const top = el("div", "h3d-perf-top");
+                const lab = el("label", null,
+                    f.label + (state === "unwired" ? " · 接线中"
+                        : state === "auto" ? " · 跟随档位" : ""));
+                if (!on) { lab.style.color = "var(--h3d-muted)"; lab.style.opacity = "0.6"; }
+                let ctl;
+                if (f.kind === "tri") {
+                    ctl = document.createElement("select");
+                    for (const [v, txt] of [["auto", "跟随启动参数"], ["true", "强制开"], ["false", "强制关"]]) {
+                        ctl.append(new Option(txt, v));
+                    }
+                    ctl.value = draft[f.key] === true ? "true" : draft[f.key] === false ? "false" : "auto";
+                } else if (f.kind === "sel") {
+                    ctl = document.createElement("select");
+                    for (const [v, txt] of (f.opts || [])) ctl.append(new Option(txt, v));
+                    ctl.value = String(draft[f.key] ?? (f.opts && f.opts[0][0]) ?? "");
+                } else if (f.kind === "bool") {
+                    ctl = document.createElement("input");
+                    ctl.type = "checkbox";
+                    ctl.checked = !!draft[f.key];
+                } else {
+                    ctl = document.createElement("input");
+                    ctl.type = "number";
+                    ctl.value = String(draft[f.key] ?? 0);
+                }
+                /* 开关两件套（f.enable 绑定一个 bool 开关 key）：开关关掉时参数控件
+                 * disabled 但**不清零** —— 用户只是临时关掉，数值还留着。
+                 * 这正是「给每个阶段配一个开启按钮 + 开启多少」的落地方式：
+                 * 一个阶段一个总开关，下面挂「开多大」的参数，层级一眼可见。
+                 * 初始灰/亮在整棵树建完后统一收尾（见本函数末尾），因为字段表里
+                 * 参数可能排在它的开关之前。 */
+                ctl.disabled = !on;
+                if (f.kind === "tri") {
+                    ctl.onchange = () => {
+                        const v = ctl.value;
+                        draft[f.key] = v === "true" ? true : v === "false" ? false : "auto";
+                    };
+                } else if (f.kind === "bool") {
+                    ctl.onchange = () => {
+                        draft[f.key] = ctl.checked;
+                        /* 总开关一动，把它名下的参数控件一起亮 / 灰（两件套的正向联动）。
+                         * 只认本字段表里 enable 指向它的那些 key —— 不猜、不误伤。 */
+                        const owned = H3_PERF_FIELDS
+                            .filter((x) => x.enable === f.key).map((x) => x.key);
+                        for (const ownedKey of owned) {
+                            const oc = document.querySelector(
+                                '[data-h3perf-key="' + ownedKey + '"]');
+                            if (oc) oc.disabled = !ctl.checked || oc.dataset.h3perfLocked === "1";
+                        }
+                    };
+                } else if (f.kind === "num") {
+                    ctl.onchange = () => { draft[f.key] = Number(ctl.value) || 0; };
+                } else {
+                    ctl.onchange = () => { draft[f.key] = ctl.value; };
+                }
+                /* 反向联动：开关一动，把它名下的参数一起亮 / 灰。用 data 属性登记，
+                 * 让参数行在 render 时能反查宿主开关（见 gate 那段）。 */
+                ctl.dataset.h3perfKey = f.key;
+                if (!on) ctl.dataset.h3perfLocked = "1";
+                /* 按值显隐：登记「本行归属哪个宿主字段、什么值下才显示」。
+                 * 为什么用 data 属性而不是现在就判：字段表里 crf 排在 encoder 之前，
+                 * 建行时宿主的 select 还没建出来 → querySelector 落空、初始态会判错。
+                 * 统一在整棵树建完后由 applyShowWhen 收尾（与 enable 两件套同一个坑）。 */
+                if (f.showWhen) {
+                    row.dataset.h3perfShowKey = f.showWhen.key;
+                    row.dataset.h3perfShowVals = (f.showWhen.values || []).join("\u0001");
+                }
+                top.append(lab, ctl);
+                row.append(top);
+                if (f.hint) {
+                    /* 说明里的 **强调** 转真加粗：原实现当纯文本渲染，星号直接露在界面上 */
+                    row.append(el("div", "h3d-perf-hint",
+                        String(f.hint).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")));
+                }
+                host.append(row);
+            }
+        }
+    }
+
+    /* 两件套收尾（必须整棵树都插进 DOM 之后再做）：逐条 enable 记录，把「开关当前
+     * 状态」应用到它名下的参数控件上。不能在做行时顺手查 —— 字段表里
+     * attn_head_chunks 排在 attn_head_on **之前**，那时宿主开关还没建出来，
+     * querySelector 会落空、参数行就永远是亮的。 */
+    for (const f of H3_PERF_FIELDS) {
+        if (!f.enable) continue;
+        const gate = body.querySelector('[data-h3perf-key="' + f.enable + '"]');
+        const child = body.querySelector('[data-h3perf-key="' + f.key + '"]');
+        if (!gate || !child) continue;
+        /* 未接线的字段已被标 locked，保持灰，别被这里点亮 */
+        child.disabled = !gate.checked || child.dataset.h3perfLocked === "1";
+    }
+
+    /* 按值显隐收尾（同 enable 两件套，必须整棵树建完后做）。
+     * 场景：crf / cq 两个质量控件随 `encoder` 的当前值切换显示 —— 选 libx264 只露
+     * crf、选 NVENC 只露 cq。**隐藏是 display 而非 disabled**：两个旋钮语义不同
+     * （NVENC 不认 crf），留着灰控件只会让人以为「这两个都要填」。 */
+    const applyShowWhen = () => {
+        for (const row of body.querySelectorAll("[data-h3perf-show-key]")) {
+            const gate = body.querySelector(
+                '[data-h3perf-key="' + row.dataset.h3perfShowKey + '"]');
+            const vals = String(row.dataset.h3perfShowVals || "").split("\u0001");
+            const cur = gate ? String(gate.value) : "";
+            row.style.display = vals.includes(cur) ? "" : "none";
+        }
+    };
+    applyShowWhen();
+    /* 宿主值一变就重算：只挂在本表内被 showWhen 引用的键上，不猜、不误伤 */
+    for (const hostKey of new Set(H3_PERF_FIELDS.filter((x) => x.showWhen)
+        .map((x) => x.showWhen.key))) {
+        const gate = body.querySelector('[data-h3perf-key="' + hostKey + '"]');
+        if (!gate) continue;
+        const prev = gate.onchange;
+        gate.onchange = (ev) => { if (prev) prev.call(gate, ev); applyShowWhen(); };
+    }
+
+    save.disabled = false;
+    save.onclick = async () => {
+        save.disabled = true;
+        save.textContent = "保存中…";
         try {
-            const r = await A.perfSet(draft);
-            const b = r && r.body;
-            if (!b || !b.ok) { status.textContent = "保存失败"; return; }
+            const b = (await A.perfSet(draft)).body;
+            if (!b || !b.ok) throw new Error("后端未接受（详见 ComfyUI 控制台）");
             const ap = b.applied || {};
             const fmt = (v) => v === true ? "开" : v === false ? "关" : (v === "auto" ? "跟随" : String(v ?? "?"));
             status.textContent = "已应用 · upcast=" + fmt(ap.upcast_attention)
@@ -4000,66 +4331,23 @@ async function paintPerfPane(pane) {
                 + " · 成片=" + fmt(ap.final_mode)
                 + " · 帧精度=" + fmt(ap.frames_dtype)
                 + " · OOM自救=" + fmt(ap.oom_autoretry)
-                + "（其余项为下一次渲染生效）";
+                /* 三态别混成两态：面板打开/保存时拿不到 UNET 体量 → 算不出目标、本次
+                 * 不写（见 perf.apply_blockswap 的守卫），此时说「关」是假话 —— 它是
+                 * 「等渲染时按真实体量生效」。 */
+                + " · 块交换=" + (ap.blockswap
+                    ? (ap.blockswap.applied
+                        ? (ap.blockswap.blocks + "块/" + ap.blockswap.path)
+                        : (ap.blockswap.on ? "待渲染生效" : "关"))
+                    : "关")
+                + "\n（其余项为下一次渲染生效）";
+            save.textContent = "✓ 已应用";
+            setTimeout(() => { save.textContent = "保存并应用"; save.disabled = false; }, 1200);
         } catch (e) {
-            status.textContent = "保存失败：" + ((e && e.message) || e);
+            save.textContent = "保存并应用";
+            save.disabled = false;
+            alert("保存失败：" + ((e && e.message) || e));
         }
     };
-    let curGroup = null;
-    for (const f of H3_PERF_FIELDS) {
-        if (f.group && f.group !== curGroup) {
-            curGroup = f.group;
-            secSet.append(el("div", "h3d-setsec-title", f.group));
-        }
-        const row = el("div", "h3d-refrow");
-        const on = f.wired === false ? false : wired.has(f.key);
-        const lab = el("label", null, f.label + (on ? "" : " · 接线中"));
-        lab.style.color = on ? "" : "var(--h3d-muted)";
-        lab.style.opacity = on ? "" : "0.6";
-        row.append(lab);
-        let ctl = null;
-        if (f.kind === "tri") {
-            ctl = document.createElement("select");
-            for (const [v, txt] of [["auto", "跟随启动参数"], ["true", "强制开"], ["false", "强制关"]]) {
-                ctl.append(new Option(txt, v));
-            }
-            ctl.value = draft[f.key] === true ? "true" : draft[f.key] === false ? "false" : "auto";
-        } else if (f.kind === "sel") {
-            ctl = document.createElement("select");
-            for (const [v, txt] of (f.opts || [])) ctl.append(new Option(txt, v));
-            ctl.value = String(draft[f.key] ?? (f.opts && f.opts[0][0]) ?? "");
-        } else if (f.kind === "bool") {
-            ctl = document.createElement("input");
-            ctl.type = "checkbox";
-            ctl.checked = !!draft[f.key];
-        } else {
-            ctl = document.createElement("input");
-            ctl.type = "number";
-            ctl.value = String(draft[f.key] ?? 0);
-            ctl.style.width = "72px";
-        }
-        ctl.disabled = !on;
-        ctl.onchange = () => {
-            if (f.kind === "tri") {
-                const v = ctl.value;
-                draft[f.key] = v === "true" ? true : v === "false" ? false : "auto";
-            } else if (f.kind === "bool") {
-                draft[f.key] = ctl.checked;
-            } else if (f.kind === "num") {
-                draft[f.key] = Number(ctl.value) || 0;
-            } else {
-                draft[f.key] = ctl.value;
-            }
-            if (on) push();
-        };
-        row.append(ctl);
-        if (f.hint) row.append(el("span", "h3d-secs-hint", f.hint));
-        secSet.append(row);
-    }
-    const statusRow = el("div", "h3d-setrow");
-    statusRow.append(status);
-    secSet.append(statusRow);
-    pane.append(secSet);
 }
 
 /* 提示词优化设置面板（结构对齐参考项目，请求仍走自研 /h3chain 后端）。
@@ -5661,6 +5949,45 @@ function injectStyles() {
     /* 设置面板里的行内说明（思考强度的能力提示等）：小一号、弱化色，
        它解释的是"为什么这个选项长这样"，不是必读项。 */
     .h3d-opt-hint{color:var(--h3d-muted);font-size:11px;line-height:1.6;margin:-2px 0 8px}
+    /* ---- ⚡ 性能优化弹窗（共用 AI 优化设置的 overlay / dialog 底）----
+       右栏那种窄折叠装不下「控件 + 整段说明」，两者挤一行等于把说明吞掉
+       （用户报的「信息展现不全」）。这里一律两行式：第一行 label + 控件，
+       第二行说明全文换行。 */
+    /* 弹窗用**列布局**：标题与底栏固定，只有正文滚。
+       AI 优化设置那份是「整个 dialog 带滚动条」，按钮跟在内容末尾 —— 项一多就
+       必须先滚到底才能点保存（用户报的痛点）。这里把按钮放到滚动区之外。 */
+    .h3d-perf-dialog{width:min(1040px,calc(100vw - 40px));height:min(900px,92vh);max-height:92vh;overflow:hidden;display:flex;flex-direction:column}
+    .h3d-perf-dialog>.h3d-opt-title,.h3d-perf-dialog>.h3d-opt-sub{flex:none}
+    .h3d-perf-body{flex:1 1 auto;min-height:0;overflow:auto;overflow-x:hidden;padding-right:6px}
+    .h3d-perf-foot{flex:none;margin-top:10px;border-top:1px solid #37332b;padding-top:9px}
+    .h3d-perf-dialog .h3d-opt-actions{margin-top:8px}
+    .h3d-perf-diag{border:1px solid #37332b;border-radius:8px;background:#181712;padding:9px 11px;margin:0 0 10px}
+    .h3d-perf-diag pre{margin:6px 0 0;white-space:pre-wrap;word-break:break-all;color:#9fb0bd;font:11px/1.7 ui-monospace,Consolas}
+    .h3d-perf-row{padding:8px 0;border-bottom:1px dashed #2e2a23}
+    .h3d-perf-row:last-child{border-bottom:0}
+    .h3d-perf-top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    .h3d-perf-top>label{color:#c8c2b4;font-size:12px;font-weight:600;min-width:0}
+    .h3d-perf-top select,.h3d-perf-top input[type=number]{flex:none;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:5px 7px;font-size:12px;outline:none;font-family:inherit;max-width:280px}
+    .h3d-perf-top input[type=number]{width:96px}
+    .h3d-perf-top input[type=checkbox]{width:15px;height:15px;accent-color:#7fc79f;flex:none}
+    .h3d-perf-hint{margin-top:4px;color:var(--h3d-muted);font-size:11.5px;line-height:1.65}
+    .h3d-perf-status{margin:8px 0 0;color:#8fc9a5;font-size:11.5px;line-height:1.6;white-space:pre-wrap}
+    /* 弹窗内的两级分类树：复用 foldSection（折叠态记忆），视觉覆盖右栏那套 ——
+       右栏的齿轮图标（.h3d-adv summary::before）与紧凑内边距在弹窗里不合适。
+       特异性必须带上 .h3d-perf-body：.h3d-adv 那几条规则定义在本块之后，
+       同级特异性会被它们压掉。 */
+    .h3d-perf-body .h3d-perf-group{border:1px solid #37332b;border-radius:9px;background:#1d1a15;margin:9px 0 0}
+    .h3d-perf-body .h3d-perf-group>summary{display:flex;align-items:center;gap:8px;padding:9px 11px;font-size:12.5px;font-weight:600;color:var(--h3d-bone)}
+    .h3d-perf-body .h3d-perf-group>summary::before{content:"▸";font-size:10px;color:var(--h3d-muted);transition:transform .15s}
+    .h3d-perf-body .h3d-perf-group[open]>summary{border-bottom:1px solid #302c25;color:var(--h3d-copper)}
+    .h3d-perf-body .h3d-perf-group[open]>summary::before{transform:rotate(90deg)}
+    .h3d-perf-body .h3d-perf-group>summary small{margin-left:auto;font-size:11px;font-weight:400;color:var(--h3d-muted)}
+    .h3d-perf-body .h3d-perf-sub{border:0;border-left:2px solid #302c25;border-radius:0;background:transparent;margin:0 0 0 10px}
+    .h3d-perf-body .h3d-perf-sub>summary{display:flex;align-items:center;gap:7px;padding:7px 10px;font-size:11.5px;font-weight:600;color:var(--h3d-muted)}
+    .h3d-perf-body .h3d-perf-sub>summary::before{content:"▸";font-size:9px;color:#5f5a4f;transition:transform .15s}
+    .h3d-perf-body .h3d-perf-sub[open]>summary{border-bottom:0;color:#a9a396}
+    .h3d-perf-body .h3d-perf-sub[open]>summary::before{transform:rotate(90deg)}
+    .h3d-perf-body .h3d-perf-group>.h3d-perf-row,.h3d-perf-body .h3d-perf-sub>.h3d-perf-row{padding:8px 11px}
 
     /* ---- 优化进度条（SSE）----
        思考阶段几十秒没有正文，没有它用户只会以为点下去卡死了。
@@ -6071,6 +6398,13 @@ function openDesk() {
         const ed = desk?.page?.querySelector(".h3d-rta, textarea, input");
         if (ed) { try { ed.focus(); } catch (e) { /* 忽略 */ } }
     };
+    /* 性能优化是**机器级**设置（这台卡多大、内存多少），不属于某个项目、也不属于
+     * 某一段，所以和上面两个兜底按钮一样放在顶栏；点开是独立弹窗（openPerfSettings）
+     * —— 右栏那种窄折叠装不下「控件 + 整段说明」，说明会被挤没。 */
+    const perfBtn = el("button", "h3d-btn", "⚡ 性能优化");
+    perfBtn.title = "OOM 自救 / FFN 分块 / 成片内存 / 编码器 / 素材库索引等机器级设置"
+        + "（全局，跨项目共用）";
+    perfBtn.onclick = openPerfSettings;
     /* 27B 本地模型 + H3 采样轮流抢显存，谁后加载谁 OOM。兜底动作：把 ComfyUI
      * 驻留的模型全卸了再清缓存 —— OOM 之后点一下就能重跑，不用重启 ComfyUI。
      * 本地 LLM 句柄本来就是用完即卸，这里只管 torch 这边的驻留模型。
@@ -6100,7 +6434,7 @@ function openDesk() {
      * 无从判断是没数据还是代码挂了。这里把区名与错误一行摆到顶栏。 */
     const zoneErr = el("span", "h3d-zoneerr", "");
     zoneErr.style.display = "none";
-    right.append(fixFocus, vramBtn, ledWrap, sub, zoneErr, close);
+    right.append(fixFocus, perfBtn, vramBtn, ledWrap, sub, zoneErr, close);
     topbar.append(left, right);
 
     /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */
@@ -8084,14 +8418,14 @@ function labeledAssetCard(node, ds, idx) {
  * ADVANCED_DEFS 保持全量（paramsSig/旧逻辑兼容口径），新增控件都要登记进去，
  * 否则改它不会触发面板重建。 */
 const BASIC_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数", "CFG", "采样器", "调度器",
-    "一采编码", "审片模式", "自动保存", "自动成片", "参考图像尺寸", W_WIDTH, W_HEIGHT];
+    "审片模式", "自动保存", "自动成片", "参考图像尺寸", W_WIDTH, W_HEIGHT];
 const KEYFRAME_DEFS = ["引导帧数", "锚定加噪", "递减锚定", "响度对齐强度"];
 const SEAM_DEFS = ["桥帧门控", "清晰度阈值", "回退上限",
     "接缝重摇", "重摇阈值", "重摇上限"];
 const PRIMARY_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数"];
 const ADVANCED_DEFS = [
     "引导帧数", "CFG", "采样器", "调度器",
-    "审片模式", "自动保存", "自动成片", "一采编码", "参考图像尺寸", "响度对齐强度",
+    "审片模式", "自动保存", "自动成片", "参考图像尺寸", "响度对齐强度",
     "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
     "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
     W_WIDTH, W_HEIGHT,
@@ -8167,7 +8501,7 @@ function renderParamsZone(sec, data) {
     const { node } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>链参数</strong><small>基础设置 + 视频延续（关键帧/检测重摇）+ 性能优化</small>"));
+        "<strong>链参数</strong><small>基础设置 + 视频延续（关键帧/检测重摇）</small>"));
     if (!node) {
         sec.append(el("div", "h3d-empty", "画布上未找到节点，参数面板不可用"));
         return;
@@ -8215,24 +8549,6 @@ function renderParamsZone(sec, data) {
     cwrap.append(kf, seam);
     cont.append(cwrap);
     sec.append(cont);
-    /* —— 性能优化（与「视频延续」并列的大折叠）——
-     * 为什么放右栏链参数区而不是段卡：它是**机器级**设置（这台卡多大、内存多少），
-     * 跟某一节的锚定参数不是一回事，也不属于任何单个项目段落。
-     * 与链参数同层，折叠状态由 foldSection 记住（_foldState），跟其余栏一致。
-     * 展开时才拉后端：renderParamsZone 会随参数改动重建，不能每次都发请求。 */
-    const perfBox = foldSection("param-perf", false,
-        "<summary>⚡ 性能优化（OOM 自救 / 分块 / 成片内存 / 编码）</summary>");
-    const perfBody = el("div");
-    perfBox.append(perfBody);
-    let perfLoaded = false;
-    const loadPerf = () => {
-        if (perfLoaded) return;
-        perfLoaded = true;
-        paintPerfPane(perfBody);
-    };
-    perfBox.addEventListener("toggle", () => { if (perfBox.open) loadPerf(); });
-    if (perfBox.open) loadPerf();
-    sec.append(perfBox);
     sec.append(el("div", "h3d-foot",
         "「锚定设置」里同名子选项按段覆盖此处（分段优先）；「生成模式」由左侧模式条控制。"));
 }
@@ -8284,9 +8600,9 @@ function upscaleSig(data) {
         up.steps ?? 0, up.cfg ?? 0, up.precision ?? "", up.time_bias ?? 0, up.mix ?? 0,
         up.adaptive === true, up.shift ?? 0, (up.include || []).join(","),
         up.stg ?? 0, up.stg_block ?? 25, up.passes ?? 1, up.decay ?? 0.5,
-        up.sharpen ?? 0, up.pixel_sharpen ?? 0, up.encode ?? "标准",
-        up.chunk !== false,
-        up.device ?? "auto", up.force_unload === true,
+        up.sharpen ?? 0, up.pixel_sharpen ?? 0,
+        /* 时序分块 / 强制卸载 / 编码档位不在这里：已迁性能优化设置（机器级、全局） */
+        up.device ?? "auto",
         up.size_mode ?? "倍率", up.target_w ?? 0, up.target_h ?? 0, up.megapixels ?? 0,
         up.sampler ?? "", up.scheduler ?? "", up.retry === true, up.retry_target ?? 0,
         (data.upscaleModels || []).join(","),
@@ -8488,39 +8804,13 @@ function renderUpscaleZone(sec, data) {
         body.append(devField);
         upOnly.push(devField);
 
-        /* 3D 时序分块：长段按 32 帧分块前向（省显存 + 治末端闪烁），2D 不受影响 */
-        const ckField = el("div", "h3d-param");
-        ckField.append(el("label", "", "时序分块"));
-        const ckRow = el("div", "h3d-seedrow");
-        const ckCb = document.createElement("input");
-        ckCb.type = "checkbox";
-        ckCb.checked = up.chunk !== false;
-        ckCb.title = "仅 3D 架构生效（2D 是逐帧卷积，不分块）：长段按时序切成 32 帧一块、"
-            + "块间带 overlap 线性融合后拼回——显存峰值随帧数不再线性增长，末端帧也"
-            + "不会因为缺右侧上下文而闪烁。默认开；关掉=整段一次前向（短段更快，"
-            + "输出与分块版仅有数值噪声级差异）。关掉才进二采指纹";
-        ckCb.onchange = () => setUpscaleField(node, "chunk", ckCb.checked);
-        ckRow.append(ckCb);
-        ckField.append(ckRow);
-        body.append(ckField);
-        upOnly.push(ckField);
-
-        /* 强制卸载：每段二采后把放大网络从缓存删掉 + soft_empty_cache（下段重载） */
-        const fuField = el("div", "h3d-param");
-        fuField.append(el("label", "", "强制卸载"));
-        const fuRow = el("div", "h3d-seedrow");
-        const fuCb = document.createElement("input");
-        fuCb.type = "checkbox";
-        fuCb.checked = up.force_unload === true;
-        fuCb.title = "每段二采结束后把放大网络从缓存里彻底删掉 + 调 soft_empty_cache"
-            + "——下段重新从磁盘加载（换取最大显存/内存头寸，代价是每段重载 ~1s）。"
-            + "默认关（段间保留缓存零加载）。多段链后段比首段更易 OOM 时再开。"
-            + "开了才进二采指纹";
-        fuCb.onchange = () => setUpscaleField(node, "force_unload", fuCb.checked);
-        fuRow.append(fuCb);
-        fuField.append(fuRow);
-        body.append(fuField);
-        upOnly.push(fuField);
+        /* ⛔ 「时序分块」与「强制卸载」两个控件**已从这里迁走**（2026-09-23）。
+         * 理由：这两项是**机器级**设置（同一台卡该怎么省显存），与作品无关；
+         * 放在项目存档里会随项目切换而串味，且 `chunk=false` / `force_unload=true`
+         * 会进二采指纹、把既有高清段判失效重做。现由「⚡ 性能优化」弹窗统一管：
+         *   · 时序分块 → 阶段「放大网络 · 分块」（upscale_temporal_chunk + 帧数/overlap）
+         *   · 强制卸载 → 阶段「放大网络 · 常驻」（keep_upscaler_resident，取反面）
+         * 别再往本面板加回来。 */
 
         /* 目标尺寸模式：倍率 / 目标尺寸 / 百万像素 —— 三选一，按模式显示对应字段 */
         const sizeField = el("div", "h3d-param");
@@ -8651,25 +8941,12 @@ function renderUpscaleZone(sec, data) {
             + "0=关（默认）；0.2-0.4 常用。与 latent 锐化正交可叠加。仅在 >0 时进二采指纹",
             (v) => setUpscaleField(node, "pixel_sharpen", v)));
 
-        /* 编码档位（抗条纹主手段） */
-        const encField = el("div", "h3d-param");
-        encField.append(el("label", "", "编码档位"));
-        const encSel = document.createElement("select");
-        encSel.className = "h3d-select";
-        encSel.title = "二采分段及最终高清成片的 mp4 编码质量（基础链不变）："
-            + "标准=crf20 veryfast（现状兼容）；高清=crf16 medium + 暗部自适应量化 + Bayer 抖动；"
-            + "极致=crf13 slow + 同上。8bit 渐变色带（暗部/天空横向条纹）靠抖动消解，"
-            + "编码层二次模糊靠 crf/preset 消解——极致档编码明显变慢。非标准档进二采指纹";
-        for (const e of UP_ENCODES) {
-            const o = document.createElement("option");
-            o.value = e;
-            o.textContent = e;
-            if (e === up.encode) o.selected = true;
-            encSel.append(o);
-        }
-        encSel.onchange = () => setUpscaleField(node, "encode", encSel.value);
-        encField.append(encSel);
-        body.append(encField);
+        /* ⛔ 「编码档位」控件**已从这里迁走**（2026-09-23）。
+         * 理由：它管的是「用哪套质量档」（crf + preset + 暗部抖动），与 perf 的
+         * `encoder`（用哪个编码器实现）+ `nvenc_cq` 是**正交**的两件事，但同属编码
+         * 话题 —— 分在两处正是「同一件事散在两个组里」的典型。现统一收进
+         * 「⚡ 性能优化 → 成片与编码 · 编码」区，与编码器并排，说明互补关系。
+         * 别再往本面板加回来。 */
 
         /* 独立采样器/调度器（空 = 沿用主链）：**下拉选择**，选项直接取主节点
          * 「采样器 / 调度器」两个控件的注册名单——与一采基础栏同一份来源，

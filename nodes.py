@@ -989,10 +989,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "后端按官方 h3-prompt-writing 三字段结构组装（含对白「」→<d> 自动转换）。"
                                        "空值或旧工作流走原有画布输入（同样获得官方结构组装，向后兼容）。"
                                        "只存相对输入文件名，不存媒体内容、密钥或绝对路径。"),
-                io.Combo.Input("一采编码", options=["标准", "高清", "极致"], default="标准",
-                               tooltip="基础链（≈一采）分段视频与成片的 mp4 编码质量——二采关闭时直接决定正片清晰度："
-                                       "标准=crf20 veryfast（现状兼容）；高清=crf16 medium + 暗部自适应量化 + Bayer 抖动；"
-                                       "极致=crf13 slow + 同上（编码明显变慢）。二采开启时其高清产物同名覆盖，此档自动失效"),
                 io.Image.Input("起始视频", optional=True,
                                tooltip="序章：上传视频（≥5 帧、24fps，超长只取前「每段时长」内）编码为第 1 段存入存档，"
                                        "成片以它开头，生成段从其结尾续拍；经一次 VAE 重编码，不能与首帧图同用"),
@@ -1048,7 +1044,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 锚定加噪=0.0,
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
-                递减锚定="关闭", 生成模式="文生视频", 导演台状态="", 一采编码="标准",
+                递减锚定="关闭", 生成模式="文生视频", 导演台状态="",
                 二采模型=None, 参考图像尺寸="match", 响度对齐强度=1.0, 自定义Sigmas=None):
         # P4d：画布媒体/提示词/参考入口已从 schema 删除，对应形参一并移除；
         # 起始视频（序章）是唯一的画布媒体入口，保留。
@@ -1449,12 +1445,33 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if up_cfg:
             # 性能设置 -> 二采 cfg（**只加不进指纹的键**：_hash_params 只认
             # _PARAM_KEYS + 条件项，新增键不会让既有高清记录失效重做）。
-            # ① 放大网络 3D 时序分块：此前硬编码为开，这里把它变成可调开关
-            #    （关掉才会进指纹——那确实改变了输出的分块口径）。
+            #
+            # ⚠ 这批键以前住在**项目存档**（ds.upscale）里，2026-09-23 统一迁到
+            # 机器级 perf.json——理由见 upscale.parse_state 的注释块。这里做一次性
+            # 合并：项目存档不再持有它们，perf 是唯一真源。
             up_cfg["chunk"] = bool(_pf.get("upscale_temporal_chunk", True))
-            # ② 放大网络别每段搬上搬下：整链只搬一次（日志里每段 3.7–8s × 8 段
-            #    ≈ 40–60s 纯腾挪）。默认 False = 沿用现状（每段卸）。
-            up_cfg["keep_upscaler_resident"] = bool(_pf.get("keep_upscaler_resident", False))
+            up_cfg["upscale_chunk_frames"] = int(_pf.get("upscale_chunk_frames") or 32)
+            # overlap=0 表示「自动取时序卷积核宽」（upscale_net 内部判定，只增不减）
+            up_cfg["upscale_overlap"] = int(_pf.get("upscale_overlap") or 0)
+            # 放大网络是否常驻：True（默认）= 段间保留缓存、零加载（**现状口径**，
+            # 与旧项目存档 `force_unload: false` 同义）；False = 每段二采收尾强制卸载
+            # （删缓存 + soft_empty_cache，下段重载 ~1s，换 CPU 侧 659MB 权重副本）。
+            # ⚠ 消费端在 upscale.render_segment 收尾处，条件只认这一个键
+            # （旧键 `force_unload` 已随项目存档退场，别再写回 cfg）。
+            up_cfg["keep_upscaler_resident"] = bool(_pf.get("keep_upscaler_resident", True))
+            # 编码档位（preset + 暗部抖动）与 crf 数值**分开**：
+            # 档位管「哪套 preset/抖动」，crf 单独给（面板上按编码器显隐）。
+            up_cfg["encode"] = str(_pf.get("encode_profile") or "标准")
+            up_cfg["x264_crf"] = _pf.get("x264_crf")
+            # 精化二采分块（机器级，不进指纹）：时序切段 / 空间 tile。
+            # 值从 perf 直下 —— upscale.parse_state 不再解析它们（见那里的注释）。
+            up_cfg["refine_temporal_on"] = bool(_pf.get("refine_temporal_on", False))
+            up_cfg["refine_temporal_chunk"] = int(_pf.get("refine_temporal_chunk") or 0)
+            up_cfg["refine_temporal_overlap"] = int(_pf.get("refine_temporal_overlap") or 8)
+            up_cfg["refine_tile_on"] = bool(_pf.get("refine_tile_on", False))
+            up_cfg["refine_tile"] = str(_pf.get("refine_tile") or "off")
+            up_cfg["refine_tile_overlap"] = int(_pf.get("refine_tile_overlap") or 32)
+            up_cfg["refine_tile_feather"] = int(_pf.get("refine_tile_feather") or 16)
         up_net = None
         _up_err = None
         if up_cfg:
@@ -1476,12 +1493,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if up_net is not None:
                 up_net.cpu()
 
-        # 一采编码档位：基础链分段/成片的编码质量（二采开启时其高清产物同名覆盖，本档自然失效）
-        _benc = str(一采编码 or "").strip()
+        # 一采编码：与二采**同一真源**（perf 的 `encode_profile` + `x264_crf`）。
+        # 原先节点上有个「一采编码」下拉，与性能设置里的「画质档位」是同一张表 ——
+        # 两个入口改同一个旋钮，已删除（2026-09-23）。二采开启时其高清产物同名覆盖，
+        # 本档只作用于二采未覆盖的段与基础成片。
+        _benc = str(_pf.get("encode_profile") or "标准")
         if _benc not in upscale.ENCODE_PROFILES:
             _benc = "标准"
-        _bcrf, _bpreset, _baq, _bdith = upscale._ENCODE_SETTINGS.get(
-            _benc, upscale._ENCODE_SETTINGS["标准"])
+        _bcrf, _bpreset, _baq, _bdith = upscale.resolve_encode_quad(
+            _benc, _pf.get("x264_crf"))
 
         # 执行序列 = 提示词段按序排列。段类型只剩两种：prompt 段（本条）与 prologue
         # 序章（链首已有视频，走节点接线，不在这个列表里）。
@@ -1991,10 +2011,23 @@ class H3SeamlessChainSampler(io.ComfyNode):
                               "这是每段一次全卸腾挪的根因", flush=True)
                     except Exception:
                         pass
+                print(f"[H3性能] {perf.blockswap_line(perf.probe_blockswap(), None)}",
+                      flush=True)
+                # 块交换：把面板那三项接到**官方**的块级权重流动上（本插件不自己搬
+                # 权重 —— 理由与证据见 perf.apply_blockswap）。放在这里是因为**只有
+                # 拿到模型才算得出 UNET 真实体量**，`blocks_to_swap=-1`（跟随档位）
+                # 才能按 suggest_blocks 反解出真块数；面板打开那次拿不到体量，会
+                # 明确「不干预」而不是瞎设一个值。模型侧的预取开关在下面与 FFN /
+                # 头分块一起装。
+                _bs = perf.apply_blockswap(_pf, _hw)
+                _bs_note = ""
+                if _bs["on"]:
+                    _bs_note = _bs["note"]
+                    print(f"[H3性能] 块交换：{_bs_note}", flush=True)
                 # 落盘：被 OOM kill 时 stdout 可能一起没了，JSONL 是唯一留存
                 perf.emit({"kind": "overview", "line": _line,
                            "guard": _guard_msg, "headroom": _hr_msg,
-                           "budget": _bd_line, "hw": _hw})
+                           "budget": _bd_line, "hw": _hw, "blockswap": _bs_note})
             except Exception:
                 pass
         if up_cfg:
@@ -2016,13 +2049,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 指纹」的行为开关，交给 upscale.render_latent 消费。
             up_cfg["guard_block"] = bool(_guard_block)
             up_cfg["vram_shuffle"] = str(_pf.get("vram_shuffle") or "auto")
-        # FFN 分块（ff_chunk_tokens>0）：主干 OOM 正崩在 FFN 的 LoRA bypass 上
-        # （单次 6.13GB）。按 token 切块算 MLP，**数学等价、零画质损失**；
-        # 装之前先自测，不通过就整段不装（默认关，见 upscale.install_ff_chunking）。
-        _ff_tokens = int(_pf.get("ff_chunk_tokens") or 0)
+        # FFN 分块：主干 OOM 正崩在 FFN 的 LoRA bypass 上（单次 6.13GB）。按 token
+        # 切块算 MLP，**数学等价、零画质损失**；装之前先自测，不通过就整段不装。
+        #
+        # 两件套（2026-09-23）：`ff_chunk_on` 是总开关，`ff_chunk_tokens` 是「切多大」，
+        # `ff_chunk_min_tokens` 是「多短就不切」。开关关掉时参数保号不生效 —— 用户
+        # 反复开关不必重填。历史默认是「tokens>0 即装」，现在改成认开关、且 tokens
+        # 缺省给 4096（见 perf.DEFAULT_PERF），关掉开关就走原路径。
+        _ff_on = bool(_pf.get("ff_chunk_on", False))
+        _ff_tokens = int(_pf.get("ff_chunk_tokens") or 0) if _ff_on else 0
+        _ff_min = int(_pf.get("ff_chunk_min_tokens") or 0)
         if _ff_tokens > 0:
             try:
-                _ff_n, _ff_why = upscale.install_ff_chunking(模型, _ff_tokens)
+                _ff_n, _ff_why = upscale.install_ff_chunking(模型, _ff_tokens,
+                                                             min_tokens=_ff_min)
                 if _ff_n:
                     report.append(f"性能：FFN 分块已启用（{_ff_n} 个 Linear，"
                                   f"每块 {_ff_tokens} token · 数学等价，画质零损失）"
@@ -2030,11 +2070,57 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 elif _ff_why:
                     report.append(f"性能：FFN 分块未启用（{_ff_why}）")
                 if 二采模型 is not None and _up_model is not 模型:
-                    _ff_n2, _ = upscale.install_ff_chunking(_up_model, _ff_tokens)
+                    _ff_n2, _ = upscale.install_ff_chunking(_up_model, _ff_tokens,
+                                                            min_tokens=_ff_min)
                     if _ff_n2:
                         report.append(f"性能：二采模型同样装上 FFN 分块（{_ff_n2} 个 Linear）")
             except Exception:
                 pass
+        # 注意力头分块（attn_head_on + attn_head_chunks）：把 attention 按 head 分组
+        # 逐组算 —— head 之间独立 → **精确、无损**；同时提前释放 normed hidden 与
+        # 融合 qkv buffer。依赖上游 Attention.forward 的内部结构，装不上就静默跳过
+        # （见 upscale.install_low_vram_attention 的结构探测 + 装前自测）。
+        _ah_on = bool(_pf.get("attn_head_on", False))
+        _ah_n = int(_pf.get("attn_head_chunks") or 1) if _ah_on else 0
+        if _ah_n > 1:
+            try:
+                _ah_k, _ah_why = upscale.install_low_vram_attention(模型, _ah_n)
+                if _ah_k:
+                    report.append(f"性能：注意力头分块已启用（{_ah_k} 个 attn，"
+                                  f"分 {_ah_n} 组 · head 独立，画质零损失）")
+                elif _ah_why:
+                    report.append(f"性能：注意力头分块未启用（{_ah_why}）")
+                if 二采模型 is not None and _up_model is not 模型:
+                    _ah_k2, _ = upscale.install_low_vram_attention(_up_model, _ah_n)
+                    if _ah_k2:
+                        report.append(f"性能：二采模型同样装上注意力头分块（{_ah_k2} 个 attn）")
+            except Exception:
+                pass
+        # 块交换的**模型侧**那半边：官方块级预取的开关。总闸是
+        # `transformer_options["prefetch_dynamic_vbars"]`（官方每次前向按
+        # patcher.is_dynamic() 写下的），预取深度由队列结构写死为「提前 1 块」→
+        # 只能是开关，见 upscale.install_block_prefetch。
+        # 默认（开）**不干预**：官方在 DynamicVRAM 下本来就是开的，装一层包装去
+        # 「确认它开着」只是白搭每前向一次字典写；只有关掉才真包一层。这里照样
+        # 调一次（幂等），因为用户可能在同一次运行里把它从关拨回开 —— 那一侧要
+        # 把包装拆掉。
+        _bp_on = bool(_pf.get("blocks_prefetch", True))
+        try:
+            _bp_k, _bp_why = upscale.install_block_prefetch(模型, _bp_on)
+            if _bp_why:
+                report.append(f"性能：{_bp_why}")
+            if 二采模型 is not None and _up_model is not 模型:
+                upscale.install_block_prefetch(_up_model, _bp_on)
+        except Exception:
+            pass
+        # ★ 这里必须重新起一个 `if up_cfg:` —— 它不是新加的条件，是**修一处既有
+        # 缩进 bug**：二采报告这一段（_tb … 以及它的 `elif _up_err:`）本来就该挂在
+        # `if up_cfg:` 下，但历史上某个「在它前面插入 if 块」的改动把这两个分块安装
+        # 块塞进了守卫与它的函数体之间，于是这段变成了「只有开了分块才生成二采报告」，
+        # 而 `elif _up_err:` 改挂到了 `if _ff_tokens > 0:` / `if _ah_n > 1:` 上
+        # （HEAD 里就已经是这样）。后果：关着分块时报告里整段二采参数消失、二采跳过
+        # 原因挂到无关条件上。此处一行复原，不改任何行为语义之外的判定。
+        if up_cfg:
             _tb = float(up_cfg.get("time_bias") or 0.0)
             _mix = float(up_cfg.get("mix") or 0.0)
             _sh = float(up_cfg.get("shift") or 0.0)
@@ -2067,7 +2153,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")
         if _benc != "标准":
-            report.append(f"一采编码：{_benc}(crf{_bcrf}/{_bpreset})——二采未覆盖的段与基础成片按此档落盘")
+            report.append(f"编码：{_benc}(crf{_bcrf}/{_bpreset})"
+                          f"（来自 ⚡ 性能优化设置）——二采未覆盖的段与基础成片按此档落盘")
         if str(宽高比) != "自定义":
             report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")
         else:

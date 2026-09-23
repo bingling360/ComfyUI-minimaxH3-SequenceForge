@@ -40,7 +40,10 @@ from . import perf
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
 ENCODE_PROFILES = ("标准", "高清", "极致")
-# HQ 编码档 → (crf, preset, aq-mode, 抖动)：x264 率失真 + 自适应量化 + 有序抖动。
+# 编码档 → (crf 默认值, preset, aq-mode, 抖动)。
+# ⚠ **crf 只是本档的默认值**：真值由 perf 的 `x264_crf` 给（见 `resolve_encode_quad`），
+# 档位本身只定 preset + 抖动。这样「画质档」与「crf 数值」是两个独立旋钮 ——
+# 用户可以在「高清」档上把 crf 再往下压，而不必新造一个档。
 # 「标准」= 现状（crf20 veryfast 无抖动，兼容）；「高清/极致」为抗糊抗条纹档——
 # veryfast 比 medium 率失真差约 5-15%（编码层二次模糊），crf 20→16/13 保高清
 # 细节；aq-mode=3 暗部自适应量化（保暗场细节）；Bayer 抖动打散 8bit 量化
@@ -50,6 +53,32 @@ _ENCODE_SETTINGS = {
     "高清": (16, "medium", 3, True),
     "极致": (13, "slow", 3, True),
 }
+# ⚠ **已确认的现状（2026-09-23，本轮不改，如实标注）**：上面这三个 crf 数字目前
+#   **取不到** —— `perf.x264_crf` 默认就是 20 且恒有值，`resolve_encode_quad` 见到
+#   非 None 就覆盖；而 `media._video_stream_options` 的 x264 分支连入参 crf 都不看，
+#   只认进程级 `ENCODER_CRF`（= perf.x264_crf）。所以切「高清 / 极致」当前只改
+#   preset + 暗部抖动，crf 仍是面板上那个数（与旧版「一采编码=高清 → crf16」相比
+#   画质偏弱）。要恢复「档位自带 crf」，得把 `x264_crf` 默认改成 "auto"、由
+#   `apply_runtime` 按档位解析（本轮未做）。
+
+
+def resolve_encode_quad(profile, x264_crf=None):
+    """(画质档, crf 覆盖值) -> (crf, preset, aq_mode, dither)。
+
+    `x264_crf` 给了有效整数就用它，否则用档位默认 —— 这是「crf 与画质档分开」
+    的落地点：档位管 preset + 抖动，crf 可以单独调。
+
+    ⚠ 当前 `x264_crf` 恒有值（`perf.DEFAULT_PERF` 给 20）→ 档位那三个 crf 实际
+    取不到，详见 `_ENCODE_SETTINGS` 上方的现状说明（本轮先如实标注，未改行为）。
+    """
+    crf, preset, aq, dither = _ENCODE_SETTINGS.get(
+        str(profile or "标准"), _ENCODE_SETTINGS["标准"])
+    try:
+        if x264_crf is not None:
+            crf = int(x264_crf)
+    except (TypeError, ValueError):
+        pass
+    return crf, preset, aq, dither
 _PARAM_KEYS = ("model", "arch", "scale", "denoise", "steps", "cfg", "precision")
 # 放大目标尺寸模式：倍率（现状）/ 目标尺寸（像素）/ 百万像素
 SIZE_MODES = ("倍率", "目标尺寸", "百万像素")
@@ -118,10 +147,7 @@ def parse_state(ds):
                  if has_steps else 6)
     else:
         steps = int(_num("steps", 6, 1, 100))
-    encode = str(up.get("encode") or "").strip()
-    if encode not in ENCODE_PROFILES:
-        encode = "标准"
-    # 抗糊武器库（全部默认关：STG=0 / passes=1 / 锐化=0 / 标准编码 / 采样器沿用
+    # 抗糊武器库（全部默认关：STG=0 / passes=1 / 锐化=0 / 采样器沿用
     # 主链 / retry 关——启用任一项才进指纹，既有二采记录不失效）
     stg_block = int(_num("stg_block", 25, 0, 49))
     # 「神经放大」开关：关闭 = 只做低强度重采样精化，完全不加载放大网络（产物仍是
@@ -139,7 +165,6 @@ def parse_state(ds):
         "mode": mode,
         "enlarge": enlarge,
         "device": device,
-        "force_unload": up.get("force_unload") is True,
         "model": (str(up.get("model") or "").strip() if enlarge else ""),
         "arch": _norm_arch(up.get("arch")),
         "scale": (_num("scale", 2.0, 1.0, 4.0) if enlarge else 1.0),
@@ -161,14 +186,21 @@ def parse_state(ds):
         "decay": _num("decay", 0.5, 0.2, 0.8),
         "sharpen": _num("sharpen", 0.0, 0.0, 1.0),
         "pixel_sharpen": _num("pixel_sharpen", 0.0, 0.0, 1.0),
-        # 3D 时序分块：默认开（省显存 + 治末端闪烁），关掉才进指纹（既有记录不失效）
-        "chunk": up.get("chunk") is not False,
-        "encode": encode,
         "sampler": str(up.get("sampler") or "").strip(),
         "scheduler": str(up.get("scheduler") or "").strip(),
         "retry": up.get("retry") is True,
         "retry_target": _num("retry_target", 0.15, 0.05, 1.0),
         "include": include,
+        # ⛔ `chunk` / `force_unload` / `encode` **不在这里解析**（2026-09-23 迁走）。
+        #
+        # 这三项是**机器级**设置，与作品无关：
+        #   · 时序分块 `chunk`        -> perf.upscale_temporal_chunk（+ 帧数 / overlap）
+        #   · 强制卸载 `force_unload` -> perf.keep_upscaler_resident（取反面；另有余量档）
+        #   · 编码档 `encode`         -> perf.encode_profile（与 encoder / nvenc_cq 并排）
+        # 它们以前随项目存档走，导致「同一台卡换个项目就得重设」，且关掉分块会进
+        # 二采指纹、把既有高清段判失效重做 —— 那是拿显存手段当画质手段。
+        # 运行时由 nodes.py 把 perf 的值合并进 up_cfg（见该处注释）。
+        # 别再往这个 dict 里加回来。
     }
 
 
@@ -516,12 +548,14 @@ def _hash_params(cfg):
         keys["sharpen"] = cfg["sharpen"]
     if cfg.get("pixel_sharpen"):
         keys["pixel_sharpen"] = cfg["pixel_sharpen"]
+    # 编码档位仍是「非标准才进指纹」——因为它改变输出内容（crf / preset / 抖动）。
+    # 真源从 up.parse_state 换成 perf.encode_profile，但语义不变。
     if cfg.get("encode") and cfg["encode"] != "标准":
         keys["encode"] = cfg["encode"]
-    if cfg.get("chunk") is False:      # 3D 时序分块：默认开，只有关掉才进指纹
-        keys["chunk"] = False
-    if cfg.get("force_unload"):         # 强制卸载：默认关，开了才进指纹
-        keys["force_unload"] = True
+    # ⛔ `chunk` / `force_unload` **不再进指纹**（2026-09-23）：它们已迁到机器级
+    # 性能设置，不再随项目存档走。以前「关掉分块」会把既有高清段全部判失效重做 ——
+    # 那是拿显存手段当画质手段，代价还不小。分块口径变化对输出只有数值噪声级影响，
+    # 不值得付全量重做的代价。
     dev = str(cfg.get("device") or "")
     if dev and dev != "auto":           # 设备：默认自动不进指纹，显式指定才进
         keys["device"] = dev
@@ -673,7 +707,8 @@ def resolve_target_hw(h, w, cfg):
     return h2, w2, scale
 
 
-def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True):
+def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True,
+                  chunk_frames=0, overlap=0):
     """[B,24,T,H,W] latent -> 神经放大（T 不变，H/W 到目标尺寸偶数对齐），float32。
 
     归一化口径与上游训练一致：放大前 (x-μ)/σ，放大后反变换；网络精度由
@@ -683,6 +718,9 @@ def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True):
     cfg["arch"] 可能仍是 auto，调用口径只认网络的真身，不认面板值。
     hw：显式目标 latent (H,W)（目标尺寸/百万像素模式）；给了就不再按 scale 换算
     尺寸，但 scale 仍进 scale embedding（网络需要知道「放大了多少」）。
+    chunk / chunk_frames / overlap：3D 时序分块口径，由导演台性能设置下发
+    （机器级、全局生效、不进二采指纹）。chunk=False 或 chunk_frames<=0 时
+    upscale_net 落回内建默认（32 帧）；overlap=0 表示自动取时序卷积核宽。
     """
     if net is None:
         # 放大关闭（enlarge=False）：精化画布 = 基础画布，视频 latent 与桥/尾/头锚
@@ -711,7 +749,8 @@ def upscale_video(video_t, net, scale, arch="auto", hw=None, chunk=True):
         xn = (x.to(nd) - mean) / std
         if ak == "3D":
             y = net(xn, scale=float(scale), target_size=(x.shape[2], h2, w2),
-                    enable_chunking=chunk)
+                    enable_chunking=chunk, chunk_frames=chunk_frames,
+                    overlap_frames=overlap)
         else:
             y = net(xn, scale=float(scale), target_hw=(h2, w2))
         # 反归一化也在块内：否则这一步又会把 y 挂回计算图
@@ -1572,7 +1611,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _mark("base", "放大前")     # 埋点①放大前
     _t = time.perf_counter()
     up_v = upscale_video(video_t, net, eff_scale, cfg["arch"],
-                         hw=(h2, w2), chunk=cfg.get("chunk", True))
+                         hw=(h2, w2), chunk=cfg.get("chunk", True),
+                         chunk_frames=cfg.get("upscale_chunk_frames", 0),
+                         overlap=cfg.get("upscale_overlap", 0))
     hf_up = latent_hf_energy(up_v)
     # 频域细节混合启用时保留纯放大 latent 的 CPU 副本（避开采样期显存峰值，
     # 精化后作低频锚；关闭时零开销不复制）
@@ -1620,18 +1661,24 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             up_guide = dict(guide)
             up_guide["latent"] = upscale_video(guide["latent"].to(dev, torch.float32),
                                                net, eff_scale, cfg["arch"],
-                                               hw=(h2, w2), chunk=cfg.get("chunk", True))
+                                               hw=(h2, w2), chunk=cfg.get("chunk", True),
+                                               chunk_frames=cfg.get("upscale_chunk_frames", 0),
+                                               overlap=cfg.get("upscale_overlap", 0))
             bridged = True
         up_tail = None
         if tail_kf_latent is not None:
             up_tail = upscale_video(tail_kf_latent.to(dev, torch.float32),
                                     net, eff_scale, cfg["arch"],
-                                    hw=(h2, w2), chunk=cfg.get("chunk", True))
+                                    hw=(h2, w2), chunk=cfg.get("chunk", True),
+                                    chunk_frames=cfg.get("upscale_chunk_frames", 0),
+                                    overlap=cfg.get("upscale_overlap", 0))
         up_head = None
         if head_kf_latent is not None:
             up_head = upscale_video(head_kf_latent.to(dev, torch.float32),
                                     net, eff_scale, cfg["arch"],
-                                    hw=(h2, w2), chunk=cfg.get("chunk", True))
+                                    hw=(h2, w2), chunk=cfg.get("chunk", True),
+                                    chunk_frames=cfg.get("upscale_chunk_frames", 0),
+                                    overlap=cfg.get("upscale_overlap", 0))
         # 汇总成 keyframe 列表再注入（_apply_guide 现在只收列表）：桥 → 头锚@0 → 尾锚@末
         _up_kfs = []
         if up_guide is not None:
@@ -1944,6 +1991,191 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             v = sharpen_latents(v, _shp).to(v.device, torch.float32)
         return v, hf_gain_ratio(hf_up, latent_hf_energy(v))
 
+    # ── 精化时序分块（2026-09-23 批次 3）───────────────────────────────────
+    #
+    # 动机：精化画布的激活是整条二采链里最大的一笔（与分辨率**平方**相关）。
+    # 把高清 latent 沿时间切成段、**每段独立跑 N 步去噪**，峰值只与本段 token 数
+    # 相关 → 显存需求按段数线性下降。
+    #
+    # ⚠ 与「放大网络 3D 时序分块」是**两码事**（务必别混）：
+    #   · 放大网络那个是纯前馈（一次 forward，切开算再融合即可，数学上可分离）
+    #   · 这个是**扩散采样循环** —— 每段独立收敛，段与段之间没有注意力交互，
+    #     两侧会落到不同的局部解 → 接缝有差异。所以必须：
+    #       ① 段间留 overlap（单位 = latent token，建议 ≥8）
+    #       ② 融合只在 core 区落盘、overlap 区按羽化权重过渡
+    #     且 overlap 太小会**逐帧闪烁**（不是一条静止的缝 —— 每段噪声轨迹不同）。
+    #
+    # 音频不参与分块：音轨沿用原声、二采不重采样（与放大网络分块同一口径），
+    # 所以段切只切视频 latent，音频整条带着走。
+    _rc_on = bool(cfg.get("refine_temporal_on", False))
+    _rc_frames = int(cfg.get("refine_temporal_chunk") or 0)
+    _rc_ov = int(cfg.get("refine_temporal_overlap") or 0)
+    # 单位换算：设置里「每段帧数」→ latent token。两者非线性（grid 的官方映射），
+    # 用 frames_to_latent_t 取最小可覆盖，保证段边界落在真实 token 网格上。
+    _rc_tokens = 0
+    if _rc_on and _rc_frames > 0:
+        _rc_tokens = max(2, grid.frames_to_latent_t(_rc_frames))
+    # 生效 overlap 必须与 `plan_refine_chunks` **同一个算法**：那边按 `c//2` 夹，
+    # 这里羽化 ramp 必须取同一个值，两侧权重才严格互补（取请求值会不互补）。
+    _rc_eff_ov = max(0, min(_rc_ov, _rc_tokens // 2)) if _rc_tokens > 0 else 0
+
+    # ── 精化空间 tile（2026-09-23 批次 4）──────────────────────────────────
+    #
+    # 动机：时序分块把峰值压到「本段 token 数」，但**段内的 H×W 还是整幅**——
+    # 画幅大时，段内那一笔激活仍是显存主项。tile 把 H/W 再切网格，峰值与本块
+    # 画幅成正比 → 与时序分块**正交**，两层可以叠加（先切时间、每段内再切空间）。
+    #
+    # ⚠ 这是三类分块里**画质风险最高**的一种，务必清醒：
+    #   · 全局注意力被切断 —— 每块只看得见自己那一小块，构图/光照/运动全局关系
+    #     断链（时序分块至少每段还是完整画幅，全局关系还在）
+    #   · 视频尤其严重：块与块各自收敛 → 块边**帧间抖动**（不是一条静止的缝）
+    #   所以：默认不推荐、档位以 2×2 为上限（每块仍有 1/4 画幅）、必须留 overlap
+    #   + 二维羽化融合。**画质优先的场景请关掉它**。
+    #
+    # 融合不变量与 `_refine_chunked` 同口径：core 区不重不漏拼满整幅；overlap
+    # 区按二维羽化权重过渡。二维权重 = 行向权重 × 列向权重（可分离，省一次 2D 场
+    # 构造，且天然是「角上最轻、中心最重」的合理形状）。
+    _rt_on = bool(cfg.get("refine_tile_on", False))
+    _rt_mode = str(cfg.get("refine_tile") or "off")
+    _rt_ov = int(cfg.get("refine_tile_overlap") or 0)
+    _rt_feather = int(cfg.get("refine_tile_feather") or 0)
+
+    def _refine_whole(sigma_start, cur_latent, cur_seed, round_desc=""):
+        """不分时序：直接交给空间层（tile 关 = 原 `_refine_once`，开 = 空间切块）。
+
+        tile 是**比时序更内层**的分块：时序层切完时间后，段内要做的仍是「一次
+        精化」，那正是空间层。所以「不分时序」不等于「不分块」——tile 单独开启
+        时走这条路。
+        """
+        return _refine_tiled(sigma_start, cur_latent, cur_seed, round_desc)
+
+    def _refine_tiled(sigma_start, cur_latent, cur_seed, round_desc=""):
+        """空间 tile 精化：把每帧 H/W 切成网格 → 逐块采样 → core 写回 + 二维羽化融合。
+
+        返回的 latent 与不分块路径**同构**（NestedTensor 的 (video, audio)），
+        故可被时序层 `_refine_chunked` 当作「段内的 refiner」调用 —— 时间先切、
+        段内再切空间，两层**自然叠加**。
+
+        ⚠ 维度约定：视频 latent 为 `[B, 24, T, H, W]`，切的是 H(轴3)/W(轴4)。
+          音频 latent 不参与分块（沿用原声，与其它分块同一口径），整条带着走。
+        ⚠ 档位 off / 画幅太小切不动时，本函数**恒等透传**（等价不分块）。
+        """
+        _src = cur_latent["samples"]
+        _vid, _aud = (_src.tensors[0], _src.tensors[1]) if hasattr(_src, "tensors") \
+            else (_src[0], _src[1])
+        H = int(_vid.shape[3])
+        W = int(_vid.shape[4])
+        plan = perf.plan_tiles(H, W, _rt_mode, _rt_ov)
+        if len(plan) <= 1:
+            # 档位 off / 画幅太小切不动 → 恒等透传（与不分块逐位相同）
+            return _refine_once(sigma_start, cur_latent, cur_seed, round_desc)
+        print(f"[H3二采] 段{seg_no}：精化空间 tile {W}×{H} → {len(plan)} 块"
+              f"（档位 {_rt_mode} · overlap {_rt_ov}px · 羽化 {_rt_feather}px）"
+              f"{round_desc}", flush=True)
+        acc = torch.zeros_like(_vid)
+        wsum = torch.zeros((1, 1, 1, H, W), device=_vid.device, dtype=torch.float32)
+        for ti, (hs, he, ws, we, chs, che, cws, cwe, eff_ov) in enumerate(plan):
+            piece = _vid[:, :, :, hs:he, ws:we]
+            sub = comfy.nested_tensor.NestedTensor((piece.contiguous(), _aud))
+            out = _refine_once(sigma_start, {"samples": sub},
+                               (cur_seed + ti * 104729) % 0xffffffffffffffff,
+                               f"{round_desc}·空间块{ti + 1}/{len(plan)}")
+            o = out["samples"]
+            sh = (o.tensors[0] if hasattr(o, "tensors") else o[0]).to(acc.dtype)
+            # 二维羽化权重：行向 × 列向（可分离）——省一次 2D 场构造。
+            # ⚠ 权重算在**写回区（core）**坐标系上（`chs..che` / `cws..cwe`）：
+            # 融合只发生在写回区里。ramp 取 `min(_rt_feather, eff_ov)` —— 上限是
+            # **实际生效**的 overlap（eff_ov，可能被 min_side 压小），取请求值会
+            # 与真实咬合带宽度不符 → 两侧权重不互补（踩过：3x3 用 16 而实际 10）。
+            # ⚠ 外缘（core 顶到画布边）恒 1：那里没有邻居补权重，羽化会让外缘
+            # 被归一化放大、噪声显式放大。
+            rh = min(_rt_feather, eff_ov)
+            rw = min(_rt_feather, eff_ov)
+            wh = perf.edge_weights(che - chs, rh, chs > 0, che < H)
+            ww = perf.edge_weights(cwe - cws, rw, cws > 0, cwe < W)
+            wv = (torch.tensor(wh, device=acc.device, dtype=torch.float32)
+                  .view(1, 1, 1, -1, 1)
+                  * torch.tensor(ww, device=acc.device, dtype=torch.float32)
+                  .view(1, 1, 1, 1, -1))
+            ah, bh = chs - hs, che - hs      # 本块 core 区在块内坐标
+            aw, bw = cws - ws, cwe - ws
+            acc[:, :, :, chs:che, cws:cwe] = (
+                acc[:, :, :, chs:che, cws:cwe]
+                + sh[:, :, :, ah:bh, aw:bw] * wv)
+            wsum[:, :, :, chs:che, cws:cwe] = (
+                wsum[:, :, :, chs:che, cws:cwe] + wv)
+        _bad = (wsum <= 0).any().item()
+        if _bad:
+            # 各块 core 的**并集**必须铺满整幅 H×W、且咬合带内权重和 >0
+            # （plan_tiles 的不变量）。真出现空洞 = 有像素没人写 → 黑洞。
+            raise UpscaleAbortError(
+                f"精化空间 tile 的 core 并集未覆盖全部 {W}×{H}（plan 有空洞）——"
+                f"本段未落盘二采产物。这是实现 bug，请把本行反馈给开发者。")
+        merged = (acc / wsum).to(_vid.dtype)
+        return {"samples": comfy.nested_tensor.NestedTensor((merged, _aud))}
+
+    def _refine_chunked(sigma_start, cur_latent, cur_seed, round_desc=""):
+        """分块精化：切时间轴 → 逐段采样 → 按 core 区写回 + overlap 羽化融合。
+
+        返回的 latent 与不分块路径**同构**（NestedTensor 的 (video, audio)），
+        故下游 `_deliver` / cascade / retry 全部无需改动。
+        """
+        _src = cur_latent["samples"]
+        _vid, _aud = (_src.tensors[0], _src.tensors[1]) if hasattr(_src, "tensors") \
+            else (_src[0], _src[1])
+        T = int(_vid.shape[2])
+        plan = perf.plan_refine_chunks(T, _rc_tokens, _rc_ov)
+        if len(plan) <= 1:
+            return _refine_tiled(sigma_start, cur_latent, cur_seed, round_desc)
+        print(f"[H3二采] 段{seg_no}：精化时序分块 {T} token → {len(plan)} 段"
+              f"（每段 {_rc_tokens} token · overlap {min(_rc_ov, _rc_tokens // 2)}）"
+              f"{round_desc}", flush=True)
+        # 累加器：core 区写回，overlap 区按权重混合（两次都没覆盖到的地方 = 不该有）
+        acc = torch.zeros_like(_vid)
+        wsum = torch.zeros((1, 1, T, 1, 1), device=_vid.device, dtype=torch.float32)
+        for ci, (s, e, cs, ce) in enumerate(plan):
+            piece = _vid[:, :, s:e]
+            sub = comfy.nested_tensor.NestedTensor(
+                (piece.contiguous(), _aud))
+            # 每段独立采样（种子逐段偏移，避免所有段拿到同一条噪声轨迹）；
+            # 段内交给空间层（tile 关 = 直通 _refine_once，开 = 段内再切块）
+            out = _refine_tiled(sigma_start, {"samples": sub},
+                               (cur_seed + ci * 7919) % 0xffffffffffffffff,
+                               f"{round_desc}·分段{ci + 1}/{len(plan)}")
+            o = out["samples"]
+            sh = (o.tensors[0] if hasattr(o, "tensors") else o[0]).to(acc.dtype)
+            # core == span（段只写自己采样过的），映射回本段内部坐标 = 全段。
+            # 权重算在**写回区**坐标系上；ramp 必须恰等于咬合带宽度（相邻段
+            # 喂入区自身的重叠 = 生效 overlap），两侧才严格互补成 1。
+            # 链两端（首/末段）没有邻居补权重 → 外缘恒 1（否则被归一化放大）。
+            core_len = ce - cs
+            w = perf.edge_weights(core_len, _rc_eff_ov, cs > 0, ce < T)
+            wv = torch.tensor(w, device=acc.device, dtype=torch.float32) \
+                .view(1, 1, core_len, 1, 1)
+            acc[:, :, cs:ce] = acc[:, :, cs:ce] + sh * wv
+            wsum[:, :, cs:ce] = wsum[:, :, cs:ce] + wv
+        _bad = (wsum <= 0).any().item()
+        if _bad:
+            # 各段 core 的**并集**必须铺满 [0,T)、且咬合带内权重和 >0
+            # （plan_refine_chunks 的不变量）。真出现空洞 = 有 token 没人写。
+            raise UpscaleAbortError(
+                f"精化时序分块的 core 并集未覆盖全部 {T} 个 token（plan 有空洞）——"
+                f"本段未落盘二采产物。这是实现 bug，请把本行反馈给开发者。")
+        merged = (acc / wsum).to(_vid.dtype)
+        return {"samples": comfy.nested_tensor.NestedTensor((merged, _aud))}
+
+    # 外层 = 时序分块（切时间）。不开则 `_refine_whole` → 空间层（tile 独立生效）。
+    _refine = _refine_chunked if _rc_tokens > 0 else _refine_whole
+    if _rc_tokens > 0:
+        print(f"[H3二采] 段{seg_no}：精化时序分块已开启"
+              f"（每段 {_rc_frames} 帧 ≈ {_rc_tokens} token · "
+              f"段间 overlap {_rc_ov} token）", flush=True)
+    if _rt_on:
+        print(f"[H3二采] 段{seg_no}：精化空间 tile 已开启"
+              f"（档位 {_rt_mode} · overlap {_rt_ov}px · 羽化 {_rt_feather}px）"
+              f"——⚠ 全局注意力被切断，块边可能出现帧间抖动，画质优先请关掉",
+              flush=True)
+
     # 多轮递降精化（cascade，抗糊 N2）：passes=1 即现状单轮；σ 序列由
     # cascade_sigmas 决定论派生（同参数同序列，重放一致）；种子逐轮 +1。
     # restore_rows 的 finally 覆盖整条精化链（任一轮异常都恢复守卫再上抛）
@@ -1953,8 +2185,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     try:
         cur = latent
         for k, sk in enumerate(sigmas):
-            cur = _refine_once(sk, cur, (seed + k) % 0xffffffffffffffff,
-                               f"（第{k + 1}轮/共{len(sigmas)}轮）")
+            cur = _refine(sk, cur, (seed + k) % 0xffffffffffffffff,
+                          f"（第{k + 1}轮/共{len(sigmas)}轮）")
 
         up_out_v, hf_gain = _deliver(cur)
         cur = None
@@ -1965,9 +2197,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             sigmas_r = cascade_sigmas(sigma_r, passes, decay)
             cur2 = latent
             for k, sk in enumerate(sigmas_r):
-                cur2 = _refine_once(sk, cur2,
-                                    (seed + len(sigmas) + k) % 0xffffffffffffffff,
-                                    f"（增益重试链第{k + 1}轮/共{len(sigmas_r)}轮）")
+                cur2 = _refine(sk, cur2,
+                               (seed + len(sigmas) + k) % 0xffffffffffffffff,
+                               f"（增益重试链第{k + 1}轮/共{len(sigmas_r)}轮）")
             v2, g2 = _deliver(cur2)
             cur2 = None
             if g2 > hf_gain:
@@ -2009,6 +2241,196 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     return up_out_v, tw, th, seed, bridged, hf_gain, retried
 
 
+def _attn_head_selfcheck(attn, n_chunks):
+    """头分块前后是否**逐元素一致**（装之前必须自测，不通过就别装）。
+
+    头之间独立是**架构事实**（H3 的 `Attention.forward` 里每个 head 共享 qkv_proj
+    的切片、各自做 norm+rope+attention，最后 concat 回 out_proj），但这份 forward
+    可能被第三方 patch 过——只要掺了任何**跨 head** 的操作（例如把 head 维揉进
+    序列做的稀疏注意力重排），按 head 切组就不再等价。与其赌，不如拿一份小输入
+    跑「整段 vs 分组」对比。用 CPU 小张量（S=8）跑，代价可忽略。
+    """
+    try:
+        heads = int(getattr(attn, "heads", 0) or 0)
+        head_dim = int(getattr(attn, "head_dim", 0) or 0)
+        if heads <= 1 or head_dim <= 0 or n_chunks <= 1 or n_chunks > heads:
+            return False
+        dev = None
+        for p in attn.parameters():
+            dev = p.device
+            break
+        if dev is None:
+            return False
+        s = 8
+        x = torch.randn((s, heads * head_dim), device=dev, dtype=torch.float32)
+        with torch.no_grad():
+            full = _attn_forward_reference(attn, x, None)
+            chunked = _attn_forward_chunked(attn, x, None, n_chunks)
+        if full is None or chunked is None:
+            return False
+        if full.shape != chunked.shape:
+            return False
+        return bool(torch.allclose(full.detach().float(), chunked.detach().float(),
+                                   atol=1e-3, rtol=1e-3))
+    except Exception:
+        return False
+
+
+def _attn_forward_reference(attn, x, rope_freqs, transformer_options=None):
+    """上游原样路径（不分头）：直接调 attn 自己，等价于未 patch 的行为。"""
+    return attn(x, rope_freqs=rope_freqs, transformer_options=transformer_options or {})
+
+
+def _attn_forward_chunked(attn, x, rope_freqs, n_chunks, transformer_options=None):
+    """按 head 分组逐组算 attention —— **head 之间独立，结果精确无损**。
+
+    为什么能省显存：kernel 内部那些随 head 数增长的临时量（int8 q/k 副本、
+    fp32 累加器）按组数缩小；同时这里比上游多释放两处内存：
+      1. qkv GEMM 之后**立刻**丢掉输入 x（normed hidden，S×hidden 的大头）
+      2. out_proj 分配输出**之前**丢掉融合的 (S, 3*inner) qkv buffer
+    这两处才是它真正省显存的地方，分组本身是次要的。
+
+    移植自 KJNodes `MiniMaxLowVRAMAttention`（nodes/minimax_nodes.py:89-138）。
+    ⚠ 与 KJ 的差别：KJ 走 `add_object_patch`（Model 类节点的官方机制），本项目
+    是**在采样节点内部直接改 nn.Module 的方法**（与 install_ff_chunking 同风格），
+    因为这里的模型是裸 nn.Module、没有 ModelPatcher 可用。
+    """
+    from comfy.ldm.modules.attention import optimized_attention
+    if isinstance(x, list):
+        x = x.pop()
+    s = x.shape[0]
+    heads = attn.heads
+    head_dim = attn.head_dim
+    n = min(int(n_chunks), heads)
+    q, k, v = attn.qkv_proj(x).split(heads * head_dim, dim=-1)
+    del x                                   # ← 释放①：normed hidden 用完即丢
+    v = v.view(s, heads, head_dim)
+    if rope_freqs is not None:
+        import comfy.model_management as _mm
+        import comfy.quant_ops as _qo
+        q = q.view(1, s, heads, head_dim)
+        k = k.view(1, s, heads, head_dim)
+        qw = _mm.cast_to(attn.q_norm.weight, device=v.device)
+        kw = _mm.cast_to(attn.k_norm.weight, device=v.device)
+        rot = rope_freqs.shape[-3] * 2
+        if _mm.in_training:
+            q, k = _qo.ck.rms_rope_split_half(q, k, rope_freqs, qw, kw,
+                                              epsilon=attn.q_norm.eps, rot_dim=rot)
+        else:
+            q, k = _qo.ck.rms_rope_split_half_(q, k, rope_freqs, qw, kw,
+                                               epsilon=attn.q_norm.eps, rot_dim=rot)
+        q = q[0]
+        k = k[0]
+    else:
+        q = attn.q_norm(q.view(s, heads, head_dim))
+        k = attn.k_norm(k.view(s, heads, head_dim))
+    q = q.transpose(0, 1).unsqueeze(0)
+    k = k.transpose(0, 1).unsqueeze(0)
+    v = v.transpose(0, 1).unsqueeze(0)
+    # 分组大小：前 heads%n 组各多 1 个 head（尽量均分，别全挤在最后一组）
+    sizes = [heads // n + (1 if i < heads % n else 0) for i in range(n)]
+    out = torch.empty((s, heads * head_dim), dtype=q.dtype, device=q.device)
+    hs = 0
+    for size in sizes:
+        he = hs + size
+        o = optimized_attention(q[:, hs:he], k[:, hs:he], v[:, hs:he], size,
+                                mask=None, skip_reshape=True,
+                                transformer_options=transformer_options or {})
+        out[:, hs * head_dim:he * head_dim] = o.squeeze(0).to(out.dtype)
+        hs = he
+    del q, k, v
+    return attn.out_proj(out)               # ← 释放②：out_proj 分配前 qkv 已丢
+
+
+def install_low_vram_attention(model, head_chunks, targets=None):
+    """给 MiniMax H3 的每个 `blocks[*].attn` 装 head 分块 + 提前释放。返回 (安装数, 说明)。
+
+    与 `install_ff_chunking` 同风格：**先自测、不通过就不装**。头分块依赖上游
+    `Attention.forward` 的内部结构（`qkv_proj` / `q_norm` / `k_norm` / `out_proj`
+    / `heads` / `head_dim`），跨 ComfyUI 版本可能变——所以这里先做**结构探测**，
+    字段不全就整段不装并报出缺哪一项。
+
+    ⚠ 与 KJ 的取舍差异：KJ 还顺手 patch 了 `DiTBlock.forward`（把 h 包进 list 让
+    attn 能提前释放）。本项目**不 patch block** —— 那会与上游 DiTBlock 的签名耦合
+    （`attention=None` 参数是较新版本才有的），而提前释放的收益已经在 attn 内部
+    拿到（release ①）。少改一处 = 少一处跨版本风险。
+    """
+    try:
+        n = int(head_chunks or 1)
+    except (TypeError, ValueError):
+        return 0, "attn_head_chunks 不是整数"
+    if n <= 1:
+        return 0, ""
+    diff = None
+    for path in ("model.diffusion_model", "diffusion_model"):
+        obj = model
+        try:
+            for p in path.split("."):
+                obj = getattr(obj, p)
+            diff = obj
+            break
+        except Exception:
+            continue
+    if diff is None:
+        return 0, "取不到 diffusion_model"
+    blocks = getattr(diff, "blocks", None)
+    if not blocks:
+        return 0, "模型里没有 diffusion_model.blocks（不是 H3 结构？）"
+    first = blocks[0]
+    attn0 = getattr(first, "attn", None)
+    # 结构探测：字段不全就整段不装，别让它跑到一半炸
+    need = ("qkv_proj", "q_norm", "k_norm", "out_proj")
+    if attn0 is None:
+        return 0, "blocks[*] 里没有 attn"
+    missing = [a for a in need if not hasattr(attn0, a)]
+    if missing:
+        return 0, f"attn 结构不匹配（缺 {', '.join(missing)}），本版 ComfyUI 不支持"
+    heads = int(getattr(attn0, "heads", 0) or 0)
+    if heads <= 1:
+        return 0, "attn.heads <= 1，无从分块"
+    eff = min(n, heads)
+    # 幂等：**已经装过同一分组数就直接返回**，别再自测、别重复包一层。
+    # ⚠ 这一步必须在自测**之前**：装过之后 attn.forward 已经是本模块的分组函数，
+    # `_attn_forward_reference` 再调 attn(…) 会进那个普通函数（self 位置收错），
+    # 自测必然失败 → 第二次调用会误报「含跨 head 操作」并把已装的也判为不该装。
+    if getattr(attn0, "_h3_attn_head_chunks", 0) == eff:
+        n_done = sum(1 for b in blocks
+                     if getattr(getattr(b, "attn", None),
+                                "_h3_attn_head_chunks", 0) == eff)
+        return n_done, ""
+    # 只对第一个 block 自测（同一份代码、同一结构，逐个测纯浪费）
+    if not _attn_head_selfcheck(attn0, eff):
+        return 0, ("注意力头分块自测不通过（attn.forward 里含跨 head 操作，"
+                   "不是纯分组可分离）——本次不装，输出保持原样")
+    installed = 0
+    for blk in blocks:
+        attn = getattr(blk, "attn", None)
+        if attn is None:
+            continue
+
+        # ⚠ 赋**普通函数**（不是 MethodType），签名里**不能有 self**：
+        # `attn.forward = _fwd` 是给**实例**挂属性，`nn.Module.__call__` 取到
+        # `self.forward` 后直接 `forward_call(*args)` —— 只有业务参数，没有 self。
+        # 多写一个 self 形参 = 必崩 `missing 1 required positional argument`
+        # （与上面 install_ff_chunking 的 _fwd 同一个道理/同一个坑）。
+        # 因此用默认参数把 attn 绑死（__sa=attn）—— 既补回 self，又避免闭包
+        # 晚绑定（循环里所有 _fwd 都指向最后一个 attn）的经典坑。
+        def _fwd(x, rope_freqs=None, transformer_options={},
+                 __n=eff, __sa=attn, **k):
+            return _attn_forward_chunked(__sa, x, rope_freqs, __n,
+                                         transformer_options=transformer_options)
+
+        try:
+            attn.forward = _fwd
+            attn._h3_attn_head_chunks = eff
+            installed += 1
+        except Exception:
+            continue
+    if installed == 0:
+        return 0, "一个 attn 也没装上"
+    return installed, ""
+
+
 def _ff_chunk_selfcheck(sub, orig, chunk_tokens):
     """分块前后是否**逐位一致**（装之前必须自测，不通过就别装）。
 
@@ -2037,7 +2459,73 @@ def _ff_chunk_selfcheck(sub, orig, chunk_tokens):
         return False
 
 
-def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
+def install_block_prefetch(model, on):
+    """把**官方**的块级预取钉开 / 钉关 —— 返回 (是否改动, 说明)。
+
+    官方 H3 的 block 循环里已经有预取队列（`comfy/ldm/minimax/model.py:751-765` 的
+    `make_prefetch_queue` / `prefetch_queue_pop`），总闸是 `comfy/model_base.py:250`
+    **每次前向**写下的 `transformer_options["prefetch_dynamic_vbars"]
+    = patcher.is_dynamic()`。预取深度由队列结构写死为「提前 1 块」
+    （`[None] + blocks + [None]`，每轮只 pin `queue[0]`）→ 本项**只能是开关**，
+    不能是「预取 N 块」。
+
+    `on=True`（默认）**不干预**：官方在 DynamicVRAM 下本来就是开的，装一层包装去
+    「确认它开着」只是白搭每前向一次字典写。只有 `on=False` 才装包装，把那个 flag
+    钉成 False → 每次前向退回「用到哪块换哪块」。
+    ⚠ 关预取 ≠ 关块级流动：op 时的基线换入（`comfy/ops.py:167` 的 `vbar_fault`）照旧，
+    去掉的只是 lookahead（少占一块显存、慢一点）。
+
+    ⚠ 包的是 `_forward`（**内层**，block 循环在那里），不是 `forward`：外层 `forward`
+    要跑音频 carry 与 `WrapperExecutor`，别的节点（Hyperflow / Spectrum）挂在
+    `_forward` 上，我们只往前包一层、不碰别人的 wrapper。默认参数把原函数绑死
+    （实例属性赋普通函数**不会**自动获得 self，这是本项目踩过的坑）。
+    """
+    diff = None
+    for path in ("model.diffusion_model", "diffusion_model"):
+        obj = model
+        for p in path.split("."):
+            obj = getattr(obj, p, None)
+            if obj is None:
+                break
+        if obj is not None:
+            diff = obj
+            break
+    if diff is None or not hasattr(diff, "_forward"):
+        return 0, "取不到 diffusion_model._forward"
+    installed = getattr(diff, "_h3_block_prefetch", None)
+    if on:
+        if installed is None:
+            return 0, ""
+        diff._forward = installed[0]           # 拆掉包装 = 交回官方默认
+        try:
+            del diff._h3_block_prefetch
+        except AttributeError:
+            pass
+        return 1, "已交回官方默认（不干预 → 预取照旧开着）"
+    if installed is not None:
+        return 0, ""                           # 幂等：已经关着了
+    orig = diff._forward
+    try:
+        import inspect
+        idx = list(inspect.signature(orig).parameters).index("transformer_options")
+    except (TypeError, ValueError):
+        return 0, "上游 _forward 签名里找不到 transformer_options（版本变了）→ 未干预"
+
+    def _fwd(*a, __idx=idx, __orig=orig, **k):
+        if len(a) > __idx and isinstance(a[__idx], dict):
+            a[__idx]["prefetch_dynamic_vbars"] = False
+        else:
+            _to = k.get("transformer_options")
+            if isinstance(_to, dict):
+                _to["prefetch_dynamic_vbars"] = False
+        return __orig(*a, **k)
+
+    diff._forward = _fwd
+    diff._h3_block_prefetch = (orig, idx)
+    return 1, "官方块级预取已关闭（每块用到才换，少占一块显存、更慢）"
+
+
+def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=0):
     """给 FFN 的 `fc1`/`fc2` 装 token 分块。返回 (安装数, 跳过原因)。
 
     为什么它能救 OOM：主干 OOM 实测崩在 FFN 里 —— `F.linear(F.linear(x, down), up)`
@@ -2045,10 +2533,15 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
     完全可分离：切块逐块算再拼回，结果与不分块**逐位相同**，是本项目少有的
     「零画质损失」优化（这也是它排在分块清单第一位的原因）。
 
-    ⚠ 两道保险，缺一不可：
+    ⚠ 三道保险，缺一不可：
       1. **装前自测**（`_ff_chunk_selfcheck`）：不一致就整段不装，宁可这次
          不生效，也不能悄悄改输出；
-      2. **默认关**（`ff_chunk_tokens=0`）：只有用户显式开才装。
+      2. **默认关**（`ff_chunk_tokens=0`）：只有用户显式开才装；
+      3. **短序列直通**（`min_tokens`）：序列 token 数低于此值就整段走原路径 ——
+         切块只增加 kernel 启动开销、省不了多少显存。对齐 KJNodes 的 seq_threshold 语义。
+
+    ⚠ `min_tokens` 是**每次前向**按实际 token 数判的（不是装的时候），所以它
+    存进被包装的 forward 里，不参与「装/不装」的决策。
     """
     try:
         ct = int(chunk_tokens or 0)
@@ -2056,6 +2549,10 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
         return 0, "ff_chunk_tokens 不是整数"
     if ct <= 0:
         return 0, ""
+    try:
+        mt = int(min_tokens or 0)
+    except (TypeError, ValueError):
+        mt = 0
     diff = None
     for path in ("model.diffusion_model", "diffusion_model"):
         obj = model
@@ -2087,9 +2584,13 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2")):
                 continue
             plan = perf.plan_ff_chunks  # 纯函数，零 torch 依赖
 
-            def _fwd(x, *a, __orig=orig, __ct=ct, __plan=plan, **k):
+            def _fwd(x, *a, __orig=orig, __ct=ct, __plan=plan, __mt=mt, **k):
                 try:
+                    # 短序列直通：token 数低于 min_tokens 时切块只增开销，不值得切
+                    # （对齐 KJNodes 的 seq_threshold 语义）。__mt<=0 = 不设阈值。
                     if not torch.is_tensor(x) or x.dim() < 2 or int(x.shape[0]) <= __ct:
+                        return __orig(x, *a, **k)
+                    if __mt > 0 and int(x.shape[0]) < __mt:
                         return __orig(x, *a, **k)
                 except Exception:
                     return __orig(x, *a, **k)
@@ -2252,8 +2753,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 不进指纹）；HQ 编码档（抗糊 N5）解析成具体参数透传编码层
     sharp = round(pixel_sharpness(frames), 2)
     _enc = str(cfg.get("encode") or "标准")
-    _ecrf, _epreset, _eaq, _edith = _ENCODE_SETTINGS.get(
-        _enc, _ENCODE_SETTINGS["标准"])
+    _ecrf, _epreset, _eaq, _edith = resolve_encode_quad(_enc, cfg.get("x264_crf"))
     if not checkpoint.save_segment_mp4(root, g, frames, wav, sample_rate,
                                        fresh=True, crf=_ecrf, preset=_epreset,
                                        aq_mode=_eaq, dither=_edith):
@@ -2312,12 +2812,16 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   f"高清解码 {_timing.get('decode', 0.0):.0f}s · "
                   f"编码落盘 {_timing.get('store', 0.0):.0f}s")
     # 收尾：释放二采残留（放大 latent / 解码帧 / 重采样缓存），给下段基础采样腾显存
-    # keep_upscaler_resident（性能设置）：放大网络整链只搬一次，别每段搬上搬下。
-    # 日志里每段一条「为把放大网络 659MB 搬上卡，全卸腾挪耗时 X s」：
-    # 6.3 / 8.0 / 6.4 / 5.7 / 6.7 / 3.7 s —— 8 段 ≈ 40–60s **纯腾挪**，换来的
-    # 只是把 659MB 送下卡。默认关（沿用现状），让用户按自己的卡决定。
-    if net is not None and cfg.get("force_unload") \
-            and not cfg.get("keep_upscaler_resident"):
+    #
+    # 放大网络是否**强制卸载**由机器级性能设置 `keep_upscaler_resident` 决定：
+    #   · True（默认）= 不强制卸载 → 网络留在 MODEL_CACHE，段间零加载（现状口径）
+    #   · False       = force_unload → 删缓存 + soft_empty_cache，下段重载（省内存）
+    # ⚠ 2026-09-23 修：此前条件是 `cfg.get("force_unload") and not keep_...` —— 而
+    #   `force_unload` 这个键**已无任何写入端**（前端控件删了、`upscale.parse_state`
+    #   不再输出、nodes 也不再写）→ `cfg.get(...)` 恒 None → 整个分支**永假**，
+    #   `upscale_net.force_unload()` 成了不可达代码，而新开关还标着「已接线」。
+    #   现在把正面条件归还给 keep_upscaler_resident（默认 True = 与旧默认同行为）。
+    if net is not None and not cfg.get("keep_upscaler_resident"):
         # 强制卸载：把放大网络从缓存里删掉 + soft_empty_cache（下段重新从磁盘加载，
         # 换取最大显存/内存头寸——多段链后段比首段更易 OOM 的主因即 CPU 侧权重副本）
         from . import upscale_net
@@ -2464,8 +2968,8 @@ def try_final(root, cfg, report, skip_slots=None):
     # 显式传给 concat：直通的基础分辨率外部素材段按此缩放对齐；实测失败不传，
     # concat 退回首源画幅（首个带记录源优先排在前时两者一致）
     target_wh = media.probe_video_size(sources[first_rec]) if first_rec >= 0 else None
-    _crf, _preset, _aq, _dither = _ENCODE_SETTINGS.get(
-        str(cfg.get("encode") or "标准"), _ENCODE_SETTINGS["标准"])
+    _crf, _preset, _aq, _dither = resolve_encode_quad(
+        str(cfg.get("encode") or "标准"), cfg.get("x264_crf"))
     if media.concat_av_mp4(sources, os.path.join(checkpoint.finals_dir(root), out_name),
                            width=target_wh[0] if target_wh else None,
                            height=target_wh[1] if target_wh else None,

@@ -326,3 +326,52 @@ def test_apply_runtime_echoes_late_keys():
     # 还原
     perf.apply_runtime(perf.parse_state({"frames_dtype": "float32",
                                          "final_mode": "auto", "oom_autoretry": True}))
+
+
+# ------------------------------------- 提交前审查修正（2026-09-23 同批）
+
+def test_keep_upscaler_resident_default_matches_old_behavior():
+    """默认必须是 True。
+
+    口径是 `resident = !force_unload`，旧默认 `force_unload=false` 就等价于
+    `resident=True`（段间保留缓存、零加载）。改成 False 等于把默认行为从
+    「段间零加载」悄悄换成「每段重载 ~1s」—— 那是改默认行为，不是迁移。
+    """
+    assert perf.DEFAULT_PERF["keep_upscaler_resident"] is True
+
+
+def _get_call_keys(src):
+    """源码里**真实代码**调用的 `x.get("键")` 键集合（AST 解析，注释不算）。
+
+    为什么不用字符串匹配：修 bug 的注释里往往要把旧条件原样写一遍（「此前是
+    `cfg.get("force_unload") and ...`」），字符串匹配会把注释一起算进去 →
+    对着正确代码报红。
+    """
+    import ast
+    out = set()
+    for n in ast.walk(ast.parse(src)):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "get" and n.args):
+            a0 = n.args[0]
+            if isinstance(a0, ast.Constant) and isinstance(a0.value, str):
+                out.add(a0.value)
+    return out
+
+
+def test_unload_gate_reads_only_resident_key():
+    """回归守卫：强制卸载的**正面条件**只能是 keep_upscaler_resident。
+
+    2026-09-23 提交前审查抓到的真 bug：`force_unload` 已从**所有写入端**退场
+    （前端控件删了、`upscale.parse_state` 不再输出、nodes.py 也不再写），但
+    `upscale.render_segment` 收尾处仍写着
+        `if net is not None and cfg.get("force_unload") and not cfg.get("keep_...")`
+    → 正面条件恒 None → 分支**永假** → `upscale_net.force_unload()` 成了不可达
+    代码，而新开关在 WIRED_KEYS / 面板字段表里标着「已接线」。这条把「不许再读
+    旧键」钉死，免得下一次重构又写回来。
+    """
+    with open(os.path.join(ROOT, "upscale.py"), encoding="utf-8") as f:
+        keys = _get_call_keys(f.read())
+    assert "force_unload" not in keys, \
+        "force_unload 已无写入端（键已退场），读它只会得到恒假条件"
+    assert "keep_upscaler_resident" in keys, \
+        "强制卸载的正面条件必须是 keep_upscaler_resident（当前无人消费它）"

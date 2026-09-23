@@ -1582,6 +1582,10 @@ def add_routes(routes):
             "ok": True, "data": table,
             "applied": perf.apply_runtime(table),
             "wired": list(perf.WIRED_KEYS),
+            # 三态判定（面板照此实现，顺序 = unwired > profile_driven > wired）：
+            # 由档位表驱动 ≠ 没接线 —— 详见 perf.PROFILE_DRIVEN_KEYS 的注释。
+            "unwired": list(perf.UNWIRED_KEYS),
+            "profile_driven": list(perf.PROFILE_DRIVEN_KEYS),
             "hw": hw,
             "report": perf.report_line(hw) if isinstance(hw, dict) else "",
             "upcast": perf.upcast_attention_state(),
@@ -1601,7 +1605,10 @@ def add_routes(routes):
             return _err("无法写入性能设置（用户目录不可用）", code="NO_DIR", status=500)
         return web.json_response({"ok": True, "data": table,
                                   "applied": perf.apply_runtime(table),
+                                  # 与 perf_get 同口径的三态信息，别只回 wired
                                   "wired": list(perf.WIRED_KEYS),
+                                  "unwired": list(perf.UNWIRED_KEYS),
+                                  "profile_driven": list(perf.PROFILE_DRIVEN_KEYS),
                                   "upcast": perf.upcast_attention_state()})
 
     async def lib_status(request):

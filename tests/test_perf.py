@@ -184,12 +184,11 @@ def test_resolve_perf_cloud_matches_plan_table():
     p = perf.resolve_perf("auto", CLOUD)
     assert p["profile"] == perf.PROFILE_CLOUD
     assert p["blocks_to_swap"] == 0
-    assert p["prefetch_blocks"] == 0
-    assert p["non_blocking"] is False
+    # blocks_prefetch 不在档位表里（官方默认即开，场景 A 全常驻时它本来就是空转）
+    assert p["blocks_prefetch"] is True
     assert p["unload_unet_seg"] is False
     assert p["max_upscale_scale"] == 4.0
     assert p["cond_cache_size"] == 32
-    assert p["decode_chunk_frames"] == 0
     assert p["guard_offload_target"] is True   # 场景 A 的关键项
 
 
@@ -197,12 +196,10 @@ def test_resolve_perf_local_matches_plan_table():
     p = perf.resolve_perf("auto", LOCAL)
     assert p["profile"] == perf.PROFILE_LOCAL
     assert p["blocks_to_swap"] == 25
-    assert p["prefetch_blocks"] == 2
-    assert p["non_blocking"] is True
+    assert p["blocks_prefetch"] is True
     assert p["unload_unet_seg"] is True
     assert p["max_upscale_scale"] == 1.5
     assert p["cond_cache_size"] == 8
-    assert p["decode_chunk_frames"] == 32
     assert p["frames_to_cpu"] is True
 
 
@@ -286,16 +283,16 @@ def test_parse_state_rejects_wrong_types():
     """类型不对 → 丢弃该项回落到默认，不做猜测式强转。"""
     d = perf.DEFAULT_PERF
     out = perf.parse_state({"blocks_to_swap": "x", "profile": 5,
-                            "non_blocking": 0, "probe": "yes"})
+                            "blocks_prefetch": 0, "probe": "yes"})
     assert out["blocks_to_swap"] == d["blocks_to_swap"]
     assert out["profile"] == d["profile"]
-    assert out["non_blocking"] == d["non_blocking"]
+    assert out["blocks_prefetch"] == d["blocks_prefetch"]   # 0 不是 bool → 丢弃回落
     assert out["probe"] == d["probe"]
 
 
 def test_parse_state_keeps_false():
     """False 是合法值，不能被当成「没填」跳过。"""
-    assert perf.parse_state({"non_blocking": False})["non_blocking"] is False
+    assert perf.parse_state({"blocks_prefetch": False})["blocks_prefetch"] is False
     assert perf.parse_state({"guard_offload_target": False})["guard_offload_target"] is False
 
 
@@ -901,3 +898,656 @@ def test_list_runs_returns_distinct_runs_in_order(logfile):
 
 def test_run_id_stable_within_process():
     assert perf.run_id() == perf.run_id()
+
+
+# ---- 分块「开关 + 参数」两件套（2026-09-23）----
+#
+# 用户要求：每个阶段给一个「开启按钮」，再给「开启多少」的参数。落到契约表上就是
+#   * ff_chunk_on / ff_chunk_tokens / ff_chunk_min_tokens
+#   * attn_head_on / attn_head_chunks
+#   * upscale_temporal_chunk / upscale_chunk_frames / upscale_overlap
+#   * refine_temporal_on / refine_temporal_chunk / refine_temporal_overlap
+#   * refine_tile_on / refine_tile / refine_tile_overlap / refine_tile_feather
+#   * blocks_swap_on / blocks_to_swap（`blocks_prefetch` 不在此列 —— 它独立生效，
+#     不受总开关管，见 perf.DEFAULT_PERF 里块交换那段注释）
+# 开关默认关（大显存机器不该被默默改行为），参数默认给非零的建议值（用户开开关
+# 就有合理值，不必先想「该填多少」）。
+#
+# ⚠ 2026-09-23 撤掉 decode_chunk_on / decode_chunk_frames：官方 H3 视频 VAE 已按
+#   tile 级分块解码（comfy/sd.py 的 handles_tiling=True，256px 空间块 × 17 帧时序块），
+#   再套一层自己的分块是 0 收益、纯多一份实现，故整组删除（不是「暂不接线」）。
+
+CHUNK_SWITCHES = (
+    "ff_chunk_on", "attn_head_on",
+    "refine_temporal_on", "refine_tile_on", "blocks_swap_on",
+)
+
+CHUNK_PAIRS = (
+    ("ff_chunk_on", ("ff_chunk_tokens", "ff_chunk_min_tokens")),
+    ("attn_head_on", ("attn_head_chunks",)),
+    ("upscale_temporal_chunk", ("upscale_chunk_frames", "upscale_overlap")),
+    ("refine_temporal_on", ("refine_temporal_chunk", "refine_temporal_overlap")),
+    ("refine_tile_on", ("refine_tile", "refine_tile_overlap", "refine_tile_feather")),
+    ("blocks_swap_on", ("blocks_to_swap",)),
+)
+
+
+def test_all_chunk_switches_off_by_default():
+    """除放大网络时序分块（历史上就是硬编码开）外，其余分块开关**默认必须关**。
+
+    默认开 = 静默改了所有人的输出/行为；分块尤其如此（除 FFN/头分块外都有代价）。
+    """
+    for k in CHUNK_SWITCHES:
+        assert k in perf.DEFAULT_PERF, f"{k} 不在 DEFAULT_PERF"
+        assert perf.DEFAULT_PERF[k] is False, f"{k} 默认该关，实际 {perf.DEFAULT_PERF[k]}"
+    # 放大网络时序分块是例外：沿袭既有行为，默认开
+    assert perf.DEFAULT_PERF["upscale_temporal_chunk"] is True
+
+
+def test_chunk_switches_and_params_are_all_wired_or_explicitly_unwired():
+    """每个分块参数键，必须在「已接线」或「未接线（有理由）」名单里，不能两头不沾。
+
+    两头不沾 = 面板上既不生效也不标「接线中」，用户勾了以为有用 —— 这是最坑的一种。
+    """
+    wired = set(perf.WIRED_KEYS)
+    unwired = set(perf.UNWIRED_KEYS)
+    for _, params in CHUNK_PAIRS:
+        for p in params:
+            assert p in perf.DEFAULT_PERF, f"{p} 不在 DEFAULT_PERF"
+            assert p in wired or p in unwired, f"{p} 既没接线也没进未接线名单"
+
+
+def test_chunk_switch_and_param_do_not_overlap_in_wiring():
+    """开关与参数不能一个接线一个没有——那会让参数永远改不动或永远改得动。
+
+    （`refine_tile_on` 与其参数曾整组在未接线名单，tile 接线后已整组转入 WIRED，
+    故此处不再需要例外分支。）
+    """
+    wired = set(perf.WIRED_KEYS)
+    for sw, params in CHUNK_PAIRS:
+        sw_wired = sw in wired
+        for p in params:
+            p_wired = p in wired
+            assert sw_wired == p_wired, (
+                f"{sw}({'已接线' if sw_wired else '未接线'}) 与 {p}"
+                f"({'已接线' if p_wired else '未接线'}) 不一致")
+
+
+def test_chunk_param_defaults_are_sane():
+    """参数默认值要「开开关即合理」：该非零的非零，该给建议值的给建议值。"""
+    d = perf.DEFAULT_PERF
+    assert d["ff_chunk_tokens"] == 4096          # 建议起点（计划实测值）
+    assert d["ff_chunk_min_tokens"] == 8192      # 对齐 KJ seq_threshold 语义
+    assert d["attn_head_chunks"] == 1            # 1 = 不分块
+    assert d["upscale_chunk_frames"] == 32       # 上游同款默认
+    assert d["upscale_overlap"] == 0             # 0 = 自动取卷积核宽（只增不减）
+    assert d["refine_temporal_overlap"] == 8     # 至少 8 latent token
+    assert d["refine_tile"] == "off"
+    assert d["refine_tile_overlap"] == 32 and d["refine_tile_feather"] == 16
+    # blocks_to_swap = -1 是「跟随档位」哨兵，不是 0 —— 0 会被读成「真的一块都不换」
+    # 从而覆盖掉档位表按显存算出来的建议值（16GB→25 等）。见 resolve_perf。
+    assert d["blocks_to_swap"] == -1
+    # blocks_prefetch 默认 True = **官方默认即开、默认不干预**（关掉才包一层；
+    # 官方预取深度写死 1 块，所以它只能是 bool）
+    assert d["blocks_prefetch"] is True
+
+
+def test_decode_chunk_is_gone_for_good():
+    """decode 分块整组不许复活。
+
+    2026-09-23 撤除理由：官方 H3 视频 VAE 已经 tile 级分块（comfy/sd.py 的
+    handles_tiling=True，256px 空间块 × 17 帧时序块），自己再分一层是 0 收益。
+    这条守卫是为了防止日后「哦这里缺个显存开关」又被加回来 —— 加之前先看官方
+    已经做过没有。
+    """
+    for k in ("decode_chunk_on", "decode_chunk_frames"):
+        assert k not in perf.DEFAULT_PERF, f"{k} 又被加回 DEFAULT_PERF 了"
+        for tbl in perf.PROFILE_TABLE.values():
+            assert k not in tbl, f"{k} 又出现在档位表里了"
+
+
+def test_profile_driven_keys_are_derived_from_profile_table():
+    """PROFILE_DRIVEN_KEYS 必须是三张档位表的**并集**，不能手写。
+
+    为什么要有这张表：面板判「这项到底生不生效」原先只有二分（在 WIRED_KEYS /
+    不在），于是 `unload_upscaler_cache` 这类「由档位表填值、auto 档下确实生效」
+    的键被画成灰色的「接线中」—— 把在用的开关说成没用。
+    """
+    union = set()
+    for tbl in perf.PROFILE_TABLE.values():
+        union |= set(tbl)
+    assert set(perf.PROFILE_DRIVEN_KEYS) == union, "档位名单与档位表并集不一致"
+    # 并集里必须真的有内容（三张表都空的话上面那条会「通过」但其实没烤到）
+    assert len(union) >= 8, f"档位表并集太小：{sorted(union)}"
+    # ★ 回归守卫：**不能**拿 PROFILE_CLOUD 这类名字去迭代 ——
+    # 它们是字符串常量（'cloud'），迭代得到单字符 'c','l','o','u','d'。
+    # 这个 bug 真的犯过：名单变成 ('a','c','d','l','m','o','s','t','u')。
+    assert not set(perf.PROFILE_DRIVEN_KEYS) <= set("cloudlocalcustom"), (
+        "档位名单退化成了单字符集合 —— 十有八九是拿 PROFILE_CLOUD 这类字符串常量迭代了")
+    for k in perf.PROFILE_DRIVEN_KEYS:
+        assert len(k) > 3 and "_" in k or k.isidentifier(), f"档位键形状可疑：{k!r}"
+
+
+def test_profile_driven_keys_match_frontend_stub():
+    """前端守卫用的桩名单必须与后端**值**一致（跨语言文本比对在 JS 侧做不了）。
+
+    JS 侧只能扒字面量，而 `PROFILE_DRIVEN_KEYS` 是推导式、源码无键名字面量 ——
+    所以这条归 Python：真 import 后逐一比对 tests/js/perf_modal_check.js 的桩。
+    """
+    import re
+    p = os.path.join(ROOT, "tests", "js", "perf_modal_check.js")
+    with open(p, "r", encoding="utf-8") as f:
+        js = f.read()
+    m = re.search(r"const UNWIRED_STUB = \[(.*?)\];", js, re.S)
+    assert m, "perf_modal_check.js 里找不到 UNWIRED_STUB"
+    stub = re.findall(r'"([a-z_]+)"', m.group(1))
+    assert sorted(stub) == sorted(perf.UNWIRED_KEYS), (
+        "JS 桩的 UNWIRED_STUB 与 perf.UNWIRED_KEYS 不一致 —— 改了后端要同步那个桩"
+        f"\n桩：{sorted(stub)}\n后端：{sorted(perf.UNWIRED_KEYS)}")
+    # 桩里的档位名单（若存在）也必须与后端一致
+    m2 = re.search(r"const PROFILE_DRIVEN_STUB = \[(.*?)\];", js, re.S)
+    if m2:
+        stub2 = re.findall(r'"([a-z_]+)"', m2.group(1))
+        assert sorted(stub2) == sorted(perf.PROFILE_DRIVEN_KEYS), (
+            "JS 桩的 PROFILE_DRIVEN_STUB 与 perf.PROFILE_DRIVEN_KEYS 不一致")
+
+
+def test_unwired_table_is_empty_and_kept():
+    """块交换接线（2026-09-23）后**未接线名单为空** —— 空表本身是被钉住的事实。
+
+    两条都要：① 表存在（`perf_get`/`perf_set` 与前端都读它，删了接口会缺字段）；
+    ② 它是空的（前端「接线中」那一态因此不再渲染）。空 ≠ 机制没了：下次加未接线
+    字段就往这里加，前端不用动。
+    """
+    assert hasattr(perf, "UNWIRED_KEYS"), "UNWIRED_KEYS 整个删了 —— 它是接口契约"
+    assert perf.UNWIRED_KEYS == (), (
+        f"未接线名单该是空的（块交换已接线），实际 {sorted(perf.UNWIRED_KEYS)}")
+
+
+def test_blocks_to_swap_is_wired_and_profile_driven():
+    """`blocks_to_swap` 是 wired ∩ profile_driven：机制已接线，但默认值 -1 的语义就是
+    「跟随档位」→ 面板照旧显示「跟随档位」而不是「已接线」。"""
+    assert "blocks_to_swap" in perf.WIRED_KEYS
+    assert "blocks_to_swap" in perf.PROFILE_DRIVEN_KEYS
+    assert perf.DEFAULT_PERF["blocks_to_swap"] == -1
+
+
+def test_wired_and_unwired_never_overlap():
+    """同一键不许同时进「已接线」与「未接线」—— 那是自相矛盾的判据。"""
+    assert not (set(perf.WIRED_KEYS) & set(perf.UNWIRED_KEYS))
+
+
+def test_every_field_key_is_classified():
+    """DEFAULT_PERF 里的每个键都要能被三态之一判到，不能两头不沾。
+
+    例外是纯内部键（`profile` / `preset` / `probe` 这类由 resolve_perf 消费、
+    不进面板的）—— 它们本来就不该出现在面板上，所以不要求进任何名单。
+    """
+    panel = set(perf.WIRED_KEYS) | set(perf.UNWIRED_KEYS) | set(perf.PROFILE_DRIVEN_KEYS)
+    internal = {"profile", "preset", "probe", "cond_cache_size",
+                "offload_guard_ratio", "guard_offload_target", "frames_to_cpu",
+                "max_upscale_scale", "unload_unet_seg", "unload_before_decode",
+                "unload_upscaler_cache"}
+    stray = set(perf.DEFAULT_PERF) - panel - internal
+    assert not stray, f"这些键既不在面板三态里、也不在内部键白名单：{sorted(stray)}"
+
+
+def test_plan_ff_chunks_boundaries():
+    """FFN 切块边界：这是「数学等价」的落点，边界错了就不等价了。"""
+    assert perf.plan_ff_chunks(0, 4096) == []
+    assert perf.plan_ff_chunks(-5, 4096) == []
+    assert perf.plan_ff_chunks(4096, 0) == [(0, 4096)]      # 0 = 不分块
+    # 整除
+    assert perf.plan_ff_chunks(8192, 4096) == [(0, 4096), (4096, 8192)]
+    # 不整除：末块要收在 n 上，且块间无缝无叠
+    assert perf.plan_ff_chunks(10000, 4096) == [(0, 4096), (4096, 8192), (8192, 10000)]
+    # 单块
+    assert perf.plan_ff_chunks(100, 4096) == [(0, 100)]
+
+
+def test_plan_ff_chunks_covers_all_tokens_exactly_once():
+    """任意切法都必须「不多不少、不重不漏」—— 否则拼接结果与不分块不等价。"""
+    for n in (1, 7, 4095, 4096, 4097, 10000, 123457):
+        for c in (1, 512, 4096, 8192):
+            spans = perf.plan_ff_chunks(n, c)
+            assert spans[0][0] == 0, f"n={n} c={c}: 起点不是 0"
+            assert spans[-1][1] == n, f"n={n} c={c}: 终点不是 {n}"
+            for (s0, e0), (s1, e1) in zip(spans, spans[1:]):
+                assert e0 == s1, f"n={n} c={c}: 块间有缝或重叠 ({e0} != {s1})"
+                assert e0 > s0, f"n={n} c={c}: 空块 ({s0},{e0})"
+
+
+def test_plan_ff_chunks_garbage_is_single_block():
+    """非法输入不炸，落回单块（等价不分块）—— 绝不能让脏配置变成「只算了前半段」。"""
+    assert perf.plan_ff_chunks(None, 4096) == [(0, 0)]
+    assert perf.plan_ff_chunks("abc", 4096) == [(0, 0)]
+
+
+# ---- 精化时序分块（批次 3）----
+
+def test_plan_refine_chunks_single_when_disabled():
+    """chunk<=0 / latent 比块短 / 非法输入 -> 单段（等效不分块，零行为变化）。"""
+    assert perf.plan_refine_chunks(0, 12, 4) == []
+    assert perf.plan_refine_chunks(-3, 12, 4) == []
+    assert perf.plan_refine_chunks(27, 0, 4) == [(0, 27, 0, 27)]
+    assert perf.plan_refine_chunks(27, 32, 4) == [(0, 27, 0, 27)]
+    assert perf.plan_refine_chunks(27, 27, 4) == [(0, 27, 0, 27)]
+    assert perf.plan_refine_chunks(None, 12, 4) == []
+    assert perf.plan_refine_chunks(27, "x", 4) == [(0, 27, 0, 27)]
+
+
+def test_plan_refine_chunks_core_covers_the_whole_range():
+    """★ 核心不变量：各段 core 的**并集**必须覆盖 [0, n)（不重不漏已成过去式）。
+
+    ⚠ 2026-09-23 语义变更：core 从「硬划分」改为「**咬合重叠**」—— 相邻段在
+    咬合带内各写一次、按互补羽化权重混合（这才是「重叠融合」）。所以这里只验
+    **并集铺满**（有洞 = 那些 token 权重为 0，是黑洞）。
+    """
+    for n in (1, 5, 27, 100, 120, 257):
+        for c in (2, 7, 12, 16, 64):
+            for ov in (0, 1, 4, 8, 64):
+                plan = perf.plan_refine_chunks(n, c, ov)
+                covered = set()
+                for _s, _e, cs, ce in plan:
+                    covered.update(range(cs, ce))
+                assert covered == set(range(n)), (
+                    f"n={n} c={c} ov={ov} 的 core 并集不是 [0,{n})：{plan}")
+
+
+def test_plan_refine_chunks_interlock_overlap():
+    """咬合：内部边界的相邻段 core 必须**真实重叠**（非硬切）。
+
+    回归钉子 —— 早先 core 是硬划分（`e - ov`），重叠从不发生、羽化形同摆设。
+    """
+    n, c, ov = 120, 16, 8
+    plan = perf.plan_refine_chunks(n, c, ov)
+    assert len(plan) >= 3
+    for (_s0, _e0, _a0, b0), (_s1, _e1, a1, _b1) in zip(plan, plan[1:]):
+        assert a1 < b0, f"相邻段 core 不重叠（硬切）：前段止于 {b0}、后段起于 {a1}"
+        assert b0 - a1 == max(1, ov - ov % 2), \
+            f"咬合带宽度该 = ov（{ov}），实际 {b0 - a1}"
+
+
+def test_plan_refine_chunks_spans_are_in_bounds_and_overlapping():
+    """每段喂入区间必须在 [0,n] 内、非空、且**包住**自己的 core 区。"""
+    n, c, ov = 120, 16, 8
+    plan = perf.plan_refine_chunks(n, c, ov)
+    assert plan[0][0] == 0 and plan[-1][1] == n, "首段须从 0 起、末段须收在 n"
+    for s, e, cs, ce in plan:
+        assert 0 <= s < e <= n, f"区间越界或为空：({s},{e})"
+        assert s <= cs < ce <= e, f"core 必须落在段内：({s},{e}) core({cs},{ce})"
+    for (s0, e0, _a, _b), (s1, _e1, _c2, _d2) in zip(plan, plan[1:]):
+        assert s1 < e0, f"相邻段没有重叠（s1={s1} >= e0={e0}）—— overlap 没生效"
+
+
+def test_plan_refine_chunks_overlap_clamped_to_half_chunk():
+    """overlap 上限 = 块长的一半（防「净推进趋近 0、段数爆炸」）。
+
+    27 token / 块 8 / 要求 overlap 8 -> 若真按 8 走，每段只前进 0 或 1 个 token，
+    会切出几十段、每段各跑一遍完整采样循环。实测过的退化案例就是这个。
+    """
+    plan = perf.plan_refine_chunks(27, 8, 8)
+    assert len(plan) == 6, f"overlap 该被夹到 4（半块），段数不该是 {len(plan)}"
+    assert plan[1][0] == 4, f"第二段该从 4 起（overlap 夹到 4），实际 {plan[1][0]}"
+
+
+def test_feather_weights_shape_and_ramps():
+    """羽化权重：首尾各 ramp 个元素**对称**升/降、中间恒 1、且**永不为 0**。
+
+    不为 0 很关键：权重 0 等于把那段信息彻底丢掉（等效黑洞）。
+    """
+    assert perf.feather_weights(0, 3) == []
+    assert perf.feather_weights(-1, 3) == []
+    assert perf.feather_weights(10, 0) == [1.0] * 10          # ramp=0 = 不羽化
+    assert perf.feather_weights(4, 5) == [1.0] * 4           # ramp 过大 = 全 1
+    w = perf.feather_weights(10, 3)
+    assert len(w) == 10
+    assert w == pytest.approx([0.25, 0.5, 0.75, 1, 1, 1, 1, 0.75, 0.5, 0.25])
+    assert all(x > 0 for x in w), "权重不该出现 0"
+    # 对称性：w[i] == w[n-1-i]（这是「两块咬合时互补」的几何基础）
+    assert all(w[i] == w[len(w) - 1 - i] for i in range(len(w)))
+
+
+def test_feather_weights_interlock_complement_to_one():
+    """★ 两块**咬合**时权重必须互补成 1：`A_tail[k] + B_head[k] == 1`。
+
+    这是「过渡没有硬边」的数学根基。A 取尾端 r 个、B 取首端 r 个（同一个咬合带），
+    两者对齐相加必须严格 = 1。
+    ⚠ 回归钉子：尾端**不能**被「改成」显式降序 —— 那会让 A、B 同向、和恒为 2 倍
+    （`2(i+1)/(r+1)`，中点附近等权混合、远离边界权重更小，过渡形状是错的）。
+    """
+    r = 8
+    w = perf.feather_weights(40, r)
+    a_tail = w[-r:]            # A 在咬合带的权重
+    b_head = w[:r]             # B 在同一咬合带的权重
+    for k in range(r):
+        assert a_tail[k] + b_head[k] == pytest.approx(1.0), (
+            f"咬合带第 {k} 点不互补：A={a_tail[k]} B={b_head[k]}")
+    # A 尾端必须是 B 首端的逆序（同一条曲线的镜像）
+    assert a_tail == pytest.approx(list(reversed(b_head)))
+
+
+def test_feather_weights_sum_is_sane():
+    """羽化权重之和应 ≥ 长度的一半 —— 归一化时不会因总权重过小放大噪声。"""
+    for n, r in ((16, 8), (32, 8), (12, 4), (100, 16)):
+        w = perf.feather_weights(n, r)
+        assert sum(w) >= n * 0.5, f"n={n} r={r} 权重和太小：{sum(w)}"
+
+
+# ---- 精化空间 tile（批次 4）----
+
+def test_tile_grid_unknown_mode_is_off():
+    """档位名不认识 -> (1,1)（不切），**绝不**静默切成怪形状。"""
+    assert perf.tile_grid("off") == (1, 1)
+    assert perf.tile_grid("") == (1, 1)
+    assert perf.tile_grid(None) == (1, 1)
+    assert perf.tile_grid("9x9") == (1, 1)
+    assert perf.tile_grid("2x2") == (2, 2)
+    assert perf.tile_grid("1x2") == (1, 2)
+    assert perf.tile_grid("2x1") == (2, 1)
+    # 大小写 / 空白容错
+    assert perf.tile_grid(" 3X3 ") == (3, 3)
+
+
+def test_plan_tiles_off_returns_single_tile():
+    """off / 非法输入 -> 单片（等效不分块，零行为变化）。"""
+    assert perf.plan_tiles(64, 64, "off", 8) == [(0, 64, 0, 64, 0, 64, 0, 64, 0)]
+    assert perf.plan_tiles(0, 64, "2x2", 8) == []
+    assert perf.plan_tiles(None, 64, "2x2", 8) == []
+    assert perf.plan_tiles(-8, 64, "2x2", 8) == []
+
+
+def test_plan_tiles_core_union_covers_whole_canvas():
+    """★ 核心不变量：各块 core 的**并集**必须铺满整幅 H×W。
+
+    ⚠ 2026-09-23 语义变更：core 从「不重不漏硬划分」改为「**咬合重叠**」——
+    相邻块在咬合带内各写一次、按互补羽化权重混合。所以这里只验并集铺满
+    （有洞 = 那些像素权重为 0，是黑洞）。
+    """
+    for H, W in ((64, 64), (96, 128), (100, 60), (256, 256), (33, 37)):
+        for mode in ("2x2", "3x3", "4x4", "2x1", "1x2", "off"):
+            for ov in (0, 4, 16, 64):
+                plan = perf.plan_tiles(H, W, mode, ov)
+                seen = set()
+                for _hs, _he, _ws, _we, chs, che, cws, cwe, _ov in plan:
+                    for y in range(chs, che):
+                        for x in range(cws, cwe):
+                            seen.add((y, x))
+                expect = {(y, x) for y in range(H) for x in range(W)}
+                assert seen == expect, (
+                    f"H={H} W={W} {mode} ov={ov}：core 并集未铺满（{len(seen)}/{H * W}）")
+
+
+def test_plan_tiles_interlock_overlap():
+    """咬合：内部边界的相邻块 core 必须**真实重叠**（非硬切）。
+
+    回归钉子 —— 早先 core 是硬划分，重叠从不发生、羽化形同摆设。
+    """
+    plan = perf.plan_tiles(64, 64, "2x2", 8)
+    assert len(plan) == 4
+    # 行方向：(0,0) 与 (1,0) 的 core 行区必须重叠 8
+    r0_0 = plan[0]      # (0,0)
+    r1_0 = plan[2]      # (1,0)
+    assert r0_0[5] > r1_0[4], f"行方向 core 不重叠：前块止 {r0_0[5]}、后块起 {r1_0[4]}"
+    assert r0_0[5] - r1_0[4] == 8, f"行咬合带该 = 8，实际 {r0_0[5] - r1_0[4]}"
+    # 列方向：(0,0) 与 (0,1)
+    assert plan[0][7] - plan[1][6] == 8, "列方向咬合带该 = 8"
+
+
+def test_plan_tiles_spans_in_bounds_and_contain_core():
+    """每块喂给采样器的区间必须在画幅内、非空，且**包住**自己的 core 区。"""
+    H, W, ov = 128, 96, 20
+    plan = perf.plan_tiles(H, W, "2x2", ov)
+    assert len(plan) == 4
+    for hs, he, ws, we, chs, che, cws, cwe, _ov in plan:
+        assert 0 <= hs < he <= H, f"行区间越界或为空：({hs},{he})"
+        assert 0 <= ws < we <= W, f"列区间越界或为空：({ws},{we})"
+        assert hs <= chs < che <= he, f"core 行必须落在块内：{chs},{che} vs {hs},{he}"
+        assert ws <= cws < cwe <= we, f"core 列必须落在块内：{cws},{cwe} vs {ws},{we}"
+
+
+def test_plan_tiles_auto_downgrades_when_too_small():
+    """画幅太小切不动 -> 自动降档（宁可少省显存，也不切碎画面）。
+
+    降档是**逐级减半**，不是一步到单片：40x40 切 4x4 时 4 等分每块 10px
+    小于 min_side 16，降到 2x2（每块 20px ≥ 16）就停下 —— 仍切 4 块。
+    """
+    # 40x40 切 4x4 -> 每块 10px < 16 -> 降到 2x2（每块 20px >= 16）
+    assert len(perf.plan_tiles(40, 40, "4x4", 8, min_side=16)) == 4
+    # 24x24 切 2x2 -> 每块 12px < 16 -> 降到单片
+    assert len(perf.plan_tiles(24, 24, "2x2", 8, min_side=16)) == 1
+    # 128x128 切 4x4 -> 每块 32px >= 16 -> 正常 16 块
+    assert len(perf.plan_tiles(128, 128, "4x4", 8, min_side=16)) == 16
+
+
+def test_plan_tiles_overlap_clamped_to_half_block():
+    """overlap 上限 = 半块边长（且取偶数）—— 与 plan_refine_chunks 同防退化逻辑。
+
+    64x64 切 2x2 -> 块边长 32 -> overlap 夹到 16（half=8）。
+    写回区：首块向右侧多要 8 -> che = 32+8 = 40；次块向左多要 8 -> chs = 32-8 = 24，
+    两者咬合带 [24,40) 宽 16。
+    """
+    # plan 顺序是**行外列内**：(0,0) (0,1) (1,0) (1,1)
+    plan = perf.plan_tiles(64, 64, "2x2", 9999)
+    assert plan[0][8] == 16, f"生效 overlap 该夹到 16，实际 {plan[0][8]}"
+    # 写回区咬合
+    assert plan[0][5] == 40, f"(0,0) che 该 = 32+8 = 40，实际 {plan[0][5]}"
+    assert plan[2][4] == 24, f"(1,0) chs 该 = 32-8 = 24，实际 {plan[2][4]}"
+    assert plan[0][5] - plan[2][4] == 16, "咬合带宽度该 = 16"
+    # 画布外缘不扩
+    assert plan[0][4] == 0 and plan[0][6] == 0, "首块外缘不该缩"
+    assert plan[3][5] == 64 and plan[3][7] == 64, "末块外缘不该扩"
+
+
+def test_plan_tiles_overlap_even_forced():
+    """生效 overlap 必须取偶数（half = ov//2 两边对称、咬合带恰好铺满 ov）。"""
+    for req in (7, 9, 15, 16, 31):
+        plan = perf.plan_tiles(128, 128, "2x2", req)
+        eff = plan[0][8]
+        assert eff % 2 == 0, f"请求 {req} -> 生效 {eff} 不是偶数"
+
+
+def test_split_divides_evenly_remainder_first():
+    """`_split` 均分且余数摊给前面的段（末段不会成为新的峰值点）。"""
+    assert perf._split(10, 1) == [(0, 10)]
+    assert perf._split(10, 2) == [(0, 5), (5, 10)]
+    assert perf._split(10, 3) == [(0, 4), (4, 7), (7, 10)]   # 4,3,3
+    assert perf._split(9, 3) == [(0, 3), (3, 6), (6, 9)]
+    # 每段长度差不超过 1，且首段 >= 末段
+    for total, parts in ((100, 7), (33, 4), (7, 8)):
+        segs = perf._split(total, parts)
+        lens = [e - s for s, e in segs]
+        assert sum(lens) == total
+        assert max(lens) - min(lens) <= 1
+        assert lens == sorted(lens, reverse=True)
+
+# ============================================================ 块交换（接线到官方机制）
+#
+# 这一组的定位：块交换**没有自己的搬权重代码**（机制在 ComfyUI 那边：DynamicVRAM 的
+# vbar 换入 + 官方 block 循环里的预取队列）。本插件只做两件事：
+#   ① 把「放出 N 块」折算成 aimdo 的**显存预留**（blocks_to_swap → headroom）
+#   ② 给模型装/拆官方预取队列的开关（blocks_prefetch → transformer_options）
+# 所以这里测的是**换算与写入纪律**，不是「搬了几块」——后者由 tools/check_blockswap.py
+# 在真 torch/aimdo 环境里验。
+
+def test_blockswap_headroom_math():
+    """N 块 → 额外预留：块大小 = UNET/50（H3_DOUBLE_BLOCK_COUNT）。"""
+    r = perf.blockswap_headroom(0, 20.0, 40.0)
+    assert r["extra_gb"] == 0.0 and r["blocks_eff"] == 0 and not r["clamped"]
+    # 20GB UNET → 每块 0.4GB；10 块 = 4GB；32GB 卡的「一半」= 16GB，不触发夹取
+    r = perf.blockswap_headroom(10, 20.0, 32.0)
+    assert abs(r["extra_gb"] - 4.0) < 1e-9
+    assert r["blocks_eff"] == 10 and r["clamped"] is False
+    assert "0.40GB" in r["note"]
+
+
+def test_blockswap_headroom_clamps_to_half_vram():
+    """★ 6GB 卡上 `suggest_blocks` 会给 40+ 块 ≈ 16GB > 显存总量 → 必须夹住并如实说明。
+
+    不夹的后果是「预留比卡还大」这种无意义设置；静默夹的后果是用户以为自己填的 41
+    生效了。所以既要夹、又要在 note 里说清被夹到几块。
+    """
+    n = perf.suggest_blocks(20.0, 6.0)
+    assert n >= 40, f"6GB 卡上该建议换出 40+ 块，实际 {n}"
+    r = perf.blockswap_headroom(n, 20.0, 6.0)
+    assert r["clamped"] is True
+    assert r["extra_gb"] <= 6.0 * perf.BLOCKSWAP_HEADROOM_CAP + 1e-9
+    assert 0 < r["blocks_eff"] < n
+    assert "夹" in r["note"] and "⚠" in r["note"]
+
+
+def test_blockswap_headroom_unknown_sizes_never_guesses():
+    """体量没探明（面板打开时还没加载模型）→ 明确「不干预」，**不编数字**。"""
+    for n in (5, 41):
+        r = perf.blockswap_headroom(n, None, 16.0)
+        assert r["extra_gb"] == 0.0 and r["blocks_eff"] == 0
+        assert "未探明" in r["note"]
+        r2 = perf.blockswap_headroom(n, 20.0, None)
+        assert r2["extra_gb"] == 0.0 and "未探明" in r2["note"]
+
+
+def test_blockswap_headroom_bad_block_count():
+    """脏输入不该抛，也不该算出负数预留。"""
+    for bad in (None, "x", -3):
+        r = perf.blockswap_headroom(bad, 20.0, 32.0)
+        assert r["extra_gb"] == 0.0 and r["blocks_eff"] == 0
+
+
+def test_blockswap_baseline_is_read_once():
+    """★ 基线只读一次：第二次读到的可能已被我们自己改过，用它当基线会让
+    「关掉开关 = 恢复原样」变成「关掉开关 = 保持我上次设的值」。"""
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": 1.5, "extra_gb": 0.4})
+        assert perf._blockswap_baseline() == {"aimdo_gb": 1.5, "extra_gb": 0.4}
+        # 就算环境变了，缓存命中就不再重读
+        perf._BS_BASELINE["aimdo_gb"] = 9.0
+        assert perf._blockswap_baseline()["aimdo_gb"] == 9.0
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_probe_blockswap_shape():
+    """探测结果字段齐全；path ∈ {aimdo, legacy, None}。
+
+    None = **没跑在 ComfyUI 进程里**（import 不到 comfy）→ 如实报「探不到」，不硬编一个
+    path。本用例在 managed python 下跑（无 comfy / 无 torch），所以这里必然是 None ——
+    这条同时钉住 perf.py 全模块的前提「量不到给 None，绝不抛」。
+    """
+    st = perf.probe_blockswap()
+    assert set(st) == {"aimdo", "dynamic", "streams", "non_blocking",
+                       "pinned_gb", "headroom_gb", "path"}
+    assert st["path"] in (None, "aimdo", "legacy")
+    if st["aimdo"] is None:
+        assert st["path"] is None, "探不到 aimdo 时不该硬报一个 path"
+
+
+def test_blockswap_line_states():
+    assert "DynamicVRAM 在线" in perf.blockswap_line({"path": "aimdo"}, 1.25)
+    assert "1.25GB" in perf.blockswap_line({"path": "aimdo"}, 1.25)
+    assert "?" in perf.blockswap_line({"path": "aimdo"}, None)
+    assert "无 DynamicVRAM" in perf.blockswap_line({"path": "legacy"}, None)
+
+
+def test_apply_blockswap_unknown_size_does_not_touch(monkeypatch):
+    """★★ **读接口不许改进程状态**。
+
+    面板打开会走 `perf_get → apply_runtime → apply_blockswap`，而那时拿不到模型体量。
+    若此时按「extra=0」照写，就会把上一次渲染设好的预留**悄悄抹掉** —— 一个 GET
+    请求不该有副作用。所以这里钉死：算不出目标 → 一次 `_set_*` 都不许调。
+    """
+    calls = []
+    monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: calls.append(gb) or 7.0)
+    monkeypatch.setattr(perf, "_set_extra_reserved", lambda gb: calls.append(gb) or 0.6)
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "aimdo", "headroom_gb": 7.0})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": 7.0, "extra_gb": 0.6})
+        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 25},
+                                   {"vram_total_gb": 16.0})
+        assert calls == [], f"体量未知却写了预留：{calls}"
+        assert out["applied"] is False and "未探明" in out["note"]
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_apply_blockswap_aimdo_applies_and_restores(monkeypatch):
+    """开 → 预留抬到 baseline + N×块大小；关 → **恢复 baseline**（不是保持在 N 块）。"""
+    seen = []
+    monkeypatch.setattr(perf, "_set_aimdo_headroom",
+                        lambda gb: (seen.append(gb), round(gb, 3))[1])
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "aimdo", "headroom_gb": 0.0})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": 0.5, "extra_gb": 0.6})
+        hw = {"unet_gb": 20.0, "vram_total_gb": 32.0}
+        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10}, hw)
+        assert out["applied"] is True and out["blocks"] == 10
+        assert abs(seen[-1] - 4.5) < 1e-9, seen          # 0.5 基线 + 4.0
+        assert abs(out["headroom_gb"] - 4.5) < 1e-9      # 读回核验后的值
+        out2 = perf.apply_blockswap({"blocks_swap_on": False, "blocks_to_swap": 10}, hw)
+        assert abs(seen[-1] - 0.5) < 1e-9, seen
+        assert "恢复" in out2["note"]
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_apply_blockswap_follows_profile_sentinel(monkeypatch):
+    """`blocks_to_swap = -1` = 跟随档位 → 用 suggest_blocks 按**真实体量**反解。"""
+    monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: round(gb, 3))
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "aimdo", "headroom_gb": 0.0})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": 0.0, "extra_gb": 0.0})
+        hw = {"unet_gb": 20.0, "vram_total_gb": 16.0}
+        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": -1}, hw)
+        assert out["blocks"] == perf.suggest_blocks(20.0, 16.0)
+        assert out["blocks"] > 0
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_apply_blockswap_legacy_path(monkeypatch):
+    """没有 DynamicVRAM 时退化为 ComfyUI 的 EXTRA_RESERVED_VRAM（同一条语义）。"""
+    seen = []
+    monkeypatch.setattr(perf, "_set_extra_reserved",
+                        lambda gb: (seen.append(gb), round(gb, 3))[1])
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "legacy", "headroom_gb": None})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": None, "extra_gb": 0.6})
+        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 5},
+                                   {"unet_gb": 20.0, "vram_total_gb": 32.0})
+        assert out["path"] == "legacy" and out["applied"] is True
+        assert abs(seen[-1] - (0.6 + 2.0)) < 1e-9, seen
+        assert "legacy" in out["note"] and "DynamicVRAM" in out["note"]
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_apply_blockswap_keys_are_stable():
+    """返回结构是接口（前端诊断区与 nodes 报告都按它读），键名不许漂。"""
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        out = perf.apply_blockswap({}, None)
+        assert set(out) == {"on", "path", "blocks", "extra_gb", "clamped",
+                            "headroom_gb", "applied", "note"}
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+

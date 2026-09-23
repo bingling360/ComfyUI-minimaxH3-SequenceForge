@@ -228,7 +228,11 @@ def test_sigmas_input_is_last_and_link_only():
 
 
 def test_no_widget_count_change_for_sigmas_slot():
-    """纯连线槽不进 widgets_values：主节点控件值仍应是 31（迁移层判据依赖它）。"""
+    """纯连线槽不进 widgets_values：主节点控件值仍应是 30（迁移层判据依赖它）。
+
+    30 = 删「一采编码」后的当前布局（2026-09-23）；sigmas 是纯输入槽，
+    不该在 widgets_values 里占位，所以这个数只随真正的控件增删而变。
+    """
     wf_path = os.path.join(ROOT, "web", "h3_default_workflow.js")
     import json
     import re
@@ -236,4 +240,4 @@ def test_no_widget_count_change_for_sigmas_slot():
     m = re.search(r"window\.H3_DEFAULT_WORKFLOW\s*=\s*(\{.*\})\s*;?\s*$", src, re.S)
     wf = json.loads(m.group(1)) if m else json.loads(src)
     sampler = [n for n in wf["nodes"] if n["type"] == "H3SeamlessChainSampler"][0]
-    assert len(sampler["widgets_values"]) == 31
+    assert len(sampler["widgets_values"]) == 30

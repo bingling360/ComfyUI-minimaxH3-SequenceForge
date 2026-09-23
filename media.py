@@ -10,14 +10,34 @@ from fractions import Fraction
 
 last_error = None
 
-# ---- 编码器（性能优化设置 `encoder` / `nvenc_cq`）----
+# ---- 编码器（性能优化设置 `encoder` / `x264_crf` / `nvenc_cq`）----
 #
-# 诚实结论：**编码不是瓶颈**——557 帧实测只要 13 秒。NVENC 的真实收益是
-# CPU 占用（libx264 默认会起 核数×1.5 个线程，跑起来整机卡），既不是耗时
-# 也不是内存（帧最终仍要落 CPU 侧进编码器）。所以它默认 auto = libx264，
-# 换不换交给用户按自己的机器选。
+# 两个正交维度，别混成一个旋钮：
+#   · `encoder` 选实现：libx264（CPU 软编，压缩效率高，但默认起 核数×1.5 个线程，
+#     长链编码时整机 CPU 吃满）/ h264_nvenc / hevc_nvenc（GPU 硬件编，几乎不占 CPU，
+#     代价是同画质需要更高码率）→ 见 resolve_encoder。
+#   · `encode_profile` 只管 preset（编码速度档）+ 8bit 暗部抖动，两边通用。
+#
+# 质量数值**跟编码器换含义**：x264 认 `crf`、NVENC 认 `cq`，互不认识。
+# 传错的一侧会被 ffmpeg 静默忽略（不报错，质量档直接失效），所以这两个值分开存、
+# 按当前 ENCODER 分流给 —— 面板上也按 encoder 的值显隐（见 h3_director.js 的 showWhen）。
+#
+# 关于「编码是不是瓶颈」：短片段（百帧级）不是，但长链是 —— 8 段 × 10s ≈ 1600+ 帧，
+# libx264 的 CPU 占用会拖住整机（采样是 GPU 在跑，编码是 CPU 在跑，两者抢的是
+# 同一台机器的整机吞吐）。所以别拿几百帧的实测去代表长链。
 ENCODER = "libx264"      # 进程级生效值（由 perf.apply_runtime 写入）
-ENCODER_CQ = 20          # NVENC 专用质量档（x264 用 crf，两者不是同一个旋钮）
+ENCODER_CRF = 20         # libx264 专用质量档（NVENC 不看这个）
+ENCODER_CQ = 20          # NVENC 专用质量档（x264 不看这个）
+
+
+def set_crf(crf=20):
+    """设置进程级 x264 crf（越小越清晰、文件越大）；返回生效值。"""
+    global ENCODER_CRF
+    try:
+        ENCODER_CRF = max(0, min(51, int(crf)))
+    except (TypeError, ValueError):
+        ENCODER_CRF = 20
+    return ENCODER_CRF
 
 
 def set_encoder(name, cq=20):
@@ -52,10 +72,14 @@ def _video_stream_options(crf, preset, threads, aq_mode):
     x264 档名（veryfast/medium 会被当成 NVENC 的 p1..p7 之外的非法值），
     所以走 NVENC 时只给 `cq` + `preset=p4`（NVENC 的中档，对应 x264 的
     medium 量级），x264 那套 crf/preset/aq-mode 原样保留。
+
+    ⚠ `crf` 入参是「调用方按 encode_profile 查表拿到的默认值」；只要用户
+      在性能设置里动过 x264 质量档，就以进程级 `ENCODER_CRF` 为准（面板那个
+      数值才是用户输入的真相，档位表的 crf 只是它的出厂默认）。
     """
     if ENCODER in ("h264_nvenc", "hevc_nvenc"):
         return ENCODER, {"cq": str(int(ENCODER_CQ)), "preset": "p4"}
-    options = {"crf": str(int(crf)), "preset": str(preset),
+    options = {"crf": str(int(ENCODER_CRF)), "preset": str(preset),
                "threads": str(max(1, int(threads)))}
     if aq_mode:
         options["aq-mode"] = str(int(aq_mode))

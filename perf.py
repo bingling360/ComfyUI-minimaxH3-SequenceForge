@@ -83,35 +83,69 @@ DEFAULT_PERF = {
     "profile": "auto",
     "preset": "auto",
 
-    # 显存：权重流动
-    "blocks_to_swap": -1,          # -1 = 跟随 profile；0..50
-    "prefetch_blocks": 2,
-    "non_blocking": True,
+    # 显存：权重流动（块交换）
+    #
+    # ★ 机制归属（2026-09-23 重开，查证后定的口径）：**块级权重流动是 ComfyUI 官方
+    # 做的**，本插件不自己搬权重。H3 的 block 循环里官方已有预取/换入队列
+    # （`comfy/ldm/minimax/model.py:751-765` 的 make_prefetch_queue / prefetch_queue_pop
+    # + `comfy/model_prefetch.py` + aimdo 的 vbar 故障页），总闸是
+    # `comfy/model_base.py:250` 的 `transformer_options["prefetch_dynamic_vbars"]
+    # = patcher.is_dynamic()`。
+    # 手工搬权重那条路的结局是：与官方 partial load / vbar **抢同一批参数**、打坏
+    # LoRA 的 patch 账（`model_loaded_weight_memory`），而且在 vbar 上根本搬不动
+    # （官方明确禁止外部 pin：ModelPatcherDynamic.pin_weight_to_device → RuntimeError）。
+    # 所以我们只驱动两个**真实存在**的旋钮，见 apply_blockswap：
+    #   · blocks_to_swap → aimdo 的「显存预留」(VRAM headroom)：抬高 = 逼 vbar 驱逐
+    #     页面 = 更多块必须从主机内存换入 → **换时间换显存**（与面板语义 1:1）
+    #   · blocks_prefetch → 官方预取队列的开关（深度由 prefetch_queue_pop 的队列
+    #     结构写死为「提前 1 块」→ 只能是 bool，不能是「预取 N 块」）
+    "blocks_swap_on": False,       # 块交换总开关（关 = 恢复 baseline，不干预官方）
+    "blocks_to_swap": -1,          # -1 = 跟随 profile（suggest_blocks 反解）；0..50
+    "blocks_prefetch": True,       # 官方块级预取（官方深度固定 1 块，只能开关）
 
     # 显存：常驻
     "unload_unet_seg": "auto",
     "unload_before_decode": "auto",
 
     # 显存：峰值
-    "decode_chunk_frames": 0,      # 0 = 不额外分块（H3 VAE 本就内部分块）
     "frames_to_cpu": "auto",
     "max_upscale_scale": 0,        # 0 = 不限
 
-    # 显存：分块（按画质风险递增排列：FFN=无 → 时序=低 → 空间 tile=中高）
-    "ff_chunk_tokens": 0,          # 0 = 关；>0 = 每块 token 数（数学等价，零画质损失）
-    "attn_backend": "auto",        # auto / sdpa / sage / flash（auto = 沿用 ComfyUI 选定）
+    # 显存：分块（按画质风险递增排列：FFN=无 → 头分块=无 → 时序=低 → 空间 tile=中高）
+    #
+    # 每类分块都是「启用开关 + 参数」两件套：开关是 `*_on`（或语义化的 bool），
+    # 参数在开关关掉时仍保留数值、只是不生效 —— 免得用户来回开关时得重填。
+    # 开关本身不进指纹（它们是显存手段，不是画质手段，见 upscale._hash_params）。
+    "ff_chunk_on": False,             # FFN token 分块总开关
+    "ff_chunk_tokens": 4096,          # 每块 token 数（数学等价，零画质损失）
+    "ff_chunk_min_tokens": 8192,      # 序列 token 低于此值不切（对齐 KJ seq_threshold 语义）
+    "attn_head_on": False,            # 注意力头分块总开关
+    "attn_head_chunks": 1,            # 注意力头分几组（1=关）；精确无损
+    "attn_backend": "auto",           # auto / sdpa / sage / flash（auto = 沿用 ComfyUI 选定）
     "upscale_temporal_chunk": True,   # 放大网络 3D 时序分块（内部已实现，此前硬编码为开）
-    "upscale_chunk_frames": 32,       # 放大网络时序分块帧数（接线中：网络只收开关，不收帧数）
-    "upscale_overlap": 5,             # 放大网络时序分块重叠帧（同上）
-    "refine_temporal_chunk": 0,       # 精化时序分块帧数（接线中：需 overlap≥8 latent token）
-    "refine_temporal_overlap": 8,     # 精化时序重叠帧
-    "refine_tile": "off",             # 精化空间分块 off / 2x2 / 3x3（实验：切断全局注意力）
-    "refine_tile_overlap": 16,        # 精化空间重叠像素
+    "upscale_chunk_frames": 32,       # 放大网络每块帧数
+    "upscale_overlap": 0,             # 块间重叠帧；0 = 自动取时序卷积核宽（只增不减）
+    # ⛔ VAE 解码分块（decode_chunk_on / decode_chunk_frames）**已整体移除**（2026-09-23）：
+    # 不是「暂不接线」，是**本就不该存在** —— H3 视频 VAE 在官方层就已 tile 级分块解码
+    # （`comfy/sd.py:1038` handles_tiling=True：256px 空间 × 17 帧时序块，且显存估算
+    # `frames = min(frames, chunk_frames + 2)` 只按单块算）。外面再套一层是与官方 tile
+    # 叠加 → 更慢更糊、显存一点不多省。留着只会让人以为勾了有用。
+    "refine_temporal_on": False,      # 精化时序分块总开关
+    "refine_temporal_chunk": 0,       # 精化每段帧数（0 = 不分块）
+    "refine_temporal_overlap": 8,     # 段间重叠 latent token（单位：latent token，非像素）
+    "refine_tile_on": False,          # 精化空间分块总开关
+    "refine_tile": "off",             # off / 2x2 / 3x3 / 4x4 / 2x1 / 1x2
+    "refine_tile_overlap": 32,        # 块间重叠像素
+    "refine_tile_feather": 16,        # 接缝羽化宽度（像素）
 
     # 显存：峰值与自救
     "oom_autoretry": True,         # 主干采样 OOM 自救（卸载 + 回收后原参重试一次）
     "act_peak_probe": True,        # 量 LoRA / bypass 前向的**激活**峰值（权重 ComfyUI 已算到）
-    "keep_upscaler_resident": False,  # 放大网络整链只搬一次（别每段搬上搬下）
+    # 放大网络常驻（**不**强制卸载）：True = 段间保留缓存、零加载 —— 这是**现状口径**
+    # （与旧项目存档里的 `force_unload: false` 同义，迁移不得改默认行为）；
+    # False = 每段二采收尾把网络从 MODEL_CACHE 删掉 + soft_empty_cache，下段重新从
+    # 磁盘加载（换 CPU 侧那 659MB 权重副本，代价是每段 ~1s 重载）。
+    "keep_upscaler_resident": True,
 
     # 内存：成片合成
     "final_mode": "auto",          # auto=能拼就拼 / stream=强制流式 / memory=强制内存帧
@@ -126,9 +160,17 @@ DEFAULT_PERF = {
     "offload_guard_ratio": DEFAULT_GUARD_RATIO,
     "guard_action": "warn",        # warn=只报 / block=critical 时禁止全卸
 
-    # 编码（耗时收益有限：557 帧实测只要 13s，主要省 CPU 占用）
-    "encoder": "auto",             # auto / libx264 / h264_nvenc / hevc_nvenc
+    # 编码。**一个「质量数值」跟着编码器换含义**（面板上按 encoder 值显隐）：
+    #   encoder=libx264     -> 读 `x264_crf`（恒定质量，越小越清晰）
+    #   encoder=*_nvenc     -> 读 `nvenc_cq`（NVENC 的恒定质量，语义对应 crf）
+    # 两者**不是同一个旋钮**：NVENC 不认 crf、x264 不认 cq，传错会被静默忽略
+    # （质量档整个失效），所以后端按 encoder 显式分流（见 media._video_stream_options）。
+    # `encode_profile` 只管**另外两样**：preset（编码速度档）+ 8bit 暗部抖动。
+    # 真源：`upscale.ENCODE_PROFILES` / `_ENCODE_SETTINGS`。
+    "encoder": "libx264",          # libx264 / h264_nvenc / hevc_nvenc（不再有假 auto）
+    "x264_crf": 20,                # x264 恒定质量（20 标准 / 16 高清 / 13 极致）
     "nvenc_cq": 20,                # NVENC 恒定质量（对应 x264 的 crf）
+    "encode_profile": "标准",       # 标准 / 高清 / 极致（**只管 preset + 抖动**）
 
     # ComfyUI 运行时开关（**节点端适配，不动启动参数**）
     "upcast_attention": "auto",   # auto=跟随启动参数；True/False=强制开/关
@@ -148,21 +190,39 @@ DEFAULT_PERF = {
 WIRED_KEYS = (
     "upcast_attention", "index_mode", "thumb_on_import", "thumb_max_mp",
     # 2026-09-23 第二批：显存自救 / 分块 / 成片内存 / 编码
-    "oom_autoretry", "act_peak_probe", "ff_chunk_tokens", "attn_backend",
+    "oom_autoretry", "act_peak_probe", "attn_backend",
     "upscale_temporal_chunk", "keep_upscaler_resident", "vram_shuffle",
     "final_mode", "frames_dtype", "guard_action", "encoder", "nvenc_cq",
+    # 2026-09-23 第三批：分块「开关 + 参数」两件套 + 编码档位合并
+    "ff_chunk_on", "ff_chunk_tokens", "ff_chunk_min_tokens",
+    "encode_profile", "x264_crf",
+    # 2026-09-23 第四批：注意力头分块 / 放大网络参数透传 / VAE 解码
+    "attn_head_on", "attn_head_chunks",
+    "upscale_chunk_frames", "upscale_overlap",
+    # 2026-09-23 第五批：精化二采时序分块
+    "refine_temporal_on", "refine_temporal_chunk", "refine_temporal_overlap",
+    # 2026-09-23 第六批：精化空间 tile（H/W 网格切块 + 二维羽化融合）
+    "refine_tile_on", "refine_tile", "refine_tile_overlap", "refine_tile_feather",
+    # 2026-09-23 第七批：块交换（接线到**官方**块级权重流动，不自己搬权重）
+    "blocks_swap_on", "blocks_to_swap", "blocks_prefetch",
 )
+
+# 尚未接线的键（面板标「接线中」+ 灰掉）——**必须逐个能说出理由**：
+# ★ 2026-09-23 第七批后 **本表为空**：块交换是最后 4 项里活下来的 3 项（`non_blocking`
+#   已删 —— 官方恒 non_blocking=True 且锁页内存是 aimdo 的硬前提，关不掉，留着就是假
+#   开关），全部接线完毕，清单清空。
+# 清空 ≠ 拆掉机制：这是「有没有假开关」的**显式契约**（perf_get / perf_set 都回它，
+# 前端按 unwired > profile_driven > wired 判态），也是下一次加新字段时的落点。
+# 空表的含义是「当前没有任何声称未接线的字段」——测试里钉了这条（别把表删了又当没这回事）。
+UNWIRED_KEYS = ()
 
 # 自动策略表（§7）—— 只列两场景有差异的项，其余沿用 DEFAULT_PERF。
 # ⚠ 这是**建议值不是强制值**：面板必须允许逐项覆盖（resolve_perf 的 overrides）。
 PROFILE_TABLE = {
     PROFILE_CLOUD: {
         "blocks_to_swap": 0,
-        "prefetch_blocks": 0,
-        "non_blocking": False,
         "unload_unet_seg": False,
         "unload_before_decode": "auto",   # 跟随 _up_swap
-        "decode_chunk_frames": 0,
         "frames_to_cpu": False,
         "max_upscale_scale": 4.0,
         "unload_upscaler_cache": False,
@@ -171,11 +231,8 @@ PROFILE_TABLE = {
     },
     PROFILE_LOCAL: {
         "blocks_to_swap": 25,
-        "prefetch_blocks": 2,
-        "non_blocking": True,
         "unload_unet_seg": True,
         "unload_before_decode": "auto",
-        "decode_chunk_frames": 32,
         "frames_to_cpu": True,
         "max_upscale_scale": 1.5,
         "unload_upscaler_cache": True,
@@ -184,6 +241,27 @@ PROFILE_TABLE = {
     },
     PROFILE_CUSTOM: {},   # 全沿用 DEFAULT_PERF，等用户逐项覆盖
 }
+
+# 由 `profile` 档位表驱动的键 —— **不是「没接线」，是「自动档下由档位表填值」**。
+#
+# 为什么要有这个名单：面板原先只有二分（在 WIRED_KEYS = 已接线 / 其余 = 接线中），
+# 结果 `unload_upscaler_cache` 这类键被画成灰色的「接线中」——可它在 PROFILE_TABLE
+# 里有明确取值（场景 A=关、场景 B=开），`profile=auto` 时**确实生效**。
+# 把在用的开关标成没用，与「列出一个没用的开关」是同一个错误的两个方向。
+#
+# 判定顺序（前端照此实现）：unwired > profile_driven > wired。
+# `blocks_to_swap` 同时出现在 PROFILE_TABLE 与 WIRED_KEYS 里，这是**故意的**：
+# 值 -1 = 跟随档位（档位表给 0 / 25，公式 suggest_blocks 再按真实体量覆盖），
+# 而执行机制已接线（apply_blockswap）。面板按「unwired > profile_driven > wired」
+# 判态 → 它显示「跟随档位」而不是「接线中」，正如它现在的行为。
+#
+# ⚠ 遍历的是 `PROFILE_TABLE`（dict），**不是** `PROFILE_CLOUD` 那几个名字 ——
+# 那三个是**字符串常量**（'cloud' / 'local' / 'custom'），拿它们迭代会得到
+# 单字符 'c','l','o','u','d'（2026-09-23 踩过，单测直接把它钉死了）。
+# 也必须定义在 PROFILE_TABLE **之后**。
+PROFILE_DRIVEN_KEYS = tuple(sorted({
+    k for tbl in PROFILE_TABLE.values() for k in tbl
+}))
 
 _AUTO_KEYS = tuple(k for k, v in DEFAULT_PERF.items() if v == "auto")
 
@@ -197,27 +275,33 @@ PERF_TYPES = {
     # 场景
     "profile": (str,),
     "preset": (str,),
-    # 显存：权重流动
+    # 显存：权重流动（块交换）
+    "blocks_swap_on": (bool,),
     "blocks_to_swap": (int,),
-    "prefetch_blocks": (int,),
-    "non_blocking": (bool,),
+    "blocks_prefetch": (bool,),
     # 显存：常驻
     "unload_unet_seg": (bool, "auto"),
     "unload_before_decode": (bool, "auto"),
     # 显存：峰值
-    "decode_chunk_frames": (int,),
     "frames_to_cpu": (bool, "auto"),
     "max_upscale_scale": (int, float),
-    # 显存：分块
+    # 显存：分块（每类 = 开关 + 参数两件套）
+    "ff_chunk_on": (bool,),
     "ff_chunk_tokens": (int,),
+    "ff_chunk_min_tokens": (int,),
+    "attn_head_on": (bool,),
+    "attn_head_chunks": (int,),
     "attn_backend": (str,),
     "upscale_temporal_chunk": (bool,),
     "upscale_chunk_frames": (int,),
     "upscale_overlap": (int,),
+    "refine_temporal_on": (bool,),
     "refine_temporal_chunk": (int,),
     "refine_temporal_overlap": (int,),
+    "refine_tile_on": (bool,),
     "refine_tile": (str,),
     "refine_tile_overlap": (int,),
+    "refine_tile_feather": (int,),
     # 显存：峰值与自救
     "oom_autoretry": (bool,),
     "act_peak_probe": (bool,),
@@ -232,9 +316,11 @@ PERF_TYPES = {
     "guard_offload_target": (bool,),
     "offload_guard_ratio": (int, float),
     "guard_action": (str,),
-    # 编码
+    # 编码（两个维度：实现 / 质量档；质量档随 encoder 换含义，crf 与 cq 分开存）
     "encoder": (str,),
+    "x264_crf": (int,),
     "nvenc_cq": (int,),
+    "encode_profile": (str,),
     # ComfyUI 运行时开关
     "upcast_attention": (bool, "auto"),
     "vram_shuffle": (str,),
@@ -404,6 +490,252 @@ def suggest_blocks(unet_gb, vram_gb, block_count=H3_DOUBLE_BLOCK_COUNT,
     return int(min(n_blocks, max(1, math.ceil(need / block))))
 
 
+
+# ---- 块交换：接线到**官方**的块级权重流动（2026-09-23，批次 5 重开）----
+#
+# 为什么这里没有「搬权重的代码」：见 DEFAULT_PERF 那段注释。一句话 —— H3 的 block
+# 循环里官方已经有预取/换入队列（`comfy/ldm/minimax/model.py:751-765`），权重住在
+# aimdo 的 vbar 里（`m._v`），官方明确禁止外部 pin，手工搬只会抢同一批参数。
+#
+# 所以我们只驱动两个**真实存在**的旋钮：
+#   1) `blocks_to_swap` → aimdo 的「显存预留」(headroom)。抬高它 = 逼 vbar 驱逐页面 =
+#      更多块只能从主机内存换入 = **换时间换显存**。与面板语义 1:1：放出 N 块 =
+#      多预留 N × (UNET/50) 字节。
+#      官方 `comfy_aimdo.control.set_simple_vram_headroom` 文档原文：「Raising it takes
+#      effect at the next VBAR fault or hooked device allocation and is honoured by
+#      evicting VBAR pages only」→ 运行期真实生效（本机 aimdo 0.5.5 实测：设完读回一致，
+#      见 tools/check_blockswap.py）。
+#   2) `blocks_prefetch` → 官方预取队列的开关。深度由 `prefetch_queue_pop` 的队列结构
+#      写死（`[None] + blocks + [None]`，每轮只 pin `queue[0]` = 下一块）→ 只能是 bool。
+#
+# 无 aimdo 的环境（老 ComfyUI / `--disable-dynamic-vram` / `--highvram`）不是没救：那时走
+# legacy ModelPatcher，模型装不下时由它自己的 `partially_load()` / `_load_list()` 按
+# **模块**流（粒度 ≈ block，每 double block ≈ 0.4GB）；我们把 `blocks_to_swap` 折算成
+# Python 侧的 `EXTRA_RESERVED_VRAM`（`load_models_gpu` 的「最低必须留空」地板）同样能
+# 改变「留多少在卡上」。
+BLOCKSWAP_HEADROOM_CAP = 0.5   # 预留最多占到显存总量的这一比例（再高没有意义）
+
+# 进程启动时的预留基线：**只读一次并缓存**。第二次读到的可能已被我们自己改过，用它
+# 当基线会让「关掉开关 = 恢复原样」变成「关掉开关 = 保持我上次设的值」。
+_BS_BASELINE = {}
+
+
+def probe_blockswap():
+    """块级权重流动的**在线状态**（best-effort，量不到给 None，绝不抛）。
+
+    `path`：
+      · ``"aimdo"``  —— DynamicVRAM 在线 → 官方的 vbar 换入 + 块级预取都在跑
+      · ``"legacy"`` —— 没有 aimdo（老版本 / 关了动态显存）→ 靠 ComfyUI 自己的按模块流
+    """
+    out = {"aimdo": None, "dynamic": None, "streams": None, "non_blocking": None,
+           "pinned_gb": None, "headroom_gb": None, "path": None}
+    try:
+        from comfy import memory_management as mem  # type: ignore
+        out["aimdo"] = bool(getattr(mem, "aimdo_enabled", False))
+    except Exception:
+        return out
+    try:
+        from comfy import model_patcher as mp  # type: ignore
+        out["dynamic"] = mp.CoreModelPatcher is mp.ModelPatcherDynamic
+    except Exception:
+        pass
+    try:
+        from comfy import model_management as mm  # type: ignore
+        out["streams"] = int(getattr(mm, "NUM_STREAMS", 0) or 0)
+        out["non_blocking"] = bool(mm.device_supports_non_blocking(mm.get_torch_device()))
+        pinned = float(getattr(mm, "MAX_PINNED_MEMORY", 0) or 0)
+        out["pinned_gb"] = round(pinned / GB, 2) if pinned > 0 else None
+    except Exception:
+        pass
+    out["headroom_gb"] = _aimdo_headroom_gb()
+    out["path"] = "aimdo" if (out["aimdo"] and out["dynamic"]) else "legacy"
+    return out
+
+
+def _aimdo_headroom_gb():
+    """当前 aimdo 显存预留（GB）；拿不到 → None（**不是 0** —— 0 是「不留」这个合法值）。"""
+    try:
+        import comfy_aimdo.control as ctl  # type: ignore
+        return round(float(ctl.get_simple_vram_headroom()) / GB, 3)
+    except Exception:
+        return None
+
+
+def blockswap_headroom(n_blocks, unet_gb, vram_gb, baseline_gb=0.0,
+                       cap=BLOCKSWAP_HEADROOM_CAP):
+    """「放出 N 块」→ 需要额外预留多少显存（**纯函数**）。
+
+    extra = N × (UNET / 50)，块大小取 H3_DOUBLE_BLOCK_COUNT（H3 = 50 个 double block）。
+
+    ⚠ **必须夹取**：6GB 卡上 `suggest_blocks` 会算出 41 块 = 16.4GB > 显存总量，真去设
+    这么大的预留是无意义的（预留不可能超过卡本身）。夹到 ``vram × cap``（默认一半，
+    另一半留给激活 / VAE / 碎片 —— 与 RESERVE_GB 同一口径），并把「被夹了」如实报出去，
+    别让用户以为自己填的 41 生效了。
+
+    返回 ``{"extra_gb", "blocks_eff", "clamped", "note"}``。
+    """
+    try:
+        n = int(n_blocks)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return {"extra_gb": 0.0, "blocks_eff": 0, "clamped": False,
+                "note": "交换块数 0 —— 不额外预留（权重全部允许常驻）"}
+    if not unet_gb or not vram_gb:
+        return {"extra_gb": 0.0, "blocks_eff": 0, "clamped": False,
+                "note": "UNET / 显存体量未探明 → 本次不干预"}
+    block_gb = float(unet_gb) / float(H3_DOUBLE_BLOCK_COUNT)
+    want = n * block_gb
+    room = max(0.0, float(vram_gb) * float(cap) - float(baseline_gb or 0.0))
+    extra = min(want, room)
+    eff = int(extra / block_gb) if block_gb > 0 else 0
+    clamped = eff < n
+    note = f"放出 {eff} 块 ≈ 多预留 {extra:.2f}GB（块大小 {block_gb:.2f}GB）"
+    if clamped:
+        note += (f"；⚠ 你要的 {n} 块 ≈ {want:.1f}GB 超过显存可让出的一半"
+                 f"（{room:.1f}GB），已夹到 {eff} 块")
+    return {"extra_gb": float(extra), "blocks_eff": eff, "clamped": clamped, "note": note}
+
+
+def _blockswap_baseline():
+    """进程启动时的两份预留基线（**只读一次**，见 `_BS_BASELINE` 注释）。"""
+    if _BS_BASELINE:
+        return _BS_BASELINE
+    _BS_BASELINE["aimdo_gb"] = _aimdo_headroom_gb()
+    extra = None
+    try:
+        from comfy import model_management as mm  # type: ignore
+        extra = round(float(mm.extra_reserved_memory()) / GB, 3)
+    except Exception:
+        pass
+    _BS_BASELINE["extra_gb"] = extra
+    return _BS_BASELINE
+
+
+def _set_aimdo_headroom(headroom_gb):
+    """真设 aimdo 显存预留并**读回核验**；返回读回值（GB）；不支持 → None。"""
+    try:
+        import comfy_aimdo.control as ctl  # type: ignore
+    except Exception:
+        return None
+    try:
+        ctl.set_simple_vram_headroom(max(0, int(float(headroom_gb) * GB)))
+        return round(float(ctl.get_simple_vram_headroom()) / GB, 3)
+    except Exception:
+        return None
+
+
+def _set_extra_reserved(headroom_gb):
+    """legacy 路径：Python 侧的「最低必须留空」地板（`load_models_gpu` 读它）。"""
+    try:
+        from comfy import model_management as mm  # type: ignore
+        mm.EXTRA_RESERVED_VRAM = max(0, int(float(headroom_gb) * GB))
+        return round(float(mm.extra_reserved_memory()) / GB, 3)
+    except Exception:
+        return None
+
+
+def apply_blockswap(table, hw=None):
+    """把块交换应用到当前进程 → 状态 dict（note 供报告 / 面板显示）。
+
+    - 总开关关 → **恢复 baseline**（别把上次设的值留在进程里）
+    - ``blocks_to_swap = -1`` → 用 ``suggest_blocks(unet_gb, vram_gb)`` 反解真实块数
+    - ``blocks_prefetch`` 是**模型侧**的（要给具体模型打包装），由
+      ``upscale.install_block_prefetch`` 在拿到模型时装 —— 这里只回声，不假装做了。
+
+    返回 ``{"on","path","blocks","extra_gb","clamped","headroom_gb","applied","note"}``。
+    """
+    t = dict(table or {})
+    hw = hw or {}
+    st = probe_blockswap()
+    base = _blockswap_baseline()
+    out = {"on": bool(t.get("blocks_swap_on", False)), "path": st["path"],
+           "blocks": 0, "extra_gb": 0.0, "clamped": False,
+           "headroom_gb": st.get("headroom_gb"), "applied": False, "note": ""}
+
+    n = t.get("blocks_to_swap", -1)
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = -1
+    if n < 0:
+        n = suggest_blocks(hw.get("unet_gb"), hw.get("vram_total_gb"))
+    out["blocks"] = n
+
+    if st["path"] == "aimdo":
+        base_gb = base.get("aimdo_gb")
+        if base_gb is None:
+            out["note"] = "读不到 aimdo 当前显存预留（版本不支持读回）→ 未干预"
+            return out
+        target = float(base_gb)
+        if out["on"] and n > 0:
+            pl = blockswap_headroom(n, hw.get("unet_gb"), hw.get("vram_total_gb"), base_gb)
+            # 算不出目标就别写：面板打开时拿不到 UNET 体量（没加载模型），此时若照
+            # 「extra=0」去写，会把上一次渲染设好的预留**悄悄抹掉** —— 读接口不该
+            # 改进程状态。
+            if pl["blocks_eff"] <= 0:
+                out["note"] = pl["note"]
+                return out
+            target = base_gb + pl["extra_gb"]
+            out.update(extra_gb=pl["extra_gb"], clamped=pl["clamped"],
+                       blocks=pl["blocks_eff"], note=pl["note"])
+        got = _set_aimdo_headroom(target)
+        if got is None:
+            out["note"] = (out["note"] + "；" if out["note"] else "") + \
+                "aimdo 拒绝设置显存预留 → 未生效"
+            return out
+        out["applied"] = True
+        out["headroom_gb"] = got
+        if not out["on"]:
+            out["note"] = f"关闭 → 已恢复进程启动时的预留（{got:.2f}GB）"
+        elif n <= 0:
+            out["note"] = f"交换块数 0 → 预留保持基线 {got:.2f}GB，权重全允许常驻"
+        else:
+            out["note"] += f"；aimdo 预留现为 {got:.2f}GB（读回核验）"
+        return out
+
+    # ---- legacy：没有 DynamicVRAM，走 ComfyUI 自己的 EXTRA_RESERVED_VRAM ----
+    base_gb = base.get("extra_gb")
+    if base_gb is None:
+        out["note"] = "拿不到 ComfyUI 的预留基线 → 未干预"
+        return out
+    target = float(base_gb)
+    if out["on"] and n > 0:
+        pl = blockswap_headroom(n, hw.get("unet_gb"), hw.get("vram_total_gb"), base_gb)
+        if pl["blocks_eff"] <= 0:       # 同上：算不出目标 → 不写（读接口不许改状态）
+            out["note"] = pl["note"]
+            return out
+        target = base_gb + pl["extra_gb"]
+        out.update(extra_gb=pl["extra_gb"], clamped=pl["clamped"],
+                   blocks=pl["blocks_eff"], note=pl["note"])
+    got = _set_extra_reserved(target)
+    if got is None:
+        out["note"] = "无法写 ComfyUI 预留 → 未生效"
+        return out
+    out["applied"] = True
+    out["headroom_gb"] = got
+    tail = (f"本机无 DynamicVRAM（legacy ModelPatcher）：已把 ComfyUI 的「最低留空」"
+            f"设成 {got:.2f}GB —— 装不下时由它按模块流动" if (out["on"] and n > 0)
+            else f"本机无 DynamicVRAM：已恢复 ComfyUI 预留基线（{got:.2f}GB）")
+    out["note"] = (out["note"] + "；" if out["note"] else "") + tail
+    return out
+
+
+def blockswap_line(state, headroom_gb=None):
+    """块级权重流动的现状一行（报告 / 面板诊断共用）。
+
+    ⚠ 只说**环境与机制归属**，不说「省了多少」—— 那要实测才有数（本机 6GB 卡跑不动
+    20GB UNET，量不到）。
+    """
+    path = (state or {}).get("path")
+    if path == "aimdo":
+        h = "?" if headroom_gb is None else f"{headroom_gb:.2f}GB"
+        return (f"块级流动：DynamicVRAM 在线（官方块级预取 + vbar 换入），"
+                f"当前显存预留 {h}")
+    return ("块级流动：本机无 DynamicVRAM（legacy ModelPatcher）→ 装不下时由 ComfyUI "
+            "自己按**模块**流动（粒度 ≈ block，每 double block ≈ 0.4GB）")
+
+
 # ============================ 策略（纯函数） ============================
 
 def resolve_perf(profile, hw=None, overrides=None):
@@ -474,7 +806,7 @@ def guard_allows_unload(hw, action="warn", ratio=DEFAULT_GUARD_RATIO):
 # ——557 帧实测只要 13 秒。NVENC 的真实收益是 CPU 占用（x264 会打满核数×1.5
 # 个线程），不是耗时、更不是内存（帧最终仍要落 CPU 进编码器）。故默认 auto
 # = 沿用 libx264，NVENC 交给用户按自己的机器选。
-ENCODERS = ("auto", "libx264", "h264_nvenc", "hevc_nvenc")
+ENCODERS = ("libx264", "h264_nvenc", "hevc_nvenc")
 _NVENC = ("h264_nvenc", "hevc_nvenc")
 
 
@@ -484,10 +816,13 @@ def resolve_encoder(name, cq=20, crf=20):
     纯函数：NVENC 用 `cq`（恒定质量，语义对应 x264 的 crf），x264 用 `crf`。
     两者**不是**同一个旋钮（NVENC 不认 crf、x264 不认 cq），传错就是静默忽略
     质量档——所以这里显式分流，而不是把 crf 原样塞给 NVENC。
+
+    ⚠ 历史上还有过一个 `auto` 值，但它的分支和 `libx264` 一模一样 —— 是个
+      「想做自动判断但没做」的假预留位，同一件事在面板上有两个入口
+      （`libx264（推荐）` / `libx264（CPU）`），用户会问「既然一样干嘛弄两个」。
+      2026-09-23 已删除；老存档里的 "auto" 仍由下面的 in 判断兜住。
     """
-    n = str(name or "auto").strip().lower()
-    if n in ("", "auto", "x264", "libx264"):
-        return "libx264", {"crf": str(int(crf))}
+    n = str(name or "libx264").strip().lower()
     if n in _NVENC:
         return n, {"cq": str(int(cq))}
     return "libx264", {"crf": str(int(crf))}
@@ -518,6 +853,258 @@ def plan_ff_chunks(tokens, chunk_tokens):
     out = []
     for s in range(0, n, c):
         out.append((s, min(n, s + c)))
+    return out
+
+
+# ---- 精化时序分块（扩散采样循环的切段）----
+
+def plan_refine_chunks(latent_t, chunk_tokens, overlap_tokens):
+    """把 `latent_t` 个视频 latent token 沿时间切成若干段 -> [(s, e, core_s, core_e), ...]。
+
+    - `s` / `e`：本段喂给采样器的区间 **[s, e)**
+    - `core_s` / `core_e`：本段**写回**的区间 —— 语义上等于 `[s, e)`：段只能写
+      自己采样过的东西。相邻段的喂入区间本身就重叠 `ov`（净推进 = c - ov），
+      那段共享区就是**咬合带**，两块在其中各自羽化、权重互补成 1。
+
+    ⚠ **core 是「咬合」不是「划分」**（2026-09-23 修正）：
+    早先 core 是「去掉右侧 overlap 的硬划分」（`core_e = e - ov`），于是相邻段的
+    写回区**完全不相交**、「overlap + 羽化」根本没发生 —— 接缝**硬切**、羽化权重
+    形同摆设。现在 core = span，相邻段的写回区在咬合带上真实重叠、按互补权重混合。
+
+    ⚠ **单位是 latent token，不是像素帧**（与 `refine_tile_overlap` 的像素不同量纲）。
+      视频模型 latent 的时间压缩不是 1:1（官方 `grid.video_latent_t`：首 token 1 帧、
+      其后 4 帧、每 5 token 循环），所以「帧」与「token」必须分清。
+
+    ⚠ 与 `plan_ff_chunks` 的**本质区别**：FFN 是纯前馈、可分离，切块结果逐位相同；
+      这里是**扩散采样循环** —— 每段独立跑 N 步去噪、段间没有注意力交互，
+      两侧各自收敛到不同的局部解，接缝会有轻微差异。所以必须**给 overlap 且做
+      加权融合**，且 overlap 太小会明显闪烁（方案建议 ≥8 token）。
+
+    单段（chunk<=0 / latent_t<=chunk / 非法输入）-> [(0, latent_t, 0, latent_t)]，
+    即「等效不分块」，调用方据此走原路径（零行为变化）。
+    """
+    # 逐个转换：**只有 latent_t 非法才算「没有 latent」**（返回 []）；
+    # chunk/overlap 非法 = 「没要求分块」→ 落回单段（等价不分块）。
+    # 两者语义不同，不能一起往 except 里塞 —— 否则一个打错的 chunk 值
+    # 会让整段精化被静默跳过（[] 在调用方眼里就是「没东西可做」）。
+    try:
+        n = int(latent_t)
+    except (TypeError, ValueError):
+        return []
+    if n <= 0:
+        return []
+    try:
+        c = int(chunk_tokens)
+    except (TypeError, ValueError):
+        c = 0
+    try:
+        ov = int(overlap_tokens)
+    except (TypeError, ValueError):
+        ov = 0
+    if c <= 0 or n <= c:
+        return [(0, n, 0, n)]
+    # overlap 上限取块长的**一半**：overlap 越接近块长，「净推进」越小 —— 到
+    # c-1 时每段只前进 1 个 token，段数爆炸（27 token 会切出 20 段），
+    # 每段还都要跑完整采样循环，纯属灾难。工程师想要的「多留上下文」到这个
+    # 程度早已饱和，所以这里硬性砍到半块。
+    ov = max(0, min(ov, c // 2))
+    # 净推进 = c - ov -> 相邻段的**喂入区间**本身就重叠 `ov`：
+    #   段i = [s, s+c)，段i+1 = [s+c-ov, s+2c-ov)，交集 = [s+c-ov, s+c) 宽 ov。
+    # **写回区 = 喂入区**（core == span）：段只能写自己采样过的东西，而它的
+    # 尾/首 ov 个 token 恰好就是与邻居共享的咬合带 —— 两块各自在其上羽化、
+    # 权重互补成 1。这样既满足「core ⊆ span」（不越界读），又真正发生重叠融合。
+    step = c - ov
+    out = []
+    s = 0
+    while s < n:
+        e = min(n, s + c)
+        out.append((s, e, s, e))
+        if e >= n:
+            break
+        s += step
+    return out
+
+
+def feather_weights(length, ramp):
+    """长度 `length` 的 1-D 权重：**首尾各 ramp 个元素对称升/降**，中间恒 1。
+
+    用于重叠区加权融合：相邻两段在重叠区各自的权重曲线**互补成 1**
+    （`a[i]*w[i] + b[i]*(1-w[i])`），过渡才平滑无硬边。
+
+    ⚠ 两端用的是**同一条曲线** `(i+1)/(r+1)` —— 首端从 `1/(r+1)` 升到 1，
+    尾端从 `1/(r+1)` 升到 1（**以自身坐标为参照**；对全局而言就是向尾部降）。
+    这样两块在咬合带对齐时（A 的尾端 ↔ B 的首端）恰好互补：
+    `A_tail[k] + B_head[k] = (r-k)/(r+1) + (k+1)/(r+1) = 1`。
+    ⚠ 别把尾端「改成」显式的降序 — 那会变成 A、B 同向，和恒为 2 倍（踩过）。
+
+    两端都取不到 0（避免「权重 0 = 丢信息」）。
+
+    `ramp<=0` 或 `ramp*2 >= length` -> 全 1（无羽化；该情形下重叠区取平均由
+    调用方自行归一 —— 见 `_refine_chunked` / `_refine_tiled` 的 `wsum` 除法）。
+    纯函数，零 torch 依赖，返回 list[float]。
+    """
+    try:
+        n = int(length)
+        r = int(ramp)
+    except (TypeError, ValueError):
+        return []
+    if n <= 0:
+        return []
+    if r <= 0 or r * 2 >= n:
+        return [1.0] * n
+    w = [1.0] * n
+    for i in range(r):
+        v = (i + 1) / (r + 1)
+        w[i] = v
+        w[n - 1 - i] = v
+    return w
+
+
+def edge_weights(length, ramp, lo_has_neighbor, hi_has_neighbor):
+    """`feather_weights` 的**边界感知**版：只对「真有邻居」的那侧羽化。
+
+    为什么必须有它（2026-09-23 修正的设计缺口）：整幅最外缘那一条（画面第 0
+    行、时间轴首 token）**没有邻居**来补权重。若也在那里羽化，本块内容会被压到
+    `1/(r+1)`，归一化 (`/wsum`) 再把它放大回来 —— 数值上仍是原值，但**权重退化
+    到 0.11**：一旦该块结果有偏差，外缘就被放大 `(r+1)` 倍（噪声显式放大）。
+
+    铁律：**羽化是「与邻居交接」的事，不是「淡出」**。只有真接壤才羽化。
+    `ramp` 必须恰等于咬合带宽度，两侧才严格互补为 1。返回 list[float]。
+
+    ⚠ `ramp` 的合法性是**按侧**判的，不是 `feather_weights` 那种「两端合计不能
+    超过全长」：这里可能只有一侧接壤（另一侧是链/画布端点，不羽化），此时 ramp
+    占满大半长度也完全合法。故只有 `r >= n`（连一侧都放不下）才退化。
+    """
+    n = int(length)
+    r = int(ramp)
+    if n <= 0:
+        return []
+    sides = int(bool(lo_has_neighbor)) + int(bool(hi_has_neighbor))
+    if r <= 0 or sides == 0 or r >= n or (sides == 2 and r * 2 >= n):
+        return [1.0] * n
+    w = [1.0] * n
+    for i in range(r):
+        if lo_has_neighbor:
+            w[i] = (i + 1) / (r + 1)
+        if hi_has_neighbor:
+            w[n - 1 - i] = (i + 1) / (r + 1)
+    return w
+
+
+# ---- 精化空间 tile（把 H/W 切网格）----
+
+# 档位表：下拉值 -> (沿高切几份, 沿宽切几份)。off = 不切。
+# 「2x1」= 横向 2 条（沿 H 切 2 份，每份整宽）；「1x2」= 竖向 2 条。
+TILE_MODES = {
+    "off": (1, 1),
+    "2x2": (2, 2),
+    "3x3": (3, 3),
+    "4x4": (4, 4),
+    "2x1": (2, 1),
+    "1x2": (1, 2),
+}
+
+
+def tile_grid(mode):
+    """档位名 -> (rows, cols)；不认识的一律 (1,1)（= 不切，绝不静默切成怪形状）。"""
+    try:
+        r, c = TILE_MODES.get(str(mode or "off").strip().lower(), (1, 1))
+    except Exception:
+        return (1, 1)
+    return (max(1, int(r)), max(1, int(c)))
+
+
+def plan_tiles(h, w, mode, overlap, min_side=16):
+    """把 H×W 切成网格 -> [(hs, he, ws, we, chs, che, cws, cwe, eff_ov), ...]。
+
+    每项 = 一段在**像素/特征图坐标**上的切片：
+    - `hs/he`、`ws/we`：喂给采样器的区间（含四周 overlap 上下文）
+    - `chs/che`、`cws/cwe`：本块**写回**的区间（相邻块的这些区间在 overlap 带上**咬合重叠**）
+    - `eff_ov`：**实际生效**的 overlap（可能被 `min_side` 上限压小）。
+      融合时羽化 ramp 必须取它 —— 取请求值会与真实咬合带宽度不符 → 权重不互补。
+
+    融合时两块在咬合带内按互补羽化权重混合（见 `edge_weights`）。
+
+    ⚠ **core 是「咬合」不是「划分」**（2026-09-23 修正）：
+    早先 core 是 `_split` 出来的**不重不漏硬划分**，于是「overlap + 羽化」根本没
+    发生 —— 相邻块各自只写自己那一半、接缝处**硬切**，羽化权重形同摆设。
+    现在每块 core 在自己的边界处**向外多要 `ov` 的一半**，与邻居在 `[b-ov/2, b+ov/2)`
+    这段带宽内互相覆盖、按互补权重混合 —— 这才是「重叠融合」的本义。
+    因此 `sum(core)` **大于** H×W（重叠部分被两块各写一次），不是划分。
+
+    `min_side`：块的最小边长（像素/特征图单位）。网格切得过细会把画面切成
+    碎片（既费算力又让全局构图彻底断裂），所以边小于它时**自动降档**到能切
+    的档位。切不动就返回单片（不切）。
+
+    ⚠ 与 `plan_refine_chunks` 的 overlap **不同量纲**：这里是像素/特征图像素，
+    那边是 latent token。别把两个值互相套用。
+
+    ⚠ 视频比图像严重：每块独立去噪 → 块边会**帧间抖动**（噪声轨迹不同）。
+      故默认只推荐 2×2（每块仍有 1/4 画幅）。
+    """
+    try:
+        H, W = int(h), int(w)
+    except (TypeError, ValueError):
+        return []
+    if H <= 0 or W <= 0:
+        return []
+    try:
+        ov = max(0, int(overlap))
+    except (TypeError, ValueError):
+        ov = 0
+    rows, cols = tile_grid(mode)
+    # 自动降档：任何一维切完边长不足 min_side 就减半网格，直到装得下
+    while (rows > 1 or cols > 1) and (H // rows < min_side or W // cols < min_side):
+        if rows > 1 and H // rows < min_side:
+            rows = max(1, rows // 2) if rows > 2 else 1
+        if cols > 1 and W // cols < min_side:
+            cols = max(1, cols // 2) if cols > 2 else 1
+        if rows == 1 and cols == 1:
+            break
+    if rows <= 1 and cols <= 1:
+        return [(0, H, 0, W, 0, H, 0, W, 0)]
+    # overlap 上限 = 半块边长（同分块，防「净推进趋近 0」）；**取偶数**，
+    # 让 half = ov//2 两边对称、两块合起来正好铺满 ov 的咬合带。
+    ov = min(ov, max(1, min(H // rows, W // cols) // 2))
+    ov = max(0, ov - (ov % 2))
+    out = []
+    hs_list = _split(H, rows)
+    ws_list = _split(W, cols)
+    for hi, (rs, re_) in enumerate(hs_list):
+        for wi, (cs, ce) in enumerate(ws_list):
+            # 喂给采样器的区间：在核心区外再向四周扩 `ov` 的上下文
+            hs = max(0, rs - ov)
+            he = min(H, re_ + ov)
+            ws = max(0, cs - ov)
+            we = min(W, ce + ov)
+            # 写回区间（core，咬合）：**外缘不扩**（画布外没有邻居），
+            # 内边界向外要 `ov//2`（与邻居共享咬合带；两块合起来正好铺满 `ov`）。
+            half = ov // 2
+            chs = 0 if hi == 0 else max(0, rs - half)
+            che = H if hi == rows - 1 else min(H, re_ + half)
+            cws = 0 if wi == 0 else max(0, cs - half)
+            cwe = W if wi == cols - 1 else min(W, ce + half)
+            out.append((hs, he, ws, we, chs, che, cws, cwe, ov))
+    return out
+
+
+def _split(total, parts):
+    """把 `total` 尽量均分成 `parts` 段 -> [(s,e), ...]（余数摊给前面的段）。
+
+    均分而不是「整除+末段兜底」：末段过大会让它成为新的显存峰值点，
+    原本想平摊峰值，结果峰值还落在一个超大的末块上。
+    """
+    parts = max(1, int(parts))
+    if parts == 1:
+        return [(0, total)]
+    base = total // parts
+    rem = total % parts
+    out = []
+    s = 0
+    for i in range(parts):
+        n = base + (1 if i < rem else 0)
+        out.append((s, s + n))
+        s += n
     return out
 
 
@@ -774,9 +1361,16 @@ def apply_attn_backend(name):
 # 读 `load_settings()` 生效。面板把它们算作「已接线」，但 apply_runtime 只能
 # 回声存下来的值——这点必须在 UI 上说清，否则用户会以为点了没反应。
 RUNTIME_LATER_KEYS = (
-    "oom_autoretry", "act_peak_probe", "ff_chunk_tokens",
-    "upscale_temporal_chunk", "keep_upscaler_resident", "vram_shuffle",
-    "final_mode", "frames_dtype", "guard_action", "nvenc_cq",
+    "oom_autoretry", "act_peak_probe",
+    "ff_chunk_on", "ff_chunk_tokens", "ff_chunk_min_tokens",
+    "attn_head_on", "attn_head_chunks",
+    "upscale_temporal_chunk", "upscale_chunk_frames", "upscale_overlap",
+    "refine_temporal_on", "refine_temporal_chunk", "refine_temporal_overlap",
+    "refine_tile_on", "refine_tile", "refine_tile_overlap", "refine_tile_feather",
+    "blocks_swap_on", "blocks_to_swap", "blocks_prefetch",
+    "keep_upscaler_resident", "vram_shuffle",
+    "final_mode", "frames_dtype", "guard_action", "nvenc_cq", "encode_profile",
+    "x264_crf",
 )
 
 
@@ -796,8 +1390,13 @@ def apply_runtime(table):
             from . import media  # type: ignore
         except ImportError:
             import media  # type: ignore
-        out["encoder"] = media.set_encoder(t.get("encoder", "auto"),
+        out["encoder"] = media.set_encoder(t.get("encoder", "libx264"),
                                            t.get("nvenc_cq", 20))
+        # x264 的质量档另走一条通道：media 的进程级 ENCODER_CRF（NVENC 不看它）
+        try:
+            media.set_crf(t.get("x264_crf", 20))
+        except AttributeError:
+            pass
     except Exception:
         out["encoder"] = None
     for k in RUNTIME_LATER_KEYS:
@@ -817,6 +1416,14 @@ def apply_runtime(table):
         except (TypeError, ValueError):
             pass
         out["thumb_max_mp"] = library.THUMB_MAX_PIXELS / 1000000.0
+    except Exception:
+        pass
+    # 块交换的进程级那半边（显存预留）**保存即生效** —— 用户点了保存就想看到反馈，
+    # 不该等到下次渲染。模型侧的预取开关在 nodes.py 拿到模型后装
+    # （upscale.install_block_prefetch）；这里 hw=None 给不出 UNET 真实体量，
+    # blocks_to_swap=-1 时先按基线走，渲染开始会用真实体量重算一次。
+    try:
+        out["blockswap"] = apply_blockswap(t)
     except Exception:
         pass
     return out

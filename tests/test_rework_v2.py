@@ -504,9 +504,15 @@ def test_optimizer_backend():
         "h3optimizer", os.path.join(ROOT, "optimizer.py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    # 规则文件齐全
+    # 规则文件：只剩两份官方英文版（中文 / 自研四字段已于 279cad0 整体下线，
+    # 口径同 tests/test_optimizer_rules.py::test_rule_files_exist）
     files = m.load_rule_files()
-    assert len(files) >= 3 and any("custom" in k for k in files)
+    assert {"minimaxh3_base_prompt_writing.txt",
+            "minimaxh3_official_ref2v_prompt_writing.txt"} <= set(files)
+    assert not [k for k in files if "custom" in k or k.endswith("_zh.txt")]
+    # 老工作流存档里存着的 custom 文件名必须回落 auto —— 静默不注入规则等于没有约束
+    assert m.pick_rule_text({"rule_file": "minimaxh3_custom_ref2v_prompt_writing.txt"},
+                            files, "Ref2VA")
     # 规则选择
     assert m.pick_rule_text({"rule_file": "none"}, files) is None
     assert m.pick_rule_text({"rule_file": "auto", "output_language": "中文"}, files)

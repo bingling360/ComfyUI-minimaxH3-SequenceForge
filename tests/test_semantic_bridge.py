@@ -182,14 +182,23 @@ def test_scan_adapters_lists_only_safetensors():
 
 
 def test_scan_adapters_finds_the_bundled_weight():
-    """插件自带权重必须被扫到 —— 扫不到的话用户开了开关也只会得到「权重不存在」。"""
-    assert any("BUNNY" in n for n in BR.scan_adapters()), \
-        f"models/ 下没扫到权重：{BR.scan_adapters()}"
+    """插件自带权重必须被扫到 —— 扫不到的话用户开了开关也只会得到「权重不存在」。
+
+    但权重是二进制且 .gitignore 全局忽略 `*.safetensors`，**不随仓库分发**：
+    本机没放权重的 clone 上跳过；放了权重（作者机 / 用户自行下载）就必须扫到，
+    否则「开关建好了却永远选不到权重」这个坑会被静默放过。
+    """
+    names = BR.scan_adapters()
+    if not names:
+        pytest.skip("models/ 下没有权重：权重不随仓库分发，需自行放置 BUNNY*.safetensors")
+    assert any("BUNNY" in n for n in names), f"models/ 下没扫到 BUNNY 权重：{names}"
 
 
 def test_path_of_accepts_bundled_name():
-    name = [n for n in BR.scan_adapters() if "BUNNY" in n][0]
-    assert os.path.isfile(BR.path_of(name))
+    names = [n for n in BR.scan_adapters() if "BUNNY" in n]
+    if not names:
+        pytest.skip("models/ 下没有 BUNNY 权重：权重不随仓库分发")
+    assert os.path.isfile(BR.path_of(names[0]))
 
 
 @pytest.mark.parametrize("bad", ["", "   ", None, "../secrets.safetensors",

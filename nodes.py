@@ -734,6 +734,28 @@ def _resolve_canvas(ar, mp):
     return round(w0 / 32) * 32, round(h0 / 32) * 32
 
 
+def _describe_canvas(w, h):
+    """宽高 -> 反解的画幅档位文案（如 "9:16 @ 0.5MP"）；命中不了写"非标准档位"。
+
+    与 `_resolve_canvas` 严格互逆（同一张 _AR_RATIO × 0.1–2.0MP + 0.98 档位表）。
+    存在的理由：存档里只存 width/height 两个数字，而画布侧是「宽高比 / 百万像素 /
+    宽 / 高」四个控件 —— 报错只有两个数字时根本看不出**谁在生效**（"我把百万像素
+    改成 0.5 了怎么还是报错"就是这么来的）。诊断行与报错提示都走这一个函数。
+    """
+    try:
+        w, h = int(w), int(h)
+    except (TypeError, ValueError):
+        return "无法反解（存档没记宽高）"
+    for ar in _AR_RATIO:
+        for mp in _MP_OPTIONS + [0.98]:
+            try:
+                if _resolve_canvas(ar, mp) == (w, h):
+                    return f"{ar} @ {mp:g}MP"
+            except Exception:
+                continue
+    return "非标准档位（自定义画幅 / 手工填的宽高）"
+
+
 def _snap_seconds(seconds):
     """秒 -> 就近的 17k+5 帧网格（@24fps，≥5 帧）。5.0s→124，与旧默认帧数一致。"""
     f = max(5, int(round(float(seconds) * 24)))
@@ -1652,6 +1674,23 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if str(宽高比) != "自定义":
             宽度, 高度 = _resolve_canvas(宽高比, 百万像素)
         width, height, seed = int(宽度), int(高度), int(种子)
+        # ---- 画布自检（诊断，2026-09-25）----
+        # 四个控件（宽高比 / 百万像素 / 宽 / 高）的实际生效关系必须留痕：
+        #   · 宽高比 ≠ 自定义 → 宽/高 控件**被换算覆盖**，改「百万像素」才有用；
+        #   · 宽高比 = 自定义 → 宽/高 直接生效，「百万像素」**完全不参与**。
+        # 报错信息里只有两个数字，看不出是谁在生效（"改成 0.5 也没用"正是这个），
+        # 所以这行放在**任何重活（模型/分块/自测）之前**打印，卡在哪都能看到它。
+        _ar_s = str(宽高比)
+        if _ar_s != "自定义":
+            _canvas_src = (f"由「宽高比 {_ar_s} × 百万像素 {float(百万像素):g}MP」换算"
+                           f"（宽/高 控件 {int(宽度)}×{int(高度)} 本次被覆盖，改它们不生效）")
+        else:
+            _canvas_src = (f"宽高比=自定义 → 直接用「宽度 {宽度} × 高度 {高度}」"
+                           f"（百万像素 {float(百万像素):g} 不参与，改它不生效）")
+        _canvas_line = (f"画布 {width}×{height} · {_canvas_src} · "
+                        f"反解 {_describe_canvas(width, height)}"
+                        f" · 存档目录「{str(存档目录).strip() or '(空=按参数指纹自动命名)'}」")
+        print(f"[H3画布] {_canvas_line}", flush=True)
         length = _snap_seconds(每段时长)
         seg_lengths = [length if s is None else s for s in seg_secs]
         # 末段尾帧锚：官方 L2VA 句式（逐字照抄 h3-dialect.md §1.2）。
@@ -2114,19 +2153,42 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _ff_min = int(_pf.get("ff_chunk_min_tokens") or 0)
         if _ff_tokens > 0:
             try:
+                _ff_st = {}
                 _ff_n, _ff_why = upscale.install_ff_chunking(模型, _ff_tokens,
-                                                             min_tokens=_ff_min)
+                                                             min_tokens=_ff_min,
+                                                             stats=_ff_st)
+                # 观测行（2026-09-25 加）：这个开关曾经能把"模型加载"拖到分钟级
+                # 甚至看起来永远不结束 —— 根因是自测拿 4097 行输入在 CPU 上跑
+                # fp16 前向（详见 upscale._FF_SELFCHECK_ROWS_CAP 上方注释）。
+                # 现在自测封顶 8 行 + 结构签名去重，这行把「测了几次/多少行/
+                # 权重在哪个设备/花了多久」全部留痕，别再靠猜。
+                print(f"[H3分块] FFN 自测 {_ff_st.get('tests', 0)} 次"
+                      f"（结构签名去重，命中缓存 {_ff_st.get('cache_hits', 0)}）"
+                      f" · 输入 {_ff_st.get('rows', '-')} 行/本地切 {_ff_st.get('test_ct', '-')}"
+                      f" · 权重 {_ff_st.get('device', '-')}/{_ff_st.get('dtype', '-')}"
+                      f" · 自测 {_ff_st.get('test_secs', 0.0):.2f}s"
+                      f" · 安装 {_ff_st.get('install_secs', 0.0):.2f}s"
+                      f" · 候选 {_ff_st.get('candidates', 0)} 装 {_ff_n}"
+                      f" 跳 {_ff_st.get('skipped', 0)}", flush=True)
+                _ff_cost = (f"，自测 {_ff_st.get('tests', 0)} 次/"
+                            f"{_ff_st.get('test_secs', 0.0):.2f}s"
+                            f"（{_ff_st.get('rows', '-')} 行输入·签名去重）")
                 if _ff_n:
                     report.append(f"性能：FFN 分块已启用（{_ff_n} 个 Linear，"
-                                  f"每块 {_ff_tokens} token · 数学等价，画质零损失）"
+                                  f"每块 {_ff_tokens} token · 数学等价，画质零损失{_ff_cost}）"
                                   + (f"；{_ff_why}" if _ff_why else ""))
                 elif _ff_why:
                     report.append(f"性能：FFN 分块未启用（{_ff_why}）")
                 if 二采模型 is not None and _up_model is not 模型:
+                    _ff_st2 = {}
                     _ff_n2, _ = upscale.install_ff_chunking(_up_model, _ff_tokens,
-                                                            min_tokens=_ff_min)
+                                                            min_tokens=_ff_min,
+                                                            stats=_ff_st2)
                     if _ff_n2:
                         report.append(f"性能：二采模型同样装上 FFN 分块（{_ff_n2} 个 Linear）")
+                    print(f"[H3分块] 二采模型：候选 {_ff_st2.get('candidates', 0)}"
+                          f" 装 {_ff_n2} 跳 {_ff_st2.get('skipped', 0)}"
+                          f" · 自测 {_ff_st2.get('test_secs', 0.0):.2f}s", flush=True)
             except Exception:
                 pass
         # 注意力头分块（attn_head_on + attn_head_chunks）：把 attention 按 head 分组
@@ -2407,7 +2469,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if manifest.get("schema") != checkpoint.SCHEMA:
                     raise ValueError(f"存档目录格式不认识（{manifest.get('schema')}），请换一个目录名；"
                                      "旧版 v1 存档不兼容本版本，请清空旧目录或换新名字")
-                _pnotes = checkpoint.assert_match(manifest["params"], ckpt_params)
+                _old_p = manifest.get("params") or {}
+                _hint = (f"本次画布 {width}×{height}（{_canvas_src}；"
+                         f"反解 {_describe_canvas(width, height)}）"
+                         f" ≠ 存档 {_old_p.get('width')}×{_old_p.get('height')}"
+                         f"（反解 {_describe_canvas(_old_p.get('width'), _old_p.get('height'))}）")
+                _pnotes = checkpoint.assert_match(manifest["params"], ckpt_params,
+                                                 hint=_hint)
                 if _pnotes:
                     report.append("参数已变更（" + "；".join(_pnotes) + "）——"
                                   "仅影响此后新生成的段；已有段是盘上张量、与采样参数无耦合，"

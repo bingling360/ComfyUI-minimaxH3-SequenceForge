@@ -243,7 +243,7 @@ def load_manifest(root: str):
         return json.load(f)
 
 
-def assert_match(old: dict, new: dict):
+def assert_match(old: dict, new: dict, hint: str = ""):
     """只校验**分辨率**（唯一硬约束）；其余参数变更只回报，不报错、不触发重做。
 
     为什么只有分辨率是硬约束：`PackedLayout` 按行预留，C/H/W 不同则桥拼不上，
@@ -254,6 +254,11 @@ def assert_match(old: dict, new: dict):
 
     佐证：模型权重根本不在 params 里——换模型连检测都没有，而它对画风影响最大。
 
+    `hint`：可选补充说明（调用方拼好的"本次画布四个控件谁在生效"），只在抛错时
+    附在末尾。分辨率不一致的**最常见**成因不是"用户改错了宽高"，而是**改错了控件**
+    ——画布侧是「宽高比/百万像素/宽/高」四件：非自定义时改宽高无效，自定义时改
+    百万像素无效。报错里只有两个数字时，用户会一直改那个不生效的控件。
+
     返回：变了但不影响已有段的参数说明列表（调用方写进报告），无变化返回 []。
     分辨率不一致直接抛 ValueError（这是硬约束）。
     """
@@ -263,7 +268,8 @@ def assert_match(old: dict, new: dict):
             raise ValueError(
                 f"存档分辨率与当前不一致（{key}: 存档={old.get(key)!r} 当前={new[key]!r}）。"
                 "分辨率是唯一硬约束——C/H/W 不同则 latent 桥拼不上，链无法延续。"
-                "请把分辨率改回存档值，或换个新存档目录开新链")
+                "请把分辨率改回存档值，或换个新存档目录开新链"
+                + (f"\n{hint}" if hint else ""))
     return [f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}"
             for k in new if old.get(k, new[k]) != new[k]]
 

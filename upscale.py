@@ -2478,30 +2478,93 @@ def install_low_vram_attention(model, head_chunks, targets=None):
     return installed, ""
 
 
-def _ff_chunk_selfcheck(sub, orig, chunk_tokens):
+# ---- FFN 分块自测：极小输入 + 结构签名缓存 ----
+#
+# ⚠ 2026-09-25 修「开了 FFN 分块就"模型加载不动"」的真因（不是加载，是自测）：
+# 旧实现按 `rows = chunk_tokens + 1` 造输入（默认 4096 → **4097 行**），
+# `device=w.device` —— 而 DynamicVRAM / 卸载态下 `sub.weight` 就在 **CPU** 上
+# （`comfy/ops.py:337 cast_bias_weight` 按 `device = input.device` 决定算在哪；
+# ops.py:358 那条 "vbar doesn't support CPU weights" 分支更会先 materialize
+# 再把整块权重拷到 CPU 上算）。H3 是 hidden=5376 / ffn=14336：fc1 5376→28672、
+# fc2 14336→5376，fp16 权重 308MB / 154MB，52 块 × 2 = **104 个 Linear**。
+# 本机实测（torch 2.14.0+cpu，8 线程，4097 行）：
+#     单块 MLP 一次 CPU fp16 前向 57.4s · 自测要跑两遍 → 52 块 ≈ **100 分钟**
+#     bf16 更慢（76.0s/次 → ≈132 分钟）；fp32 也要 8.0s/次 → ≈14 分钟
+# 也就是说：**采样一行都还没跑，先在自测里把 24GB 的 FFN 权重按模块在 CPU 上过一遍**，
+# 表现就是"加载特别久 / 根本加载不动"，而且日志停在模型加载之后、什么都不说。
+#
+# 等价性与 chunk 大小、与序列长度**都无关**（要证的只是"这个 forward 里有没有
+# 跨 token 操作"），所以：① 输入行数封顶 `_FF_SELFCHECK_ROWS_CAP`（8 行，
+# 本地 chunk=4 → 真的切成两块，跨 token 操作照样暴露）；② 同一**结构签名**
+# 只测一次（进程内缓存）—— H3 全部 104 个 Linear 归并成 2 个签名（fc1 / fc2）。
+# 实测：分钟级 × 52 → **亚秒级**。
+_FF_SELFCHECK_ROWS_CAP = 8
+_FF_SELFCHECK_CACHE = {}
+
+
+def _ff_selfcheck_signature(sub):
+    """结构签名：决定"逐行可分离"的只有这些 —— 形状/设备/dtype 都不影响结论。
+
+    带上 forward 的**函数对象**：第三方补丁若替换过某个模块的 forward，它会单独
+    成一个签名、单独受测，不会蹭别人的结论。不可哈希时退化成 repr（保守：不缓存）。
+    """
+    fwd = getattr(sub, "forward", None)
+    fwd = getattr(fwd, "__func__", fwd)
+    try:
+        hash(fwd)
+    except TypeError:
+        fwd = repr(fwd)
+    return (type(sub).__module__, type(sub).__qualname__, fwd,
+            getattr(sub, "in_features", None), getattr(sub, "out_features", None),
+            getattr(sub, "bias", None) is not None)
+
+
+def _ff_chunk_selfcheck(sub, orig, chunk_tokens, stats=None):
     """分块前后是否**逐位一致**（装之前必须自测，不通过就别装）。
 
-    `nn.Linear` 沿行（token）可分离是**数学事实**，但 `fc1` / `fc2` 上可能挂着
-    bypass adapter（HyperFlow 的 `F.linear(F.linear(x, down), up)`）、
-    LayerNorm、甚至第三方补丁——只要里面掺了任何**跨 token** 的操作，切块
-    就不再等价。与其赌，不如拿一份比 chunk 更大的随机输入跑一遍对比。
+    输入行数**封顶**（见上方注释）：要证明的是"forward 里有没有跨 token 操作"，
+    与 chunk 大小、序列长度无关 —— 8 行 / 本地切两块足以让任何跨 token 操作暴露，
+    却把代价从分钟级压到毫秒级。同一结构签名只算一次（进程内缓存）。
     """
+    sig = _ff_selfcheck_signature(sub)
+    if sig in _FF_SELFCHECK_CACHE:
+        if stats is not None:
+            stats["cache_hits"] = stats.get("cache_hits", 0) + 1
+        return _FF_SELFCHECK_CACHE[sig]
+    ok = _ff_chunk_selfcheck_run(sub, orig, chunk_tokens, stats)
+    _FF_SELFCHECK_CACHE[sig] = ok
+    return ok
+
+
+def _ff_chunk_selfcheck_run(sub, orig, chunk_tokens, stats=None):
     try:
         w = getattr(sub, "weight", None)
         if w is None or getattr(w, "dim", lambda: 0)() < 2:
             return False
         inf = int(w.shape[1])
-        rows = max(int(chunk_tokens) + 1, 4)
+        # 行数封顶 + 本地小 chunk：保证真的走切块路径，但不做几千行的矩阵乘
+        rows = max(4, min(int(chunk_tokens) + 1, _FF_SELFCHECK_ROWS_CAP))
+        test_ct = max(1, rows // 2)
+        _t0 = time.perf_counter()
         x = torch.randn((rows, inf), device=w.device, dtype=w.dtype)
         a = orig(x)
         if not torch.is_tensor(a):
             return False
-        parts = [orig(x[s:e]) for s, e in perf.plan_ff_chunks(rows, chunk_tokens)]
+        parts = [orig(x[s:e]) for s, e in perf.plan_ff_chunks(rows, test_ct)]
         b = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
         if a.shape != b.shape:
             return False
-        return bool(torch.allclose(a.detach().float(), b.detach().float(),
-                                   atol=1e-4, rtol=1e-3))
+        ok = bool(torch.allclose(a.detach().float(), b.detach().float(),
+                                 atol=1e-4, rtol=1e-3))
+        if stats is not None:
+            stats["tests"] = stats.get("tests", 0) + 1
+            stats["test_secs"] = round(stats.get("test_secs", 0.0)
+                                       + (time.perf_counter() - _t0), 3)
+            stats["rows"] = rows
+            stats["test_ct"] = test_ct
+            stats["device"] = str(w.device)
+            stats["dtype"] = str(w.dtype)
+        return ok
     except Exception:
         return False
 
@@ -2572,8 +2635,13 @@ def install_block_prefetch(model, on):
     return 1, "官方块级预取已关闭（每块用到才换，少占一块显存、更慢）"
 
 
-def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=0):
+def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=0,
+                        stats=None):
     """给 FFN 的 `fc1`/`fc2` 装 token 分块。返回 (安装数, 跳过原因)。
+
+    `stats`：可选 dict，回填自测/安装的**观测**（候选数 / 装了几个 / 跳了几个 /
+    自测跑了几次 / 命中缓存几次 / 自测与安装耗时 / 输入行数 / 权重所在设备与 dtype）。
+    调用方据此打一行诊断日志 —— 没有观测的"性能开关"只能靠猜。
 
     为什么它能救 OOM：主干 OOM 实测崩在 FFN 里 —— `F.linear(F.linear(x, down), up)`
     **单次请求 6.13GB**（D2，占 24GB 卡的 26%）。`nn.Linear` 沿 token（行）
@@ -2582,7 +2650,9 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=
 
     ⚠ 三道保险，缺一不可：
       1. **装前自测**（`_ff_chunk_selfcheck`）：不一致就整段不装，宁可这次
-         不生效，也不能悄悄改输出；
+         不生效，也不能悄悄改输出。**输入封顶 8 行 + 结构签名去重**——
+         旧版按 chunk+1 行（默认 4097）造输入，在 CPU 上跑 fp16 前向要
+         57s/块 × 52 块 ≈ 100 分钟，看着就像"模型加载不动"（见上方注释）；
       2. **默认关**（`ff_chunk_tokens=0`）：只有用户显式开才装；
       3. **短序列直通**（`min_tokens`）：序列 token 数低于此值就整段走原路径 ——
          切块只增加 kernel 启动开销、省不了多少显存。对齐 KJNodes 的 seq_threshold 语义。
@@ -2593,8 +2663,12 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=
     try:
         ct = int(chunk_tokens or 0)
     except (TypeError, ValueError):
+        if stats is not None:
+            stats["reason"] = "ff_chunk_tokens 不是整数"
         return 0, "ff_chunk_tokens 不是整数"
     if ct <= 0:
+        if stats is not None:
+            stats["reason"] = "开关关着（tokens<=0）"
         return 0, ""
     try:
         mt = int(min_tokens or 0)
@@ -2611,19 +2685,26 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=
         except Exception:
             continue
     if diff is None:
+        if stats is not None:
+            stats["reason"] = "取不到 diffusion_model"
         return 0, "取不到 diffusion_model"
+    _t0 = time.perf_counter()
     n = 0
     skipped = 0
+    seen = 0
+    already = 0
     for m in diff.modules():
         for name in targets:
             sub = getattr(m, name, None)
             if sub is None or not hasattr(sub, "forward"):
                 continue
+            seen += 1
             if getattr(sub, "_h3_ff_chunk", 0) == ct:
                 n += 1
+                already += 1
                 continue
             orig = sub.forward
-            if not _ff_chunk_selfcheck(sub, orig, ct):
+            if not _ff_chunk_selfcheck(sub, orig, ct, stats=stats):
                 # 自测不过就跳过**这一个**，不提前 return：别的模块可能是干净的。
                 # 半装本身不破坏正确性（每个装上的都自测过、彼此等价），
                 # 但报告必须说清「装了几个 / 跳了几个」，别让用户以为全没生效。
@@ -2653,6 +2734,10 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=
             except Exception:
                 pass
             n += 1
+    if stats is not None:
+        stats.update({"candidates": seen, "installed": n, "skipped": skipped,
+                      "already": already,
+                      "install_secs": round(time.perf_counter() - _t0, 3)})
     if skipped and not n:
         return 0, (f"{skipped} 个 Linear 分块自测全部不通过（模块里含跨 token 操作，"
                    "不是纯逐行 FFN）——本次不装，输出保持原样")

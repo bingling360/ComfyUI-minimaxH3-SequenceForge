@@ -274,13 +274,23 @@ function segmentFrames(node, seg) {
     return snapFrames(segmentSeconds(node, seg));
 }
 
-/** 宽高比+百万像素 -> 显示徽章文案；自定义/非法返回 null */
+/** 宽高比+百万像素 -> 显示徽章文案；无法判断返回 null。
+ *
+ * 「自定义」也要出徽章（2026-09-25）：此模式下「百万像素」**完全不参与**换算、
+ * 直接吃「宽度/高度」两个控件 —— 以前这里返回 null（自定义就没有徽章），于是
+ * "我把百万像素改成 0.5 了怎么还报分辨率不一致"在界面上**完全看不出来**。
+ * 反过来非自定义时「宽度/高度」被换算覆盖，也要说清（改它们不生效）。 */
 function canvasBadgeText(node) {
     const ar = String(getWidgetValue(node, W_AR) ?? "");
-    if (!AR_RATIO[ar]) return null;
+    if (!AR_RATIO[ar]) {
+        const w = Number(getWidgetValue(node, W_WIDTH));
+        const h = Number(getWidgetValue(node, W_HEIGHT));
+        if (!Number.isFinite(w) || !Number.isFinite(h) || !w || !h) return null;
+        return `自定义画幅 ${w}×${h}（百万像素不参与，改它无效）`;
+    }
     const mp = String(getWidgetValue(node, W_MP) ?? "0.5");
     const c = resolveCanvas(ar, mp);
-    return c ? `${ar} · ${mp}MP → ${c[0]}×${c[1]}` : null;
+    return c ? `${ar} · ${mp}MP → ${c[0]}×${c[1]}（宽/高 控件被覆盖，改它们无效）` : null;
 }
 
 /** 反推：宽高完全命中某 AR×MP 组合则返回 [ar, mp]，否则 null（旧工作流迁移用）。
@@ -8613,13 +8623,17 @@ function renderParamsZone(sec, data) {
         }
         bgrid.append(renderWidgetField(node, name, PARAM_LABELS[name]));
     }
-    if (AR_RATIO[ar]) {
-        const badgeTxt = canvasBadgeText(node);
-        if (badgeTxt) {
-            const b = el("div", "h3d-convbadge", `${escapeHtml(badgeTxt)} · 32倍数对齐`);
-            b.title = "官方 Resolution Selector 同款换算：1MP=1024×1024，两侧各自 round 对齐 32 倍数";
-            bgrid.append(b);
-        }
+    /* 徽章：自定义画幅也要显示（说清「百万像素不参与」），见 canvasBadgeText 注释 */
+    const badgeTxt = canvasBadgeText(node);
+    if (badgeTxt) {
+        const isCustom = !AR_RATIO[ar];
+        const b = el("div", "h3d-convbadge",
+            isCustom ? escapeHtml(badgeTxt) : `${escapeHtml(badgeTxt)} · 32倍数对齐`);
+        b.title = isCustom
+            ? "宽高比=自定义：本次画幅直接用「宽度/高度」两个控件，「百万像素」不参与换算"
+            : "官方 Resolution Selector 同款换算：1MP=1024×1024，两侧各自 round 对齐 32 倍数；"
+              + "此模式下「宽度/高度」控件被换算覆盖，改它们不生效";
+        bgrid.append(b);
     }
     basic.append(bgrid);
     sec.append(basic);

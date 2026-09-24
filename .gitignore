@@ -8,6 +8,12 @@
 *.pth
 *.pt
 
+# 例外：语义桥权重 models/*.safetensors —— 仅 22MB，远低于 100MB 限制，**要随插件分发**。
+# 导演台右栏「语义桥」的下拉靠扫这个目录，tests/test_semantic_bridge.py 也要求能扫到；
+# 不放行的话用户装了插件也只会看到「权重不存在」。只放开 models/ 直属一层，
+# 别处（尤其二采放大权重）仍按上面的规则全部忽略。
+!models/*.safetensors
+
 # 项目工作数据（AI 助手本地记忆，不属于插件本体）
 .workbuddy/
 .workbuddy-ai/

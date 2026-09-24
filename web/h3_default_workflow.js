@@ -15,6 +15,11 @@
  *   它们均无执行入口（非 OUTPUT_NODE）且全部前端代码零引用，属资产库时代残留。
  * - 注意：本文件由导出 JSON 直接转换，widget 顺序须与 nodes.py define_schema 严格一致
  *   （已校验 31 项）。如需改默认参数，改导出 JSON 后重新生成，勿手工编辑此数组。
+ * - 2026-09-24：导演台参数按用户导出（默认工作流3.json）更新——百万像素 0.4→1、
+ *   审片模式 关闭→逐段确认、导演台状态换成新 schema（二采 scale 1.4 / size_mode 倍率 /
+ *   target 1280×704 / denoise 0.2 / steps 4 / device auto，语义桥开启 alpha 0.15 scope all）。
+ *   「存档目录」保持空（空 = 按画布参数指纹自动命名项目）。本次只动这一处控件数组，
+ *   节点输入/输出槽与连线一律未动（与 nodes.py schema、冻结测试保持一致）。
  */
 window.H3_DEFAULT_WORKFLOW = {
   "id": "h3-chain-director-default",
@@ -282,7 +287,7 @@ window.H3_DEFAULT_WORKFLOW = {
       },
       "widgets_values": [
         "16:9",
-        0.4,
+        1,
         864,
         480,
         5,
@@ -299,7 +304,7 @@ window.H3_DEFAULT_WORKFLOW = {
         30,
         34,
         0,
-        "关闭",
+        "逐段确认",
         "分段",
         0,
         "关闭",
@@ -308,7 +313,7 @@ window.H3_DEFAULT_WORKFLOW = {
         "关闭",
         "文生视频",
         "开启",
-        "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"unlink\":false,\"disabled\":false,\"frame_refs\":null}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"3D\",\"scale\":1.5,\"denoise\":0.35,\"steps\":3,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0.03,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"encode\":\"高清\",\"sampler\":\"\",\"scheduler\":\"\",\"retry\":false,\"retry_target\":0.15,\"include\":[]}}",
+        "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"unlink\":false,\"disabled\":false,\"frame_refs\":null}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"3D\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.2,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0.05,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"\",\"scheduler\":\"\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":null,\"opt_hist\":null}",
         "match",
         1.0
       ]

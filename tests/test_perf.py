@@ -956,7 +956,7 @@ def test_chunk_param_defaults_are_sane():
     d = perf.DEFAULT_PERF
     assert d["ff_chunk_tokens"] == 4096          # 建议起点（计划实测值）
     assert d["ff_chunk_min_tokens"] == 8192      # 对齐 KJ seq_threshold 语义
-    assert d["attn_head_chunks"] == 1            # 1 = 不分块
+    assert d["attn_head_chunks"] == 8            # 建议起点（实测平台期起点；1 = 不分块）
     assert d["upscale_chunk_frames"] == 32       # 上游同款默认
     assert d["upscale_overlap"] == 0             # 0 = 自动取卷积核宽（只增不减）
     assert d["refine_temporal_overlap"] == 8     # 至少 8 latent token

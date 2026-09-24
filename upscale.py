@@ -2275,26 +2275,50 @@ def _attn_forward_reference(attn, x, rope_freqs, transformer_options=None):
 def _attn_forward_chunked(attn, x, rope_freqs, n_chunks, transformer_options=None):
     """按 head 分组逐组算 attention —— **head 之间独立，结果精确无损**。
 
-    为什么能省显存：kernel 内部那些随 head 数增长的临时量（int8 q/k 副本、
-    fp32 累加器）按组数缩小；同时这里比上游多释放两处内存：
-      1. qkv GEMM 之后**立刻**丢掉输入 x（normed hidden，S×hidden 的大头）
-      2. out_proj 分配输出**之前**丢掉融合的 (S, 3*inner) qkv buffer
-    这两处才是它真正省显存的地方，分组本身是次要的。
+    ★ 省显存到底靠什么（2026-09-24 实测订正，见下）：
+
+      · 分组本身**确实有效**，且随组数单调下降：真 int8 kitchen 内核的区间增量
+        0.192GB（整段）→ 0.048GB（4 组）→ 0.024GB（8 组），严格按 1/n 缩。
+      · 但**输出缓冲的收法**决定了这份收益能留下多少。早先的实现预先
+        `torch.empty((s, inner))` 一整块再逐组写回，于是两件事同时发生：
+          ① 这一整块**在循环开始前就分配**（峰值提前到进 kernel 之前）；
+          ② 为了往固定地址写，q/k/v 三份视图必须**活到循环结束**。
+        两项加起来 ≈「一整份 inner」，与分组省下的量级相当 → 净收益被吃掉大半
+        （n=8 时只留下 22.7%，改 cat 后 25.7%）。
+      · 现在改成**逐组收集 + 一次 torch.cat**：小份随用随放，只在最后一次拷贝时
+        短暂出现「小份 + 结果」双份。n≥4 时净赚（n=2 时双份 = 168MB > 112MB，
+        反而退步，故 n<4 回退到预分配写法）。
+      · ⚠ 历史注释里那句「qkv GEMM 之后立刻丢掉输入 x（normed hidden）」在本项目
+        **不成立**（2026-09-24 弱引用实证）：上游 `DiTBlock.forward` 里那个张量是
+        具名局部 `h`、`RefinerBlock` 里是调用方求值栈，两者在 attn 返回前都持有它
+        → 这里的 `del x` 只删掉本地名字，**不释放任何显存**。KJ 之所以有效，是因为
+        它**同时** patch 了 `DiTBlock.forward` 把 h 包进 list、再在 attn 里 `pop()`
+        （pop 后 list 空、真释放）。本项目主动不 patch block（降跨版本风险，见本模块
+        `install_low_vram_attention` 的说明），所以下面那个 `isinstance(x, list)`
+        分支**永远收不到 list，是防御性死代码**；保留只是为了让「万一将来真的
+        patch 了 block」时这段不用再改一次。
+
+    ⚠ 输出不再是 qkv buffer 的视图（cat 出来的是新张量）：`Attention.forward` /
+    本函数的调用方只做 `.squeeze(0)` → `out_proj`，**不含原地写**，所以安全。
+    将来谁要往这条路径上加 in-place 操作，必须先回到预分配写法。
 
     移植自 KJNodes `MiniMaxLowVRAMAttention`（nodes/minimax_nodes.py:89-138）。
     ⚠ 与 KJ 的差别：KJ 走 `add_object_patch`（Model 类节点的官方机制），本项目
     是**在采样节点内部直接改 nn.Module 的方法**（与 install_ff_chunking 同风格），
     因为这里的模型是裸 nn.Module、没有 ModelPatcher 可用。
+    ⚠ KJ 那边**也是预分配写法**，带着同一个「收益被自己吃掉」的问题（2026-09-24
+    逐字复刻对比：n=2/4/8 峰值与旧实现分毫不差）；这里改成 cat 是本项目的改进，
+    不是抄错后的修补。
     """
     from comfy.ldm.modules.attention import optimized_attention
-    if isinstance(x, list):
+    if isinstance(x, list):          # 见 docstring：本项目不该走到这里（防御性）
         x = x.pop()
     s = x.shape[0]
     heads = attn.heads
     head_dim = attn.head_dim
     n = min(int(n_chunks), heads)
     q, k, v = attn.qkv_proj(x).split(heads * head_dim, dim=-1)
-    del x                                   # ← 释放①：normed hidden 用完即丢
+    del x
     v = v.view(s, heads, head_dim)
     if rope_freqs is not None:
         import comfy.model_management as _mm
@@ -2320,17 +2344,38 @@ def _attn_forward_chunked(attn, x, rope_freqs, n_chunks, transformer_options=Non
     v = v.transpose(0, 1).unsqueeze(0)
     # 分组大小：前 heads%n 组各多 1 个 head（尽量均分，别全挤在最后一组）
     sizes = [heads // n + (1 if i < heads % n else 0) for i in range(n)]
-    out = torch.empty((s, heads * head_dim), dtype=q.dtype, device=q.device)
+    if n < 4:
+        # n<4 时双份（各组和 + cat 结果）比一整块预分配更费 —— 实测 S=8192：
+        # n=2 预分配 0.906GB / cat 0.797GB 看似 cat 更好，但那是相对「上游整段」；
+        # 真正的判据是「峰值能否随 n 继续下降」：n=2 时 cat 的小份 = 56MB×2，
+        # 加 cat 结果 112MB = 168MB > 预分配的 112MB。故小 n 用预分配。
+        out = torch.empty((s, heads * head_dim), dtype=q.dtype, device=q.device)
+        hs = 0
+        for size in sizes:
+            he = hs + size
+            o = optimized_attention(q[:, hs:he], k[:, hs:he], v[:, hs:he], size,
+                                    mask=None, skip_reshape=True,
+                                    transformer_options=transformer_options or {})
+            out[:, hs * head_dim:he * head_dim] = o.squeeze(0).to(out.dtype)
+            hs = he
+        del q, k, v
+        return attn.out_proj(out)
+    # n>=4：逐组收集 + 一次 cat。小份随用随放，峰值不再被「循环前预分配的一整块」钉住。
+    # ⚠ kernel 返回 [1, S, H*D]（带 batch 维，skip_reshape=True 口径），cat 前必须自己
+    #    squeeze(0) —— 预分配分支是靠赋值进 out[:, ...] 时显式 squeeze 的，cat 分支没有
+    #    那个赋值动作，漏 squeeze 就会比整段算多一个维度（2026-09-24 被 checker 抓到）。
+    outs = []
     hs = 0
     for size in sizes:
         he = hs + size
-        o = optimized_attention(q[:, hs:he], k[:, hs:he], v[:, hs:he], size,
-                                mask=None, skip_reshape=True,
-                                transformer_options=transformer_options or {})
-        out[:, hs * head_dim:he * head_dim] = o.squeeze(0).to(out.dtype)
+        outs.append(optimized_attention(q[:, hs:he], k[:, hs:he], v[:, hs:he], size,
+                                        mask=None, skip_reshape=True,
+                                        transformer_options=transformer_options or {}).squeeze(0))
         hs = he
     del q, k, v
-    return attn.out_proj(out)               # ← 释放②：out_proj 分配前 qkv 已丢
+    out = torch.cat(outs, dim=-1)
+    del outs
+    return attn.out_proj(out)
 
 
 def install_low_vram_attention(model, head_chunks, targets=None):

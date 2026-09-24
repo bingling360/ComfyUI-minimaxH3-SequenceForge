@@ -121,7 +121,7 @@ DEFAULT_PERF = {
     "ff_chunk_tokens": 4096,          # 每块 token 数（数学等价，零画质损失）
     "ff_chunk_min_tokens": 8192,      # 序列 token 低于此值不切（对齐 KJ seq_threshold 语义）
     "attn_head_on": False,            # 注意力头分块总开关
-    "attn_head_chunks": 1,            # 注意力头分几组（1=关）；精确无损
+    "attn_head_chunks": 8,            # 注意力头分几组（1=关）；精确无损（2026-09-24 实测平台期起点）
     "attn_backend": "auto",           # auto / sdpa / sage / flash（auto = 沿用 ComfyUI 选定）
     "upscale_temporal_chunk": True,   # 放大网络 3D 时序分块（内部已实现，此前硬编码为开）
     "upscale_chunk_frames": 32,       # 放大网络每块帧数

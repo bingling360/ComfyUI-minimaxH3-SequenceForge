@@ -3954,9 +3954,10 @@ const H3_PERF_FIELDS = [
       hint: "小显存卡的主要手段之一。**head 之间独立 → 精确、无损**。装之前会自测（拿小输入跑"
           + "「分组 vs 整段」对比），不一致就不装 —— 依赖 ComfyUI 内部结构，装不上会静默跳过并保持原样，不会让渲染失败" },
     { key: "attn_head_chunks", label: "　　切成几组头", kind: "num", enable: "attn_head_on", group: "一采采样 · 注意力",
-      hint: "把注意力按 head 分组逐组算：kernel 内部的临时量（int8 q/k 副本、fp32 累加器）按组数缩小。"
-          + "同时会在 qkv 之后立刻释放 normed hidden、out_proj 之前释放融合的 qkv buffer —— "
-          + "**这两处才是它真正省显存的地方**（分组本身是次要的）。1=关，建议 4，上限 = 头数。移植自 KJNodes MiniMaxLowVRAMAttention" },
+      hint: "把注意力按 head 分组逐组算：kernel 内部的临时量（int8 q/k 副本、fp32 累加器）按组数缩小，"
+          + "融合 qkv buffer 也被拆成小组随用随放 —— **省的就是这两处**。1=关，建议 8，上限 = 头数。"
+          + "实测（S=8192，同 int8 内核）：8 组省 25.7%、耗时与整段持平，14 组只多省 1.5 个点 → 8 是平台期起点。"
+          + "数学等价（head 之间独立），装前自测不一致就不装。移植自 KJNodes MiniMaxLowVRAMAttention" },
     { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "一采采样 · 注意力",
       opts: [["auto", "跟随 ComfyUI（推荐）"], ["sdpa", "sdpa"], ["sage", "SageAttention"], ["flash", "FlashAttention"]],
       hint: "auto = 不动。Sage 在 30 系上有失败报告；环境里拿不到该后端时会保持现状而不是置空" },

@@ -44,13 +44,20 @@ def kern():
 
 
 def test_minimal_block_shape(kern):
-    """官方 subject_definitions 句式：<Picture N> 自己当主语，后接「is the ...」。"""
+    """官方标签语义分流：可复用可见内容（角色/场景/道具/风格图）归 <Subject N>，
+    整片关系归 <Video N>，音频信号归 <Audio N>。
+
+    ⛔ 不再把三类一律写成 `<Picture N> is the reference image ...`：官方 ref-en.txt
+    §2.2 规定 `<Picture N>` 只给「图片本身当某镜首帧/关键帧/末帧/构图锚」的情形，
+    而"用于定义角色/场景/服装/风格的图不单独建 picture 条目"。旧写法与帧锚编号
+    池共用 <Picture N> 序号，会让模型把角色图当成"某镜的一帧"。
+    """
     out = kern._reference_tags_minimal(
         [("image", "角色1"), ("video", "片"), ("audio", "乐")])
     assert out.splitlines() == [
-        '<Picture 1> is the reference image "角色1".',
-        '<Video 1> is the reference video "片".',
-        '<Audio 1> is the reference audio "乐".',
+        '<Subject 1> is the content shown in <Picture 1>, the source image "角色1".',
+        '<Video 1> is the source video for the target video edit, the file "片".',
+        '<Audio 1> is the reference audio signal that is reused in the target video, the file "乐".',
     ]
     # 自造赋值表（`token = 别名` / [References] 头）已废止
     assert "[References]" not in out and " = " not in out
@@ -65,8 +72,9 @@ def test_missing_tags_filled(kern):
     assert uncovered == ["片", "乐"]
     head = kern._reference_tags_minimal(
         [(k, lbl) for k, lbl in kern._normalize_order(order) if lbl in uncovered])
-    assert head.splitlines() == ['<Video 1> is the reference video "片".',
-                                 '<Audio 1> is the reference audio "乐".']
+    assert head.splitlines() == [
+        '<Video 1> is the source video for the target video edit, the file "片".',
+        '<Audio 1> is the reference audio signal that is reused in the target video, the file "乐".']
     assert "角色1" not in head  # 已覆盖的不重复声明
 
 

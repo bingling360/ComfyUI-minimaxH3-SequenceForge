@@ -792,26 +792,65 @@ def _apply_label_tokens(prompt, label_order):
 
 
 def _reference_tags_minimal(label_order):
-    """段首最小引用声明：每资源一行**官方 subject_definitions 句式**，不写散文。
+    """段首最小引用声明：按**官方标签语义**分流的最小句式（不写散文）。
 
-    官方 skill 的引用声明是「<Picture 1> is ...」这种定义句（`<Picture N>` 自己
-    就是主语，后接它是什么 / 扮演什么角色），不是 `token = 别名` 的赋值表 ——
-    赋值表是自造格式，模型只能当普通文本读。这里按官方句式补最小声明：
-    `<Picture 1> is the reference image "女主".`（类 noun 由 token 类别决定）。
+    官方 ref-en.txt §2 的四类标签语义是**互斥**的，不能一律写成 `<Picture N>`：
 
-    H3 模型硬约束：软引用必须在文本里出现 <Picture k> 等 tag，模型才会真正
-    使用对应素材（官方模板亦然）。勾选了引用但正文没写 tag 时，只补这几行声明、
-    不再自动生成英文长文；写了 tag 的段保持原样直通。
+    - `<Picture N>` 只给「图片本身当某镜的首帧 / 关键帧 / 末帧 / 构图锚点」
+      （"Use a standalone <Picture N> when the reference image itself serves as a
+      shot's first frame, keyframe, last frame, edited keyframe, or composition
+      anchor"）；
+    - 角色 / 场景 / 服装 / 风格这类**可复用可见内容**归 `<Subject N>`，且
+      "an image used only to define a character, scene, costume, or style does
+      not create a standalone picture entry" —— 图片来源写在该 subject 的定义内部；
+    - `<Video N>` 是整片剪辑 / 续接 / 时间结构来源；
+    - `<Audio N>` 是被复制或引用的音频信号。
+
+    历史写法把三类全部塞进 `<Picture 1> is the reference image "女主".` —— 语义
+    错位（角色图不是帧锚），且 `<Picture N>` 与帧锚编号池共用一套序号，正文里
+    会让模型以为它是「某镜的一帧」。现在按类别分别落到对应标签：
+    图 → `<Subject N>`（并注明其图片来源），视 → `<Video N>`，音 → `<Audio N>`。
+
+    ⚠ 句式**逐字照官方示例**（ref-en.txt 的代码块），不是自己编的散文：
+
+        `<Subject 1> is the young woman in <Picture 1>, with long dark hair, ...`
+        `<Video 1> is the source video for the target video edit.`
+        `<Audio 1> is the voice-timbre reference for <Subject 1> (S1).`
+
+    我们只有素材名（没有内容描述），所以句尾以 `the source image "名字"` 收口，
+    保官方骨架（`<Subject N> is … in <Picture k>`）不变。
+
+    H3 模型硬约束：软引用必须在文本里出现对应 tag，模型才会真正使用该素材
+    （官方模板亦然）。勾选了引用但正文没写 tag 时，只补这几行声明、不再自动
+    生成英文长文；写了 tag 的段保持原样直通。
     无 ComfyUI 可单测（纯函数，仅依赖 _normalize_order/_kind_tokens）。
     """
-    # 官方句式里 <Picture>/<Video>/<Audio> 各有一个固定的英文名词
-    noun = {"Picture": "reference image", "Video": "reference video",
-            "Audio": "reference audio"}
     mapping = _kind_tokens(_normalize_order(label_order))
     lines = []
+    # mapping 同类别内按 _kind_tokens 的编号递增，所以图 <Picture k> 的 k 与
+    # 该图在本段图池里的序号一致 —— 引用句里直接指明来源图号，避免模型猜。
+    pic_no = {}
+    n_pic = 0
     for lbl, tok in mapping.items():
-        cls = tok[1:].split(" ")[0] if tok.startswith("<") else ""
-        lines.append(f'{tok} is the {noun.get(cls, "reference asset")} "{lbl}".')
+        if tok.startswith("<Picture "):
+            n_pic += 1
+            pic_no[lbl] = n_pic
+    for lbl, tok in mapping.items():
+        kind = tok[1:].split(" ")[0].lower() if tok.startswith("<") else ""
+        if kind == "picture":
+            # 角色 / 场景 / 道具 / 风格：官方 `<Subject N> is … in <Picture k>` 句式，
+            # 图片来源写在定义内部（官方 ref-en.txt §2.1）。
+            lines.append(f'<Subject {len(lines) + 1}> is the content shown in '
+                         f'<Picture {pic_no.get(lbl, 1)}>, the source image "{lbl}".')
+        elif kind == "video":
+            # 官方 §2.3：`<Video N> is the source video for the target video edit.`
+            lines.append(f'<Video {tok[7:-1]}> is the source video for the target '
+                         f'video edit, the file "{lbl}".')
+        elif kind == "audio":
+            # 官方 §2.4：`<Audio N> is the voice-timbre reference for <Subject N> (Sx).`
+            # 我们不知道它配给谁，退到官方另一种写法（被复制/参考的音频信号）。
+            lines.append(f'<Audio {tok[7:-1]}> is the reference audio signal that is '
+                         f'reused in the target video, the file "{lbl}".')
     return "\n".join(lines)
 
 

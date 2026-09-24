@@ -18,6 +18,11 @@
  *   弹窗的 encode_profile 管，节点上留一份是「一张表两处入口」，两处会打架）。
  *   于是当前布局 31 → 30 值，老 31 值存档需要 `splice(28, 1)` 摘掉那一格。
  *
+ * 2026-09-24：默认工作流的**导演台参数**按用户导出更新（百万像素 0.4→1、
+ *   审片模式 关闭→逐段确认、导演台状态换新 schema + 语义桥开启）。下面
+ *   「关键位语义仍对齐」逐位写的就是**自带默认工作流自己的值**——它是串位探测器，
+ *   所以以后**每次改默认工作流参数，这里对应的那几行必须同步改**，不许删。
+ *
  * 用法：node tests/js/widget_layout_migrate_check.js
  *      （pytest 侧由 tests/test_js_checks.py 统一收集）
  */
@@ -71,14 +76,14 @@ t("迁移后关键位语义仍对齐（任何一位串位都会红）", () => {
     const graph = clone(w.H3_DEFAULT_WORKFLOW);
     w.migrateGraphWidgets(graph);
     const wv = samplerOf(graph).widgets_values;
-    assert.strictEqual(wv[1], 0.4, "百万像素");
+    assert.strictEqual(wv[1], 1, "百万像素");
     assert.strictEqual(wv[2], 864, "宽度");
     assert.strictEqual(wv[8], 20, "步数");
     assert.strictEqual(wv[9], 1, "CFG");
     assert.strictEqual(wv[10], "res_multistep", "采样器");
     assert.strictEqual(wv[16], 34, "回退上限");
     assert.strictEqual(wv[17], 0, "锚定加噪");
-    assert.strictEqual(wv[18], "关闭", "审片模式");
+    assert.strictEqual(wv[18], "逐段确认", "审片模式");
     assert.strictEqual(wv[21], "关闭", "接缝重摇");
     assert.strictEqual(wv[22], 0.06, "重摇阈值");
     assert.strictEqual(wv[23], 1, "重摇上限");

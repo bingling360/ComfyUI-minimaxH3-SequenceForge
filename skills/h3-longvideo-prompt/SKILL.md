@@ -10,26 +10,28 @@ description: 把用户的一段话写成**多段长视频**的完整提示词—
 ## 交付物长什么样
 
 ```
-【段1】
-时长：10
-独立镜头：否
+[Segment 1]
+Duration: 10
+Standalone: no
 
-提示词：
-integrated_multimodal_description: [Shot 1] …（官方格式正文）
+Prompt:
+integrated_multimodal_description: [Shot 1] …（官方格式正文，英文）
 
 overall_soundscape: …
 
 non_diegetic_music: N/A
 
-【段2】
-时长：10
-独立镜头：否
+[Segment 2]
+Duration: 10
+Standalone: no
 
-提示词：
+Prompt:
 …
 
-【完】
+[END]
 ```
+
+**段头与段级标签一律英文**（`[Segment N]` / `Duration:` / `Standalone:` / `Prompt:` / `[END]`）。正文也是英文，只有 `<d>[语言] …</d>` 里的对白 / 歌词保原语言。解析器仍能读中文旧标签，但你**不许产出**——中英混排正文会出严重问题。
 
 ## 五步流程（按顺序，不许跳步）
 
@@ -37,16 +39,29 @@ non_diegetic_music: N/A
 |---|---|---|
 | 0 | **先解决参考图**（必须和第 1 步一起问） | `references/05-reference-images.md` |
 | 1 | 提问，把需求问清 | `references/01-interview.md` |
-| 2 | 逐段扩写剧本（中文，只管内容） | `references/02-expand.md` |
-| 3 | 逐段压成 H3 官方格式 | `references/03-optimize.md` + `references/06-rules/` |
-| 4 | 拼成多段文本（段头 + 三个段级标签） | `references/04-master-format.md` |
+| 2 | 逐段扩写剧本（只管内容，**不设创作上限**） | `references/02-expand.md` |
+| 3 | 逐段压成 H3 官方格式（英文） | `references/03-optimize.md` + `references/06-rules/` |
+| 4 | 拼成多段文本（段头 + 三个英文段级标签） | `references/04-master-format.md` |
 | 5 | 自检后交付 | `references/07-checklist.md` |
+
+## 两条环境、两条起手式
+
+- **线上 agent**（在对话里服务用户）：**先问清需求，再在需求基础上自由发挥**。第 1 步一次问完；拿到答复后不要自我审查，把内容往满里写。
+- **本地**（挂在导演台上跑）：**直接自由发挥**，不需要先确认。
 
 ## 三条铁律
 
-1. **不改用户的东西**：用户点名的人物、关键道具、原话台词（一字不改）、结局走向，全部不动。
-2. **段与段必须连得上**：默认 `独立镜头：否`，此时下一段必须承接上一段的**动作、位置、情绪、光线、时间**（上段结尾她刚推开门，下段就只能从门里开始，不能凭空站在街上）。只有跳转 / 闪回 / 蒙太奇才写 `独立镜头：是`。
+1. **不改用户点名要保的东西**：用户点名的人物、关键道具、原话台词（一字不改）、结局走向。这是**唯一**的创作约束。
+2. **段与段必须连得上**：默认 `Standalone: no`，此时下一段必须承接上一段的**动作、位置、情绪、光线、时间**（上段结尾她刚推开门，下段就只能从门里开始，不能凭空站在街上）。只有跳转 / 闪回 / 蒙太奇才写 `Standalone: yes`。
 3. **每段正文长度必须配得上它的时长**：太长会超时截断，太短会原地拖沓。量化表见 `02-expand.md`（扩写）与 `03-optimize.md`（成品）。
+
+## 与官方 skill 的关系（**只有三处不同**）
+
+除下面三处，其余格式一律**对齐官方** `h3-prompt-writing`，逐字照抄不许自创：
+
+1. **素材引用用 `@素材名`**（后端会压成官方 `<Subject N>` 等标签）。
+2. **混合模式（FL2VA）的首尾帧对齐方式**——锚点由锚定设置挂，不写进正文。
+3. **总提示词框的分段格式**（`[Segment N]` + `Duration` / `Standalone` / `Prompt`）——这是 SequenceForge 的框语法，官方没有。
 
 ## 分步交付（重要）
 
@@ -64,6 +79,6 @@ non_diegetic_music: N/A
 - `references/03-optimize.md` —— 官方格式压写（字段集 / 分流 / 禁令 / 字数）
 - `references/04-master-format.md` —— 总提示词框语法（段头 / 三标签 / 陷阱）
 - `references/05-reference-images.md` —— 参考图全流程（有无两条分支）
-- `references/06-rules/` —— 六份撰写规则原文（按模式选用，逐字遵守）
+- `references/06-rules/` —— 两份官方英文规则原文（按模式选用，逐字遵守）
 - `references/07-checklist.md` —— 交付前自检清单
 - `references/08-example.md` —— 一份完整的两段范例（**动手写之前先看它**）

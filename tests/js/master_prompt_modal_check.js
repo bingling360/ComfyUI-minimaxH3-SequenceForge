@@ -4,7 +4,7 @@
  *  · 打开**不自动载入**链上提示词（不是段卡提示词的镜像/同步框）；
  *  · 弹窗里**没有任何 AI 入口**（分段优化 / 扩写 / 优化设置 / 原稿回退）；
  *  · 顶部不再有模式 / 缺省时长，不再有「参考素材（AI 可见）」chips；
- *  · 手动点「从当前链载入」才出现【段N】，且只写 时长 / 独立镜头 / 提示词，
+ *  · 手动点「从当前链载入」才出现 [Segment N]，且只写 Duration / Standalone / Prompt，
  *    不写 意图 / 剧本 / 参考（资产引用只在正文里以 @素材名 出现）。
  *
  * 跑法：NODE_PATH=<repo>/node_modules node tests/js/master_prompt_modal_check.js
@@ -26,7 +26,7 @@ const ds = {
         + "overall_soundscape: 雨声持续。\n\nnon_diegetic_music: N/A",
         "integrated_multimodal_description: [Shot 1] 实拍，她转身挤进人流。",
     ],
-    /* 第二段的 auto_ref=false → 独立镜头：是（导出侧口径 segAutoRef） */
+    /* 第二段的 auto_ref=false → Standalone: yes（导出侧口径 segAutoRef） */
     segments: [{ seconds: 9, refs: [], auto_ref: true },
         { seconds: 8, refs: [], auto_ref: false, unlink: true }],
     ref_assets: [],
@@ -59,7 +59,7 @@ ok(!!taEl.__h3Editor, "编辑器实例未挂到 DOM 元素上（拿不到正文�
 
 /* 2. 打开**不**自动载入：它是分配框，不是段卡提示词的结果框/镜像 */
 ok(!String(ta.value || "").trim(), "打开时不应自动载入链上提示词：" + JSON.stringify(ta.value));
-ok(String(ta.value || "").indexOf("【段1】") < 0, "打开即载入 = 又变回同步框");
+ok(String(ta.value || "").indexOf("[Segment 1]") < 0, "打开即载入 = 又变回同步框");
 
 /* 3. 按钮：只剩 载入 / 清空 / 取消 / 解析并分配（+ 框头的解析引用） */
 const labels = [...dialog.querySelectorAll("button")].map((b) => String(b.textContent || "").trim());
@@ -83,11 +83,11 @@ const bLoad = [...dialog.querySelectorAll("button")]
     .find((b) => String(b.textContent || "").trim() === "从当前链载入");
 ok(!!bLoad, "找不到「从当前链载入」按钮");
 bLoad.onclick();
-ok(ta.value.indexOf("【段1】") >= 0, "载入后缺【段1】：" + JSON.stringify(ta.value));
-ok(ta.value.indexOf("【段2】") >= 0, "载入后缺【段2】");
-ok(ta.value.indexOf("时长：9") >= 0, "段时长应随载入带上：\n" + ta.value);
-ok(ta.value.indexOf("独立镜头：是") >= 0, "独立镜头（跳过引用上段）应随载入带上：\n" + ta.value);
-ok(ta.value.indexOf("提示词：") >= 0, "正文应带「提示词：」标签（导出口径）");
+ok(ta.value.indexOf("[Segment 1]") >= 0, "载入后缺 [Segment 1]：" + JSON.stringify(ta.value));
+ok(ta.value.indexOf("[Segment 2]") >= 0, "载入后缺 [Segment 2]");
+ok(ta.value.indexOf("Duration: 9") >= 0, "段时长应随载入带上：\n" + ta.value);
+ok(ta.value.indexOf("Standalone: yes") >= 0, "Standalone（跳过引用上段）应随载入带上：\n" + ta.value);
+ok(ta.value.indexOf("Prompt:") >= 0, "正文应带 Prompt: 标签（导出口径）");
 for (const dead of ["意图：", "剧本：", "参考：", "场景：", "角色：", "环境音：", "配乐："]) {
     ok(ta.value.indexOf(dead) < 0, `载入不该再写「${dead}」标签`);
 }

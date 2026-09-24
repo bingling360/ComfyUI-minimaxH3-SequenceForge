@@ -337,10 +337,15 @@ def test_master_prompt_single_box_modal():
     # 写回仍是「解析并分配」那一条链路
     assert "applyMasterPrompt(node, text)" in block
     assert "解析并分配" in block
-    # 单框渲染器：只写 时长 / 独立镜头 / 提示词
+    # 单框渲染器：只写 Segment 头 / Duration / Standalone / Prompt，且一律英文
     assert "function mpRenderState(state)" in d
-    assert "旧四框已下线" in d
-    assert "【段${i + 1}】" in d
+    assert "function exportMasterPrompt(node)" in d
+    assert 'rows.push(`Duration: ${seg.seconds}`)' in d
+    assert '`Standalone: ${seg.unlink ? "yes" : "no"}`' in d
+    assert 'rows.push(main ? `Prompt:\\n${main}` : "Prompt:")' in d
+    assert '`[Segment ${i + 1}]`' in d
+    # 中文段头只作为**只读兼容**留在解析正则里，渲染器不再产出
+    assert "【段${i + 1}】" not in d, "渲染器不该再写中文段头"
 
 
 def test_seg_card_tabs_are_prompt_and_anchor_only():

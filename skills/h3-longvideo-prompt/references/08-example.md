@@ -6,68 +6,81 @@
 ## 交付文本（直接可粘贴）
 
 ```
-【段1】
-时长：10
-独立镜头：否
+[Segment 1]
+Duration: 10
+Standalone: no
 
-提示词：
-subject_definitions: @雪山主峰_广角.png 为固定场景参考（山脊线轮廓、雪线高度、天空色调）；@藏袍牧民_远景.png 为远景人群参考（藏袍形制与配色）。
+Prompt:
+subject_definitions:
+<Subject 1> is the content defined by <Picture 1>, the reference image "雪山主峰_广角.png". It fixes the mountain ridge silhouette, the snow-line height and the sky tone.
+<Subject 2> is the content defined by <Picture 2>, the reference image "藏袍牧民_远景.png". It fixes the cut and colour of the Tibetan robes worn by the distant group.
 
-summary: [reference generation] 清晨高原，@雪山主峰_广角.png 所在的山体在静止中显出第一道裂痕，雪屑沿陡坡滑落，远景处 @藏袍牧民_远景.png 中的三名牧民驻足仰望。
+summary: [reference generation] Early morning on the plateau; the massif defined by <Subject 1> shows its first crack while still otherwise motionless, snow grains sliding down the steep slope, three herders abstracted from <Subject 2> stopping in the far distance to look up.
 
-retention_analysis: @雪山主峰_广角.png: fully_preserved - 山脊轮廓、雪线高度与天空色调全程不变；@藏袍牧民_远景.png: partially_preserved - 保留藏袍形制与配色，人物仅作远景剪影。
+retention_analysis:
+<Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved - ridge silhouette, snow-line height and sky tone stay unchanged throughout.
+<Subject 2> (appears in [Shot 3]): partially_preserved - robe cut and colour retained; the figures remain distant silhouettes only.
 
-detailed_description: [Shot 1] CG 三维渲染，实拍级体积光与全局光照，固定机位，广角远景把整座雪山主峰压在画面右侧三分之二，山脊线锐利，峰顶折射出一线冷白高光，山脚裸露灰褐色岩层与碎石坡，山腰浮着一层薄冰晶雾，雪面在左上角低角度侧逆光下呈冷白偏蓝，天空是未亮透的深青灰。
+detailed_description: A CG three-dimensional render with live-action-grade volumetric and global illumination. [Shot 1] A locked-off wide shot presses the whole massif into the right two thirds of the frame, the ridge line sharp, a single cold-white highlight refracting off the summit, grey-brown exposed rock and scree at the foot, a thin ice-crystal haze floating at mid-height, the snow field reading cold-white with a blue cast under a low side-backlight from the upper left, the sky an unlit deep slate grey. The camera pushes in with small amplitude at slow speed.
 
-[Shot 2] At 00:04.000，镜头以大幅慢速向右横移并轻微下压，山脊线上裂开一道细长缝隙，碎冰与雪屑沿陡坡向下滑出一道白色轨迹，扬起的雪尘在侧光里显出密集颗粒，裂缝内部的阴影呈深蓝色，缝隙边缘有少量碎块脱离坡面翻滚下落。
+[Shot 2] At 00:04.000, the camera trucks right with large amplitude at slow speed while pressing down slightly. A narrow crack opens along the ridge line; ice shards and snow grains slide down the steep slope in a white streak, the lifted snow dust showing dense grains in the side light, the shadow inside the crack a deep blue, a few blocks breaking loose from the edge and tumbling down.
 
-[Shot 3] At 00:07.500，镜头小幅慢速推近至裂痕处，裂口边缘的冰层断面露出层叠的蓝色层理与气泡痕，画面左下角三名牧民停在原地仰望，身影只占画面高度十分之一，深红藏袍在雪地反光里显出边缘轮廓，其中一人抬起手臂指向山脊。
+[Shot 3] At 00:07.500, the camera pushes in toward the crack with small amplitude at slow speed. The ice cross-section at the crack edge reveals layered blue strata and bubble marks. In the lower left, three herders of <Subject 2> stand still and look up, each about one tenth of the frame height, the deep-red robes picking up a rim light from the snow, one of them raising an arm to point at the ridge.
 
-overall_soundscape: 高原持续的低频风声，雪屑滑落的细碎摩擦声，远处冰层内部传来一声沉闷开裂，牧民的呼吸声轻微。
+overall_soundscape: A steady low-frequency plateau wind, the fine rasp of snow grains sliding, one dull crack from deep inside the ice in the distance, light breathing from the herders.
 
-non_diegetic_music: 低频弦乐持续长音，速度极慢，底部有大鼓单次轻击，无渐强。
+non_diegetic_music: A sustained low string drone at a very slow tempo, a single soft kick from a low drum underneath, no build.
 
-【段2】
-时长：10
-独立镜头：否
+[Segment 2]
+Duration: 10
+Standalone: no
 
-提示词：
-subject_definitions: @雪山主峰_广角.png 为崩塌主体参考；@洪水峡谷_航拍.png 为洪水与峡谷地形参考。
+Prompt:
+subject_definitions:
+<Subject 1> is the content defined by <Picture 3>, the reference image "雪山主峰_广角.png". It is the collapsing massif.
+<Subject 2> is the content defined by <Picture 4>, the reference image "洪水峡谷_航拍.png". It fixes the floodwater and the canyon terrain.
 
-summary: [reference generation] 承接上一段，山脊裂痕扩展为整段崩塌，冰川与岩层沿陡坡倾泻，雪雾扬尘卷起遮住半个山头，同一画面下方洪水从峡谷口涌出，冲上谷底碎石滩。
+summary: [reference generation] Continuing from the previous segment, the ridge crack widens into a full collapse of that stretch; glacier ice and rock pour down the steep face, snow mist and rock dust rolling up to hide half the peak, while in the same frame floodwater surges out of the canyon mouth and climbs the gravel flat below.
 
-retention_analysis: @雪山主峰_广角.png: partially_preserved - 山脊轮廓保留，顶部分解为崩塌碎块；@洪水峡谷_航拍.png: fully_preserved - 峡谷走向、水面色与滩地形态全程不变。
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): partially_preserved - ridge silhouette retained, the upper part decomposing into collapse debris.
+<Subject 2> (appears in [Shot 2], [Shot 3]): fully_preserved - canyon direction, water colour and flat morphology unchanged throughout.
 
-detailed_description: [Shot 1] CG 三维渲染，延续上一段机位与侧逆光方向，裂痕在数秒内扩展成整段山脊崩塌，冰川碎块与灰褐岩层沿陡坡成片倾泻，雪雾与岩粉在侧光中翻卷成一道斜向的灰白色帷幕，帷幕外缘的碎块呈不规则几何形体，下落时拖出短促的烟尘尾迹。
+detailed_description: A CG three-dimensional render, continuing the previous segment's camera position and side-backlight direction. [Shot 1] The crack widens within seconds into a full collapse of that stretch of ridge; glacier blocks and grey-brown rock pour down the steep face in sheets, snow mist and rock powder rolling into a diagonal grey-white curtain in the side light, the outer edge of the curtain made of irregular geometric blocks that drag short dust trails as they fall. The camera pulls back with large amplitude at slow speed while rising into an aerial overhead.
 
-[Shot 2] At 00:03.500，镜头大幅慢速后拉并抬升为航拍俯瞰，崩塌的雪雾遮住半个山头，画面下方露出峡谷口，@洪水峡谷_航拍.png 中的浊黄洪水从谷口涌出，体量大、推进快，水面翻起连贯的白色泡沫带，冲上谷底碎石滩并淹没先前滑落的小冰块，滩边碎石在水流里持续位移。
+[Shot 2] At 00:03.500, the collapse mist hides half the peak. The canyon mouth is revealed below; the turbid-yellow floodwater of <Subject 2> surges out of it, large in volume and fast in advance, lifting a continuous white foam band across the surface, climbing the gravel flat at the canyon floor and swallowing the small ice blocks that slid down earlier, the shore gravel shifting continuously in the current.
 
-[Shot 3] At 00:08.000，镜头小幅中速向左平移，洪水沿峡谷向下游推进，河面宽度在数秒内扩张，浊黄水体里翻出断续的白色涌浪与漂浮的碎木，先前显露的碎石滩被整片覆盖，水线一直推到画面左侧的岩壁根部。
+[Shot 3] At 00:08.000, the camera pans left with small amplitude at moderate speed. The floodwater advances downstream, the channel widening within seconds; broken white surge and drifting splintered wood turn up in the turbid water, the gravel flat is covered whole, and the waterline pushes all the way to the base of the rock wall on the left of frame.
 
-overall_soundscape: 崩塌的连续低频轰鸣，岩石相互撞击的碎裂声，洪水涌出时的宽频水声由远及近，风声被人声压过。
+overall_soundscape: A continuous low-frequency roar from the collapse, the crunch of rock striking rock, broad-spectrum water noise from the canyon mouth moving from far to near, the wind drowned out.
 
-non_diegetic_music: 低频弦乐转为密集短弓震音，速度加快，底部大鼓连击力度递增，无旋律。
+non_diegetic_music: The low strings turn to dense short-bow tremolo at a faster tempo, the low drum striking in a run of increasing force, no melody.
 
-【完】
+[END]
 ```
 
 ## 这个范例做对了什么
 
 | 要点 | 体现 |
 |---|---|
-| 段间强关联 | 段2 首句明写「承接上一段」「延续上一段机位与侧逆光方向」；段1 的裂痕→段2 扩展成崩塌；段1 埋的「峡谷」在段2 兑现 |
+| 段间强关联 | 段2 首句明写「Continuing from the previous segment」「continuing the previous segment's camera position and side-backlight direction」；段1 的裂痕→段2 扩展成崩塌；段1 埋的「峡谷」在段2 兑现 |
 | 长度配得上时长 | 两段主描述各约 280 汉字（10 秒 × 20–40 字/秒 = 200–400） |
 | 六个字段齐全 + 顺序固定 | subject_definitions → summary → retention_analysis → detailed_description → overall_soundscape → non_diegetic_music |
-| 段级标签写在 `提示词：` 之前 | 段头 / 时长 / 独立镜头 / 提示词，顺序固定 |
+| 段级标签写在 `Prompt:` 之前 | 段头 / `Duration` / `Standalone` / `Prompt`，顺序固定，**全英文** |
+| `Standalone:` 显式写出 | 每段都写 `Standalone: no`（全片连续），不是省略 |
 | 参考图默认全段引用 | 两段都引用了场景图；段2 追加洪水图 |
-| 引用用素材全名 | `@雪山主峰_广角.png`（含扩展名），不是别名 |
+| **引用位置正确** | `@` 只出现在 `subject_definitions` 定义行；`summary` / `retention_analysis` / `detailed_description` 一律用 `<Subject N>` 指代 |
+| **标签语义正确** | 可复用的内容（山、洪水）用 `<Subject N>`；`<Picture N>` 只作「图本身」出现 |
+| 保留标记分流 | 可见内容走 `fully_preserved` / `partially_preserved`；没有音频所以不出现 `fully_copy` 那套 |
 | 配乐走非叙事 | 只写乐器、速度、力度，不写「悲壮 / 史诗」 |
 | 无对白不硬凑 | 全片无对白，`overall_soundscape` 只写环境音与物理声 |
-| `[Shot 1]` 无时间戳 | 后续 `[Shot 2]/[Shot 3]` 带 `At MM:SS.mmm`，递增且 ≤ 10 秒 |
-| `独立镜头：否` | 全片连续，没有跳转/闪回 |
+| `[Shot 1]` 无时间戳 | 后续 `[Shot 2]` / `[Shot 3]` 带 `At MM:SS.mmm`，递增且 ≤ 10 秒 |
+| 风格句在 `[Shot 1]` 之前 | 「A CG three-dimensional render with live-action-grade volumetric and global illumination.」独立成句，先立风格再开镜 |
 
 ## 反例提醒
 
 - ❌ 段2 直接写「洪水冲进村子」——段1 没有任何铺垫，观众断线；且属于「不许改结局」之外的**加戏**。
 - ❌ 每段都把「三名牧民穿深红藏袍」重写一遍——重复静态信息，浪费字数，还会让模型以为换了造型。
-- ❌ 把 `参考：雪山主峰_广角.png` 写成独立标签——已废弃，且会静默进正文（见 `04-master-format.md`）。
+- ❌ 在 `detailed_description` 里写 `@雪山主峰_广角.png`——这正是「多参时正文冒出图片引用」的 bug；正文只能用 `<Subject N>`。
+- ❌ 把 `Reference: 雪山主峰_广角.png` 写成独立标签——已废弃，且出现在 `Prompt:` 之后会**静默进正文**（见 `04-master-format.md`）。
+- ❌ 段头写成 `【段1】` / `时长：10`——中文标签。解析器读得懂，但正文是英文，不产出。

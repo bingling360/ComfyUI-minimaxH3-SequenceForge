@@ -44,33 +44,70 @@ optimizer = _load("optimizer", os.path.join(ROOT, "optimizer.py"))
 # ------------------------------------------------ 后端 system prompt
 
 def test_system_prompt_offers_asset_names():
-    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景", "少女立绘"], "中文")
+    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景", "少女立绘"], None)
     assert "@回廊场景" in s and "@少女立绘" in s, "应把素材名告诉模型"
     assert "可用素材" in s
 
 
-def test_system_prompt_tells_not_to_write_picture_tags():
-    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景"], "中文")
-    assert "不要写 <Picture N>" in s
+def test_system_prompt_keeps_asset_name_out_of_description():
+    """@素材名 **只**允许出现在 subject_definitions 的定义行。
+
+    镜头正文里必须用 <Subject N> 等官方标签指代 —— 这正是用户报的
+    「多参时镜头正文里也出现图片引用」那个 bug 的正面契约。
+    """
+    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景"], None)
+    assert "Never write a bare @素材名 inside the description" in s
+    assert "subject_definitions" in s
 
 
 def test_system_prompt_has_no_contradiction():
-    """回归：曾同时出现「具体帧锚用 <Picture N>」与「不要写 <Picture N>」。"""
-    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景"], "中文")
-    # 去掉那句显式禁令后，不应再出现把 <Picture N> 当正面写法的指令
-    body = s.replace("不要写 <Picture N>", "")
-    assert "<Picture N>" not in body, f"仍有互相矛盾的 <Picture N> 指令：{body}"
+    """回归：曾同时出现「具体帧锚用 <Picture N>」与「不要写 <Picture N>」。
+
+    官方语义下两者**不冲突**：<Picture N> 是有确切含义的官方标签（具体帧锚），
+    只是「只用来定义角色/场景/服装/风格的图」不该单独占一行 <Picture N>，
+    应并进 <Subject N> 的定义行。所以这里钉的是**语义归属**，不是禁令。
+    """
+    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景"], None)
+    # <Picture N> 只允许作为「具体帧锚」出现
+    assert "<Picture N> = a reference image used as a concrete frame" in s
+    # 且必须写明「只作定义用的图不单独占 <Picture N> 行」
+    assert "does NOT get a standalone <Picture N> line" in s
+
+
+def test_system_prompt_tags_asset_kinds():
+    """视频 / 音频素材必须带类别标签 —— 否则模型一律写 <Subject N>。
+
+    官方把三类标签语义做得**互斥**（ref-en.txt §2）：图片归 <Subject N> /
+    <Picture N>，视频归 <Video N>，音频归 <Audio N>。只给一串名字（图片和视频
+    长得一样）时模型没法判种类，只会全写成 <Subject N>，官方语义直接错位。
+    """
+    s = optimizer.build_system_prompt(
+        "Ref2VA", 12.0,
+        [{"name": "女主.png", "kind": "image"},
+         {"name": "运镜.mp4", "kind": "video"},
+         {"name": "雨声.wav", "kind": "audio"}], None)
+    assert "@运镜.mp4（视频）" in s, "视频素材要带（视频）标记"
+    assert "@雨声.wav（音频）" in s, "音频素材要带（音频）标记"
+    assert "@女主.png" in s and "@女主.png（" not in s, "图片不必加括号（默认类）"
+    assert "<Video N>" in s and "<Audio N>" in s, "要告诉模型类别与标签的对应"
+
+
+def test_system_prompt_labels_backward_compatible():
+    """labels 的三种形状都要能用：纯字符串 / dict / 二元组。"""
+    for labels in (["a.png"], [{"name": "a.png"}], [("image", "a.png")]):
+        s = optimizer.build_system_prompt("T2VA", 8.0, labels, None)
+        assert "@a.png" in s, f"{labels!r} 应能解析出素材名"
 
 
 def test_system_prompt_without_assets():
-    s = optimizer.build_system_prompt("T2VA", 5.0, [], "中文")
+    s = optimizer.build_system_prompt("T2VA", 5.0, [], None)
     assert "本段无参考素材" in s
     assert "可用素材" not in s, "没素材时不该给素材名单"
 
 
 def test_subject_tag_still_documented():
     """@素材名 只替代素材引用；<Subject N> 等仍按官方写法。"""
-    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景"], "中文")
+    s = optimizer.build_system_prompt("Ref2VA", 10.0, ["回廊场景"], None)
     assert "<Subject N>" in s
     assert "<Video N>" in s
 
@@ -108,6 +145,26 @@ def test_collect_seg_media_uses_mark_not_raw_name():
         "不应再用 <Picture N> 当 media.label"
 
 
+def test_collect_seg_media_keeps_video_and_audio():
+    """视频 / 音频参考**不许**被 collectSegMedia 过滤掉。
+
+    历史 bug：循环里写了 `if (!hit || hit.kind !== "image") continue;`，
+    且 media 一律 push `kind: "image"` —— 结果视频与音频参考被静默丢弃，
+    模型根本不知道本段挂了它们，永远写不出官方的 <Video N> / <Audio N>。
+    后端 REF_CAPS 明明是 {image:9, video:3, audio:3}，官方标签也分了三类。
+    """
+    src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    block = _fn_block(src, "async function collectSegMedia")
+    assert 'hit.kind !== "image"' not in block, \
+        "不许按 kind 过滤参考素材（会把视频/音频整类丢掉）"
+    assert 'kind: "image", label: nm' not in block, \
+        "media.kind 必须跟随素材真实类别，不能一律写 image"
+    assert 'media.push({ kind: "audio", label: nm })' in block, \
+        "音频参考要进 media（带 kind: audio，不带 images）"
+    assert 'media.push({ kind: _k, label: nm, images: [dataUrl] })' in block, \
+        "图/视频参考的 media.kind 要用素材真实 kind"
+
+
 def test_collect_seg_media_note_mentions_marks():
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     block = _fn_block(src, "async function collectSegMedia")
@@ -137,10 +194,19 @@ def test_llm_roundtrip_uses_mark_codec():
 # ------------------------------------------------ AI 扩写链 prompt
 
 def test_compile_prompt_requires_asset_names():
+    """跳2 编译器：`@素材名` 只许出现在 subject_definitions 定义行。
+
+    历史口径是"素材引用写 @素材名，不要写 <Picture N>"（把 @ 当**正文**写法）。
+    现行口径与之相反：`@` 只进定义行，正文一律用官方标签 —— 所以钉的是
+    「位置」与「全篇英文」，不是旧禁令。
+    """
     p = os.path.join(TOOLS, "prompts", "system_compile.md")
     src = open(p, encoding="utf-8").read()
-    assert "@素材名" in src
-    assert "不要写 `<Picture N>`" in src
+    assert "@素材名" in src, "要说明素材名的写法"
+    assert "subject_definitions" in src and "定义行" in src, \
+        "必须写明 @素材名 只允许出现在 subject_definitions 的定义行"
+    assert "detailed_description" in src, "要说明正文里用官方标签指代"
+    assert "全篇英文" in src, "语言口径必须是全英文（中英混排会出严重问题）"
 
 
 def test_dialect_documents_the_divergence():

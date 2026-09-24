@@ -30,40 +30,57 @@ prompts = _load("h3prompts_rules", "prompts.py")
 
 
 def test_rule_files_exist():
+    """规则文件只剩**两个官方英文版**（语言分歧已整体下线）。
+
+    历史：曾按 output_language 分成中英两套（`*_zh.txt` / 无后缀 = en），
+    还额外自研过一套四字段 ref 规则。中文产物混进英文正文会导致严重问题，
+    已全部删除并逐字换成官方 base-en / ref-en。
+    """
     files = optimizer.load_rule_files()
-    for name in ("minimaxh3_base_prompt_writing_zh.txt",
-                 "minimaxh3_base_prompt_writing.txt",
-                 "minimaxh3_custom_ref2v_prompt_writing_zh.txt"):
+    for name in ("minimaxh3_base_prompt_writing.txt",
+                 "minimaxh3_official_ref2v_prompt_writing.txt"):
         assert name in files, name
+    for gone in ("minimaxh3_base_prompt_writing_zh.txt",
+                 "minimaxh3_custom_ref2v_prompt_writing.txt",
+                 "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
+                 "prompt_translate_to_en.txt"):
+        assert gone not in files, f"{gone} 应已删除（中文生成链路已下线）"
 
 
 def test_pick_rule_split_by_task():
+    """规则文件按 **task**（不是语言）分流：base 模式 / Ref2VA 各取一份。"""
     files = optimizer.load_rule_files()
-    base_zh = optimizer.pick_rule_text(
-        {"rule_file": "auto", "output_language": "中文"}, files, "T2VA")
-    ref_zh = optimizer.pick_rule_text(
-        {"rule_file": "auto", "output_language": "中文"}, files, "Ref2VA")
-    assert base_zh is not None and ref_zh is not None
+    base = optimizer.pick_rule_text({"rule_file": "auto"}, files, "T2VA")
+    ref = optimizer.pick_rule_text({"rule_file": "auto"}, files, "Ref2VA")
+    assert base is not None and ref is not None
     # 常规模式绝不能再拿到全参考规则（历史 bug）
-    assert "integrated_multimodal_description" in base_zh
-    assert "<@" not in base_zh and "<#" not in base_zh
+    assert "integrated_multimodal_description" in base
+    assert "<@" not in base and "<#" not in base
     # 全参考模式走**六段式** ref 规则 —— 与 build_system_prompt 的 REF2VA 分支、
-    # prompts.REF_FIELDS 三者同口径（历史 bug：这里是四字段版，模型收到两条互斥的最高优先级指令）
-    assert "subject_definitions" in ref_zh and "retention_analysis" in ref_zh
-    assert "detailed_description" in ref_zh and "summary" in ref_zh
-    # 参考素材走 @素材名（后端压实成 <Picture k>）；保留标记与说话人 ID 照官方写法
-    assert "@素材名" in ref_zh
-    assert "fully_preserved" in ref_zh and "<Subject " in ref_zh
-    assert "<#" not in ref_zh, "旧的 <#名字:对话> 语法应已下线"
-    # 英文 + 常规
-    base_en = optimizer.pick_rule_text(
-        {"rule_file": "auto", "output_language": "English"}, files, "FL2VA")
-    assert base_en is not None and "integrated_multimodal_description" in base_en
+    # prompts.REF_FIELDS 三者同口径
+    assert "subject_definitions" in ref and "retention_analysis" in ref
+    assert "detailed_description" in ref and "summary" in ref
+    assert "fully_preserved" in ref and "<Subject " in ref
+    assert "<#" not in ref, "旧的 <#名字:对话> 语法应已下线"
+    # 语言已不再是分流维度：任何模式拿到的都是官方英文规则。
+    # 注意：官方示例里**允许**出现中文 —— 那是"屏幕上可见文字要照抄"的正面例子
+    # （`A red neon sign reading "营业中"`），不是中文指令。所以只禁"指令性中文"：
+    # 中文出现在正文/字段说明里必然带这些高信号词，官方示例一个都不带。
+    zh_cmd = ("提示词", "镜头", "必须", "不要", "应该", "字段", "段落", "时长",
+              "参考", "素材", "保留", "音频", "视频", "风格")
+    for task in ("T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA"):
+        t = optimizer.pick_rule_text({"rule_file": "auto"}, files, task) or ""
+        assert t, task
+        bad = [w for w in zh_cmd if w in t]
+        assert not bad, f"{task} 的规则文件里混进了中文指令词：{bad}"
     # 显式选择优先于自动分流
     forced = optimizer.pick_rule_text(
-        {"rule_file": "minimaxh3_custom_ref2v_prompt_writing_zh.txt"},
-        files, "T2VA")
-    assert "summary" in forced
+        {"rule_file": "minimaxh3_official_ref2v_prompt_writing.txt"}, files, "T2VA")
+    assert "subject_definitions" in forced
+    # 老存档里的中文文件名静默回落 auto（不炸）
+    legacy = optimizer.pick_rule_text(
+        {"rule_file": "minimaxh3_custom_ref2v_prompt_writing_zh.txt"}, files, "Ref2VA")
+    assert legacy is not None and "subject_definitions" in legacy
     # none 不注入
     assert optimizer.pick_rule_text({"rule_file": "none"}, files, "Ref2VA") is None
 
@@ -71,8 +88,7 @@ def test_pick_rule_split_by_task():
 def test_all_base_modes_never_get_ref_rule():
     files = optimizer.load_rule_files()
     for task in ("T2VA", "I2VA", "FL2VA", "L2VA"):
-        text = optimizer.pick_rule_text(
-            {"rule_file": "auto", "output_language": "中文"}, files, task)
+        text = optimizer.pick_rule_text({"rule_file": "auto"}, files, task) or ""
         assert "<@" not in text, task
         assert "<#" not in text, task
 
@@ -176,8 +192,7 @@ def test_optimize_multi_passes_task_to_rule_pick(monkeypatch):
 
     monkeypatch.setattr(optimizer, "optimize_once", fake_optimize_once)
     optimizer.optimize_multi_once(
-        {"mode": "api", "provider": "openai", "api_key": "sk-x",
-         "output_language": "中文"},
+        {"mode": "api", "provider": "openai", "api_key": "sk-x"},
         {"segments": [{"prompt": "x", "seconds": 5, "task": "T2VA"}]})
     assert picked and "<@" not in (picked[0] or "")
 

@@ -1,11 +1,13 @@
 /* 总提示词分段格式：提示词单主体 + 两个段级标签 + 旧标签只读丢弃 + 导出回环。
  *
  * 背景：工作台退化成**纯分段流水线**——只给每段三样东西：提示词 / 时长 / 独立镜头。
- * 文本交换格式相应收敛为：
- *   【段N】 + 段级标签（时长 / 独立镜头）+ 提示词正文（可带 `提示词：` 标签，
- *   不带也行，段头后的裸正文一律归提示词）。
+ * 文本交换格式相应收敛为（★ 一律英文，与正文同为英文，避免中英混排）：
+ *   [Segment N] + 段级标签（Duration / Standalone）+ 提示词正文（可带 `Prompt:` 标签，
+ *   不带也行，段头后的裸正文一律归提示词）；结束标记 [END]。
  *
- * 上一代的分层全部**只读丢弃**（认出来 → 整块丢掉 → 进 notes 点名）：
+ * 中文旧标签（【段N】/ 时长：/ 独立镜头：/ 提示词：/ 【完】）与上一代的分层标签
+ * 都**只读兼容**：段头与三个段级标签照旧解析（否则老文本的「时长：8」会被当成
+ * 正文吞进提示词），其余七个分层标签认出来就整块丢掉并进 notes 点名：
  *   参考 / 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本
  * 为什么不是"看不懂就当正文"：这些块的内容**不该进模型**，悄悄并进提示词等于
  * 把"不进模型"的内容送进模型；也不能静默丢弃，用户会以为内容还在。
@@ -72,61 +74,91 @@ const check = (name, cond, extra) => {
     if (extra !== undefined) console.log("       " + extra);
 };
 
-/* ---------- 1. 段级标签只有 时长 / 独立镜头；旧标签只读丢弃 ---------- */
+/* ---------- 1. 英文段级标签；旧中文标签只读兼容 ---------- */
 {
     const text = [
-        "【段1】",
-        "时长：9",
-        "独立镜头：否",
-        "参考：角色1，图片2",
-        "场景：黄昏教室",
-        "角色：短发少女",
-        "环境音：翻书声",
-        "配乐：钢琴独奏",
-        "意图：雨夜霓虹市场，女孩回头笑说跟上我",
-        "剧本：",
-        "时长：9 秒",
+        "[Segment 1]",
+        "Duration: 9",
+        "Standalone: no",
+        "Reference: 角色1，图片2",
+        "Scene: 黄昏教室",
+        "Character: 短发少女",
+        "Ambience: 翻书声",
+        "Music: 钢琴独奏",
+        "Intent: 雨夜霓虹市场，女孩回头笑说跟上我",
+        "Script:",
+        "Duration: 9 秒",
         "",
         "镜头一（0–3 秒）：雨幕里霓虹糊成色块，她忽然停下回头",
         "镜头二（3–9 秒）：她笑了一下，喊了一声",
         "",
-        "提示词：",
-        "integrated_multimodal_description: [Shot 1] 实拍、电影感……",
+        "Prompt:",
+        "integrated_multimodal_description: [Shot 1] Live-action, cinematic…",
         "",
-        "overall_soundscape: 雨声持续。",
+        "overall_soundscape: Steady rain continues.",
         "",
         "non_diegetic_music: N/A",
-        "【完】",
+        "[END]",
     ].join("\n");
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
     check("识别 1 段", p.segs.length === 1, "实际 " + p.segs.length);
     const s = p.segs[0];
-    check("时长：9", Number(s.seconds) === 9, String(s.seconds));
-    check("独立镜头：否 → false", s.unlink === false, String(s.unlink));
+    check("Duration: 9", Number(s.seconds) === 9, String(s.seconds));
+    check("Standalone: no → false", s.unlink === false, String(s.unlink));
     /* 上一代的七个标签全部不再产出字段 */
     for (const k of ["refs", "scene", "character", "soundscape", "music", "intent", "script"]) {
         check(`「${k}」不再解析成字段`, s[k] === undefined, JSON.stringify(s[k]));
     }
     check("剧本/场景正文**没被当提示词吞掉**",
         String(s.main || "").indexOf("镜头一") < 0
-        && String(s.main || "").indexOf("时长：9 秒") < 0
+        && String(s.main || "").indexOf("Duration: 9 秒") < 0
         && String(s.main || "").indexOf("黄昏教室") < 0
-        && String(s.main || "").indexOf("参考：角色1") < 0,
+        && String(s.main || "").indexOf("Reference: 角色1") < 0,
         JSON.stringify(s.main));
-    check("提示词 → main（含空行）",
+    check("Prompt → main（含空行）",
         s.main && s.main.indexOf("integrated_multimodal_description") === 0
         && s.main.indexOf("overall_soundscape") > 0 && s.main.indexOf("\n\n") > 0,
         JSON.stringify(s.main));
     check("丢弃要说出来（进 notes）",
         p.notes.some((n) => n.indexOf("已忽略") >= 0), JSON.stringify(p.notes));
-    check("「参考」单独点名（否则用户以为挂上素材了）",
+    check("「Reference」单独点名（否则用户以为挂上素材了）",
         p.notes.some((n) => n.indexOf("参考") >= 0), JSON.stringify(p.notes));
+}
+
+/* ---------- 1b. 大小写不敏感 + 中文旧段级标签仍认 ---------- */
+{
+    const text = "[segment 2]\nDURATION: 7\nduration: 8\nstandalone: YES\nPrompt:\n甲";
+    const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
+    check("小写段头/标签都认", p.segs.length === 1 && Number(p.segs[0].seconds) === 8,
+        JSON.stringify(p.segs[0] && p.segs[0].seconds));
+    check("standalone: YES → true（大写值也认）", p.segs[0].unlink === true,
+        String(p.segs[0].unlink));
+    check("Prompt: 标签后正文归 main", p.segs[0].main === "甲", JSON.stringify(p.segs[0].main));
+
+    const cn = "【段1】\n时长：9\n独立镜头：是\n提示词：\n甲\n【完】";
+    const q = run("parseMasterPrompt(" + JSON.stringify(cn) + ")");
+    check("中文旧段头/标签只读兼容", q.segs.length === 1 && Number(q.segs[0].seconds) === 9
+        && q.segs[0].unlink === true && q.segs[0].main === "甲",
+        JSON.stringify(q.segs[0]));
+}
+
+/* ---------- 1c. 段级标签写进正文块内 → 不再是标签（官方字段保护） ---------- */
+{
+    const body = "integrated_multimodal_description: [Shot 1] Live-action.\n\n"
+        + "Duration: 9 seconds of screen time.\n\noverall_soundscape: Rain.";
+    const text = "[Segment 1]\nPrompt:\n" + body;
+    const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
+    check("已在正文块内 → Duration 行不再被当段级标签",
+        p.segs[0].seconds === undefined, String(p.segs[0].seconds));
+    check("该行原样留在正文里",
+        String(p.segs[0].main).indexOf("Duration: 9 seconds of screen time.") > 0,
+        JSON.stringify(p.segs[0].main));
 }
 
 /* ---------- 2. 资产引用只认正文里的 @素材名（不再有「参考：」通道） ---------- */
 {
-    const text = "【段1】\n提示词：integrated_multimodal_description: [Shot 1] "
-        + "<Picture 1> 的雨夜市场，@女主.png 站在巷口。";
+    const text = "[Segment 1]\nPrompt:\nintegrated_multimodal_description: [Shot 1] "
+        + "<Picture 1> is the reference image, @女主.png 站在巷口。";
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
     check("引用原样留在正文里（不被任何标签吃掉）",
         String(p.segs[0].main).indexOf("@女主.png") > 0, JSON.stringify(p.segs[0].main));
@@ -135,10 +167,11 @@ const check = (name, cond, extra) => {
 
 /* ---------- 3. 软换行丢失容错（从 markdown 界面复制） ---------- */
 {
-    const text = "【段1】 时长：9 意图：雨夜市场 剧本：镜头一…… 【段2】 时长：8 提示词：[Shot 1] ……";
+    const text = "[Segment 1] Duration: 9 Intent: 雨夜市场 Script: 镜头一…… "
+        + "[Segment 2] Duration: 8 Prompt: [Shot 1] ……";
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
     check("挤成一行的文本 → 自动重分行识别出 2 段", p.segs.length === 2, "实际 " + p.segs.length);
-    check("重分行后意图仍被忽略（不再是字段）",
+    check("重分行后 intent 仍被忽略（不再是字段）",
         p.segs[0] && p.segs[0].intent === undefined, JSON.stringify(p.segs[0]));
     check("重分行会给出提示 notes", p.notes.length > 0);
 }
@@ -160,6 +193,11 @@ const check = (name, cond, extra) => {
         { intent: "天台看烟花", script: "镜头一：跑到天台", main: "", seconds: 12, unlink: true, refs: [] },
     ];
     const text = run("mpRenderState(" + JSON.stringify(state) + ")");
+    check("导出写英文段头/标签", text.indexOf("[Segment 1]") >= 0
+        && text.indexOf("Duration: 9") >= 0 && text.indexOf("Prompt:") >= 0
+        && text.indexOf("[END]") >= 0, JSON.stringify(text));
+    check("导出不写中文段头/标签", text.indexOf("【段") < 0
+        && text.indexOf("时长：") < 0 && text.indexOf("独立镜头") < 0, JSON.stringify(text));
     for (const dead of ["意图：", "剧本：", "参考：", "场景：", "角色：", "环境音：", "配乐："]) {
         check(`导出不再写「${dead.replace("：", "")}」`, text.indexOf(dead) < 0, JSON.stringify(text));
     }
@@ -168,6 +206,7 @@ const check = (name, cond, extra) => {
     const a = p.segs[0] || {};
     check("回环 提示词 一致", a.main === state[0].main, JSON.stringify(a.main));
     check("回环 时长 一致", Number(a.seconds) === 9, String(a.seconds));
+    check("回环 独立镜头 否 → false", a.unlink === false, String(a.unlink));
     const b = p.segs[1] || {};
     check("回环 独立镜头 是 → true", b.unlink === true, String(b.unlink));
     check("回环 空提示词 → 空串不是 undefined", b.main === "", JSON.stringify(b.main));
@@ -176,7 +215,7 @@ const check = (name, cond, extra) => {
 
 /* ---------- 6. 段头序号与出现顺序不一致只提示不报错 ---------- */
 {
-    const text = "【段3】\n提示词：甲\n\n【段2】\n提示词：乙";
+    const text = "[Segment 3]\nPrompt:\n甲\n\n[Segment 2]\nPrompt:\n乙";
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
     check("序号乱序仍按出现顺序排", p.segs.length === 2 && p.segs[0].main === "甲");
     check("序号不一致进 notes", p.notes.some((n) => n.indexOf("不一致") >= 0), JSON.stringify(p.notes));
@@ -184,12 +223,28 @@ const check = (name, cond, extra) => {
 
 /* ---------- 7. 只读块到下一个段头为止（跨段重置） ---------- */
 {
-    const text = "【段1】\n剧本：甲剧本\n提示词：甲\n\n【段2】\n提示词：乙";
+    const text = "[Segment 1]\nScript: 甲剧本\nPrompt:\n甲\n\n[Segment 2]\nPrompt:\n乙";
     const p = run("parseMasterPrompt(" + JSON.stringify(text) + ")");
     check("只读块被下一个标签终止", p.segs[0] && p.segs[0].main === "甲",
         JSON.stringify(p.segs[0] && p.segs[0].main));
     check("只读块不跨段残留", p.segs[1] && p.segs[1].main === "乙",
         JSON.stringify(p.segs[1] && p.segs[1].main));
+}
+
+/* ---------- 8. [END] / Prompt 字面量：占位文本自己必须能回环 ---------- */
+{
+    const ph = /const MP_PH_MAIN = `([\s\S]*?)`;/m.exec(src);
+    check("占位文本存在", !!ph);
+    if (ph) {
+        const p = run("parseMasterPrompt(" + JSON.stringify(ph[1]) + ")");
+        check("空框占位 → 解析出 2 段", p.segs.length === 2, "实际 " + p.segs.length);
+        check("占位第 1 段 Duration: 8", Number(p.segs[0].seconds) === 8, String(p.segs[0].seconds));
+        check("占位第 2 段 Standalone: yes → true", p.segs[1].unlink === true, String(p.segs[1].unlink));
+        check("占位正文含官方三字段且保留空行",
+            p.segs[0].main.indexOf("integrated_multimodal_description") === 0
+            && p.segs[0].main.indexOf("\n\n") > 0, JSON.stringify(p.segs[0].main));
+        check("占位正文不含中文段级标签", p.segs[0].main.indexOf("【段") < 0);
+    }
 }
 
 console.log(bad ? `\n${bad} 个用例不符` : "\n全部通过");

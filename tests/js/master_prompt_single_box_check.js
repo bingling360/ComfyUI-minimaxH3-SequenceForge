@@ -1,7 +1,7 @@
 /* 总提示词工作台**单框**回环（三框已下线）。
  *
  * 背景：工作台从三框（① 意图 / ② 剧本 / ③ 结果）退化为单框——框里就是直接进
- * 模型的提示词，用【段N】分段。三框那套「三框按段号同序合成一份文本」的逻辑
+ * 模型的提示词，用 [Segment N] 分段。三框那套「三框按段号同序合成一份文本」的逻辑
  * （mpSplitBox / mpComposeBoxes）随之删除；这个用例改钉单框的**往返口径**：
  *
  *   框里写的文本 → parseMasterPrompt → mpRenderState → 再解析
@@ -82,12 +82,12 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
         JSON.stringify(p.segs[0].main));
 }
 
-/* ---------- 2. 多段：段级标签 + 正文按【段N】同序 ---------- */
+/* ---------- 2. 多段：段级标签 + 正文按 [Segment N] 同序 ---------- */
 {
     /* 「参考：」是上一代的资产引用通道，已停用：认出来 → 丢弃 → 进 notes。
      * 关键是它**不能并进正文**（否则把不该进模型的清单送进模型），也不能静默消失。 */
-    const text = "【段1】\n时长：9\n参考：角色1\n\n" + OFFICIAL
-        + "\n\n【段2】\n时长：12\n独立镜头：是\n参考：角色1\n\n"
+    const text = "[Segment 1]\nDuration: 9\nReference: 角色1\n\n" + OFFICIAL
+        + "\n\n[Segment 2]\nDuration: 12\nStandalone: yes\nReference: 角色1\n\n"
         + "integrated_multimodal_description: [Shot 1] 乙";
     const p = parse(text);
     check("多段段数=2", p.segs.length === 2, String(p.segs.length));
@@ -105,21 +105,21 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
         JSON.stringify(b.main));
 }
 
-/* ---------- 3. 空段 → 渲染出「提示词：」→ 回读为显式空串（= 清空该段） ---------- */
+/* ---------- 3. 空段 → 渲染出 Prompt: → 回读为显式空串（= 清空该段） ---------- */
 {
-    const p = parse("【段1】\n");
+    const p = parse("[Segment 1]\n");
     check("空段头 → main 未定义（分配时按空串 = 清空）",
         p.segs[0] && p.segs[0].main === undefined,
         JSON.stringify(p.segs[0] && p.segs[0].main));
     const t = render([{ seconds: null, unlink: false }]);
-    check("渲染空段会写出「提示词：」标签", t.indexOf("提示词：") >= 0, JSON.stringify(t));
+    check("渲染空段会写出 Prompt: 标签", t.indexOf("Prompt:") >= 0, JSON.stringify(t));
     check("渲染→回读 = 显式空串（不是 undefined）", parse(t).segs[0].main === "",
         JSON.stringify(parse(t).segs[0].main));
 }
 
 /* ---------- 4. 连续正文行不许被拼成一行（pushBody 换行口径回归） ---------- */
 {
-    const text = "【段1】\n提示词：\n甲行一\n甲行二\n\n乙段\n\noverall_soundscape: 雨声。";
+    const text = "[Segment 1]\nPrompt:\n甲行一\n甲行二\n\n乙段\n\noverall_soundscape: 雨声。";
     const p = parse(text);
     const s = p.segs[0] || {};
     check("连续正文行保留换行", String(s.main || "").indexOf("甲行一\n甲行二") === 0,
@@ -130,8 +130,8 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
 
 /* ---------- 5. 单框往返幂等：文本 → 解析 → 渲染 → 再解析 ---------- */
 {
-    const text = "【段1】\n时长：9\n\n" + OFFICIAL
-        + "\n\n【段2】\n时长：8\n独立镜头：是\n\n"
+    const text = "[Segment 1]\nDuration: 9\n\n" + OFFICIAL
+        + "\n\n[Segment 2]\nDuration: 8\nStandalone: yes\n\n"
         + "integrated_multimodal_description: [Shot 1] 乙\n\nnon_diegetic_music: N/A";
     const p1 = parse(text);
     const t2 = render(p1.segs);
@@ -158,7 +158,7 @@ const OFFICIAL = "integrated_multimodal_description: [Shot 1] 实拍、电影感
     check("渲染不再写 意图 / 剧本 / 参考",
         t.indexOf("意图：") < 0 && t.indexOf("剧本：") < 0 && t.indexOf("参考：") < 0,
         JSON.stringify(t));
-    const p = parse("【段1】\n意图：雨夜市场\n剧本：镜头一\n提示词：" + OFFICIAL);
+    const p = parse("[Segment 1]\nIntent: 雨夜市场\nScript: 镜头一\nPrompt:" + OFFICIAL);
     check("解析丢弃 意图", p.segs[0] && p.segs[0].intent === undefined,
         JSON.stringify(p.segs[0] && p.segs[0].intent));
     check("解析丢弃 剧本", p.segs[0] && p.segs[0].script === undefined,

@@ -56,7 +56,6 @@ DEFAULT_CONFIG = {
     "model": "glm-5.3-flashx",
     "protocol": "openai",
     "read_media": True,
-    "output_language": "中文",
     "local_model": "",
     "local_mmproj": "",
     "local_device": "cuda",
@@ -149,27 +148,28 @@ def default_config() -> dict:
             cur[k] = v
     return cur
 
+# 规则文件 = **官方 h3-prompt-writing 的 base-en.txt / ref-en.txt 逐字副本**。
+# 只有这两份，不再有中文版、不再有「自定义四字段版」（`<@名字>` / `<#名字:对话>`
+# 是自造语法，官方 tokenizer 根本不认，模型收到它只会写出非官方格式）。
+#
+# 官方 Open Rules（SKILL.md 的 Output Rules + 两份 references 自身）就要求
+# **正文英文**、只有 `<d>` 里的对白 / 歌词与画面可见文字保原语言 —— 所以
+# 「输出语言」这个概念在官方口径下不存在，字段已整体删除。历史教训：以前
+# auto + 中文注入的是一份**全参考四字段**规则，注释还写着"此规则优先于其他
+# 通用格式要求"，于是给常规段优化时模型同时收到两条互斥的最高优先级指令，
+# 产出 summary/detailed_description + `<Subject N>` 混排的非官方语法。
 RULE_OPTIONS = (
     "auto",
-    "minimaxh3_base_prompt_writing_zh.txt",
     "minimaxh3_base_prompt_writing.txt",
-    "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
-    "minimaxh3_custom_ref2v_prompt_writing.txt",
     "minimaxh3_official_ref2v_prompt_writing.txt",
     "none",
 )
 
-# 规则文件按模式分流：官方 base（T2VA/I2VA/FL2VA/L2VA）与全参考（Ref2VA）是两套
-# 完全不同的字段集（三字段 vs 六字段）与标签语法（<Picture N> vs <Subject N>）。
-# 历史 bug：auto + 中文一律注入"自定义中文版"——那是一份**全参考四字段**规则，
-# 且注入语写着"此规则优先于其他通用格式要求"，于是给常规段优化时模型同时收到
-# 两条互相矛盾的最高优先级指令，产出 summary/detailed_description + <@名字>/
-# <#名字:对话> 这类非官方语法。这里按 task 选文件，从根上分流。
+# 规则按 **task** 分流：官方 base（T2VA/I2VA/FL2VA/L2VA，三字段）与全参考
+# （Ref2VA，六段式）是两套完全不同的字段集与标签体系，串用必出非官方格式。
 REF_TASKS = ("REF2VA", "HYBRID")
-RULE_BASE = {"中文": "minimaxh3_base_prompt_writing_zh.txt",
-             "English": "minimaxh3_base_prompt_writing.txt"}
-RULE_REF = {"中文": "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
-            "English": "minimaxh3_custom_ref2v_prompt_writing.txt"}
+RULE_BASE_FILE = "minimaxh3_base_prompt_writing.txt"
+RULE_REF_FILE = "minimaxh3_official_ref2v_prompt_writing.txt"
 
 
 def prompt_dir() -> str:
@@ -194,20 +194,22 @@ def load_rule_files() -> dict:
 
 
 def pick_rule_text(settings: dict | None, files: dict | None, task: str | None = None) -> str | None:
-    """按「显式选择 > 语言+模式」选规则文件。
+    """按「显式选择 > task 分流」选规则文件（只剩两份官方英文规则）。
 
-    task 为 None 时按常规（base）处理——调用方应显式传 task（见 optimize_once）。
+    task 为 None 时按常规（base）处理 —— 调用方应显式传 task（见 optimize_once）。
+    显式选择里历史遗留的中文 / 自定义四字段文件名（老工作流存档里存着）一律
+    回落 auto：那两个文件已经不存在，原样透传只会让规则**静默不注入**，
+    模型拿不到官方格式约束。
     """
     sel = str((settings or {}).get("rule_file") or "auto")
     if sel == "none":
         return None
     files = files if isinstance(files, dict) else load_rule_files()
     if sel != "auto":
-        return files.get(sel)
-    lang = "中文" if str((settings or {}).get("output_language") or "中文") == "中文" else "English"
-    is_ref = str(task or "").upper() in REF_TASKS
-    table = RULE_REF if is_ref else RULE_BASE
-    return files.get(table[lang]) or files.get(RULE_REF[lang])
+        return files.get(sel) or files.get(
+            RULE_REF_FILE if str(task or "").upper() in REF_TASKS else RULE_BASE_FILE)
+    name = RULE_REF_FILE if str(task or "").upper() in REF_TASKS else RULE_BASE_FILE
+    return files.get(name)
 
 
 def normalize_config(raw: dict | None) -> dict:
@@ -249,8 +251,6 @@ def normalize_config(raw: dict | None) -> dict:
     effort = str(raw.get("reasoning_effort") or cur.get("reasoning_effort") or "").lower()
     if effort not in GLM_EFFORT_VALUES:
         effort = ""
-    lang_raw = str(raw.get("output_language") or cur["output_language"])
-    lang = "中文" if lang_raw.lower() in {"中文", "chinese", "zh"} else "English"
     return {
         "mode": "local" if str(raw.get("mode") or cur["mode"]).lower() == "local" else "api",
         "provider": provider,
@@ -261,7 +261,6 @@ def normalize_config(raw: dict | None) -> dict:
         "provider_models": {str(k): str(v or "") for k, v in provider_models.items()},
         "protocol": str(raw.get("protocol") or (preset[2] if preset else cur["protocol"])).lower(),
         "read_media": bool(raw.get("read_media", cur["read_media"])),
-        "output_language": lang,
         "local_model": str(raw.get("local_model") or cur["local_model"] or "").strip(),
         "local_mmproj": str(raw.get("local_mmproj") or cur["local_mmproj"] or "").strip(),
         "local_device": str(raw.get("local_device") or cur["local_device"] or "cuda").lower(),
@@ -449,50 +448,182 @@ def scan_mmproj_models() -> list:
 
 
 def build_system_prompt(task: str, duration: float, labels: list,
-                        output_language: str = "中文", context: dict | None = None) -> str:
-    """自写的系统提示词：只定结构与标签纪律，文风细则由 prompt/*.txt 规则注入。"""
+                        context: dict | None = None) -> str:
+    """自写的系统提示词：只定**结构与标签纪律**，文风细则由 prompt/*.txt 规则注入。
+
+    ⛔ 这里写下的每条结构要求都必须能在官方 `base-en.txt` / `ref-en.txt` 里找到
+    原文依据。历史 bug 就是在这里自造规则：REF2VA 分支曾写「参考素材直接用
+    @素材名」—— 而官方 ref-en.txt 的 `<Subject N>` 才是**镜头正文里**指代参考
+    内容的唯一标签，`@素材名` 只出现在项目侧的 `subject_definitions` 定义行。
+    两者搞反，模型就会在镜头正文里大段写素材文件名，正是"多参时正文出现图片
+    引用"的根因。FL2VA 分支曾写「小写裸词 picture 1」，官方原文其实是大写
+    `Picture 1`（见 base-en.txt §2.1），又是一处自造规则。
+
+    素材名走末尾的 `@名字` 名单（见 lbl）而不是 `<Picture N>`：LLM 写 `@素材名`，
+    由后端 `_apply_label_tokens` 按 seg.refs 顺序压实成 `<Picture k>`。顺序无关、
+    回填时前端 applyPromptEdit→syncRefsFromText 自动挂图，外部 agent 也只需知道
+    素材名。与 web/h3_director.js 的 collectSegMedia 配套（它把素材名放进
+    media.label）。
+
+    ⛔ 这里**不设创作上限**：曾有过 "Only rewrite what the user gave you; invent no
+    new events, characters, props or lines." —— 已删。扩写要放开发挥（用户要求：
+    本地尽量自由发挥，线上先问清需求再自由发挥），只保留「不许改用户点名要保的
+    东西」这一条保真红线。
+
+    ⚠ `labels` 可以给三种形状（向后兼容，旧的纯字符串列表照样能用）：
+      1. `"名字"` —— 当图片处理；
+      2. `{"name": "名字", "kind": "image"|"video"|"audio"}` —— 带类别；
+      3. `("image", "名字")` 二元组 —— 带类别。
+    带类别的会写成 `@名字（视频）`，模型才能选对 `<Video N>` / `<Audio N>`；
+    不带类别的按图片算（旧调用方语义不变）。
+    """
     t = str(task or "T2VA").upper()
     dur = max(0.5, min(30.0, float(duration or 5.0)))
-    lang = "中文" if str(output_language or "中文") in ("中文", "chinese", "zh") else "English"
-    # 传**素材名**而不是 <Picture N>：LLM 写 @素材名，由后端 _apply_label_tokens
-    # 按 seg.refs 顺序压实成 <Picture k>。这样顺序无关、回填时前端
-    # applyPromptEdit→syncRefsFromText 会自动挂图，外部 agent 也只需知道素材名。
-    # 与 web/h3_director.js 的 collectSegMedia 配套（它把素材名放进 media.label）。
-    lbl = (("可用素材：" + "、".join("@" + str(x) for x in labels)
-            + "（正文里直接写 @名字 引用，不要写 <Picture N>）") if labels
-           else "本段无参考素材")
+    # 归一 (kind, name)：kind 决定模型该用哪一类官方标签
+    _kinds = {"image": "图片", "video": "视频", "audio": "音频"}
+    norm = []
+    for x in (labels or []):
+        if isinstance(x, dict):
+            nm, kd = str(x.get("name") or x.get("label") or ""), str(x.get("kind") or "image")
+        elif isinstance(x, (tuple, list)) and len(x) >= 2:
+            kd, nm = str(x[0]), str(x[1])
+        else:
+            nm, kd = str(x), "image"
+        kd = kd.lower()
+        if kd not in _kinds:
+            kd = "image"
+        if nm:
+            norm.append((kd, nm))
+    _has_kind = any(kd != "image" for kd, _ in norm)
+    lbl = (("可用素材：" + "、".join(
+                "@%s（%s）" % (nm, _kinds[kd]) if kd != "image" else "@%s" % nm
+                for kd, nm in norm)
+            + "（只在 subject_definitions 的定义行写 @名字；镜头正文里一律用"
+              "<Subject N> 等官方标签指代，不要写文件名。"
+            + ("**括号里是素材类别**：图片 → <Subject N> 或 <Picture N>，"
+               "视频 → <Video N>，音频 → <Audio N>）" if _has_kind
+               else "图片 → <Subject N> 或 <Picture N>）"))
+           if norm else "本段无参考素材")
+    # ⛔ "Only rewrite what the user gave you; invent no new events, characters,
+    # props or lines." 已删 —— 扩写不设创作上限（用户明确要求：本地尽量自由发挥，
+    # 线上先问清需求再自由发挥）。这里只保留**保真**那一条：不许改用户点名的
+    # 人物 / 关键道具 / 原话台词 / 结局走向。
     if t in ("REF2VA", "HYBRID"):
+        # 官方 ref-en.txt §1/§2/§4/§5 的结构摘要。语言、标签、标记、小节顺序
+        # 都是官方硬契约，逐条对应原文，不自造。
         return (
-            "你是 MiniMax H3 全参考提示词改写器。输出语言：%s。"
-            "恰好输出六节，每节标题独占一行、冒号后换行写内容，节间空一行："
-            "subject_definitions, summary, retention_analysis, detailed_description, "
-            "overall_soundscape, non_diegetic_music。"
-            # 参考素材走 @素材名（见 lbl），这里不再提 <Picture N> —— 否则与
-            # 末尾「不要写 <Picture N>」自相矛盾。首尾帧对齐指令由前端自动生成，
-            # 本就不需要模型写。
-            "标签纪律：复用可见内容用 <Subject N>，参考素材直接用 @素材名（名单见末尾），"
-            "整片编辑/续写用 <Video N>，音频用 <Audio N>；summary 首行用 [task type] 前缀；"
-            "retention 每行形如 <label>: marker - 解释；对白用 <d>[语言] 原文</d>，说话人用 (S1)/(S2)；"
-            "镜头用 [Shot 1] 开头（无时间戳），后续 [Shot N] At MM:SS.mmm；"
-            "只改写用户给的内容，不虚构新事件。目标时长 %.1fs，%s。"
-            % (lang, dur, lbl)
+            "You are a MiniMax H3 full-reference (Ref2VA) prompt rewriter. "
+            "Write all six sections in English; preserve the original language only "
+            "inside <d>[language] ...</d> for dialogue/lyrics and for text visibly "
+            "present on screen. Output exactly six sections, in this order, each "
+            "section name on its own line followed by a colon: subject_definitions, "
+            "summary, retention_analysis, detailed_description, overall_soundscape, "
+            "non_diegetic_music. "
+            "Reference labels (fixed meaning across all sections): <Subject N> = reusable "
+            "visible content abstracted from the assets; <Picture N> = a reference image "
+            "used as a concrete frame or storyboard anchor; <Video N> = a reference video "
+            "used for editing, continuation, or whole-video temporal structure; "
+            "<Audio N> = an audio signal that is copied or referenced. "
+            "subject_definitions: one line per tracked item, each beginning with its label. "
+            "Follow the official sentence shapes verbatim: an image-derived subject is "
+            "`<Subject N> is the … in <Picture k>-derived content, the source image \"name\".`; "
+            "a video is `<Video N> is the source video for the target video edit, the file "
+            "\"name\".`; an audio signal is `<Audio N> is the reference audio signal that is "
+            "reused in the target video, the file \"name\".` "
+            "The asset list below tags each entry with its kind in parentheses — images, "
+            "videos and audio take DIFFERENT labels, never force everything into <Subject N>. "
+            "An image used only to define a character, scene, costume, or style does NOT get "
+            "a standalone <Picture N> line — cite it inside the corresponding <Subject N> "
+            "definition instead. "
+            "summary: one short paragraph starting with a bracketed task-type prefix, built "
+            "from the reference labels already defined (keyframe completion / reference "
+            "generation / video editing / video continuation / audio reuse / audio "
+            "reference, joined with ' + '); do not introduce new labels here. "
+            "retention_analysis: one line per label, formatted `<label> (appears in [Shot N]...): "
+            "marker - explanation`; visible content uses fully_preserved / partially_preserved "
+            "/ attribute_transfer / weak_reference, audio uses fully_copy / partially_copy / "
+            "reference / weak_reference; never write (Sx) in this section. "
+            "detailed_description: Style is established in one or two English sentences "
+            "BEFORE [Shot 1]. Then [Shot 1] with no timestamp; later shots use "
+            "[Shot N] At MM:SS.mmm, strictly increasing and within duration. At the first "
+            "appearance of an important <Subject N>, describe its referenced characteristics, "
+            "position in frame, and current action; keep using the same label later without "
+            "redefining it. Never write a bare @素材名 inside the description — that is only "
+            "for the subject_definitions definition lines. Aim for 350-500 English words. "
+            "Speakers use stable (S1)/(S2) IDs, written as `<Subject N> (Sx)` when the speaker "
+            "is a referenced subject; dialogue goes in <d>[Language] verbatim text</d>. "
+            "Shared rules with base mode: camera motion written as a natural clause with "
+            "type/amplitude/speed (never a tag stacked at the end); on-screen text inside "
+            "English double quotes, untranslated; a single-shot segment ends with "
+            "`One continuous shot with no cuts.` "
+            "overall_soundscape: 1-4 English sentences of ambience, physical action sounds, "
+            "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 English "
+            "sentences of instrumentation, tempo and dynamics only; write N/A when absent. "
+            "Target duration %.1fs. %s. Freedom: enrich the scene freely — camera angles, "
+            "lighting, texture, micro-actions, breathing, ambient sound sources, set dressing "
+            "and background extras are all fair game. The ONLY hard constraint is fidelity: "
+            "do not change the user-named characters, key props, quoted lines (verbatim) or "
+            "the ending they specified." % (dur, lbl)
         )
     if t == "FL2VA":
+        # 官方 base-en.txt §2.1 / §3.2：对齐指令是**一整句、首行、后接一个空行**，
+        # 且由后端注入（S.SS 必须由段长帧数换算，手写必错）。这里的措辞是
+        # 「不要写，后端会注入」——规则文件里已有同样一段，重复一次是为了防止
+        # 规则未注入时模型自己编一句更差的。
         return (
-            "你是 MiniMax H3 首尾帧提示词改写器。输出语言：%s。恰好三节："
-            "integrated_multimodal_description, overall_soundscape, non_diegetic_music。"
-            "首尾帧标签必须用小写裸词 picture 1（0.00s 起点锚）与 picture 2（%.2fs 终点锚），"
-            "首尾各复述一次；描述一条可观察的连续运动路径；对白用 <d>[语言] 原文</d>。"
-            % (lang, dur)
+            "You are a MiniMax H3 first-and-last-frame (FL2VA) prompt rewriter. "
+            "Write the body in English; preserve the original language only inside "
+            "<d>[language] ...</d> for dialogue/lyrics and for text visibly present on "
+            "screen. Output exactly three fields, in this order, each field name on its "
+            "own line followed by a colon: integrated_multimodal_description, "
+            "overall_soundscape, non_diegetic_music. "
+            "The first-and-last-frame alignment instruction is injected by the backend as "
+            "the first line of the final prompt, followed by one blank line before the "
+            "fields — do NOT write it yourself (its S.SS derives from the segment's frame "
+            "count, so hand-writing it is always wrong). "
+            "[Shot 1] has no timestamp; later shots use [Shot N] At MM:SS.mmm. FL2VA "
+            "generally favors a single shot so the model can interpolate continuously; the "
+            "last frame must be reached by the final shot. Describe the observable motion "
+            "path between the two frames rather than restating two static images. "
+            "Camera motion is a natural clause with type/amplitude/speed. Speakers use "
+            "stable (S1)/(S2) IDs; dialogue goes in <d>[Language] verbatim text</d>. "
+            "On-screen text goes inside English double quotes, untranslated. A single-shot "
+            "segment ends with `One continuous shot with no cuts.` "
+            "overall_soundscape: 1-4 English sentences of ambience, physical action sounds, "
+            "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 English "
+            "sentences of instrumentation, tempo and dynamics only; write N/A when absent. "
+            "Target duration %.1fs. Freedom: enrich the scene freely — camera angles, "
+            "lighting, texture, micro-actions, breathing and ambient sound sources are all "
+            "fair game. The ONLY hard constraint is fidelity: do not change the user-named "
+            "characters, key props, quoted lines (verbatim) or the ending they specified."
+            % dur
         )
+    # T2VA / I2VA / L2VA：官方 base-en.txt §2 三字段 + §3.1/§3.3 关键帧语义。
+    # I2VA 与 L2VA 的对齐句同样由后端注入（见 prompts.alignment_lines）。
     return (
-        "你是 MiniMax H3 提示词改写器（%s）。输出语言：%s。恰好三节："
-        "integrated_multimodal_description, overall_soundscape, non_diegetic_music。"
-        "用 [Shot 1] 开头，有真实切镜才加后续 [Shot N] At MM:SS.mmm；"
-        "运镜写自然语句（含类型/幅度/速度）；对白用 <d>[语言] 原文</d>，说话人 (S1)/(S2)；"
-        "环境氛围进 overall_soundscape，角色听不到的配乐进 non_diegetic_music（无则 N/A）。"
-        "目标时长 %.1fs，%s。只改写用户给的内容。"
-        % (t, lang, dur, lbl)
+        "You are a MiniMax H3 prompt rewriter (%s). Write the body in English; preserve "
+        "the original language only inside <d>[language] ...</d> for dialogue/lyrics and "
+        "for text visibly present on screen. Output exactly three fields, in this order, "
+        "each field name on its own line followed by a colon: "
+        "integrated_multimodal_description, overall_soundscape, non_diegetic_music. "
+        "The keyframe alignment instruction (if this mode has one) is injected by the "
+        "backend as the first line of the final prompt followed by one blank line — do NOT "
+        "write it yourself. "
+        "[Shot 1] has no timestamp and carries the overall style plus the initial "
+        "composition; later shots use [Shot N] At MM:SS.mmm, strictly increasing and "
+        "within duration. Camera motion is a natural clause with type/amplitude/speed, "
+        "never a tag stacked at the end. Speakers use stable (S1)/(S2) IDs; dialogue goes "
+        "in <d>[Language] verbatim text</d>. On-screen text goes inside English double "
+        "quotes, untranslated. A single-shot segment ends with "
+        "`One continuous shot with no cuts.` "
+        "overall_soundscape: 1-4 English sentences of ambience, physical action sounds, "
+        "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 English "
+        "sentences of instrumentation, tempo and dynamics only; write N/A when absent. "
+        "Target duration %.1fs. %s. Freedom: enrich the scene freely — camera angles, "
+        "lighting, texture, micro-actions, breathing, ambient sound sources and set dressing "
+        "are all fair game. The ONLY hard constraint is fidelity: do not change the "
+        "user-named characters, key props, quoted lines (verbatim) or the ending they "
+        "specified." % (t, dur, lbl)
     )
 
 
@@ -1529,10 +1660,14 @@ def optimize_once(config_in: dict | None, payload: dict | None, on_progress=None
     except (TypeError, ValueError):
         duration = 5.0
     media = payload.get("media") if isinstance(payload.get("media"), list) else []
-    labels = [str(m.get("label")) for m in media if isinstance(m, dict) and m.get("label")]
+    # 带 kind 传给 build_system_prompt：视频/音频必须让模型知道是哪一类，
+    # 否则它会一律写 <Subject N>（官方语义错位）。
+    labels = [{"name": str(m.get("label")), "kind": str(m.get("kind") or "image")}
+              for m in media if isinstance(m, dict) and m.get("label")]
     context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
-    system = build_system_prompt(task, duration, labels, cfg.get("output_language"), context)
-    # 规则文件强注入（最高优先级）：按模式分流，别再给常规段喂全参考规则
+    system = build_system_prompt(task, duration, labels, context)
+    # 规则文件强注入（最高优先级）：官方 base-en / ref-en 按 task 分流，
+    # 别再给常规段喂全参考规则（那是历史上非官方格式的根因之一）。
     rule_text = pick_rule_text(cfg, None, task)
     if rule_text:
         user_prompt = ("请严格按照以下《提示词撰写规则》重写用户提供的视频提示词，"

@@ -1788,8 +1788,13 @@ function defaultSegment() {
 }
 
 function segAutoRef(seg) {
-    if (seg && seg.auto_ref !== undefined && seg.auto_ref !== null) return !!seg.auto_ref;
+    /* ⚠ 顺序不能反：`unlink` 是**显式赋值**（总提示词框 `Standalone:` / 段卡开关写的就是
+     * 它），`auto_ref` 只是它的镜像。以前先读 auto_ref，于是刚从总提示词框贴进来的段
+     * （base.unlink = true/false 已赋值，base.auto_ref 还是旧值）会被判成旧值 ——
+     * 导出时 `Standalone:` 整行消失，用户刚贴进去的「独立镜头」回环一圈就丢了。
+     * 口径：显式 unlink 优先，其次 auto_ref，最后默认 true。 */
     if (seg && typeof seg.unlink === "boolean") return !seg.unlink;
+    if (seg && seg.auto_ref !== undefined && seg.auto_ref !== null) return !!seg.auto_ref;
     return true;
 }
 
@@ -2349,43 +2354,65 @@ function renameAssetLabel(node, idx, text) {
 }
 
 /* ---- 总提示词（多段一次性分配）----
- * 定位：**纯粹的分段流水线**，不是结果框、不做 AI、不与段卡提示词双向同步。
+ * 定位：**纯粹的分段流水线**，不是结果框、不做 AI、不与段卡提示词双�向同步。
  * 把外部（AI / 另一个项目 / 手写）的一大段多段文本粘进来 → 「解析并分配」写回段落。
  * 只给每段三样东西：**提示词、时长、独立镜头**（是否跳过引用上段尾帧）。
  *
- * 格式（提示词正文按 H3 官方格式，见 tools/h3_prompt_expander/references/h3-dialect.md）：
- *   【段1】          ← 段头：【段1】/【第1段】/【段落1】等价；序号可省略，按出现顺序排段
- *   时长：5         → seg.seconds（官方字段；不写=不动该段时长）
- *   独立镜头：是    → seg.unlink（是/否；是=断链不锚定上段尾帧，跳转/闪回/蒙太奇用）
- *   提示词：…       → 段主体（ds.prompts[i]，即段卡那个框），可多行（续行不写标签）。
- *                     正文按 H3 官方格式写：三字段 integrated_multimodal_description /
+ * ★ 段头与段级标签**一律英文**（与提示词正文同为英文，避免中英混排被模型
+ *   当成正文的一部分）。骨架：
+ *   [Segment 1]      ← 段头：`[Segment 1]` / `[Seg 1]` / `[Part 1]` / `[Shot Group 1]` 等价；
+ *                      序号可省（按出现顺序排段）
+ *   Duration: 5      → seg.seconds（不写=不动该段时长）
+ *   Standalone: yes  → seg.unlink（yes=断链不锚定上段尾帧，跳转/闪回/蒙太奇用；
+ *                      no=连续接上段。旧写法 `独立镜头：是/否` 仍认）
+ *   Prompt: …        → 段主体（ds.prompts[i]，即段卡那个框），可多行（续行不写标签）
+ *                     正文按 H3 官方格式：三字段 integrated_multimodal_description /
  *                     overall_soundscape / non_diegetic_music（字段间空行），Ref2VA 六段式；
  *                     I2VA/FL2VA/L2VA 的关键帧对齐指令写在正文最前、空一行再接三字段。
  *                     **资产引用就写在正文里：@素材名**，与段卡提示词框同一套语义。
- *   【完】          ← 结束标记（可选）：其后的所有内容（如 AI 的参考素材建议）不参与解析
+ *   [END]            ← 结束标记（可选）：其后的所有内容（如 AI 的参考素材建议）不参与解析
  *
  * 只读兼容（认出来 → 整块丢弃 → 提示「已忽略」，绝不悄悄并进正文）：
- *   参考 / 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本
+ *   参考 / 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本（中文旧标签）
+ *   Reference / Scene / Character / Ambience / Music / Intent / Script（英文旧标签）
  * ——这些都是**上一代**的分层：场景/角色/环境音/配乐被官方三字段吸收（写进正文），
  *   意图/剧本不再进模型，参考则已统一成正文里的 @素材名。留着它们只是为了旧文本
  *   与外部 skill 的产出**不把不该进模型的内容静默塞进提示词**，所以认出即丢并点名。
  * 规则：段头后未带标签的正文行视为提示词内容；只认上述行首标签，其余文本原样进主体
- * （官方字段标签 integrated_multimodal_description: 等不受影响）；某标签「写了即生效
- * （含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。
+ * （官方字段标签 integrated_multimodal_description: 等不受影响；官方字段里出现
+ *  `Duration:` / `Prompt:` 这类词时由「正文块保护」挡住，不会冲掉段级元数据）；
+ * 某标签「写了即生效（含写空=清空），没写不动该字段」。整个文本无任何段头时视为单段主体。
  * 容错：markdown 渲染界面复制常把段内换行合并成空格（软换行丢失），整段糊成一行；
  * 检测到段头不在行首独占即自动「重分行」（见 mpReflow）再按常规行解析。 */
-const MP_HEAD_RE = /^【\s*(?:第\s*)?(?:段(?:落)?\s*(\d+)?|(\d+)\s*段(?:落)?)\s*】\s*$/;
-const MP_END_RE = /^【\s*(?:完|END|end|结束)\s*】$/;
-const MP_FIELD_RE = /^(场景|角色|环境音|配乐|时长|独立镜头|参考|意图|剧本|提示词)\s*[：:]\s*(.*)$/;
-const MP_FIELDS = { "场景": "scene", "角色": "character", "环境音": "soundscape", "配乐": "music", "时长": "seconds", "独立镜头": "unlink", "参考": "refs", "意图": "intent", "剧本": "script", "提示词": "main" };
-const MP_YES = ["是", "独立", "断链", "开", "true", "yes"];
-const MP_NO = ["否", "连续", "关", "false", "no"];
+/* 段头：英文为唯一写入口径（`[Segment N]` / `[Seg N]` / `[Part N]` / `[Shot Group N]`，
+ * 序号可省）；中文旧写法 `【段1】` / `【第1段】` / `【段落1】` / `【1段】` 只读兼容 ——
+ * 去掉它会让老文本的段头不匹配 → 整篇塌成一整段、段内标签全糊进正文且无警告。 */
+const MP_HEAD_RE = /^(?:\[\s*(?:segment|seg|part|shot\s*group)\s*(\d+)?\s*\]|【\s*(?:第\s*)?(?:段(?:落)?\s*(\d+)?|(\d+)\s*段(?:落)?)\s*】)\s*$/i;
+/* 【完】的中文写法保留（只读兼容老文本），新写一律 [END]。 */
+const MP_END_RE = /^(?:\[\s*end\s*\]|【\s*(?:完|END|end|结束)\s*】)$/i;
+/* 段级标签：英文为唯一写入口径；中文旧名只读兼容（认出来照样当段级标签解析，
+ * 不然老文本里的「时长：8」会被当成正文吞进提示词）。 */
+const MP_FIELD_RE = /^(Duration|Standalone|Prompt|Reference|Scene|Character|Ambience|Music|Intent|Script|时长|独立镜头|提示词|参考|场景|角色|环境音|配乐|意图|剧本)\s*[:：]\s*(.*)$/i;
+const MP_FIELDS = {
+    "duration": "seconds", "standalone": "unlink", "prompt": "main",
+    "reference": "refs", "scene": "scene", "character": "character",
+    "ambience": "soundscape", "music": "music", "intent": "intent", "script": "script",
+    "时长": "seconds", "独立镜头": "unlink", "提示词": "main", "参考": "refs",
+    "场景": "scene", "角色": "character", "环境音": "soundscape", "配乐": "music",
+    "意图": "intent", "剧本": "script",
+};
+const MP_YES = ["是", "独立", "断链", "开", "true", "yes", "y", "on"];
+const MP_NO = ["否", "连续", "关", "false", "no", "n", "off"];
 /* 正文块字段：一旦进入，段级标签（时长/独立镜头/参考）就不再在正文里生效。
  * 背景：剧本正文是自由格式，模型常写「时长：9 秒」「配乐：无」这类行——
  * 当成段级标签会把 seg.seconds 冲成 NaN、剧本内容被截断，是个真实的解析冲突。 */
 const MP_BODY_KEYS = new Set(["main", "intent", "script", "scene", "character",
     "soundscape", "music"]);
-const MP_HEAD_SUB_RE = /【\s*(?:第\s*)?(?:段(?:落)?\s*\d*|\d+\s*段(?:落)?)\s*】/;   // 段头子串版（无行锚，序号可省）
+/* 段头子串版（无行锚，序号可省）：英文新写法 + 中文旧写法都认。
+ * ⚠ 必须带 `g`：mpReflow 里是 `new RegExp(MP_HEAD_SUB_RE.source, "g")` 复用它做全局
+ * 替换 —— 少一个 `g` 就成了「只替换第一处」甚至一处都不换（lastIndex 语义），
+ * 表现为「挤成一行的文本重分行后还是 1 段」，全篇静默塌成单段。 */
+const MP_HEAD_SUB_RE = /\[\s*(?:segment|seg|part|shot\s*group)\s*\d*\s*\]|【\s*(?:第\s*)?(?:段(?:落)?\s*\d*|\d+\s*段(?:落)?)\s*】/gi;
 
 /* 软换行丢失容错（mpReflow）：聊天界面按 markdown 渲染 AI 输出时，段内单个换行
  * 复制后常变空格——段头正则要求独占一行，全文于是塌缩成「1 段」、八标签全部糊进
@@ -2397,10 +2424,22 @@ function mpReflow(text, notes) {
     const degraded = lines.some((l) => { const t = l.trim(); return t && !MP_HEAD_RE.test(t) && MP_HEAD_SUB_RE.test(t); });
     if (!degraded) return text;
     notes.push("检测到段落结构被合并成单行（常见于从 markdown 渲染界面复制丢失换行），已自动重分行解析");
-    const fieldSub = new RegExp("(" + Object.keys(MP_FIELDS).join("|") + ")\\s*[：:]", "g");
-    const endSub = MP_END_RE.source.replace(/^\^|\$$/g, "");                 // 去行锚的【完】子串版
+    /* 标签前缀必须带**词边界**：`Duration` / `Prompt` / `Scene` 这些英文词是正文与
+     * 官方字段里极常见的普通词，没有边界的话 `Duration: 9 seconds of screen time.`
+     * 会被拦腰断成「\nDuration: 9 …」，把一句正文拆成两行。中文标签天然无此问题，
+     * 但统一加边界更省心（`(?<![\w])` 不认中文，中文仍靠后面的 [：:] 判据）。 */
+    const fieldSub = new RegExp(
+        "(?<![\\w])(" + Object.keys(MP_FIELDS).join("|") + ")\\s*[:：]", "gi");
+    /* 去行锚的 [END] / 【完】子串版：两端标记必须整体处理，只认 `[` `]` 内部完整形式，
+     * 否则正文里的 `[END]` 字面量会被误当结束标记切一刀。 */
+    const endSub = MP_END_RE.source.replace(/^\^|\$$/g, "");
+    /* ⚠ 重建正则必须**连同原 flags 一起带**（MP_HEAD_SUB_RE.flags = "gi"）：
+     * 只写 "g" 会丢掉 `i`，于是 `[Segment 1]`（大写 S）匹配不上，重分行形同虚设 ——
+     * 挤成一行的文本重分行后仍是 1 段，而且因为 notes 已经报了"已自动重分行"，
+     * 用户只会看到"提示说重分了、但还是只有一段"。 */
+    const headSub = new RegExp(MP_HEAD_SUB_RE.source, MP_HEAD_SUB_RE.flags);
     return lines.map((l) =>
-        l.replace(new RegExp(MP_HEAD_SUB_RE.source, "g"), "\n$&\n")          // 段头独占一行
+        l.replace(headSub, "\n$&\n")                                       // 段头独占一行
             .replace(new RegExp(endSub, "g"), "\n$&\n")                      // 行内【完】独占一行截断
             .replace(fieldSub, (m, _p1, off, s) =>                            // 行中标签提到行首
                 off === 0 || s[off - 1] === "\n" ? m : "\n" + m)
@@ -2450,7 +2489,9 @@ function parseMasterPrompt(text) {
         const hm = line.match(MP_HEAD_RE);
         if (hm) {
             openSeg();
-            const n = hm[1] !== undefined || hm[2] !== undefined ? Number(hm[1] ?? hm[2]) : 0;
+            const n = hm[1] !== undefined ? Number(hm[1])
+                : (hm[2] !== undefined ? Number(hm[2])
+                    : (hm[3] !== undefined ? Number(hm[3]) : 0));
             if (n && n !== out.segs.length) {
                 out.notes.push(`段头序号 ${n} 与出现顺序（第 ${out.segs.length} 段）不一致，已按出现顺序排列`);
             }
@@ -2459,7 +2500,13 @@ function parseMasterPrompt(text) {
         const fm = line.match(MP_FIELD_RE);
         if (fm) {
             if (!cur) { stray.push(line); continue; }   // 字段行出现在任何段头之前
-            const key = MP_FIELDS[fm[1]];
+            /* 标签查表必须**归一化**：MP_FIELD_RE 带 `i`（认 Duration / duration /
+             * DURATION），而 MP_FIELDS 的键是小写 + 中文原名。直接 MP_FIELDS[fm[1]]
+             * 会让 `Duration:` 查不到（undefined）→ 掉进 else 分支被当成正文写入
+             * cur[undefined]，段时长静默丢失。 */
+            const rawKey = fm[1].trim();
+            const key = MP_FIELDS[rawKey] || MP_FIELDS[rawKey.toLowerCase()];
+            if (!key) { pushBody(field || "main", line); continue; }
             /* 意图 / 剧本的**丢弃**放在解析之后统一做（见函数末尾）——这里照旧
              * 解析进 cur：剧本正文里写「时长：9 秒」是常态，靠 inBody 挡住才不会
              * 把段时长冲成 NaN；不解析就丢了这道保护。 */
@@ -2473,12 +2520,12 @@ function parseMasterPrompt(text) {
             if (key === "seconds") {
                 const v = Number(fm[2]);
                 cur.seconds = isFinite(v) && v > 0 ? v : undefined;
-                if (!isFinite(v) || v <= 0) out.notes.push(`「时长：${fm[2]}」不是有效秒数，已忽略`);
+                if (!isFinite(v) || v <= 0) out.notes.push(`「${rawKey}: ${fm[2]}」不是有效秒数，已忽略`);
             } else if (key === "unlink") {
                 const v = fm[2].trim().toLowerCase();
                 if (MP_YES.includes(v)) cur.unlink = true;
                 else if (MP_NO.includes(v)) cur.unlink = false;
-                else out.notes.push(`「独立镜头：${fm[2].trim()}」应为 是/否，已忽略`);
+                else out.notes.push(`「${rawKey}: ${fm[2].trim()}」应为 yes/是 或 no/否，已忽略`);
             } else if (key === "refs") {
                 cur.refs = fm[2].split(/[，,、;；]+/).map((s) => s.trim()).filter(Boolean);
             } else {
@@ -2530,27 +2577,34 @@ function parseMasterPrompt(text) {
     return out;
 }
 
-/** 工作台状态 -> 分段文本（【段N】+ 时长/独立镜头/提示词）。
+/** 工作台状态 -> 分段文本（[Segment N] + Duration / Standalone / Prompt）。
  *  段级标签只有这三个：**资产引用不在这里**——它就写在提示词正文里的 @素材名，
  *  与段卡提示词框同一套语义（导出正文 = 导出引用，不需要第二份清单）。
+ *  ★ 一律英文（与正文同为英文）：`[Segment N]` / `Duration:` / `Standalone: yes|no`
+ *  / `Prompt:` / `[END]`。中文旧标签仍可解析（只读兼容，见 parseMasterPrompt）。
  *  注意：**不再写 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本 / 参考**——这些层
- *  已经没有 UI 承载，写进文本只会在下次贴回时触发"已忽略"提示。解析侧仍认
- *  它们（只读兼容，见 parseMasterPrompt）。 */
+ *  已经没有 UI 承载，写进文本只会在下次贴回时触发"已忽略"提示。 */
 function mpRenderState(state) {
     const blocks = [];
     for (let i = 0; i < state.length; i++) {
         const seg = state[i] || {};
-        const rows = [`【段${i + 1}】`];
-        /* 旧四框已下线：导出不再写场景/角色/环境音/配乐（解析仍兼容旧文本，见 parseMasterPrompt） */
-        if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`时长：${seg.seconds}`);
-        if (seg.unlink) rows.push("独立镜头：是");
+        const rows = [`[Segment ${i + 1}]`];
+        if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`Duration: ${seg.seconds}`);
+        /* Standalone 是**两态显式值**，yes / no 都要写出来：
+         * 以前只在 `seg.unlink` 为真时写 `Standalone: yes`，false 一侧干脆不写 ——
+         * 于是「导出 → 贴回」的往返里 no 是**不可表达**的（贴回来时该标签缺席 =
+         * 不动该字段，继承旧值）。用户看到的就是「我把 Standalone 改成 no，
+         * 贴回去又变回 yes」。 */
+        if (seg.unlink !== undefined && seg.unlink !== null) {
+            rows.push(`Standalone: ${seg.unlink ? "yes" : "no"}`);
+        }
         /* 提示词正文按 H3 官方格式（三字段 / Ref2VA 六段），自身含空行——
            标签独占一行、正文从下一行开始，贴回时按续行原样归入 main。 */
         const main = String(seg.main || "").trim();
-        rows.push(main ? `提示词：\n${main}` : "提示词：");
+        rows.push(main ? `Prompt:\n${main}` : "Prompt:");
         blocks.push(rows.join("\n"));
     }
-    return blocks.join("\n\n") + "\n\n【完】";
+    return blocks.join("\n\n") + "\n\n[END]";
 }
 
 /** 把当前链的提示词导出为总提示词文本（只写非空字段，可回贴/喂给外部改）。
@@ -3349,29 +3403,45 @@ async function collectSegMedia(node, ds, idx) {
     if (endFile) addAnchor(endFile, "尾帧锚点：画面必须在这一帧结束（末帧硬钉）");
     for (const key of ((Array.isArray(seg.refs) ? seg.refs : []).slice(0, 8))) {
         const hit = pool.find((a) => a && (refKeyOf(a) === key || a.asset_id === key));
-        if (!hit || hit.kind !== "image") continue;
+        if (!hit) continue;
+        /* ⚠ **不许按 kind 过滤**（以前只收图片，把视频/音频整类丢掉了）：
+         * 后端 REF_CAPS 是 {image:9, video:3, audio:3}，官方标签也
+         * 分了 <Video N> / <Audio N> —— 视频与音频是一等公民。丢掉的话模型
+         * 根本不知道本段挂了参考视频/音频，永远写不出 <Video N> / <Audio N>。 */
         if (pickedFiles.has(hit.file)) continue;      // 已是帧锚 → 不重复挂
         pickedFiles.add(hit.file);
-        picks.push({ file: hit.file, asset_id: hit.asset_id || "",
+        const _kind = String(hit.kind || "image").toLowerCase();
+        picks.push({ file: hit.file, asset_id: hit.asset_id || "", kind: _kind,
             label: refKeyOf(hit), mark: markTextOf(hit),
-            role: `参考素材「${refKeyOf(hit)}」` });
+            role: `参考${_kind === "video" ? "视频" : _kind === "audio" ? "音频" : "素材"}「${refKeyOf(hit)}」` });
     }
     const media = [];
     const notes = [];
     /* 标注 -> 素材全名：LLM 返回的是 `@图片1`，回写前要用它译回 `@女主.png` */
     const markMap = {};
     for (const asset of picks) {
-        if (media.length >= 8) break;
-        const dataUrl = await optImageToDataUrl(
-            assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
-        if (!dataUrl) continue;
         /* label 用**标注**（图片1 / 视频1 / 音频1），不再用素材全名：
          * LLM 看见长文件名（`微信图片_20260730….png`）很容易抄错，标注短而稳，
          * 且不会凭空造出一个不存在的素材名。返回后由 decodeMarks 译回真名。
          * 首尾帧没有标注 → 回落到引用名（后端按 label 过滤空值）。 */
         const nm = String(asset.mark || asset.label || "");
+        const _k = String(asset.kind || "image").toLowerCase();
+        if (_k === "audio") {
+            /* 音频没有画面可预览，也**不该**塞进 images：它只是"有这条素材"的
+             * 声明。带上 kind 让模型知道该写 <Audio N> 而不是 <Subject N>。 */
+            if (asset.mark && asset.label) markMap[asset.mark] = asset.label;
+            media.push({ kind: "audio", label: nm });
+            if (nm) notes.push(`@${nm}`);
+            continue;
+        }
+        if (media.length >= 8) break;
+        const dataUrl = await optImageToDataUrl(
+            assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
+        if (!dataUrl) continue;
         if (asset.mark && asset.label) markMap[asset.mark] = asset.label;
-        media.push({ kind: "image", label: nm, images: [dataUrl] });
+        /* 视频：取首帧当缩略图，但 kind 必须是 "video" —— 否则模型会拿
+         * <Subject N> 去指代一条视频，官方语义直接错位。 */
+        media.push({ kind: _k, label: nm, images: [dataUrl] });
         if (nm) notes.push(`@${nm}`);
     }
     const base = notes.length
@@ -6468,7 +6538,7 @@ function openDesk() {
     const cHead = el("div", "h3d-sechead",
         "<strong>段落流水线</strong><small>顶部横向选段（点选看一段，＋ 加段，pill 可拖调序）；✏ 改词 · 🎲 重摇 · 🎬 锚定设置</small>");
     const mpBtn = el("button", "h3d-btn h3d-mpbtn", "📋 总提示词");
-    mpBtn.title = "多段工作台：一个框管全片，用【段N】分段，框里就是直接进模型的提示词；"
+    mpBtn.title = "多段工作台：一个框管全片，用 [Segment N] 分段，框里就是直接进模型的提示词；"
         + "可一键洗成 H3 官方格式再分配回段落（扩写在段卡上做）";
     mpBtn.onclick = openMasterPromptModal;
     cHead.append(mpBtn);
@@ -9539,9 +9609,11 @@ function openNewProjectModal() {
  * 另一个工程 / 手写）的一大段多段文本粘进来，「解析并分配」写回段落。
  * 给每段的东西只有三样：
  *   · 提示词 —— ds.prompts[i]，就是段卡那个框，直接进模型；
- *   · 时长   —— `时长：9`；
- *   · 独立镜头 —— `独立镜头：是` = 本段不自动引用上段尾帧（跳转 / 闪回 / 蒙太奇）。
+ *   · 时长   —— `Duration: 9`；
+ *   · 独立镜头 —— `Standalone: yes` = 本段不自动引用上段尾帧（跳转 / 闪回 / 蒙太奇）。
  * 段级标签只有这三个，其余一律是正文。
+ * ★ 标签一律**英文**（与正文同为英文）：`[Segment N]` / `Duration:` /
+ *   `Standalone:` / `Prompt:` / `[END]`。中文旧标签仍可解析（只读兼容）。
  *
  * **资产引用与段卡同一套语义**：就写在提示词正文里的 `@素材名`（绿框），
  * 分配时由正文的 @序列 派生 seg.refs（syncRefsFromText）。不再有「参考：」那条
@@ -9554,32 +9626,32 @@ function openNewProjectModal() {
  * **也不与段卡同步**：打开时不自动载入。「从当前链载入」是个手动按钮，只服务于
  * 「导出 → 外部改 → 贴回」的往返，不是常驻镜像。 */
 
-/* 空框占位（严格按 tools/h3_prompt_expander/references/h3-dialect.md：
- * 英文骨架逐字不改，主体中文；[Shot 1] 无时间戳且先声明风格，后续 [Shot N] At MM:SS.mmm；
- * 运镜写成句内自然动作（类型+幅度+速度）；(S1) 说话人 + <d>[Chinese] 原文</d>；
- * 环境音进 overall_soundscape，配乐无则 N/A）。
- * 只示范「段头 + 时长 / 独立镜头 + 提示词」这一种写法——模式、对齐指令那些是
+/* 空框占位（严格按官方 h3-prompt-writing base-en.txt：三字段英文骨架逐字不改；
+ * [Shot 1] 无时间戳且先声明风格，后续 [Shot N] At MM:SS.mmm；运镜写成句内自然动作
+ * （类型+幅度+速度）；(S1) 说话人 + <d>[Language] 原文</d>；环境音进
+ * overall_soundscape，配乐无则 N/A。正文英文，只有对白保原语言）。
+ * 只示范「段头 + Duration / Standalone + Prompt」这一种写法——模式、对齐指令那些是
  * 段卡上「AI 优化」按锚点产出的，这里不做 AI，就不在占位里假装有。 */
-const MP_PH_MAIN = `【段1】
-时长：8
+const MP_PH_MAIN = `[Segment 1]
+Duration: 8
 
-提示词：
-integrated_multimodal_description: [Shot 1] 实拍、电影感，手持轻微晃动，中景框住雨夜市场的窄巷，霓虹招牌在积水里拉出红蓝长影。
+Prompt:
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium shot with slight handheld shake frames the narrow alley of a rainy night market, neon signs dragging long red and blue streaks across the standing water. The camera pushes in with small amplitude at slow speed as a young woman with a quiet, breathy voice (S1) stops and looks back, saying: <d>[Chinese] 你要走了吗？</d>
 
-[Shot 2] At 00:03.200，镜头以小幅慢速推近她的侧脸，她停下脚步回头看向镜头，嘴角翘起。
+[Shot 2] At 00:03.200, the camera cuts to a close-up of her side profile as the corners of her mouth lift slightly.
 
-overall_soundscape: 雨声持续，落在铁棚顶上的密集雨点，远处摊贩的叫卖声。
+overall_soundscape: Steady rain continues, tapping densely on the metal stall roofs, with distant vendors calling out over the crowd.
 
 non_diegetic_music: N/A
 
-【段2】
-时长：8
-独立镜头：是
+[Segment 2]
+Duration: 8
+Standalone: yes
 
-提示词：
-integrated_multimodal_description: [Shot 1] 实拍，她转身挤进人流，镜头以小幅中速跟拍。
+Prompt:
+integrated_multimodal_description: [Shot 1] Live-action, she turns and squeezes into the crowd as the camera tracks right with small amplitude at moderate speed.
 
-overall_soundscape: 叫卖声渐远，脚步声明显。
+overall_soundscape: The vendors' calls fade with distance while her footsteps become prominent.
 
 non_diegetic_music: N/A`;
 
@@ -9593,9 +9665,9 @@ function openMasterPromptModal() {
     dialog.innerHTML = `
         <h3>📋 总提示词 · 多段分配</h3>
         <p class="h3d-lead">把外部（AI / 另一个工程 / 手写）的一大段多段文本粘进来，
-        <b>「解析并分配」</b>一次写回所有段落。用 <code>【段N】</code> 分段
+        <b>「解析并分配」</b>一次写回所有段落。用 <code>[Segment N]</code> 分段
         （不写段头 = 单段）；段内只有三个段级标签
-        <b>时长 / 独立镜头 / 提示词</b>，其余一律是正文。
+        <b>Duration / Standalone / Prompt</b>，其余一律是正文。
         <b>资产引用就写在提示词正文里的 <code>@素材名</code></b>——与段卡提示词框同一套，
         粘完点「🔗 解析引用」可把别名 / 标注统一成素材全名。
         这里<b>不做 AI</b>：要洗格式请去段卡上的「✨ AI扩写+优化 / ✨ 提示词优化」。
@@ -9615,7 +9687,7 @@ function openMasterPromptModal() {
         + "（含后缀），认不出来的名字会点名提示。\n"
         + "从别处复制来的提示词粘进来后点它一次即可。";
     head.append(el("b", "", "提示词（最终进模型）"),
-        el("small", "", "【段N】分段 · 段级标签只有 时长 / 独立镜头 / 提示词"
+        el("small", "", "[Segment N] 分段 · 段级标签只有 Duration / Standalone / Prompt"
             + " · 资产引用写正文 @素材名"),
         btnResolve);
     /* 素材池（总提示词框用）：与段卡读同一处活状态，别用快照。 */

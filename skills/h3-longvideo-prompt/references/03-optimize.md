@@ -2,6 +2,8 @@
 
 你是 **MiniMax H3 提示词改写器**。职责是**格式化与压缩，不是创作**：不许新增剧本里没有的事件、人物、道具、台词；剧本过长就按密度压缩，而不是另写一段。
 
+> 创作发生在第 2 步（`02-expand.md`），那里不设上限。到了这一步就只做翻译——把已经决定好的内容，写成官方认的英文格式。**正文一律英文**，唯一保留原语言的只有 `<d>[语言] …</d>` 里的对白 / 歌词，以及画面中可见的文字。
+
 ## 第一步：定模式（决定字段集，选错全篇作废）
 
 | 模式 | 何时用 | 输出 |
@@ -18,29 +20,18 @@
 
 ## 第二步：读规则文件（**最高优先级，压过其它一切通用格式要求**）
 
-原文在 `references/06-rules/`。按模式 + 语言选：
+原文在 `references/06-rules/`。**只有两份**，按模式选，不按语言选：
 
 | 条件 | 文件 |
 |---|---|
-| 常规模式 + 中文 | `06-rules/minimaxh3_base_prompt_writing_zh.txt` |
-| 常规模式 + English | `06-rules/minimaxh3_base_prompt_writing.txt` |
-| 全参考 + 中文（自定义版，四字段） | `06-rules/minimaxh3_custom_ref2v_prompt_writing_zh.txt` |
-| 全参考 + English（自定义版，四字段） | `06-rules/minimaxh3_custom_ref2v_prompt_writing.txt` |
-| 全参考 + 官方六段式（英文输出） | `06-rules/minimaxh3_official_ref2v_prompt_writing.txt` |
-| 四字段提示词中译英 | `06-rules/prompt_translate_to_en.txt` |
+| 常规模式（T2VA / I2VA / FL2VA / L2VA） | `06-rules/minimaxh3_base_prompt_writing.txt` |
+| 全参考模式（Ref2VA） | `06-rules/minimaxh3_official_ref2v_prompt_writing.txt` |
 
-⚠️ **规则文件按模式分流，不许串用**：拿全参考的四字段规则去洗常规段，会产出 `summary` / `detailed_description` 加 `<@名字>` / `<#名字:对话>` 这类非官方语法。
+⚠️ **规则文件按模式分流，不许串用**：拿全参考的六段式规则去洗常规段，会产出 `subject_definitions` / `retention_analysis` 这类常规模型不认的字段。
 
-⚠️ **Ref2VA 有两条口径，选一条并全程用同一条**：
+⚠️ 这两份都是**官方英文原文，逐字不许改**。它们和本文件冲突时，以它们为准。
 
-| | 官方六段式（原味） | 项目口径（**要贴进 SequenceForge 就用这条**） |
-|---|---|---|
-| 字段结构 | 六段式 | 六段式（相同） |
-| 正文语言 | **全英文**，只有 `<d>` 里保原语言 | 中文（骨架英文） |
-| 素材引用 | `<Subject N>` 标签 | 正文 `@素材名` |
-| 适用 | 直接调 H3 API | 贴进总提示词框 |
-
-还有第三条更简单的路：**四字段自定义版**（`summary` / `detailed_description` / `overall_soundscape` / `non_diegetic_music`，用 `<@名字>` 标主体、`<#名字:对话>` 标对白）。它与六段式不兼容，别混用。
+> 历史包袱（别再用）：曾经存在按语言分的 `*_zh.txt`、自研的四字段 ref 规则（`<@名字>` / `<#名字:对话>`）、以及中译英规则文件。**已全部删除**——中文产物混进英文正文会导致严重问题。如果你在旧笔记里看到这些文件名，忽略。
 
 ## 第三步：结构硬约束
 
@@ -54,7 +45,7 @@
 2. **主体首次出现要描述其特征**：第一次引用某个素材时，把它的可见特征（外观、位置、当前动作）写出来，后面再出现就不再重复定义。
 3. **尽量详细**：官方要求 `detailed_description` 每段 350–500 英文词，**不能写成剧情摘要或参考关系清单**。
 
-**FL2VA 特有**：首尾帧标签必须用小写**裸词** `picture 1`（0.00s 起点锚）与 `picture 2`（终点锚），**首尾各复述一次**；描述一条可观察的连续运动路径。
+**FL2VA 特有**：首尾帧由**锚定设置**挂（不写进正文），对齐指令照第一节模板写。描述一条可观察的连续运动路径。
 
 **对齐指令**（I2VA / FL2VA / L2VA）：必须是最终提示词**第一行**，其后空一行再接字段。整句照抄，只替换镜号 N 与秒数 S.SS（恰好两位小数）：
 
@@ -62,12 +53,73 @@
 - FL2VA：`How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.`
 - L2VA：`How the reference pictures align with the target video — <Picture 1> (from [Shot N]) aligns with the S.SS-second mark of the target video.`
 
+> 这三句是**后端按帧数注入的**（`S.SS = 帧数 / 24`）。你在 Skill 里手写时要保持同款措辞，别自己发明句式。
+
 T2VA 与 Ref2VA 没有对齐指令。
 
-## 素材引用怎么写
+## 素材引用怎么写（**多参最容易错的地方**）
 
-**正文里写 `@素材名`，不要写 `<Picture N>`。** 名单形如 `可用素材：@女主、@雨夜窄巷`；没有素材写「本段无参考素材」。
-后端会按正文**首次出现顺序**压实成 `<Picture k>`，所以顺序无关。
+后端会把正文里的 `@素材名` 序列**压成官方的标签**。所以关键不是「写不写 @」，而是**写在哪**。
+
+| 模式 | `@素材名` 写在哪 | 压成的标签 |
+|---|---|---|
+| base（T2VA / I2VA / FL2VA / L2VA） | 直接写进正文。挂哪些素材由正文 `@` 序列决定 | `<Picture N>`（素材图） |
+| Ref2VA | **只**写在 `subject_definitions` 的定义行；`detailed_description` 及以后**一律用标签指代** | `<Subject N>` / `<Picture N>` / `<Video N>` / `<Audio N>` |
+
+**Ref2VA 错误写法**（用户报的 bug：正文里冒出图片引用）：
+
+```
+detailed_description: [Shot 1] @女主 stops and looks back, @雨夜窄巷 neon flickers.   ← 错
+```
+
+**Ref2VA 正确写法**（`@名字` 只进定义行，正文全用标签）：
+
+```
+subject_definitions:
+<Subject 1> is the young woman in <Picture 1>, the source image "女主.png".
+<Subject 2> is the neon alley in <Picture 2>, the source image "雨夜窄巷.png".
+
+detailed_description: [Shot 1] <Subject 1> stops and looks back; the neon of <Subject 2> flickers across the wet ground.
+```
+
+### 定义行的官方句式（**照抄骨架，只替换名字与描述**）
+
+定义行是**一句话**：`<标签 N> is … , the source image / file "素材名".`。句子里提到的 `<Picture k>` / `<Video k>` 是这条素材在**定义区**的编号，与正文里的 `<Subject N>` 编号**各算各的**。
+
+| 素材类型 | 官方句式骨架 |
+|---|---|
+| 图片 → 抽象成可复用主体 | `<Subject 1> is the young woman in <Picture 1>, the source image "名字.png".` |
+| 图片 + 视频各供一半 | `<Subject 1> is the woman whose appearance comes from <Picture 1> and whose walking motion comes from <Video 1>, the source image "名字.png".` |
+| 图片当具体帧 / 分镜锚 | `<Picture 2> is the first frame of [Shot 1], showing a woman seated beside a café window, the source image "名字.png".` |
+| 视频当整段结构来源 | `<Video 1> is the source video for the target video edit, the file "名字.mp4".` |
+| 音频信号 | `<Audio 1> is the reference audio signal that is reused in the target video, the file "名字.wav".` |
+| 音频给某个主体的嗓音 | `<Audio 1> is the voice-timbre reference for <Subject 1> (S1), the file "名字.wav".` |
+
+⚠️ **标点与空格**：句末素材名**必须带引号**；`<Subject 1>` 标签内侧各一个空格（`<Subject N>`，不是 `<SubjectN>`）；句末一个句点，不留多余空格。
+
+**官方标签的固定含义**（全节通用，别混）：
+
+| 标签 | 指什么 |
+|---|---|
+| `<Subject N>` | 从素材里抽象出来的**可复用可见内容**（角色 / 场景 / 道具 / 风格） |
+| `<Picture N>` | 当**具体帧 / 分镜锚**用的一张参考图 |
+| `<Video N>` | 当**整段时序结构**用的一条参考视频（剪辑 / 续写） |
+| `<Audio N>` | 被复制或参考的音频信号 |
+
+只在定义里出现、用于说明「这个角色长什么样」的图，**不单独占一行 `<Picture N>`**——把它并进对应的 `<Subject N>` 定义行即可。
+
+**保留标记**（`retention_analysis` 一节里用）：
+
+- 可见内容：`fully_preserved` / `partially_preserved` / `attribute_transfer` / `weak_reference`
+- 音频：`fully_copy` / `partially_copy` / `reference` / `weak_reference`（**音频专用**，别跟上面那套混）
+
+`retention_analysis` 每行形如 `<标签 N> (appears in [Shot N]…): marker - 解释`。⚠️ **`(appears in [Shot N])` 只给可见内容**（`<Subject N>` / `<Picture N>` / `<Video N>`）；音频行**不带**这一截——音频不「出现在某一镜」，它是全程铺的：
+
+```
+<Audio 1>: fully_copy - the reference audio signal is reused throughout the target video.
+```
+
+名单形如 `可用素材：@女主、@雨夜窄巷`；变体素类别按后端下发，**视频写 `@名字（视频）`、音频写 `@名字（音频）`**（图片不加后缀）。没有素材写「本段无参考素材」。
 
 ## 说话人与画外音
 
@@ -79,9 +131,9 @@ T2VA 与 Ref2VA 没有对齐指令。
 
 ## 密度压缩：成品长度必须配得上时长
 
-`integrated_multimodal_description`（Ref2VA 为 `detailed_description`）正文按 **20–40 字/秒**（中文口径）；官方原味口径更严，要求 `detailed_description` 每段 **350–500 英文词**（约合中文 500–750 字）。中文口径下低于 250 字就会显得空。
+`integrated_multimodal_description`（Ref2VA 为 `detailed_description`）正文按 **20–40 字/秒**（中文口径换算）；官方口径更严，要求 `detailed_description` 每段 **350–500 英文词**（约合中文 500–750 字）。
 
-| 段时长 | 主描述字数 | 全段三/六字段合计 |
+| 段时长 | 主描述字数（中文字符） | 全段三/六字段合计 |
 |---|---|---|
 | 4–5 秒 | 80–200 | 约 +20% |
 | 6–8 秒 | 120–320 | 约 +20% |

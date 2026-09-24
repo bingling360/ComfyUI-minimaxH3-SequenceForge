@@ -49,6 +49,7 @@ from . import metrics
 from . import guides
 from . import grid
 from . import perf
+from . import semantic_bridge
 from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
                    audio_tokens_for_frames, align_frame_count_down)
 
@@ -1063,6 +1064,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 与 ds.perf 分开：性能设置是**机器相关**的（这台卡多大、内存多少），
         # 全局落盘、跨项目共用，不进导演台状态。整链读一次（mtime 缓存），别每段读盘。
         _pf = perf.current_settings()
+        # 语义桥（ds.bridge）：逐项目的条件增强，与性能设置分开 —— 那个是机器相关、
+        # 全局落盘；这个改的是画出来的东西，必须跟着作品走。
+        _bridge_cfg = semantic_bridge.config(ds)
         _oom_autoretry = bool(_pf.get("oom_autoretry", True))
         _act_peak_probe = bool(_pf.get("act_peak_probe", True))
         _frames_uint8 = str(_pf.get("frames_dtype") or "float32").lower() == "uint8"
@@ -2283,6 +2287,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 下「多一个空键」也是新指纹，会让既有项目的存档全部续不上。
         if _sig_tag is not None:
             ckpt_params["sigmas"] = _sig_tag
+        # 语义桥进指纹（**只在开启时加键**，与 sigmas 同一个理由：未启用时不加键，
+        # 既有项目存档续跑零影响）。它改的是每段的 cond 张量 —— 不进指纹就会出现
+        # 「前几段带桥、后几段不带」的半条链，那比整链重做糟得多。
+        if _bridge_cfg["enabled"]:
+            ckpt_params["bridge"] = {
+                "adapter": _bridge_cfg["adapter"],
+                "alpha": _bridge_cfg["alpha"],
+                "scope": _bridge_cfg["scope"],
+            }
         # 衔接诊断参数（下阶段基建：重摇/锚定）只记录不进指纹（改值不触发重跑；报告回看用）
         seam_refine = {"reroll": 接缝重摇, "reroll_th": float(重摇阈值),
                        "reroll_max": int(重摇上限), "anchor_aug": aug}
@@ -2842,7 +2855,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         guide_kf, tail_kf, head_kf, cur_seed,
                         skip_f, vis_len,
                         wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag,
-                        _up_swap=_up_swap)
+                        bridge=_bridge_cfg, _up_swap=_up_swap)
                 if not _reload_logged[0]:
                     _reload_logged[0] = True
                     # ⚠ 窗口包住的是整个 render_segment，n 里混着 TE（建高清 cond）
@@ -3213,6 +3226,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _seg_t["cond"] += time.perf_counter() - _t
 
                 cond, latent = out[0], out[1]
+                # 语义桥（FourBunny BUNNY H3 Conditioning Bridge 内联版）：只改 cond 的
+                # 文本张量、不碰元数据 —— 与下面「锚定来源」那段注入正交，所以放在注入
+                # 之前还是之后结果逐字节相同（放这里只是读起来离 cond 诞生点最近）。
+                cond = semantic_bridge.apply(cond, _bridge_cfg)
                 _chain_ref[0] = latent
                 # 锚定来源：普通段 = 段属性（unlink 屏蔽上桥、尾帧图/每段尾帧锚定收尾）；
                 # 重摇段 = 四种锚定模式（本次重做的临时策略，独立于段属性 unlink）——

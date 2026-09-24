@@ -1453,8 +1453,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent,
                   cur_seed,
                   采样器, 调度器, report=None, _timing=None, seg_no=None,
-                  _vram=None, _rss=None):
+                  bridge=None, _vram=None, _rss=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
+
+    bridge：语义桥配置（semantic_bridge.config 的返回值，由 render_segment 透传）。
+    二采的 cond 是在**本函数里**重建的，所以语义桥也必须在这里过 —— 只在 render_segment
+    收尾处调会造成「基础链带桥、高清链不带桥」的一采/二采语义漂移。
 
     _vram / _rss：阶段 0 诊断埋点的**出参容器**（dict，由 render_segment 建好后
     传进来，函数内只往里写）。默认 None = 零开销不采样。
@@ -1481,6 +1485,7 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
 
     from . import nodes as plugin_nodes
+    from . import semantic_bridge
 
     def _tmark(key, t0):
         # 耗时账（render_segment 的 ⏱ 分解行数据源）；_timing=None 时零开销
@@ -1640,6 +1645,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         out = MiniMaxH3ImageToVideo.execute(
             clip=clip, vae=video_vae, prompt="", width=tw, height=th, length=length)
     cond, latent = out[0], out[1]
+
+    # 语义桥：与一采**同一份配置、同一个位置**（cond 刚诞生、锚定还没注入）。
+    # 二采是从零重建 cond 的，这里不过一次就会造成「基础链带桥、高清链不带桥」——
+    # 一采/二采语义漂移，正是本项目最忌的「一条数据两个真相」。
+    if bridge is not None:
+        cond = semantic_bridge.apply(cond, bridge)
 
     # 桥锚 CondSync：上段尾帧桥/尾帧锚/首帧图头锚的 latent 同步神经放大后注入
     # 重采样 cond——锚住段首与上段高清尾的连续性（只依赖上段基础 latent + scale，
@@ -2656,12 +2667,16 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
                    skip_f, vis_len,
                    wav, sample_rate, bh, report, 采样器, 调度器, model_tag=None,
-                   _up_swap=False):
+                   bridge=None, _up_swap=False):
     """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪）。
 
     model_tag：二采模型结构签名（model_tag()），仅用于报告标注与写进
     manifest.upscale.segs[g].model 留痕——不进 params_hash，换模型不会
     触发既有高清分段重做（要重做请设「重跑起始段」）。
+
+    bridge：语义桥配置（semantic_bridge.config 的返回值）。二采的 cond 是在
+    render_latent 里重新编码出来的（高清画幅），所以必须**透传下去**在那里过桥；
+    只在收尾处调会造成「基础链带桥、高清链不带桥」的一采/二采语义漂移。
 
     _up_swap：本次二采用的 `模型` 是否与一采模型是**两份不同权重**
     （`upscale.models_distinct` 判定，nodes.py 传入）。为真时解码前会先卸掉
@@ -2722,7 +2737,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
             video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
             pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
             采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1,
-            _vram=_vram, _rss=_rss)
+            bridge=bridge, _vram=_vram, _rss=_rss)
     except BaseException:
         _dump_partial("二采渲染中断")
         raise

@@ -2,6 +2,12 @@
 # https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler ）
 放大模型放到latent_upscale_models/
 
+# 二采放大权重：不管放哪都别入库（同上超限；有人习惯丢在插件目录里）
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
 # 项目工作数据（AI 助手本地记忆，不属于插件本体）
 .workbuddy/
 .workbuddy-ai/

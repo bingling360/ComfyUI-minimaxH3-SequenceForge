@@ -9,6 +9,7 @@
 - POST /delete_file     删除项目内单个文件（成片等，限 h3_projects/<项目>/<文件>）
 - POST /merge           按序合并若干段/成片/外部视频 -> merged_*.mp4（流式编码）
 - GET  /upscale_models  列出 latent_upscale_models 目录里的放大权重（二采面板下拉）
+- GET  /bridge_models   列出本插件 models/ 里的语义桥权重（语义桥面板下拉）
 - POST /upscale_reset   清掉某段的二采记录与高清产物（下次运行重做该段）
 
 均受限于输出目录内、防目录穿越；无新依赖。
@@ -44,6 +45,7 @@ ROUTES = [
     ("GET", "/h3chain/projects"),
     ("GET", "/h3chain/project"),
     ("GET", "/h3chain/upscale_models"),
+    ("GET", "/h3chain/bridge_models"),
     ("GET", "/h3chain/vae_files"),
     ("GET", "/h3chain/prompt-rules"),
     ("GET", "/h3chain/optimizer-config"),
@@ -275,6 +277,15 @@ def add_routes(routes):
         try:
             from . import upscale_net
             models = upscale_net.scan_models()
+        except Exception:
+            models = []
+        return web.json_response({"ok": True, "models": models})
+
+    async def bridge_models(request):
+        """本插件 models/ 里的语义桥权重列表（语义桥面板下拉数据源）。只读。"""
+        try:
+            from . import semantic_bridge
+            models = semantic_bridge.scan_adapters()
         except Exception:
             models = []
         return web.json_response({"ok": True, "models": models})
@@ -2600,6 +2611,7 @@ def add_routes(routes):
         ("GET", "/h3chain/projects", list_projects),
         ("GET", "/h3chain/project", project_detail),
         ("GET", "/h3chain/upscale_models", upscale_models),
+        ("GET", "/h3chain/bridge_models", bridge_models),
         ("GET", "/h3chain/vae_files", vae_files),
         ("GET", "/h3chain/prompt-rules", prompt_rules),
         ("GET", "/h3chain/optimizer-config", optimizer_config),

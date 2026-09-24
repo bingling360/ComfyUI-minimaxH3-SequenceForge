@@ -1742,7 +1742,18 @@ function fixInvalidArWidget(node) {
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
 
 function defaultDs() {
-    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", end_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], redo_segs: [], upscale: defaultUpscale() };
+    return { mode: MODE_DEFAULT, prompts: [""], first_frame: "", end_frame: "", last_frame: "", ref_images: [], ref_assets: [], segments: [], inserts: [], redo_segs: [], upscale: defaultUpscale(), bridge: defaultBridge() };
+}
+
+/* 语义桥（BUNNY H3 Conditioning Bridge 内联版）：对 H3 文本 conditioning 过一次
+ * 5120→512→512→5120 的小网络，把「谁在做什么 / 道具归属 / 前后状态」的关系表达推清楚。
+ *
+ * 逐项目（跟二采设置同款，不像性能设置那样跟机器）：它改的是画出来的东西，该跟着作品走。
+ * 关闭时后端一个张量都不碰 —— 不加载权重、不建张量，也不进任何指纹。
+ * 开启时进 ckpt_params 指纹（`scope`/`alpha`/权重任一变化 → 整链重做）：cond 变了，
+ * 只重做一半会做出「前几段带桥、后几段不带」的半条链，比整链重做糟得多。 */
+function defaultBridge() {
+    return { enabled: false, adapter: "", alpha: 0.15, scope: "all" };
 }
 
 function defaultUpscale() {
@@ -1994,6 +2005,15 @@ function getDs(node) {
             include: (Array.isArray(upRaw.include) ? upRaw.include : [])
                 .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
         };
+        /* 语义桥配置（旧 JSON 无此键 = 关闭；与后端 semantic_bridge.config 同口径）。
+           开启后它会进后端 ckpt_params 指纹 —— 改开关/强度/范围/权重都整链重做。 */
+        const brRaw = raw.bridge && typeof raw.bridge === "object" ? raw.bridge : {};
+        const bridge = {
+            enabled: brRaw.enabled === true,
+            adapter: typeof brRaw.adapter === "string" ? brRaw.adapter.trim() : "",
+            alpha: upNum(brRaw.alpha, 0.15, 0.0, 1.0),
+            scope: BRIDGE_SCOPES.includes(brRaw.scope) ? brRaw.scope : "all",
+        };
         return {
             mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
             prompts,
@@ -2010,6 +2030,7 @@ function getDs(node) {
                 .filter((x) => x && typeof x === "object" && Number.isInteger(Number(x.slot)))
                 .map((x) => ({ slot: Number(x.slot), mode: REDO_MODES.some((r) => r[0] === x.mode) ? x.mode : "双锚" })),
             upscale,
+            bridge,
             /* AI优化配置与历史（自研后端）：透存，不进后端指纹 */
             optimizer: (raw.optimizer && typeof raw.optimizer === "object") ? raw.optimizer : null,
             opt_hist: (raw.opt_hist && typeof raw.opt_hist === "object") ? raw.opt_hist : null,
@@ -5552,6 +5573,7 @@ async function collectData() {
     const ping = await apiGet("/h3chain/ping");
     let projects = [];
     let upscaleModels = [];
+    let bridgeModels = [];
     /* 链状态指针（h3_projects/h3chain_state.json）随项目列表一起回。它以前由前端
      * 经 /api/view 直读 —— 同一个陈旧缓存问题：这个文件每跑一段就改写。 */
     let stateRaw = null;
@@ -5563,6 +5585,8 @@ async function collectData() {
         }
         const um = await apiGet("/h3chain/upscale_models");
         if (um.ok) upscaleModels = um.data?.models || [];
+        const bm = await apiGet("/h3chain/bridge_models");
+        if (bm.ok) bridgeModels = bm.data?.models || [];
     }
     setApiError(ping.ok ? "" :
         `项目存档接口未注册（HTTP ${ping.status || "??"}）：请重启 ComfyUI 并检查控制台是否出现`
@@ -5632,7 +5656,7 @@ async function collectData() {
             plan = [];
         }
     }
-    return { node, state, mf, plan, drafts, ds, projects, apiOk: ping.ok, upscaleModels };
+    return { node, state, mf, plan, drafts, ds, projects, apiOk: ping.ok, upscaleModels, bridgeModels };
 }
 
 function statusLine(state, mf, plan) {
@@ -6451,9 +6475,10 @@ function openDesk() {
     colC.append(cHead);
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
+    const rBridge = el("section", "h3d-rsec h3d-psec");
     const rUpscale = el("section", "h3d-rsec h3d-upsec");
     const rHist = el("section", "h3d-rsec h3d-hsec");
-    colR.append(rParams, rUpscale, rHist);
+    colR.append(rParams, rBridge, rUpscale, rHist);
     stage.append(colL, colC, colR);
 
     /* 页脚 */
@@ -6472,7 +6497,7 @@ function openDesk() {
             project: sub,
             colC,
             lProj,
-            rParams, rUpscale, rHist,
+            rParams, rBridge, rUpscale, rHist,
             footInfo, run,
             zoneErr,
         },
@@ -6580,12 +6605,17 @@ function updateDesk(data) {
     /* 中栏：状态条 + 进度轨 + 段落卡片（有编辑器/播放中时跳过重渲） */
     runZone("段落流水线", () => renderCenterColumn(z.colC, data));
 
-    /* 右栏：链参数（编辑中不重建）+ 二采面板（编辑中不重建）+ 成片历史（播放中不重建） */
+    /* 右栏：链参数（编辑中不重建）+ 语义桥 + 二采面板（编辑中不重建）+ 成片历史（播放中不重建） */
     const psig = paramsSig(node);
     const pgrid = z.rParams.querySelector(".h3d-params");
     if (!(pgrid && pgrid.contains(document.activeElement)) && z.rParams.dataset.sig !== psig) {
         z.rParams.dataset.sig = psig;
         runZone("链参数", () => renderParamsZone(z.rParams, data));
+    }
+    const bsig = bridgeSig(data);
+    if (!z.rBridge.contains(document.activeElement) && z.rBridge.dataset.sig !== bsig) {
+        z.rBridge.dataset.sig = bsig;
+        runZone("语义桥", () => renderBridgeZone(z.rBridge, data));
     }
     const usig = upscaleSig(data);
     if (!z.rUpscale.contains(document.activeElement) && z.rUpscale.dataset.sig !== usig) {
@@ -8582,6 +8612,177 @@ function repaintAfterWidget(name) {
     if (name !== W_AR && name !== W_MP && name !== W_WIDTH && name !== W_HEIGHT) return;
     repaintParams();
     repaintUpscale();
+}
+
+/* ---- 语义桥（右栏独立一栏：自己的签名、自己的渲染主人） ----
+ *
+ * 为什么独立成栏、而不是塞进「链参数」：那一栏的签名来自**画布控件值**
+ * （paramsSig(node)），而语义桥整份配置住在 ds 里 —— 塞进去就只有改画布控件时
+ * 才会重渲，面板会一直停在旧值上。独立一栏 + 自己的 bridgeSig 才符合
+ * 「一块 UI 只能有一个渲染主人」。
+ *
+ * 配置真源是 ds.bridge（逐项目）；权重列表走 /h3chain/bridge_models（后端扫插件 models/）。 */
+
+/* 作用范围（与后端 semantic_bridge.SCOPES 同表，别各写一套）：
+ *   all  = 全量过桥（参考图/首帧图的视觉 token 一起改，作者原版行为）
+ *   text = 仅文本过桥（视觉 token 逐字节保留，素材保真优先） */
+const BRIDGE_SCOPES = ["all", "text"];
+const BRIDGE_SCOPE_LABELS = { all: "全量过桥", text: "仅文本过桥" };
+
+function bridgeSig(data) {
+    const b = data.ds?.bridge || {};
+    return JSON.stringify([
+        b.enabled === true, b.adapter ?? "", b.alpha ?? 0, b.scope ?? "all",
+        (data.bridgeModels || []).join(","),
+    ]);
+}
+
+/** 语义桥配置写回（提交型编辑当场重建，理由同 repaintUpscale）。 */
+function setBridge(node, patch) {
+    const ds = getDs(node);
+    Object.assign(ds.bridge, patch);
+    setDs(node, ds);
+    scheduleRefresh(60);
+    repaintBridge();
+}
+
+function repaintBridge() {
+    if (!desk || !desk.zones || !desk.zones.rBridge) return;
+    try {
+        const data = Object.assign({}, desk.lastData, { node: findNode() });
+        data.ds = data.node ? getDs(data.node) : (data.ds || {});
+        desk.zones.rBridge.dataset.sig = bridgeSig(data);
+        renderBridgeZone(desk.zones.rBridge, data);
+    } catch (e) {
+        console.warn("[h3-director] repaintBridge failed:", e);
+    }
+}
+
+function renderBridgeZone(sec, data) {
+    const { node } = data;
+    const b = data.ds?.bridge || defaultBridge();
+    const models = data.bridgeModels || [];
+    sec.replaceChildren();
+    const det = foldSection("bridge-top", false,
+        "<summary>🌉 语义桥（条件增强）"
+        + (b.enabled ? ' <span class="h3d-chip cyan">已开启</span>' : "") + "</summary>");
+    const body = el("div", "h3d-adv-grid");
+    det.append(body);
+    sec.append(det);
+    if (!node) {
+        body.append(el("div", "h3d-empty", "画布上未找到节点，语义桥面板不可用"));
+        return;
+    }
+    /* 关闭时把下面几行整体置灰（**不隐藏**）：让「功能在、只是没开」一眼可见，
+     * 也免得开关一勾整栏跳版。 */
+    const dim = [];
+    const gate = () => dim.forEach((f) => { f.style.opacity = b.enabled ? "" : "0.45"; });
+
+    const enField = el("div", "h3d-param");
+    enField.append(el("label", "", "语义桥"));
+    const enRow = el("div", "h3d-seedrow");
+    const enCb = document.createElement("input");
+    enCb.type = "checkbox";
+    enCb.checked = b.enabled;
+    enCb.title = "开启后每段 cond 都过一次小网络（5120→512→512→5120），把"
+        + "「谁在做什么 / 道具归属 / 谁攻击谁 / 遮挡后的身份与状态」这类关系表达推清楚；"
+        + "它不是动作修复工具，也不改写提示词。"
+        + "开启会进整链指纹：改开关 / 强度 / 范围 / 权重都从第 1 段整链重做"
+        + "（cond 变了，只重做一半会做出「前几段带桥、后几段不带」的半条链）。"
+        + "关闭时后端一个张量都不碰，连权重都不加载。";
+    enCb.onchange = () => {
+        /* 勾上时若还没选权重、而 models/ 里又有文件，顺手选第一个 ——
+         * 否则一开启就是「权重名为空」的报错，白让用户撞一次墙。 */
+        const patch = { enabled: enCb.checked };
+        if (enCb.checked && !b.adapter && models.length) patch.adapter = models[0];
+        setBridge(node, patch);
+    };
+    enRow.append(enCb);
+    enField.append(enRow);
+    body.append(enField);
+
+    const alField = el("div", "h3d-param");
+    alField.append(el("label", "", "强度 alpha"));
+    const alRow = el("div", "h3d-seedrow");
+    const alInp = document.createElement("input");
+    alInp.type = "number";
+    alInp.value = b.alpha;
+    alInp.min = "0";
+    alInp.max = "1";
+    alInp.step = "0.05";
+    alInp.title = "桥的混合比例：out = 原值 + alpha ×（过桥值 − 原值）。"
+        + "作者推荐 0.10~0.15 起步，0 = 等于不启用。"
+        + "强度不是越高越好 —— 他自述约 10% 的案例开启后反而出现新错误，0.2 以上画面细节会变软。"
+        + "请固定同一个 seed 做对照，别凭一次结果下结论。";
+    alInp.addEventListener("wheel", (e) => e.preventDefault(), { passive: false });
+    alInp.onchange = () => {
+        const n = Number(alInp.value);
+        if (isFinite(n)) setBridge(node, { alpha: Math.min(1, Math.max(0, n)) });
+    };
+    alRow.append(alInp);
+    alField.append(alRow);
+    body.append(alField);
+
+    const scField = el("div", "h3d-param");
+    scField.append(el("label", "", "作用范围"));
+    const scSel = document.createElement("select");
+    scSel.className = "h3d-select";
+    scSel.title = "cond 张量里同时混着文本 token 与视觉 token —— H3 不走 chat template，"
+        + "参考图/首帧图是以 vision block 形式拼进同一个序列的。"
+        + "「全量过桥」= 两类都改（作者原版行为）；"
+        + "「仅文本过桥」= 视觉 token 逐字节保留，参考图/首帧图的原始表达不受影响。"
+        + "注意：尾帧图、每段尾帧锚定、头锚、手动锚只做 VAE latent，不进这个张量，"
+        + "语义桥碰不到它们 —— 别把它理解成「连 latent 锚一起增强」。";
+    for (const sc of BRIDGE_SCOPES) {
+        const o = document.createElement("option");
+        o.value = sc;
+        o.textContent = BRIDGE_SCOPE_LABELS[sc];
+        if (sc === b.scope) o.selected = true;
+        scSel.append(o);
+    }
+    scSel.onchange = () => setBridge(node, { scope: scSel.value });
+    scField.append(scSel);
+    body.append(scField);
+
+    const mdField = el("div", "h3d-param");
+    mdField.append(el("label", "", "权重文件"));
+    const mdSel = document.createElement("select");
+    mdSel.className = "h3d-select";
+    mdSel.title = "本插件 models/ 目录下的语义桥权重（.safetensors）。"
+        + "列表为空 = 该目录下没有权重文件，请先放一个进去再开启。";
+    if (models.length) {
+        for (const m of models) {
+            const o = document.createElement("option");
+            o.value = m;
+            o.textContent = m;
+            if (m === b.adapter) o.selected = true;
+            mdSel.append(o);
+        }
+    } else {
+        const o = document.createElement("option");
+        o.value = "";
+        o.textContent = "models/ 下无权重";
+        mdSel.append(o);
+        mdSel.disabled = true;
+    }
+    mdSel.onchange = () => setBridge(node, { adapter: mdSel.value });
+    mdField.append(mdSel);
+    body.append(mdField);
+
+    dim.push(alField, scField, mdField);
+    gate();
+
+    const foot = el("div", "h3d-hint",
+        b.enabled
+            ? "已开启：每段一采与二采都会过一次语义桥（同一份配置、同一个位置）。"
+                + "改这里的任何一项都会让整链重做。"
+            : (models.length
+                ? "未开启：后端不加载权重、不改 cond，与加这个功能之前逐字节一致。"
+                : "未开启；且 models/ 目录下没有权重文件 —— 先放一个 .safetensors 进去。"));
+    sec.append(foot);
+    sec.append(el("div", "h3d-foot",
+        "权重放在本插件目录的 models/ 里；作用范围只区分「文本 / 视觉」两类 token，"
+        + "无法只护参考图而放开首帧图（两者在同一条视觉 token 段里）。"));
 }
 
 /* ---- 潜空间放大二采面板（右栏，独立后处理通道：主链完成后的清扫执行） ---- */

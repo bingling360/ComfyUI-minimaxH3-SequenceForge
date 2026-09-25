@@ -15,6 +15,9 @@
   ② 权重归一化后，若「各块采样结果 == 原 latent」（理想收敛），融合输出**逐位等于**原 latent
   ③ 二维羽化权重 = 行权重 × 列权重，且核区恒 1
   ④ 只有 tile 开、时序关时也真的会切（不能被时序层的直通吞掉）
+  ⑤ **采样输出在 CPU 时融合仍成立** —— `comfy.sample.sample` 收尾恒把结果丢到
+     `intermediate_device()`（无 `--gpu-only` 时 = CPU），累加器却在 cuda；
+     旧代码只写 `.to(acc.dtype)`，线上第一次融合就崩（2026-09-25）。
 
 这三条是数学性质，与具体 H3 权重无关 —— 用随机张量即可判定。
 """
@@ -62,6 +65,10 @@ def _assert(cond, msg):
         raise AssertionError(msg)
 
 
+class _Skip(Exception):
+    """环境不满足（如本机无 CUDA）——不算通过也不算失败，报告里显式标出。"""
+
+
 class FakeNested:
     """NestedTensor 的最小同构体：`.tensors` 元组 + 下标访问（upscale 里两种都用）。"""
 
@@ -78,8 +85,13 @@ def _fuse(vid, aud, mode, ov, feather, sampled=None):
     `sampled` = None 表示「各块采样结果 == 切下来的输入」（理想收敛，融合应恒等）。
     否则 `sampled(vid_piece, ti)` 返回该块采样后的张量，用来验证「不同的块结果
     在 overlap 区按权重过渡、在 core 区各自生效」。
+
+    ⚠ 融合前的「采样输出 → 累加器」那一步**必须调真代码的 `_sampler_out_to`**，
+    不能自己写 `.to(acc.dtype)`：本副本早先就是那么写的，于是永远测不出
+    「采样输出在 CPU、累加器在 cuda」这条真实故障（2026-09-25 线上踩到）。
     """
     from h3seqforge import perf
+    up = sys.modules["h3seqforge.upscale"]
 
     H, W = int(vid.shape[3]), int(vid.shape[4])
     plan = perf.plan_tiles(H, W, mode, ov)
@@ -88,7 +100,7 @@ def _fuse(vid, aud, mode, ov, feather, sampled=None):
     for ti, (hs, he, ws, we, chs, che, cws, cwe, eff_ov) in enumerate(plan):
         piece = vid[:, :, :, hs:he, ws:we]
         out = sampled(piece, ti) if sampled is not None else piece
-        sh = out.to(acc.dtype)
+        sh = up._sampler_out_to(out, acc)
         # 权重算在**写回区（core）**坐标系上；ramp 上限 = 实际生效 overlap
         rh = min(feather, eff_ov)
         rw = min(feather, eff_ov)
@@ -117,6 +129,8 @@ def main():
         try:
             fn()
             results.append(("OK  ", name))
+        except _Skip as e:
+            results.append(("SKIP", f"{name} :: {e}"))
         except AssertionError as e:
             results.append(("FAIL", f"{name} :: {e}"))
         except Exception as e:                        # noqa: BLE001
@@ -260,15 +274,46 @@ def main():
                         f"时序咬合带第 {k} 点不互补：{w0[len(w0) - eff + k]} + {w1[k]} = {tot}"
     check("时序分块咬合 + 权重互补（3 组参数）", t_temporal_interlock)
 
+    # ⑧ 采样输出在 **CPU**（`comfy.sample.sample` 的真实返回设备）时融合仍成立
+    #
+    # 这是线上踩到的原样：`comfy/sample.py:83` 收尾把采样结果
+    # `.to(intermediate_device())`，而 `intermediate_device()` 在没加 `--gpu-only`
+    # 时恒为 CPU；融合累加器却是 `torch.zeros_like(_vid)`（cuda）。
+    # 旧代码只写 `.to(acc.dtype)`（不搬设备）→ 第一次融合就
+    # `RuntimeError: Expected all tensors to be on the same device … cuda:0 and cpu!`
+    #
+    # ⚠ 只有在**有 CUDA** 的机器上才有判别力：纯 CPU 环境里 acc 与 sh 同设备，
+    # 本用例会退化成恒真（所以它是「有卡则真测，无卡则明说跳过」）。
+    def t_sampler_out_on_cpu():
+        dev = "cuda" if torch.cuda.is_available() else None
+        if dev is None:
+            raise _Skip("本机无 CUDA：acc 与采样输出同设备，该用例无判别力")
+        vid = torch.randn(1, 2, 2, 64, 64, device=dev, dtype=torch.float32)
+
+        def sampled(piece, ti):
+            # 采样输出的真实形态：算完在 cuda、交回时已在 CPU
+            return (piece + 0.0).to("cpu")
+
+        got, plan = _fuse(vid, None, "2x2", 16, 16, sampled=sampled)
+        assert len(plan) > 1, "该用例需要真的切块"
+        assert got.device.type == "cuda", f"融合结果该在 cuda，实际 {got.device}"
+        assert torch.allclose(got.cpu(), vid.cpu(), atol=1e-4, rtol=1e-4), \
+            "采样输出在 CPU 时融合结果不等于原 latent"
+    check("采样输出在 CPU 时融合仍成立（真机 cuda 判别）", t_sampler_out_on_cpu)
+
     print()
     bad = 0
+    skipped = 0
     for tag, msg in results:
         print(f"  {tag} {msg}")
-        if tag != "OK  ":
+        if tag == "SKIP":
+            skipped += 1
+        elif tag != "OK  ":
             bad += 1
     print()
-    print("check_refine_tile_fusion：全部通过" if not bad
-          else f"check_refine_tile_fusion：{bad} 项失败")
+    _tail = f"（跳过 {skipped} 项：环境不满足）" if skipped else ""
+    print("check_refine_tile_fusion：全部通过" + _tail if not bad
+          else f"check_refine_tile_fusion：{bad} 项失败{_tail}")
     return 0 if not bad else 1
 
 

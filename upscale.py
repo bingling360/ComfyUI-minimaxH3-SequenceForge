@@ -800,6 +800,30 @@ def _tensors_to_device(obj, dev):
     return obj
 
 
+def _sampler_out_to(t, acc):
+    """采样输出 → 累加器（`acc`）的设备与精度。
+
+    ⚠ **必须显式搬设备，不能只写 `.to(acc.dtype)`** —— 分块融合的累加器是
+    `torch.zeros_like(_vid)`（cuda），而采样输出**恒在 CPU**：
+
+    `comfy.sample.sample` 收尾那一行会把结果
+    `.to(device=intermediate_device())`（`comfy/sample.py:83`），而
+    `intermediate_device()` 在**没加 `--gpu-only`** 时恒返回 `torch.device("cpu")`
+    （`comfy/model_management.py:1267`）。本机（NORMAL_VRAM，无 `--gpu-only`）正是这一档。
+
+    于是 `acc + sh * wv` 直接
+    `RuntimeError: Expected all tensors to be on the same device, but found at least
+    two devices, cuda:0 and cpu!` —— 时序分块 / 空间 tile 的**第一次融合必崩**
+    （2026-09-25 实测，段1 首个空间块采样完即中断；整链被按「单段降级」吞掉，
+    只留一行报告，成片回落到基础分辨率）。
+
+    为什么离线校验没抓到：`tools/check_refine_tile_fusion.py` 的 `_fuse` 是这段
+    数学的**副本**，在纯 CPU 下 acc 与 sh 同设备，永远不触发 —— 该工具已同步
+    改用本函数，并补了「sh 在 CPU」的用例。
+    """
+    return t.to(acc.device, acc.dtype)
+
+
 def _cuda_if_room(min_free_gb=2.0):
     """intermediate_device 返回 CPU 时的纠偏探测：CUDA 可用且空闲显存充足则返回
     cuda 设备。魔改运行时（DynamicVRAM）账面紧张会把 intermediate_device 打回
@@ -2083,7 +2107,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                                (cur_seed + ti * 104729) % 0xffffffffffffffff,
                                f"{round_desc}·空间块{ti + 1}/{len(plan)}")
             o = out["samples"]
-            sh = (o.tensors[0] if hasattr(o, "tensors") else o[0]).to(acc.dtype)
+            # 采样输出恒在 CPU（见 _sampler_out_to），累加器在 cuda —— 必须搬回来
+            sh = _sampler_out_to(
+                o.tensors[0] if hasattr(o, "tensors") else o[0], acc)
             # 二维羽化权重：行向 × 列向（可分离）——省一次 2D 场构造。
             # ⚠ 权重算在**写回区（core）**坐标系上（`chs..che` / `cws..cwe`）：
             # 融合只发生在写回区里。ramp 取 `min(_rt_feather, eff_ov)` —— 上限是
@@ -2145,7 +2171,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                                (cur_seed + ci * 7919) % 0xffffffffffffffff,
                                f"{round_desc}·分段{ci + 1}/{len(plan)}")
             o = out["samples"]
-            sh = (o.tensors[0] if hasattr(o, "tensors") else o[0]).to(acc.dtype)
+            # 同上：采样输出在 CPU、acc 在 cuda（见 _sampler_out_to）
+            sh = _sampler_out_to(
+                o.tensors[0] if hasattr(o, "tensors") else o[0], acc)
             # core == span（段只写自己采样过的），映射回本段内部坐标 = 全段。
             # 权重算在**写回区**坐标系上；ramp 必须恰等于咬合带宽度（相邻段
             # 喂入区自身的重叠 = 生效 overlap），两侧才严格互补成 1。

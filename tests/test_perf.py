@@ -954,7 +954,10 @@ def test_chunk_switches_and_params_are_in_the_table():
 def test_chunk_param_defaults_are_sane():
     """参数默认值要「开开关即合理」：该非零的非零，该给建议值的给建议值。"""
     d = perf.DEFAULT_PERF
-    assert d["ff_chunk_tokens"] == 4096          # 建议起点（计划实测值）
+    # 建议起点。⚠ 必须够大：块数 = 序列 token ÷ 此值，而 H3 常见序列 5–10 万 token
+    # —— 4096 会切出 20+ 块、把采样拖慢（2026-09-25 由 4096 上调到 16384）。
+    assert d["ff_chunk_tokens"] == 16384
+    assert d["ff_chunk_tokens"] >= 8192, "太小会在长序列下切出过多块（代价 ∝ 块数）"
     assert d["ff_chunk_min_tokens"] == 8192      # 对齐 KJ seq_threshold 语义
     assert d["attn_head_chunks"] == 8            # 建议起点（实测平台期起点；1 = 不分块）
     assert d["upscale_chunk_frames"] == 32       # 上游同款默认

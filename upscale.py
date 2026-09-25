@@ -2501,6 +2501,18 @@ def install_low_vram_attention(model, head_chunks, targets=None):
 _FF_SELFCHECK_ROWS_CAP = 8
 _FF_SELFCHECK_CACHE = {}
 
+# ---- FFN 分块的**运行时**观测（2026-09-25 加）----
+#
+# 安装期只能报「装了几个 Linear」，报不出**代价** —— 代价 ∝ 块数，而
+# 块数 = 序列 token ÷ 每块 token，**序列长度只有跑到前向才知道**。
+# 块数是这个开关唯一的关键数字：块数一多，每个 Linear 每块的固定开销
+# （vbar 权重取用 + 流同步）就按块数线性增长，表现就是「开了反而非常慢」。
+# 按 (token 数, 每块大小) 去重报一次 —— 52 层 × 2 个 Linear 各打一行会刷屏。
+_FF_BLOCK_REPORTED = set()
+_FF_BLOCK_WARN_AT = 32          # 块数超过此值就提醒「代价按块数线性增长」
+_FF_INSTALLED_LINEARS = 0       # 已装分块的 Linear 数（报告里换算总取用次数）
+_FF_FFN2 = 28672                # H3：fc1 输出维 = ffn×2 = 14336×2（显存代价换算用）
+
 
 def _ff_selfcheck_signature(sub):
     """结构签名：决定"逐行可分离"的只有这些 —— 形状/设备/dtype 都不影响结论。
@@ -2517,6 +2529,35 @@ def _ff_selfcheck_signature(sub):
     return (type(sub).__module__, type(sub).__qualname__, fwd,
             getattr(sub, "in_features", None), getattr(sub, "out_features", None),
             getattr(sub, "bias", None) is not None)
+
+
+def _report_ff_blocks(tokens, chunk, blocks):
+    """首次跑到某个 (序列, 每块) 组合时，把**真实块数**打出来（含建议值）。
+
+    为什么必须报：安装期只报「装了几个 Linear」，而**代价 ∝ 块数** ——
+    块数 = 序列 token ÷ 每块 token，只有前向时才知道序列多长。用户看到的
+    只是「开了就变慢」，看不到「慢在切了 27 块」，于是只能靠猜参数。
+    """
+    key = (int(tokens), int(chunk))
+    if key in _FF_BLOCK_REPORTED:
+        return
+    _FF_BLOCK_REPORTED.add(key)
+    n_lin = _FF_INSTALLED_LINEARS
+    extra = f" × {n_lin} 个 Linear ≈ {blocks * n_lin} 次权重取用" if n_lin else ""
+    print(f"[H3分块] FFN 实际切块：序列 {tokens} token ÷ 每块 {chunk} = {blocks} 块{extra}",
+          flush=True)
+    if blocks <= _FF_BLOCK_WARN_AT:
+        return
+    # 建议值：从当前值翻倍，直到块数降到 8 以内（或到 32768 封顶）。
+    # ⚠ 方向 —— **调大**才降块数。块数少了固定开销才下来，而显存代价只是
+    # 「每块 token × ffn×2 × 2 字节」，长序列下依然远小于整段激活。
+    want = int(chunk)
+    while want < 32768 and tokens // want > 8:
+        want *= 2
+    cost_gb = want * _FF_FFN2 * 2 / (1024 ** 3)
+    print(f"[H3分块] ⚠ 块数偏多（{blocks} 块）：固定开销按块数线性增长 —— "
+          f"建议把「每块 token 数」从 {chunk} 提到 {want}（→ 约 {tokens // want} 块，"
+          f"单块激活代价 ≈ {cost_gb:.2f}GB）；还 OOM 再减半", flush=True)
 
 
 def _ff_chunk_selfcheck(sub, orig, chunk_tokens, stats=None):
@@ -2722,8 +2763,12 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=
                         return __orig(x, *a, **k)
                 except Exception:
                     return __orig(x, *a, **k)
-                outs = [__orig(x[s:e], *a, **k)
-                        for s, e in __plan(int(x.shape[0]), __ct)]
+                # 块数先算出来（顺带报一次观测，见 _report_ff_blocks）：
+                # 这个数字直接决定「每块的固定开销 × 块数」有多大 —— 它就是
+                # 用户填的「每块 token 数」唯一的反馈信号。
+                _plan_ = __plan(int(x.shape[0]), __ct)
+                _report_ff_blocks(int(x.shape[0]), __ct, len(_plan_))
+                outs = [__orig(x[s:e], *a, **k) for s, e in _plan_]
                 return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
             # 赋**普通函数**（不是 MethodType）：nn.Module.__call__ 取 `self.forward`
@@ -2734,6 +2779,10 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=
             except Exception:
                 pass
             n += 1
+    # 记下已装的 Linear 数：forward 侧报块数时要拿它换算「总权重取用次数」
+    # （一采 / 二采两个模型各装一次，取大值即可 —— 报告里是量级参照）。
+    global _FF_INSTALLED_LINEARS
+    _FF_INSTALLED_LINEARS = max(_FF_INSTALLED_LINEARS, n)
     if stats is not None:
         stats.update({"candidates": seen, "installed": n, "skipped": skipped,
                       "already": already,

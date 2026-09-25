@@ -4047,17 +4047,26 @@ const H3_PERF_FIELDS = [
       hint: "按 token 切块算 MLP —— **主干 OOM 正崩在这里**（HyperFlow bypass 单次请求 6.13GB，占 24GB 卡的 26%）。"
           + "`nn.Linear` 沿 token 行可分离，所以**数学等价、零画质损失**，是本项目唯一无损的分块。装之前会先自测，不一致就不装" },
     { key: "ff_chunk_tokens", label: "　　每块 token 数", kind: "num", enable: "ff_chunk_on", group: "一采采样 · 分块",
-      hint: "切成多大一块。**越小越省显存、开销略增**。太小则 kernel 启动开销占主导；太大则起不到压峰作用。"
-          + "建议从 4096 起，还 OOM 就减半。⚠ 本项目单位是「每块的 token 数」，与 KJNodes 的「切成几份」不是同一口径" },
+      hint: "切成多大一块。**块数 = 序列 token ÷ 此值**，而开销 ∝ 块数 —— 每个 Linear 每块都要取一次权重、"
+          + "同步一次流，块数一多就线性拖慢采样。所以**宁大勿小**：H3 常见序列 5–10 万 token，"
+          + "填 4096 会切出 20 多块。显存代价 = 每块 token × 28672 × 2 字节（16384 ≈ 0.9GB）。"
+          + "建议 16384 起，还 OOM 再减半；实际块数会在日志里打出来（`[H3分块] FFN 实际切块`）。"
+          + "⚠ 单位是「每块的 token 数」，与 KJNodes 的「切成几份」不是同一口径" },
     { key: "ff_chunk_min_tokens", label: "　　低于多少 token 不切", kind: "num", enable: "ff_chunk_on", group: "一采采样 · 分块",
       hint: "短序列切块只增加开销、省不了多少。序列 token 数低于此值就整段直通（对齐 KJNodes 的 seq_threshold，其默认 4096）" },
     { key: "attn_head_on", label: "注意力头分块（Low VRAM Attention）", kind: "bool", group: "一采采样 · 注意力",
-      hint: "小显存卡的主要手段之一。**head 之间独立 → 精确、无损**。装之前会自测（拿小输入跑"
-          + "「分组 vs 整段」对比），不一致就不装 —— 依赖 ComfyUI 内部结构，装不上会静默跳过并保持原样，不会让渲染失败" },
+      hint: "把注意力按 head 分组逐组算。**head 之间独立 → 分组本身精确无损**；装之前会自测（拿小输入跑"
+          + "「分组 vs 整段」对比），不一致就不装。收益**完全取决于后端内核**："
+          + "**int8 kitchen 内核下实测有效** —— S=8192 时省 25.7% 的 kernel 临时量、耗时与整段持平"
+          + "（5619ms vs 5465ms），8 组即平台期。默认 sdpa / flash 不物化注意力矩阵，理论收益小得多"
+          + "（**未实测**），此时主要是多 n 次 kernel 调用的开销。"
+          + "⚠ 要拿 kitchen 收益必须**启动加 `--use-ck-attention` 并重启** —— 面板的「Attention 后端」只在"
+          + "已加载的后端之间切换，切不到它" },
     { key: "attn_head_chunks", label: "　　切成几组头", kind: "num", enable: "attn_head_on", group: "一采采样 · 注意力",
       hint: "把注意力按 head 分组逐组算：kernel 内部的临时量（int8 q/k 副本、fp32 累加器）按组数缩小，"
-          + "融合 qkv buffer 也被拆成小组随用随放 —— **省的就是这两处**。1=关，建议 8，上限 = 头数。"
-          + "实测（S=8192，同 int8 内核）：8 组省 25.7%、耗时与整段持平，14 组只多省 1.5 个点 → 8 是平台期起点。"
+          + "融合 qkv buffer 也被拆成小组随用随放 —— **省的就是这两处**。1=关，上限 = 头数。"
+          + "⚠ 下面这组实测的前提是 **int8 kitchen 内核**：8 组省 25.7%、耗时与整段持平，14 组只多省 1.5 个点"
+          + "（S=8192）→ 8 是平台期起点。⚠ 默认 sdpa 后端下这两处收益**未实测**，见上面总开关的说明。"
           + "数学等价（head 之间独立），装前自测不一致就不装。移植自 KJNodes MiniMaxLowVRAMAttention" },
     { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "一采采样 · 注意力",
       opts: [["auto", "跟随 ComfyUI（推荐）"], ["sdpa", "sdpa"], ["sage", "SageAttention"], ["flash", "FlashAttention"]],

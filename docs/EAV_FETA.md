@@ -2,9 +2,21 @@
 
 MiniMax H3 的 **Enhance-A-Video / FETA** 时序注意力增强，实现在 `eav_feta.py`。
 
-- 论文：*Enhance-A-Video: Better Generated Video for Free*（[arXiv:2502.07508v3](https://arxiv.org/abs/2502.07508)）
-- 参考实现（Apache-2.0）：[NUS-HPC-AI-Lab/Enhance-A-Video](https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video)
-- H3 适配参考：[T8mars/comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)
+- 论文（**真正的源头**）：*Enhance-A-Video: Better Generated Video for Free*
+  （[arXiv:2502.07508v3](https://arxiv.org/abs/2502.07508)，2025-02-27 定稿；NUS 团队，
+  一作 Yang Luo，通讯 Yang You）
+- 官方实现（**Apache-2.0**）：[NUS-HPC-AI-Lab/Enhance-A-Video](https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video)
+  —— 核心只有 `enhance_a_video/enhance.py` 里约 20 行的 `enhance_score()`。
+  T8 的注释把版本钉在 commit `16a7899e6f55f85ea19f1d3a415c6dc0c4096176`（2025-03-08）。
+- H3 适配参考（**GPL-3.0-or-later**，注意**不是** Apache-2.0）：
+  [T8mars/comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)
+  → `h3_t8/enhance_a_video_advanced.py`。T8 自称是「clean-room adapter derived from the
+  equations」，即按论文公式重写、非代码移植。
+
+> **关于「FETA」这个名字**：论文与官方仓库全文都没有出现过 FETA，官方术语只有
+> Enhance-A-Video / CFI / enhance temperature。这个叫法出自 T8 的源码头注释
+> （"derived from the equations in Enhance-A-Video / FETA"）。本模块沿用它是为了
+> 与 T8 的示例工作流（`H3_Enhance_A_Video_FETA_*.json`）对照，**它不是论文术语**。
 
 `eav_feta.py` **不依赖本项目其它模块**（只用 `torch` + `comfy_api` + 标准库），
 也不修改任何既有文件。移除时删掉该文件与 `__init__.py` 里的两行注册即可。

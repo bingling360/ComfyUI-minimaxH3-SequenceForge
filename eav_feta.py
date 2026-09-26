@@ -14,7 +14,7 @@ T×T 的小矩阵，抹掉对角线后取均值：
 本模块**不依赖本项目的其它模块**（只用 torch + comfy_api + 标准库），
 也不修改任何既有文件；从 __init__.py 注册两个节点即可，移除时删掉本文件与那两行注册。
 
-与 T8mars/comfyui-minimax-h3-audio-T8 的 H3 适配（Apache-2.0）的三点差异
+与 T8mars/comfyui-minimax-h3-audio-T8 的 H3 适配（GPL-3.0-or-later）的三点差异
 --------------------------------------------------------------------
 1. 不需要 sigmas 输入 —— 进度窗口直接读采样器写入的 transformer_options["sigmas"]。
 2. 不做任务白名单 —— 不检查 keyframe 位置 / refs / denoise mask，只认 video 段。
@@ -22,6 +22,13 @@ T×T 的小矩阵，抹掉对角线后取均值：
    optimized_attention 的注意力实现共存（例如 KJ 的 H3 省显存 Attention）。
 
 参考实现（Apache-2.0）：NUS-HPC-AI-Lab/Enhance-A-Video
+（T8 的注释把版本钉在 commit 16a7899e6f55f85ea19f1d3a415c6dc0c4096176，即 2025-03-08 的 Wan2.1 支持版）
+
+关于「FETA」这个名字：论文（arXiv:2502.07508v3）与官方仓库都只用
+Enhance-A-Video / CFI / enhance temperature 这套术语，**全文没有出现过 FETA**。
+「Enhance-A-Video / FETA」这个叫法出自 T8 的 H3 适配
+（h3_t8/enhance_a_video_advanced.py 源码头注释 "derived from the equations in
+Enhance-A-Video / FETA"），本模块沿用该命名只为与 T8 的工作流对照，不是论文术语。
 """
 
 from __future__ import annotations

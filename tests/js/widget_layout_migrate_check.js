@@ -158,6 +158,22 @@ t("★ 老 31 值布局迁到 30 值：只摘掉第 28 位「一采编码」，�
     assert.deepStrictEqual(out, cur, "老 31 值迁移后应与当前 30 值逐位相同");
 });
 
+t("★ 当前布局但宽高比=「自定义」（已删档位）→ 只换画布两槽，其余位原样", () => {
+    const before = samplerOf(clone(w.H3_DEFAULT_WORKFLOW)).widgets_values;
+    const legacy = before.slice();
+    legacy[0] = "自定义";
+    // 864×480 面积 ≈0.3955MP → 就近 0.4MP；比例 1.8 → 16:9
+    const graph = { nodes: [{ type: "H3SeamlessChainSampler", widgets_values: legacy }] };
+    w.migrateGraphWidgets(graph);
+    const out = graph.nodes[0].widgets_values;
+    assert.strictEqual(out.length, CUR, "迁移不应改变值数");
+    assert.strictEqual(out[0], "16:9", "宽高比应反推到最近比例");
+    assert.strictEqual(out[1], 0.4, "百万像素应按面积就近（0.1 步进）");
+    for (let i = 2; i < CUR; i++) {
+        assert.strictEqual(out[i], before[i], `第 ${i} 位不应被迁移改动`);
+    }
+});
+
 t("非主节点/空值不被误伤", () => {
     const other = { nodes: [{ type: "VAELoader", widgets_values: ["a.safetensors"] }] };
     w.migrateGraphWidgets(other);

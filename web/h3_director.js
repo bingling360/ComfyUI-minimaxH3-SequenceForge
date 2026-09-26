@@ -50,7 +50,7 @@ const H3D_VER = "20260914+lib-dup-gate";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
-const AR_LIST = ["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"];
+const AR_LIST = ["21:9", "16:9", "9:16", "4:3", "3:4", "1:1"];   // 「自定义」画幅已删（2026-09-27）
 const AR_RATIO = { "21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1 };
 const MP_LIST = [...Array.from({ length: 20 }, (_v, i) => ((i + 1) / 10).toFixed(1)), "0.98"].sort((a, b) => a - b);   // 0.1–2.0 共 20 档 + 0.98（官方 1344×768 原生档，旧档迁移用）
 const QUICK_LABELS = ["角色1", "角色2", "场景1", "场景2", "风格", "道具"];
@@ -296,21 +296,14 @@ function segmentFrames(node, seg) {
 
 /** 宽高比+百万像素 -> 显示徽章文案；无法判断返回 null。
  *
- * 「自定义」也要出徽章（2026-09-25）：此模式下「百万像素」**完全不参与**换算、
- * 直接吃「宽度/高度」两个控件 —— 以前这里返回 null（自定义就没有徽章），于是
- * "我把百万像素改成 0.5 了怎么还报分辨率不一致"在界面上**完全看不出来**。
- * 反过来非自定义时「宽度/高度」被换算覆盖，也要说清（改它们不生效）。 */
+ *  「自定义」画幅已删（2026-09-27）：画布唯一来源 = 宽高比 × 百万像素，
+ *  「宽度/高度」控件降级为旧版兼容位（导演台也不再渲染它们），徽章只报换算结果。 */
 function canvasBadgeText(node) {
     const ar = String(getWidgetValue(node, W_AR) ?? "");
-    if (!AR_RATIO[ar]) {
-        const w = Number(getWidgetValue(node, W_WIDTH));
-        const h = Number(getWidgetValue(node, W_HEIGHT));
-        if (!Number.isFinite(w) || !Number.isFinite(h) || !w || !h) return null;
-        return `自定义画幅 ${w}×${h}（百万像素不参与，改它无效）`;
-    }
+    if (!AR_RATIO[ar]) return null;
     const mp = String(getWidgetValue(node, W_MP) ?? "0.5");
     const c = resolveCanvas(ar, mp);
-    return c ? `${ar} · ${mp}MP → ${c[0]}×${c[1]}（宽/高 控件被覆盖，改它们无效）` : null;
+    return c ? `${ar} · ${mp}MP → ${c[0]}×${c[1]}` : null;
 }
 
 /** 反推：宽高完全命中某 AR×MP 组合则返回 [ar, mp]，否则 null（旧工作流迁移用）。
@@ -323,6 +316,26 @@ function matchCanvasCombo(w, h) {
         }
     }
     return null;
+}
+
+/** 最近档位反推（旧「自定义」画幅存档迁移用，2026-09-27 该档位已删）。
+ *  ① 先试 matchCanvasCombo 精确命中；② 否则按**比例**最近选 AR、按**面积**
+ *  就近（0.1 步进，钳 0.1–2.0）选 MP。选出的档位换算结果与旧宽高通常差几个
+ *  像素（32 倍数对齐所致），画布指纹随之变化 → 旧项目续跑会整链重做，属预期。 */
+function nearestCanvasCombo(w, h) {
+    w = Number(w); h = Number(h);
+    const exact = (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0)
+        ? matchCanvasCombo(w, h) : null;
+    if (exact) return exact;
+    const r = (w > 0 && h > 0) ? w / h : 16 / 9;
+    let ar = "16:9", best = Infinity;
+    for (const k of Object.keys(AR_RATIO)) {
+        const d = Math.abs(Math.log(r / AR_RATIO[k]));
+        if (d < best) { best = d; ar = k; }
+    }
+    const area = (w > 0 && h > 0) ? (w * h) / (1024 * 1024) : 0.5;
+    const mp = Math.min(2.0, Math.max(0.1, Math.round(area * 10) / 10));
+    return [ar, Number(mp.toFixed(1))];
 }
 
 /* ---------- 素材标签工具 ---------- */
@@ -1625,14 +1638,14 @@ function remapOldWidgetValues(wv) {
     const hasCtrl = typeof maybeCtrl === "string" && SEED_CTRL_VALUES.includes(maybeCtrl);
     const ctrl = hasCtrl ? maybeCtrl : "fixed";
     const tail = hasCtrl ? rest : [maybeCtrl, ...rest];
-    const combo = matchCanvasCombo(Number(w), Number(h));
+    const [ar, mp] = nearestCanvasCombo(Number(w), Number(h));
     const framesNum = Number(frames);
     const secs = isFinite(framesNum) && framesNum > 0
         ? Math.max(0.5, Math.min(15, Math.round((framesNum / 24) * 10) / 10)) : 5.0;
     return [
-        combo ? combo[0] : "自定义",          // 宽高比：能命中 AR×MP 组合则迁移，否则保持自定义画幅
-        combo ? combo[1] : 0.5,              // 百万像素（浮点控件）
-        Number(w), Number(h),                // 宽/高（自定义模式继续生效，存档指纹不变）
+        ar,                                  // 宽高比：由旧宽高反推最近档位（「自定义」画幅已删）
+        mp,                                  // 百万像素（浮点控件）
+        Number(w), Number(h),                // 宽/高（旧版兼容位，后端不再读取）
         secs, guide, Number(seed), ctrl, ...tail,
     ];
 }
@@ -1732,12 +1745,28 @@ function migrateGraphWidgets(graphData) {
     let migrated = 0;
     for (const n of graphData.nodes) {
         if (n.type !== NODE_TYPE || !Array.isArray(n.widgets_values) || !n.widgets_values.length) continue;
-        const wv = n.widgets_values;
+        let wv = n.widgets_values;
         // 已是当前布局则跳过；否则（极老数字首项 / 35 值陈旧）统一迁移。
         // 判据看形态不看长度 —— 长度会随控件增删漂移，比错判更危险（详见上方说明）。
-        if (isCurrentWidgetLayout(wv)) continue;
+        if (isCurrentWidgetLayout(wv)) {
+            // 「自定义」画幅已删（2026-09-27）：当前布局旧存档只换画布两槽
+            // （宽高比/百万像素 ← 由存档宽高反推最近档位），其余位原样。
+            if (wv[0] !== "自定义") continue;
+            const [ar, mp] = nearestCanvasCombo(wv[2], wv[3]);
+            console.warn(`[h3-director] 旧存档「自定义」画幅 ${wv[2]}×${wv[3]} 已迁到最近档位`
+                + `「${ar} · ${mp}MP」（换算宽高与旧值可能差几个像素，指纹变化会整链重做）`);
+            n.widgets_values = wv.slice();
+            n.widgets_values[0] = ar;
+            n.widgets_values[1] = mp;
+            migrated += 1;
+            continue;
+        }
         try {
-            n.widgets_values = remapOldWidgetValuesToCurrent(wv);
+            wv = remapOldWidgetValuesToCurrent(wv);
+            if (wv[0] === "自定义") {
+                [wv[0], wv[1]] = nearestCanvasCombo(wv[2], wv[3]);
+            }
+            n.widgets_values = wv;
             migrated += 1;
         } catch (e) {
             console.warn(`[h3-director] 节点 ${n.type} 参数迁移失败，保持原样交由兜底修正`, e);
@@ -1747,7 +1776,8 @@ function migrateGraphWidgets(graphData) {
     return graphData;
 }
 
-/** 兜底：宽高比控件值非法（错位载入/手工改坏）时修正，避免后端换算报错 */
+/** 兜底：宽高比控件值非法（错位载入/手工改坏/旧「自定义」档）时修正，避免后端换算报错。
+ *  「自定义」画幅已删（2026-09-27）→ 不在 AR_LIST 即非法：按存档宽高反推最近档位。 */
 function fixInvalidArWidget(node) {
     if (!node) return;
     const w = (node.widgets || []).find((x) => x.name === W_AR);
@@ -1756,11 +1786,10 @@ function fixInvalidArWidget(node) {
     if (AR_LIST.includes(v)) return;
     const width = Number(getWidgetValue(node, W_WIDTH));
     const height = Number(getWidgetValue(node, W_HEIGHT));
-    const combo = (Number.isFinite(width) && Number.isFinite(height)) ? matchCanvasCombo(width, height) : null;
-    const fixed = combo ? combo[0] : "自定义";
-    console.warn(`[h3-director] 「宽高比」控件值「${v}」无效，已修正为「${fixed}」（旧工作流请用 Load 按钮载入以完整迁移）`);
+    const [fixed, mp] = nearestCanvasCombo(width, height);
+    console.warn(`[h3-director] 「宽高比」控件值「${v}」无效，已修正为「${fixed} · ${mp}MP」（旧工作流请用 Load 按钮载入以完整迁移）`);
     setWidgetValue(node, W_AR, fixed);
-    if (combo) setWidgetValue(node, W_MP, combo[1]);
+    setWidgetValue(node, W_MP, mp);
 }
 
 /* ---------- 导演台状态（JSON widget 驱动，不操作画布连线） ---------- */
@@ -2722,8 +2751,8 @@ function setUpscaleField(node, field, value) {
 }
 
 /** 目标画布估算（与后端 target_hw 同口径：latent 偶数对齐=像素 32 倍数）。
- *  画幅来源与后端 _resolve_canvas / 链参数换算徽章同源：非「自定义」按 宽高比×百万像素
- *  换算——宽/高控件此时只是旧残留，直接读会算出与主徽章打架的错数；「自定义」才读宽高。 */
+ *  画幅来源与后端 _resolve_canvas 同源：按 宽高比×百万像素 换算。宽/高控件只是
+ *  旧版兼容位（「自定义」画幅已删），此处的宽高回落分支仅兜非法值防御。 */
 function upTargetCanvas(node, up) {
     const ar = String(getWidgetValue(node, W_AR) ?? "");
     let w = 0, h = 0;
@@ -5531,8 +5560,8 @@ async function switchProject(dir) {
  *  覆盖进指纹的全部共享参数：画幅/时长/引导帧数/步数/CFG/采样器/调度器/
  *  递减锚定/桥帧门控三件套——重摇提交前自动调用纠偏参数漂移（后端
  *  assert_match 同口径），也供手动「套用参数」按钮复用。
- *  自定义画幅（无 AR×MP 命中）同时把宽高比切到「自定义」：非自定义时后端
- *  会按宽高比×MP 重新换算宽高，只写宽/高控件不生效。 */
+ *  画幅一律映射到 AR×MP 档位：精确命中用之，无命中反推最近档位（「自定义」
+ *  画幅已删，2026-09-27——只写宽/高控件不生效）。 */
 function applyChainParams(node, params) {
     if (!node || !params) return [];
     const applied = [];
@@ -5544,25 +5573,16 @@ function applyChainParams(node, params) {
     };
     const w = Number(params.width), h = Number(params.height);
     if (w && h) {
-        const combo = matchCanvasCombo(w, h);
-        if (combo) {
-            const oldAr = String(getWidgetValue(node, W_AR) ?? "");
-            const oldMp = String(getWidgetValue(node, W_MP) ?? "");
-            setWidgetValue(node, W_AR, combo[0]);
-            setWidgetValue(node, W_MP, combo[1]);
-            if (oldAr !== combo[0] || oldMp !== String(combo[1])) {
-                applied.push(`画幅 ${combo[0]}·${combo[1]}MP（${w}×${h}）`);
-            }
-        } else {
-            const old = [String(getWidgetValue(node, W_AR) ?? ""),
-                String(getWidgetValue(node, W_WIDTH) ?? ""),
-                String(getWidgetValue(node, W_HEIGHT) ?? "")];
-            setWidgetValue(node, W_AR, "自定义");
-            setWidgetValue(node, W_WIDTH, w);
-            setWidgetValue(node, W_HEIGHT, h);
-            if (old[0] !== "自定义" || old[1] !== String(w) || old[2] !== String(h)) {
-                applied.push(`宽×高 ${w}×${h}（自定义）`);
-            }
+        /* 「自定义」画幅已删（2026-09-27）：精确命中 AR×MP 就用之，否则反推
+         * 最近档位（比例就近 + 面积就近 0.1MP）——只写宽/高控件不再有任何效果。 */
+        const combo = matchCanvasCombo(w, h) || nearestCanvasCombo(w, h);
+        const exact = !!matchCanvasCombo(w, h);
+        const oldAr = String(getWidgetValue(node, W_AR) ?? "");
+        const oldMp = String(getWidgetValue(node, W_MP) ?? "");
+        setWidgetValue(node, W_AR, combo[0]);
+        setWidgetValue(node, W_MP, combo[1]);
+        if (oldAr !== combo[0] || oldMp !== String(combo[1])) {
+            applied.push(`画幅 ${combo[0]}·${combo[1]}MP（${exact ? "" : "近似 "}${w}×${h}）`);
         }
     }
     if (params.length) {
@@ -5630,7 +5650,8 @@ function paramsSummary(node, mf) {
         const w = node && (node.widgets || []).find((x) => x.name === name);
         return w ? String(w.value ?? "").trim() : "";
     };
-    /* 画幅：优先 宽高比+百万像素 换算，自定义/非法回落 宽×高（或存档指纹） */
+    /* 画幅：优先 宽高比+百万像素 换算，非法回落 宽×高（或存档指纹）。
+     * 「自定义」画幅已删，回落分支只兜控件值异常的防御。 */
     const ar = AR_RATIO[gw(W_AR)] ? gw(W_AR) : "";
     let geo = "";
     if (ar) {
@@ -5671,7 +5692,10 @@ function chainSeconds(node, ds, plan) {
 
 async function collectData() {
     const node = findNode();
-    if (node) fixInvalidArWidget(node);
+    if (node) {
+        fixInvalidArWidget(node);
+        mountDeskButton(node);   // 刷新路径兜底补藏：防前端建控件晚于 nodeCreated 时漏藏
+    }
 
     /* 诊断 + 项目列表（后端实时扫描磁盘，一个项目一个文件夹） */
     const ping = await apiGet("/h3chain/ping");
@@ -8477,8 +8501,11 @@ function labeledAssetCard(node, ds, idx) {
  * 节点控件与后端逻辑照旧保留，只是不占界面。
  * ADVANCED_DEFS 保持全量（paramsSig/旧逻辑兼容口径），新增控件都要登记进去，
  * 否则改它不会触发面板重建。 */
+/* 「宽度/高度」不进面板（2026-09-27）：它们是旧版兼容位（原「自定义」画幅入口，
+ * 该档位已删），画布始终由 宽高比×百万像素 换算——露出只会引来"改了没生效"。
+ * ADVANCED_DEFS 同步摘除（paramsSig 不再盯着两个死值）。 */
 const BASIC_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数", "CFG", "采样器", "调度器",
-    "审片模式", "自动保存", "自动成片", "参考图像尺寸", W_WIDTH, W_HEIGHT];
+    "审片模式", "自动保存", "自动成片", "参考图像尺寸"];
 const KEYFRAME_DEFS = ["引导帧数", "锚定加噪", "递减锚定", "响度对齐强度"];
 const SEAM_DEFS = ["桥帧门控", "清晰度阈值", "回退上限",
     "接缝重摇", "重摇阈值", "重摇上限"];
@@ -8488,7 +8515,6 @@ const ADVANCED_DEFS = [
     "审片模式", "自动保存", "自动成片", "参考图像尺寸", "响度对齐强度",
     "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
     "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
-    W_WIDTH, W_HEIGHT,
 ];
 const PARAM_LABELS = { [W_DUR]: "每段时长(秒) · 新段默认" };
 
@@ -8566,30 +8592,19 @@ function renderParamsZone(sec, data) {
         sec.append(el("div", "h3d-empty", "画布上未找到节点，参数面板不可用"));
         return;
     }
-    const ar = String(getWidgetValue(node, W_AR) ?? "");
     /* —— 基础设置：**首次打开默认展开**的一栏（其余栏与子面板首次一律收起）；
      * 之后一律跟随用户的折叠操作（见 foldSection）。 —— */
     const basic = foldSection("param-basic", true,
         "<summary>📐 基础设置（分辨率 / 时长 / 采样器 / 存档与成片）</summary>");
     const bgrid = el("div", "h3d-adv-grid");
     for (const name of BASIC_DEFS) {
-        if (name === W_WIDTH || name === W_HEIGHT) {
-            if (ar !== "自定义") continue;
-            bgrid.append(renderWidgetField(node, name));
-            continue;
-        }
         bgrid.append(renderWidgetField(node, name, PARAM_LABELS[name]));
     }
-    /* 徽章：自定义画幅也要显示（说清「百万像素不参与」），见 canvasBadgeText 注释 */
+    /* 徽章：画布唯一来源 = 宽高比×百万像素（宽/高控件已是旧版兼容位，不进面板） */
     const badgeTxt = canvasBadgeText(node);
     if (badgeTxt) {
-        const isCustom = !AR_RATIO[ar];
-        const b = el("div", "h3d-convbadge",
-            isCustom ? escapeHtml(badgeTxt) : `${escapeHtml(badgeTxt)} · 32倍数对齐`);
-        b.title = isCustom
-            ? "宽高比=自定义：本次画幅直接用「宽度/高度」两个控件，「百万像素」不参与换算"
-            : "官方 Resolution Selector 同款换算：1MP=1024×1024，两侧各自 round 对齐 32 倍数；"
-              + "此模式下「宽度/高度」控件被换算覆盖，改它们不生效";
+        const b = el("div", "h3d-convbadge", `${escapeHtml(badgeTxt)} · 32倍数对齐`);
+        b.title = "官方 Resolution Selector 同款换算：1MP=1024×1024，两侧各自 round 对齐 32 倍数";
         bgrid.append(b);
     }
     basic.append(bgrid);
@@ -8647,10 +8662,10 @@ function repaintParams() {
     }
 }
 
-/** 链参数编辑后的跨区联动：画幅四件（宽高比/百万像素/宽/高）变更重建本区
- *  （换算徽章、自定义模式宽高输入切换）与二采区（目标画布）；其余参数无跨区显示不动。 */
+/** 链参数编辑后的跨区联动：画幅两件（宽高比/百万像素）变更重建本区（换算徽章）
+ *  与二采区（目标画布）；宽/高已不进面板（旧版兼容位），不再参与联动。 */
 function repaintAfterWidget(name) {
-    if (name !== W_AR && name !== W_MP && name !== W_WIDTH && name !== W_HEIGHT) return;
+    if (name !== W_AR && name !== W_MP) return;
     repaintParams();
     repaintUpscale();
 }
@@ -10050,16 +10065,57 @@ function removeFab() {
     if (fabEl) { fabEl.remove(); fabEl = null; }
 }
 
+/* ---- 节点本体：全部参数控件隐藏，只留一个「打开导演台」按钮（2026-09-27）----
+ * 为什么藏而不删：widgets_values 是**按位**序列化的（30 值布局被
+ * tests/test_workflows_frozen.py 与迁移判据钉死），删控件=布局迁移全套跟进，
+ * 收益为零——参数编辑早就在导演台里，画布上这些控件只剩噪音。
+ *
+ * 隐藏手法（前端 1.52.7 实证）：widget.hidden=true 后 isWidgetVisible 跳过绘制、
+ * computeSize/getLayoutWidgets 跳过占位，节点自动缩到只剩标题+按钮；值照常
+ * 序列化，导演台所有 setWidgetValue 照常读写。options.hidden 一并置位——
+ * 属性面板（widget 搜索侧栏）按 options?.hidden 过滤，两处都不露头。
+ *
+ * 按钮：serialize:false 必须设——按钮没有业务值，混进 widgets_values 会把
+ * 30 值布局搅成 31 值（位次形态判据虽然撞不上，但后端按位取值会多读一个空位）。
+ * 点击行为与左侧栏迷你卡/悬浮球同源（openDesk）。 */
+function mountDeskButton(node) {
+    if (!node) return;
+    // 隐藏部分**可重复执行**：某些前端时序里控件晚于 nodeCreated 创建，漏网的
+    // 下次刷新补藏（按钮自己带 __h3DeskBtn 标记，不会被误藏）
+    for (const w of node.widgets || []) {
+        if (w.__h3DeskBtn) continue;
+        w.hidden = true;
+        if (w.options) w.options.hidden = true;
+    }
+    if (node.__h3DeskButton) return;
+    // 防御：addWidget 不在（非画布环境 / 测试 mock 节点）就只藏控件不挂按钮，
+    // 绝不能让入口按钮把整个刷新链炸掉
+    if (typeof node.addWidget !== "function") return;
+    node.__h3DeskButton = true;
+    const btn = node.addWidget("button", "🎬 打开导演台", null, () => openDesk());
+    btn.__h3DeskBtn = true;
+    btn.serialize = false;
+    if (btn.options) btn.options.serialize = false;
+    // 隐藏后 computeSize 忽略全部控件行，尺寸当场收缩（旧存档带着大尺寸载入也一并校正）
+    try { node.setSize(node.computeSize()); } catch (e) { /* 尺寸收缩失败不影响功能 */ }
+}
+
 app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",
     /* 画布节点就绪即刷新：面板首刷可能早于工作流载入（节点未就绪 → 各区渲染
      * 「画布上未找到节点」），之后没有任何事件再触发刷新——这里在节点载入/
      * 新建时主动补一刷，mini 卡与参数/二采区随之恢复可用 */
     loadedGraphNode(node) {
-        if (node && node.type === NODE_TYPE) scheduleRefresh(250);
+        if (node && node.type === NODE_TYPE) {
+            mountDeskButton(node);   // 载入路径兜底：某些前端版本建控件晚于 nodeCreated
+            scheduleRefresh(250);
+        }
     },
     nodeCreated(node) {
-        if (node && node.type === NODE_TYPE) scheduleRefresh(250);
+        if (node && node.type === NODE_TYPE) {
+            mountDeskButton(node);   // 画布节点只留「打开导演台」按钮，参数全在导演台
+            scheduleRefresh(250);
+        }
     },
     setup() {
         console.log("[h3-director] loaded", H3D_VER);

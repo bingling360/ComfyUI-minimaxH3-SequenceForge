@@ -229,19 +229,21 @@ def test_describe_canvas_names_the_incident_values():
 
 
 def test_assert_match_hint_is_appended():
-    """报错必须带上"画布侧四个控件谁在生效"——只有两个数字时用户会一直改错的控件。"""
+    """报错必须带上"画布谁在生效"的提示——只有两个数字时用户会一直改错的控件。"""
     spec = importlib.util.spec_from_file_location(
         "h3_ckpt_hint", os.path.join(ROOT, "checkpoint.py"))
     ck = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ck)
     old = {"width": 544, "height": 960}
     new = {"width": 768, "height": 1376}
+    hint = ("本次画布 768×1376（由「宽高比 9:16 × 百万像素 1MP」换算；"
+            "宽/高 控件为旧版兼容位，改它们不生效）")
     with pytest.raises(ValueError) as ei:
-        ck.assert_match(old, new, hint="宽高比=自定义 → 直接用「宽度 768 × 高度 1376」")
+        ck.assert_match(old, new, hint=hint)
     msg = str(ei.value)
     assert "width: 存档=544 当前=768" in msg          # 原有口径不许改
     assert "唯一硬约束" in msg
-    assert "宽高比=自定义" in msg                     # 新增的诊断必须真的附上
+    assert "宽/高 控件为旧版兼容位" in msg             # 新增的诊断必须真的附上
     # 不传 hint 时行为与旧版逐字一致（无尾随换行）
     with pytest.raises(ValueError) as ei2:
         ck.assert_match(old, new)

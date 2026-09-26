@@ -738,8 +738,8 @@ def _describe_canvas(w, h):
     """宽高 -> 反解的画幅档位文案（如 "9:16 @ 0.5MP"）；命中不了写"非标准档位"。
 
     与 `_resolve_canvas` 严格互逆（同一张 _AR_RATIO × 0.1–2.0MP + 0.98 档位表）。
-    存在的理由：存档里只存 width/height 两个数字，而画布侧是「宽高比 / 百万像素 /
-    宽 / 高」四个控件 —— 报错只有两个数字时根本看不出**谁在生效**（"我把百万像素
+    存在的理由：存档里只存 width/height 两个数字，而画布侧真正的控件是「宽高比 /
+    百万像素」—— 报错只有两个数字时根本看不出**谁在生效**（"我把百万像素
     改成 0.5 了怎么还是报错"就是这么来的）。诊断行与报错提示都走这一个函数。
     """
     try:
@@ -753,7 +753,7 @@ def _describe_canvas(w, h):
                     return f"{ar} @ {mp:g}MP"
             except Exception:
                 continue
-    return "非标准档位（自定义画幅 / 手工填的宽高）"
+    return "非标准档位（旧版自定义画幅的存档宽高）"
 
 
 def _snap_seconds(seconds):
@@ -957,17 +957,22 @@ class H3SeamlessChainSampler(io.ComfyNode):
                               tooltip="生成用 CLIP（转码专跑不需要，可空）"),
                 io.Vae.Input("视频VAE"),
                 io.Vae.Input("音频VAE"),
-                io.Combo.Input("宽高比", options=["自定义", "21:9", "16:9", "9:16", "4:3", "3:4", "1:1"], default="16:9",
-                               tooltip="官方 Resolution Selector 同款：与「百万像素」共同换算画布（1MP=1024×1024，32 倍数对齐）。"
-                                       "选「自定义」时直接用下方宽度/高度"),
+                # 「自定义」画幅已删（2026-09-27）：画布唯一来源 = 宽高比 × 百万像素。
+                # 旧存档里的「自定义」由前端迁移成最接近的 AR×MP 档（见 h3_director.js
+                # nearestCanvasCombo），后端不再留兜底分支。
+                io.Combo.Input("宽高比", options=["21:9", "16:9", "9:16", "4:3", "3:4", "1:1"], default="16:9",
+                               tooltip="官方 Resolution Selector 同款：与「百万像素」共同换算画布"
+                                       "（1MP=1024×1024，32 倍数对齐）"),
                 io.Float.Input("百万像素", default=0.5, min=0.1, max=2.0, step=0.1,
                                tooltip="目标总像素（MP），0.1–2.0 步进 0.1，箭头微调（官方 Resolution Selector 同款口径）："
                                        "0.2 草稿（608×352）/ 0.5 快速预览（960×544）/ 0.98 H3 官方原生（1344×768）/ "
                                        "1.0（1376×768）/ 2.0 超采样（1920×1088）"),
                 io.Int.Input("宽度", default=864, min=32, max=16384, step=32, advanced=True,
-                             tooltip="「宽高比=自定义」时直接生效；其余模式由 宽高比+百万像素 换算覆盖"),
+                             tooltip="旧版兼容位（原「自定义」画幅入口，该档位已删）："
+                                     "画布始终由 宽高比+百万像素 换算覆盖，改这两个控件不生效"),
                 io.Int.Input("高度", default=480, min=32, max=16384, step=32, advanced=True,
-                             tooltip="「宽高比=自定义」时直接生效；其余模式由 宽高比+百万像素 换算覆盖"),
+                             tooltip="旧版兼容位（原「自定义」画幅入口，该档位已删）："
+                                     "画布始终由 宽高比+百万像素 换算覆盖，改这两个控件不生效"),
                 io.Float.Input("每段时长", default=5.0, min=0.5, max=15.0, step=0.1,
                                tooltip="每段可见时长（秒）@24fps，内部自动吸附 H3 的 17k+5 帧网格："
                                        "5.0s→124帧、6.0s→141帧。全链默认值，导演台每段可单独覆盖"),
@@ -1671,22 +1676,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                      or _head_seg):
             raise ValueError("起始视频（序章）与首帧图（i2v 起始）不能同时使用：两者都定义第 1 段的视觉起点")
 
-        if str(宽高比) != "自定义":
-            宽度, 高度 = _resolve_canvas(宽高比, 百万像素)
+        宽度, 高度 = _resolve_canvas(宽高比, 百万像素)
         width, height, seed = int(宽度), int(高度), int(种子)
-        # ---- 画布自检（诊断，2026-09-25）----
-        # 四个控件（宽高比 / 百万像素 / 宽 / 高）的实际生效关系必须留痕：
-        #   · 宽高比 ≠ 自定义 → 宽/高 控件**被换算覆盖**，改「百万像素」才有用；
-        #   · 宽高比 = 自定义 → 宽/高 直接生效，「百万像素」**完全不参与**。
-        # 报错信息里只有两个数字，看不出是谁在生效（"改成 0.5 也没用"正是这个），
-        # 所以这行放在**任何重活（模型/分块/自测）之前**打印，卡在哪都能看到它。
+        # ---- 画布自检（诊断）----
+        # 画布唯一来源 = 宽高比 × 百万像素（官方 Resolution Selector 公式）。
+        # 「宽度/高度」控件只是旧版兼容位（原「自定义」画幅入口，该档位已删），
+        # 任何模式下都不再生效——留痕是为了"改了宽高怎么没变"不再成为悬案。
+        # 这行放在**任何重活（模型/分块/自测）之前**打印，卡在哪都能看到它。
         _ar_s = str(宽高比)
-        if _ar_s != "自定义":
-            _canvas_src = (f"由「宽高比 {_ar_s} × 百万像素 {float(百万像素):g}MP」换算"
-                           f"（宽/高 控件 {int(宽度)}×{int(高度)} 本次被覆盖，改它们不生效）")
-        else:
-            _canvas_src = (f"宽高比=自定义 → 直接用「宽度 {宽度} × 高度 {高度}」"
-                           f"（百万像素 {float(百万像素):g} 不参与，改它不生效）")
+        _canvas_src = (f"由「宽高比 {_ar_s} × 百万像素 {float(百万像素):g}MP」换算"
+                       f"（宽/高 控件为旧版兼容位，改它们不生效）")
         _canvas_line = (f"画布 {width}×{height} · {_canvas_src} · "
                         f"反解 {_describe_canvas(width, height)}"
                         f" · 存档目录「{str(存档目录).strip() or '(空=按参数指纹自动命名)'}」")
@@ -2270,10 +2269,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if _bhq:
             report.append(f"编码：高清档({_bpreset} · crf{_bcrf})"
                           f"（来自 ⚡ 性能优化设置）——二采未覆盖的段与基础成片按此档落盘")
-        if str(宽高比) != "自定义":
-            report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}（官方换算，1MP=1024×1024，32 倍数对齐）")
-        else:
-            report.append(f"画布：自定义 {width}×{height}")
+        report.append(f"画布：{宽高比} · {float(百万像素):g}MP → {width}×{height}"
+                      f"（官方换算，1MP=1024×1024，32 倍数对齐）")
         _custom_len = [i for i in range(len(seg_lengths)) if seg_lengths[i] != length]
         if _custom_len:
             report.append("每段时长：" + " ".join(f"段{i + 1}={seg_lengths[i] / 24:.1f}s({seg_lengths[i]}帧)" for i in _custom_len)

@@ -222,8 +222,16 @@
     /* 合并顺序角标：数字就是拼接位次。放左下角（左上/右上已被评分与角色角标占住），
      * 必须登记进 tileKeepers() —— 缩略图懒加载会 replaceChildren，漏了它滚动一次就没了。 */
     .h3l-order{position:absolute;left:5px;bottom:5px;min-width:21px;height:21px;padding:0 5px;border-radius:11px;background:#316dca;color:#fff;font-size:12px;font-weight:700;line-height:21px;text-align:center;box-shadow:0 2px 8px #000a;pointer-events:none}
-    .h3l-merging .h3l-tile.sel{border-color:#316dca;box-shadow:0 0 0 2px #316dca inset}
+    /* 合并模式的显隐切换：**靠类切**，不重建 DOM（重建会丢滚动位置与已选清单）。
+     * 两条 .h3l-merging 规则的选择器权重更高，压得住 .h3l-batch / .h3l-btn 自带的
+     * display；.h3l-only-merge 的 display:none 写在 .h3l-batch 之后，同权重时后者生效。 */
+    .h3l-only-merge{display:none}
+    .h3l-merging .h3l-only-normal{display:none}
+    .h3l-merging .h3l-only-merge{display:flex}
     .h3l-merging .h3l-hint{color:#9ecbff}
+    /* 合并模式下的非视频瓦片：看得见但点不动（点了给一句说明） */
+    .h3l-nomerge{opacity:.42;cursor:not-allowed}
+    .h3l-nomerge:hover{border-color:#37332b;background:#181712}
 .h3l-name{font-weight:600;font-size:12.5px;word-break:break-all;color:#f0ece2}
 .h3l-meta{font-size:10.5px;color:#8a857b;word-break:break-all;display:flex;gap:5px;flex-wrap:wrap}
 .h3l-badges{display:flex;gap:3px;flex-wrap:wrap}
@@ -316,6 +324,9 @@
   function renderScopes() {
     S.scopeBox.replaceChildren();
     for (const [k, zh] of SCOPES) {
+      /* 合并只收视频：latent 库在合并模式下**必然是空的**（类型被强制成 video），
+       * 摆一个点进去只有"没有匹配的素材"的页签，就是让人白点一次。 */
+      if (S.merge && k === "latent") continue;
       const n = S.counters[k] || 0;
       const b = el("button", "h3l-scope" + (S.scope === k ? " on" : ""),
         esc(zh) + `<em>${n}</em>`);
@@ -389,7 +400,13 @@
   }
 
   function tileFor(it) {
-    const t = el("div", "h3l-tile" + (S.sel.has(it.id) ? " sel" : ""));
+    /* 合并模式只收视频：非视频瓦片**标出来并挡住**。列表已被强制过滤成 video，
+     * 这里再挡一层是防"筛选器被改回 all"之类的漏网 —— 一旦有图片进了清单，
+     * 后端会以"只能合并视频：X 是图片"把**整单**拒掉，用户看到的是一次
+     * 莫名其妙的整体失败，而不是"这张图不该选"。 */
+    const noMerge = S.merge && it.kind !== "video";
+    const t = el("div", "h3l-tile" + (S.sel.has(it.id) ? " sel" : "")
+      + (noMerge ? " h3l-nomerge" : ""));
     t.dataset.id = it.id;
     const th = el("div", "h3l-thumb");
     th.append(el("span", "h3l-ico", KIND_ICON[it.kind] || "📄"));
@@ -453,6 +470,11 @@
       /* 合并模式：点击 = 排进/移出合并清单。**顺序就是 S.mergeOrder 的数组顺序**，
        * 所以移除一个之后后面的角标要整体重排（paintMergeBadges 全片重画）。 */
       if (S.merge) {
+        if (noMerge) {
+          say(`只能合并视频：「${it.name}」是${KIND_CN[it.kind] || it.kind}。`
+            + "退出合并模式后可以正常浏览、预览、调入项目");
+          return;
+        }
         const i = S.mergeOrder.findIndex((x) => x.id === it.id);
         if (i >= 0) S.mergeOrder.splice(i, 1);
         else S.mergeOrder.push({
@@ -460,7 +482,6 @@
         });
         t.classList.toggle("sel", i < 0);
         paintMergeBadges();
-        if (S.onMergeChanged) S.onMergeChanged(S.mergeOrder.slice());
         renderFoot();
         return;
       }
@@ -515,6 +536,94 @@
     }
   }
 
+  /** 切「选材合并」模式：**不重建 DOM**，只切类 + 改标题 + 重拉列表。
+   *
+   * 进入时把类型筛选**强制成 video**（合并只收视频）。为什么不是"让用户自己挑
+   * 类型"：图片/音频/latent 进了清单后端会整单拒掉（"只能合并视频：X 是图片"），
+   * 与其让人选完再失败，不如根本不给选的机会。退出时还原成 all。
+   *
+   * 清单在退出时**立即清空**（Q1 口径）：它是纯内存的临时选择，留着只会在下次
+   * 进合并模式时"莫名其妙多出几个角标"。 */
+  function setMergeMode(on) {
+    if (!S || S.pick) return;                 // 挑选模式（锚源）没有合并这回事
+    const next = !!on;
+    if (next === S.merge) return;
+    S.merge = next;
+    S.mergeOrder = [];
+    S.kind = next ? "video" : "all";
+    if (S.overlay) S.overlay.classList.toggle("h3l-merging", next);
+    if (S.headTitle) S.headTitle.textContent = next ? "🗂 选择要合并的素材" : "🗂 素材库";
+    if (S.headHint) {
+      S.headHint.textContent = next
+        ? "点素材排进合并清单：瓦片角标 1 / 2 / 3 / 4 就是拼接顺序"
+          + "（再点一次取消；双击可预览）"
+        : "";
+    }
+    if (S.kindSel) S.kindSel.value = S.kind;
+    /* 退出时把瓦片上的勾选/角标一起抹掉：`sel` 是多选批量用的，跟合并清单不是
+     * 一回事，混在一起会让人以为"这些也进了合并"。 */
+    if (S.grid) {
+      S.grid.querySelectorAll(".h3l-tile.sel").forEach((n) => n.classList.remove("sel"));
+    }
+    renderScopes();
+    paintMergeBadges();
+    renderFoot();
+    fetchPage(false);                          // 类型筛选变了，列表必须重拉
+    if (next) say("选材模式：点素材排进合并清单（角标 1→N 就是拼接顺序）");
+  }
+
+  /** 就地发起合并（POST /h3chain/merge）。
+   *
+   * 顺序 = `S.mergeOrder` 的数组顺序，**绝不 sort** —— 顺序就是数据本身。
+   * 请求里同时给 `asset`（素材 id，后端据此精确解析，全局库素材只有这条能认）
+   * 与 `file`（回落路径）。失败一定要把**后端原话**显示出来：`_err` 的字段名是
+   * `message`，以前这里读的是 `error`，于是所有失败都只剩一句"HTTP 400"，
+   * 真正的原因（素材没了 / 不是视频 / 路径越界）全被吞掉。 */
+  async function doMerge() {
+    if (S.mergeBusy) return;
+    if (!S.dir) { say("合并需要先打开一个项目：产物落在该项目的 finals/ 里"); return; }
+    if (!S.mergeOrder.length) {
+      say("先点素材排进合并清单：瓦片角标 1 / 2 / 3 就是拼接顺序（再点一次取消）");
+      return;
+    }
+    const items = S.mergeOrder.map((x) => ({
+      asset: String(x.id || ""), file: String(x.file || ""), name: String(x.name || ""),
+    }));
+    const A = api();
+    S.mergeBusy = true;
+    if (typeof S.paintMergeBtn === "function") S.paintMergeBtn();
+    /* 告诉导演台"合并跑起来了"：PyAV 流式编码是分钟级 CPU 密集任务，这期间
+     * 再提交生成就是两个重活抢 CPU。导演台没加载（老页面缓存）时静默跳过。 */
+    try { window.H3Merge?.begin?.(); } catch (e) { /* 没有导演台也照常合并 */ }
+    say(`合并 ${items.length} 项拼接中…（分钟级，期间可继续浏览，但先别提交生成）`);
+    let ok = false;
+    try {
+      const r = await A.libMerge(S.dir, items);
+      if (!r.body?.ok) {
+        fail(A.errText(r, "合并失败"));
+      } else {
+        ok = true;
+        const file = String(r.body.file || "");
+        S.mergeOrder = [];
+        /* 先切 scope 再退模式：产物落在 `<proj>/finals/`，正是「成片」这个 scope，
+         * 而 setMergeMode(false) 里那次 fetchPage 就会落在成片上（省一次全量索引查询）。 */
+        S.scope = "finals";
+        setMergeMode(false);
+        say(`已合并 → ${file || "merged_*.mp4"}（已在「成片」里，可直接播放/预览）`);
+      }
+    } catch (e) {
+      fail(`合并请求失败：${e?.message || e}`);
+    } finally {
+      S.mergeBusy = false;
+      if (typeof S.paintMergeBtn === "function") S.paintMergeBtn();
+      /* end(ok)：ok 为真时导演台会 refresh —— 产物出现在成片区，它那边要跟着更新；
+       * 失败也要 end，否则互斥标记会永远挂着，生成按钮再也点不动。 */
+      try { window.H3Merge?.end?.(ok); } catch (e) { /* 同上 */ }
+      /* 没有导演台时（独立打开素材库 / 单测）才走通用回调，免得两边都刷一次。 */
+      if (!window.H3Merge) notify();
+    }
+  }
+
   function renderGrid() {
     if (io) io.disconnect();
     S.grid.replaceChildren();
@@ -566,7 +675,7 @@
     S.footInfo.textContent =
       `第 ${S.page}/${S.totalPages} 页 · 共 ${S.total} 项` +
       (S.merge
-        ? (mn ? ` · 已排 ${mn} 个（合并顺序 1→${mn}）` : " · 合并清单为空：点素材开始排")
+        ? (mn ? ` · 已排 ${mn} 个（合并顺序 1→${mn}）` : " · 合并清单为空：点视频开始排")
         : (S.sel.size ? ` · 已选 ${S.sel.size}` : ""));
     S.moreBtn.style.display = S.page < S.totalPages ? "" : "none";
     /* 「☑ 全选 / ☐ 全不选」跟着当前页的实际勾选状态走：翻页/换筛选后列表换了，
@@ -981,10 +1090,6 @@
     if (document.querySelector(".h3l-overlay")) return;
     injectStyles();
     const pickMode = typeof o.onPick === "function";
-    /* 合并模式（o.merge）：点瓦片 = 按**点击顺序**排进合并清单，瓦片上画 1/2/3/4
-     * 角标。与挑选模式（o.onPick，单击即返回）是**两套独立上下文**，别混用状态位：
-     * 挑选是"选一个就走"，合并是"累加排序"。 */
-    const mergeMode = !!o.merge;
     S = {
       dir: String(o.dir || ""), seg: Number(o.seg) || 1,
       onChanged: o.onChanged,
@@ -999,27 +1104,28 @@
       pick: pickMode ? o.onPick : null,
       pickKinds: Array.isArray(o.pickKinds) ? o.pickKinds : null,
       cur: null,
-      /* 合并上下文：mergeOrder 是**数组**（顺序即数据，别用 Set）。 */
-      merge: mergeMode,
-      mergeOrder: mergeMode && Array.isArray(o.order)
-        ? o.order.filter((x) => x && x.id).map((x) => ({ ...x })) : [],
-      onMergeChanged: typeof o.onMergeChanged === "function" ? o.onMergeChanged : null,
-      onMergeCommit: typeof o.onMergeCommit === "function" ? o.onMergeCommit : null,
+      /* 合并导出**整个住在素材库里**（入口按钮、选材、顺序、发起拼接都在这儿）。
+       *
+       * 为什么不做成"导演台开合并模式、素材库当选择器"：那样同一个功能有
+       * 两处入口、两份清单状态，必然漂移成"我在这儿选好了，那边却显示没选"。
+       * 导演台只剩一个互斥标记（`window.H3Merge`），在拼接期间挡住生成按钮。
+       *
+       * mergeOrder 是**数组**（顺序即数据，别用 Set）：点一个 push 一个，
+       * 再点一次 splice 掉，瓦片角标 = 下标 + 1。 */
+      merge: false,
+      mergeOrder: [],
+      mergeBusy: false,
     };
 
-    const overlay = el("div", "h3l-overlay"
-      + (pickMode ? " h3l-picking" : "") + (mergeMode ? " h3l-merging" : ""));
+    const overlay = el("div", "h3l-overlay" + (pickMode ? " h3l-picking" : ""));
     const box = el("div", "h3l-box");
     const head = el("div", "h3l-head");
-    head.append(el("strong", "", mergeMode ? "🗂 选择要合并的素材"
-      : (pickMode ? "🗂 选择素材" : "🗂 素材库")));
-    if (pickMode) {
-      head.append(el("span", "h3l-hint", "点一下素材就选中，窗口自动关闭"));
-    }
-    if (mergeMode) {
-      head.append(el("span", "h3l-hint",
-        "点素材排进合并清单：瓦片角标 1 / 2 / 3 / 4 就是拼接顺序（再点一次取消；双击可预览）"));
-    }
+    /* 标题与提示在切合并模式时改写（setMergeMode），所以留住引用。 */
+    S.headTitle = el("strong", "", pickMode ? "🗂 选择素材" : "🗂 素材库");
+    head.append(S.headTitle);
+    S.headHint = el("span", "h3l-hint", pickMode ? "点一下素材就选中，窗口自动关闭" : "");
+    head.append(S.headHint);
+    S.overlay = overlay;
     S.scopeBox = el("div", "h3l-scopes");
     head.append(S.scopeBox, el("div", "h3l-spacer"));
     const close = el("button", "h3l-close", "✕");
@@ -1047,9 +1153,15 @@
     };
     // 挑选模式下按 pickKinds 收窄类型下拉：锚源只收图片/视频/latent，
     // 留着「音频」让用户点了再被后端拒，属于把错误推给下一个环节。
-    bar.append(mkSel(S.pickKinds
+    const kindSel = mkSel(S.pickKinds
       ? KINDS.filter(([v]) => v === "all" || v === "media" || S.pickKinds.includes(v))
-      : KINDS, "kind"));
+      : KINDS, "kind");
+    /* 合并模式只收视频，类型筛选会被**强制成 video**，所以这个下拉在合并模式下
+     * 藏起来（`h3l-only-normal`）—— 留着会让人以为"还能挑图片"，而图片一旦进清单
+     * 后端会整单拒掉，用户看到的是一次莫名其妙的失败。 */
+    kindSel.classList.add("h3l-only-normal");
+    S.kindSel = kindSel;
+    bar.append(kindSel);
     bar.append(mkSel(SORTS, "sort"));
     bar.append(mkSel(RATINGS, "minRating"));
     const ordBtn = el("button", "h3l-btn", "↓ 倒序");
@@ -1066,7 +1178,7 @@
      * 糊满（缩略图只剩一条），而"对一批素材做同一件事"反而要一张张点。
      * 现在统一收到工具条，**不选也一直看得见**——选中态只是决定它作用于谁，
      * 不是决定这个按钮存不存在（藏起来只会让人以为功能没了）。 */
-    const batchBox = el("div", "h3l-batch");
+    const batchBox = el("div", "h3l-batch h3l-only-normal");
     const selAllBtn = el("button", "h3l-btn", "☑ 全选");
     selAllBtn.type = "button";
     selAllBtn.title = "选中当前页全部素材；再点一次取消全选（只作用于当前页，不跨页）";
@@ -1127,51 +1239,52 @@
       () => actDelete([...S.sel]), true);
     S.paintSelAll = paintSelAll;
 
-    /* ---- 合并清单区（只在合并模式出现） ----
-     * 合并模式下**不摆**批量区：那三个按钮（调入项目 / 存入全局库 / 删除）跟拼接
-     * 没关系，并排放在一起只会让人点错。这里换成合并自己的两个按钮。
-     * 「开始合并」只是把清单交回导演台 —— 合并请求 / 进度条 / LED / 历史都长在
-     * 那边，素材库再实现一份必然漂移。 */
-    const mergeBox = el("div", "h3l-batch h3l-mergebox");
+    /* ---- 合并导出：入口 + 清单区（都住在素材库里） ----
+     *
+     * 合并**整套**在这里：入口按钮 → 选材模式 → 点素材排顺序 → 就地发起拼接。
+     * 导演台不再有合并入口、也不再存清单（只留一个互斥标记 `window.H3Merge`）。
+     *
+     * 两个区靠 CSS 类切换（`.h3l-only-normal` / `.h3l-only-merge` 配
+     * `.h3l-merging`），**不重建 DOM** —— 重建会把滚动位置和已选清单一起丢掉。 */
+    const mergeEntry = el("button", "h3l-btn h3l-btn-cta h3l-only-normal", "⧉ 合并导出");
+    mergeEntry.type = "button";
+    mergeEntry.title = "把多个视频按顺序拼成一条（不改链、不动存档）："
+      + "进入选材模式后点素材排顺序，瓦片角标 1→N 就是拼接顺序；"
+      + "只收视频；产物落在本项目 finals/，完成后自动跳到「成片」";
+    mergeEntry.onclick = () => {
+      if (!S.dir) { say("合并需要先打开一个项目：产物落在该项目的 finals/ 里"); return; }
+      setMergeMode(true);
+    };
+
+    const mergeBox = el("div", "h3l-batch h3l-mergebox h3l-only-merge");
     const mergeBtn = el("button", "h3l-btn h3l-btn-cta", "⧉ 开始合并");
     mergeBtn.type = "button";
     const paintMergeBtn = () => {
       const n = (S.mergeOrder || []).length;
+      if (S.mergeBusy) {
+        mergeBtn.textContent = "⧉ 合并中…";
+        mergeBtn.disabled = true;
+        mergeBtn.classList.add("on");
+        return;
+      }
+      mergeBtn.disabled = false;
       mergeBtn.textContent = n ? `⧉ 开始合并（按 1→${n} 顺序）` : "⧉ 开始合并";
       mergeBtn.title = n
-        ? `按瓦片角标顺序拼接这 ${n} 个素材（与导演台「⧉ 合并导出」是同一件事）`
+        ? `按瓦片角标顺序拼接这 ${n} 个视频为 merged_*.mp4（PyAV，分钟级，期间可继续浏览）`
         : "先点素材排进清单：瓦片角标 1 / 2 / 3 就是拼接顺序（再点一次取消）";
       mergeBtn.classList.toggle("on", n > 0);
     };
-    mergeBtn.onclick = () => {
-      if (!S.mergeOrder.length) {
-        say("先点素材排进合并清单：瓦片角标 1 / 2 / 3 就是拼接顺序（再点一次取消）");
-        return;
-      }
-      const items = S.mergeOrder.slice();
-      if (typeof S.onMergeCommit === "function") S.onMergeCommit(items);
-      else say(`已选 ${items.length} 个素材，请回导演台点「⧉ 合并导出」`);
-    };
-    const clearOrderBtn = el("button", "h3l-btn", "✕ 清空顺序");
-    clearOrderBtn.type = "button";
-    clearOrderBtn.title = "清空合并清单（角标全部消失；不影响素材本身）";
-    clearOrderBtn.onclick = () => {
-      if (!S.mergeOrder.length) { say("合并清单本来就是空的"); return; }
-      S.mergeOrder = [];
-      /* 只重画角标与勾选，**不 renderGrid** —— 整片重建会把滚动位置也重置，
-       * 刚翻到第 8 页点一下就被弹回顶部。 */
-      if (S.grid) S.grid.querySelectorAll(".h3l-tile.sel").forEach((n) => n.classList.remove("sel"));
-      paintMergeBadges();
-      renderFoot();
-      if (S.onMergeChanged) S.onMergeChanged([]);
-    };
-    mergeBox.append(mergeBtn, clearOrderBtn);
+    mergeBtn.onclick = () => doMerge();
+    const exitMergeBtn = el("button", "h3l-btn", "✕ 退出合并");
+    exitMergeBtn.type = "button";
+    exitMergeBtn.title = "退出选材模式并清空清单（素材本身不受影响）";
+    exitMergeBtn.onclick = () => setMergeMode(false);
+    mergeBox.append(mergeBtn, exitMergeBtn);
     S.paintMergeBtn = paintMergeBtn;
-    paintMergeBtn();
+    if (typeof S.paintMergeBtn === "function") S.paintMergeBtn();
 
-    // 挑选模式单击就返回，不存在"选中一批"这回事；合并模式用合并清单，不摆批量区
-    if (mergeMode) bar.append(mergeBox);
-    else if (!pickMode) bar.append(batchBox);
+    // 挑选模式单击就返回，不存在"选中一批"这回事，也没有合并这回事
+    if (!pickMode) bar.append(batchBox, mergeEntry, mergeBox);
 
     /* 上传落点 = 当前所在库，**上传到哪里就是哪里，不顺手复制**：
      *   全局库 → 只进全局库（跨项目复用）

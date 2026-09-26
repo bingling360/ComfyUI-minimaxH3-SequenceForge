@@ -117,30 +117,29 @@ let refreshTimer = null;
 let ledPhase = "idle";
 let ledText = "待命";
 let apiErrorText = "";
-let lastDir = "";            // 最近一次数据刷新解析出的当前项目目录（合并导出用）
-/* 合并模式（纯内存勾选态，不落 ds / 不触发重做）：勾选已完成段
- * 按链顺序）+ 可追加上传外部素材 -> 拼接出新 merged_*.mp4，不动链与存档 */
-/* 合并模式的内存清单（不落盘、不动链与存档）。
- *   order —— 素材库里点选的素材，**数组顺序就是合并顺序**（Q1 口径：点击顺序即
- *            合并顺序，不做拖拽排序）。用数组不用 Set，就是因为顺序本身就是数据。
- *   files —— 追加上传的外部视频（永远排在 order 之后）。
- *   segs  —— 旧"勾选段号"通道。段卡上的勾选框已删，这里**保留字段但不再写入**，
- *            只为兼容可能的旧调用点，别在别处读它。
- *   running —— **合并导出进行中**。互斥守卫只看这一个标记，不看 on：
- *            `on` 现在是个常显的开关，随手开着不该拦住生成。 */
-const mergeSel = { on: false, order: [], segs: [], files: [], running: false };
-
-/** 退出合并模式 = 清空全部清单（退出立即 reset，无副作用：清单不落盘）。 */
-function resetMergeSel() {
-    mergeSel.order = [];
-    mergeSel.segs = [];
-    mergeSel.files = [];
-    mergeSel.running = false;
-}
-
-/** 合并清单总项数（素材 + 外部视频）。 */
-function mergeCount() {
-    return (mergeSel.order || []).length + (mergeSel.files || []).length;
+let lastDir = "";            // 最近一次数据刷新解析出的当前项目目录
+/* 合并导出的**互斥标记**（导演台这边只剩这一个职责）。
+ *
+ * 合并模式整套 UI 已搬到**素材库**（`web/h3_library.js`）：在库里点 `⧉ 合并导出`
+ * 进选材模式、点素材排顺序、在库里发起拼接。导演台不再有合并入口，也不再存清单 ——
+ * 同一个功能两处入口、两套状态，只会互相漂移（"我在这儿选好了，那边却显示没选"）。
+ *
+ * 但导演台必须知道"合并正在跑"：PyAV 流式编码是分钟级 CPU 密集任务，此时再提交
+ * 生成就是两个重活抢 CPU。所以素材库发起前调 `window.H3Merge.begin()`、结束后调
+ * `.end(ok)`，四处提交守卫只读 `mergeJob.running`。素材库没加载（老页面缓存）时
+ * 守卫读不到这个全局，按"没在合并"处理即可。 */
+const mergeJob = { running: false };
+if (typeof window !== "undefined") {
+    window.H3Merge = {
+        get running() { return mergeJob.running; },
+        /** 合并开始：立互斥标记并刷新（状态条会给用户一句说明）。 */
+        begin() { mergeJob.running = true; scheduleRefresh(0); },
+        /** 合并结束：`ok` 为真时顺带 refresh —— 产物落在 finals/，成片区要跟着更新。 */
+        end(ok) {
+            mergeJob.running = false;
+            if (ok) refresh(); else scheduleRefresh(0);
+        },
+    };
 }
 /* 拖拽调序进行中（{idx: 提示词数组下标, fromP: 当前 plan 位}）：
  * 重建锁定 + drop 目标计算用；dragend 后置 null */
@@ -1564,16 +1563,10 @@ function inputViewUrl(name) {
     return `/api/view?type=input&subfolder=${encodeURIComponent(sub)}&filename=${encodeURIComponent(file)}`;
 }
 
-async function uploadToInput(file) {
-    const fd = new FormData();
-    fd.append("image", file);
-    fd.append("type", "input");
-    fd.append("overwrite", "true");
-    const r = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    return j.subfolder ? `${j.subfolder}/${j.name}` : j.name;
-}
+/* uploadToInput(file) 已删：它唯一的调用点是「＋ 上传视频」（合并清单条上的外部
+ * 素材上传），而合并整套 UI 已搬到素材库，上传改走素材库自带的「＋ 上传到XX」
+ * （H3Assets.uploadDirect，落到哪个库就登记到哪个库）。留着它就是"有代码无入口"，
+ * 与当初删 H3LatentExtract 的理由一致 —— 想再上传到 input 目录时重写即可。 */
 
 /* ---------- 画布节点操作 ---------- */
 
@@ -2776,7 +2769,7 @@ function upTargetCanvas(node, up) {
 async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (mergeSel.running) { alert("合并导出进行中：等它跑完再操作"); return; }
+    if (mergeJob.running) { alert("合并导出进行中：等它跑完再操作"); return; }
     const ds = getDs(node);
     if (!ds.upscale?.model) {
         alert("请先在右栏「二采面板」选择放大模型，再对本段执行二采。");
@@ -2957,99 +2950,12 @@ async function loadDefaultWorkflow() {
  * 旧 stub appendInsert/pickInsertVideo/removeInsert 随规划 §7 删除清单一并移除，
  * 无调用点残留（插入视频 UI 此前已下掉），不再保留兼容壳。 */
 
-/* ---- 合并导出（勾选态纯内存，POST /h3chain/merge 流式拼接成 merged_*.mp4） ---- */
-
-/** 上传外部视频追加到合并清单末尾（input 目录，不进链，仅作拼接素材）。 */
-function pickMergeVideo() {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "video/*";
-    input.onchange = async () => {
-        const f = input.files && input.files[0];
-        if (!f) return;
-        try {
-            const name = await uploadToInput(f);
-            mergeSel.files = [...(mergeSel.files || []), name];
-            scheduleRefresh(0);
-        } catch (e) {
-            alert(`上传失败：${e}`);
-        }
-    };
-    input.click();
-}
-
-/** 打开素材库的「合并模式」上下文：点一个素材就按选择顺序排进去。
- *  顺序与角标都由素材库那边维护，这里只收结果；两边共用同一个 mergeSel.order，
- *  所以关掉窗口再打开，之前选好的顺序与角标还在。 */
-function openMergeLibrary() {
-    if (!window.H3Lib?.open) { alert("素材库模块未加载（请刷新页面）"); return; }
-    window.H3Lib.open({
-        dir: getDirValue(findNode()) || lastDir || "",
-        merge: true,
-        order: (mergeSel.order || []).slice(),
-        onMergeChanged: (order) => {
-            mergeSel.order = Array.isArray(order) ? order.slice() : [];
-            scheduleRefresh(0);
-        },
-        /* 素材库里的「⧉ 开始合并」= 导演台的「⧉ 合并导出」：收掉素材库窗口，
-         * 回导演台跑（进度/LED/历史都长在这边，素材库不自己发合并请求）。 */
-        onMergeCommit: (order) => {
-            mergeSel.order = Array.isArray(order) ? order.slice() : [];
-            const lb = document.querySelector(".h3l-overlay");
-            if (lb) lb.remove();
-            scheduleRefresh(0);
-            doMergeExport(null);
-        },
-    });
-}
-
-/** `btn` 可以为 null：素材库里点「开始合并」时导演台的清单条可能根本没渲染
- *  （合并模式开着但中栏没画到那一条），没有按钮可改文案就直接跑。 */
-async function doMergeExport(btn) {
-    const dir = lastDir;
-    if (!dir) { alert("没有当前项目目录（先读档或运行一次）"); return; }
-    /* 顺序 = 用户在素材库里点选的顺序（mergeSel.order）。**这里绝对不能 sort**：
-     * 合并顺序就是数据本身，排一下就把用户点出来的顺序改掉了。
-     * asset 给后端按 id 精确解析（全局库素材也认），file 是回落路径。 */
-    const items = [
-        ...(mergeSel.order || []).map((x) => ({
-            asset: String(x.id || ""), file: String(x.file || ""), name: String(x.name || ""),
-        })),
-        ...(mergeSel.files || []).map((f) => ({ file: f })),
-    ];
-    if (!items.length) { alert("先到素材库里点选要合并的素材（或上传外部视频）"); return; }
-    const oldTxt = btn ? btn.textContent : "";
-    if (btn) { btn.disabled = true; btn.textContent = "合并中…"; }
-    mergeSel.running = true;                 // 互斥守卫只看这个（不看 on）
-    setLed("running", `合并 ${items.length} 项拼接中`);
-    try {
-        const r = await api.fetchApi("/h3chain/merge", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ dir, items }),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (r.ok && j.ok) {
-            setLed("done", `已合并 → ${j.file}`);
-            /* 合并成功即收摊：退出模式并清空清单（与手动「✕ 退出」同一条路径）。 */
-            mergeSel.on = false;
-            resetMergeSel();
-            refresh();
-            return;
-        }
-        if (r.status === 404 || r.status === 405) {
-            setApiError(`合并接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台「路由已注册」日志。`);
-        } else {
-            alert(`合并失败：${j.error || `HTTP ${r.status}`}`);
-        }
-    } catch (e) {
-        alert("合并请求失败：" + e);
-    } finally {
-        mergeSel.running = false;      // 成功路径已 reset，这里兜底失败/异常
-        if (btn) { btn.disabled = false; btn.textContent = oldTxt; }
-    }
-}
-
+/* 合并导出（pickMergeVideo / openMergeLibrary / doMergeExport / 状态条合并按钮 /
+ * 合并清单条）已**整体搬到素材库**（web/h3_library.js）：入口、选材、顺序、发起
+ * 拼接都在那边，导演台只留 `mergeJob` 互斥标记 + `window.H3Merge`（见文件头）。
+ * 为什么不留导演台入口：同一个功能两处入口、两套清单状态，必然漂移成
+ * "我在这儿选好了，那边却显示没选"。上传外部视频改走素材库自带的
+ * 「＋ 上传到XX」（落到哪个库就在哪个库，上传完点一下瓦片就排进清单）。 */
 /* ---- 提示词写回防抖 ---- */
 
 const _taTimers = new Map();
@@ -5160,9 +5066,9 @@ function redoQueued(data) {
 }
 
 function queuePrompt() {
-    /* 互斥只看**合并导出进行中**，不看 `mergeSel.on`：合并模式现在是个常显开关，
-     * 随手开着但清单空着时不该拦住生成。 */
-    if (mergeSel.running) { alert("合并导出进行中：等它跑完再提交生成"); return; }
+    /* 互斥只看**合并导出进行中**（素材库发起时立的 `mergeJob.running`）。
+     * 合并模式本身住在素材库里，导演台不再有"合并模式开着"这种状态。 */
+    if (mergeJob.running) { alert("合并导出进行中：等它跑完再提交生成"); return; }
     const node = findNode();
     if (node) {
         const ds = getDs(node);
@@ -5242,7 +5148,7 @@ async function stopGeneration() {
 async function submitRedo() {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (mergeSel.running) { alert("合并导出进行中：等它跑完再提交重摇"); return; }
+    if (mergeJob.running) { alert("合并导出进行中：等它跑完再提交重摇"); return; }
     let restored = [];
     if (lastDir) {
         const mf = await fetchManifest(lastDir);
@@ -5283,7 +5189,7 @@ async function submitRedo() {
 function openRerollModal(idx, data) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (mergeSel.running) { alert("合并导出进行中：等它跑完再标记重摇"); return; }
+    if (mergeJob.running) { alert("合并导出进行中：等它跑完再标记重摇"); return; }
     if (document.querySelector(".h3d-overlay")) return;
 
     const { mf, plan, ds, state } = data;
@@ -6073,11 +5979,8 @@ function injectStyles() {
     /* 段禁用（不上链）：半透明虚线框，与待生成 todo 区分 */
     .h3d-card.offchain{opacity:.5;border-style:dashed;border-color:#59626f}
     .h3d-card.offchain:hover{opacity:.85}
-    /* .h3d-mergecb 已删（段卡合并勾选框下线）。 */
-    .h3d-mergebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:-2px 0 14px;padding:9px 12px;border:1px solid #7a5f36;border-radius:8px;background:linear-gradient(90deg,#352a19,#2d333b)}
-    .h3d-merge-sum{flex:1;min-width:200px;color:#e9c07a;font-size:11.5px;line-height:1.7;word-break:break-all}
-    .h3d-merge-sum b{color:#f5d9a0}
-    .h3d-merge-sum small{display:block;color:var(--h3d-muted);font:10px ui-monospace,Consolas;word-break:break-all}
+    /* .h3d-mergecb / .h3d-mergebar / .h3d-merge-sum 已删（合并勾选框与合并清单条
+     * 一起搬到素材库，见 web/h3_library.js 的 .h3l-mergebox）。 */
     .h3d-thumb{position:relative;width:150px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#10151c;display:grid;place-items:center;color:#636e7b;font:700 11px ui-monospace,Consolas}
     /* 视频/图片绝对定位填满盒子：若走普通流，grid 自动行高会把竖屏视频的 intrinsic 高度
        （如 9:16 → 150×266.7）当元素高度，底部控制栏被 overflow:hidden 整条裁掉——
@@ -6789,8 +6692,6 @@ function cardsSignature(data) {
         redo: [(ds?.redo_segs || []).map((x) => `${x.slot}:${x.mode}`).join(","),
                (mf?.redo_queue || []).map((x) => (Array.isArray(x) ? x.join(":") : "")).join(",")],
         dur: String(getWidgetValue(data.node, W_DUR) ?? ""),
-        merge: [mergeSel.on, (mergeSel.order || []).map((x) => x.id).join(","),
-                (mergeSel.files || []).join(",")],
     });
 }
 
@@ -6994,9 +6895,12 @@ function renderV2Section(sec, data) {
         const nLat = (mf?.latents || []).length;
         const b = el("button", "h3d-hubbtn",
             "🗂 打开素材库" +
-            `<small>资产 ${nAsset} · 成片 ${nFin} · latent ${nLat} · 可搜索 / 筛选 / 批量</small>`);
+            `<small>资产 ${nAsset} · 成片 ${nFin} · latent ${nLat} · 可搜索 / 筛选 / 批量 / 合并导出</small>`);
         b.type = "button";
-        b.title = dir ? "浏览与管理全部素材（右键 = 动作菜单，双击 = 预览）" : "先新建 / 读档一个项目";
+        b.title = dir
+            ? "浏览与管理全部素材（右键 = 动作菜单，双击 = 预览）。"
+              + "「⧉ 合并导出」也在库里：进选材模式后点素材排顺序，角标 1→N 就是拼接顺序"
+            : "先新建 / 读档一个项目";
         b.onclick = () => {
             if (!dir) { alert("先新建 / 读档一个项目"); return; }
             if (!window.H3Lib) { alert("素材库前端未加载（web/h3_library.js）"); return; }
@@ -7565,24 +7469,9 @@ function buildCenterBody(data) {
     bar.append(el("div", "h3d-st-text", escapeHtml(st.text)));
     if (state?.review) bar.insertAdjacentHTML("beforeend", badge("逐段审片", "cyan"));
     if (state?.reroll > 0) bar.insertAdjacentHTML("beforeend", badge(`重跑起始段=${state.reroll}`, "warn"));
-    if (mergeSel.on) bar.insertAdjacentHTML("beforeend", badge("合并模式", "media"));
-    /* 合并模式：到**素材库**点选素材，点击顺序即合并顺序（纯内存清单，不动链与存档）。
-     *  **常显** —— 以前被 `done > 0` 包着，一段都没生成时根本看不到这个入口，而
-     *  "把已有素材拼一条片子"本来就该是随时可用的独立动作。 */
-    {
-        const nSel = mergeCount();
-        const mergeBtn = el("button", "h3d-btn" + (mergeSel.on ? " h3d-btn-cyan" : ""),
-            mergeSel.on ? `⧉ 合并模式·开${nSel ? `（${nSel}）` : ""}` : "⧉ 合并模式");
-        mergeBtn.title = "开启后到素材库里点选要合并的素材（**点击顺序 = 合并顺序**），"
-            + "可再追加外部视频，按 1→N 流式拼接成 merged_*.mp4 导出到项目文件夹；"
-            + "不动链、不动存档，随时可退出（退出即清空清单）";
-        mergeBtn.onclick = () => {
-            mergeSel.on = !mergeSel.on;
-            if (!mergeSel.on) resetMergeSel();
-            scheduleRefresh(0);
-        };
-        bar.append(mergeBtn);
-    }
+    /* 合并导出进行中：给个说明徽标。入口不在导演台（整套 UI 在素材库），
+     * 但"为什么生成按钮点了没反应"必须在这条状态线上答得出来。 */
+    if (mergeJob.running) bar.insertAdjacentHTML("beforeend", badge("合并导出进行中", "media"));
     wrap.append(bar);
     /* 状态条上那个 ↻ 已挪到顶栏「⌨ 输入修复」旁边并升级成 refreshAll ——
      * 摆在这儿容易被当成"只刷这一条状态"，而用户点刷新想要的是全局重刷。 */
@@ -7614,43 +7503,8 @@ function buildCenterBody(data) {
     /* 横向分段选择条（点选看一段；＋ 横向加段；pill 可拖调序） */
     if (total > 0) wrap.append(renderSegStrip(data));
 
-    /* 合并清单条：素材（按 1→N 顺序）+ 外部上传 + 导出/退出。
-     * 清单内容全在**素材库**里点选（本条的「从素材库选」是唯一入口），
-     * 这里只回显顺序与总数 —— 段卡上那套"逐段切屏勾选"已删。 */
-    if (mergeSel.on) {
-        const mbar = el("div", "h3d-mergebar");
-        const order = mergeSel.order || [];
-        const fileSum = (mergeSel.files || []).length
-            ? ` ＋ 外部视频×${mergeSel.files.length}` : "";
-        const sum = el("div", "h3d-merge-sum",
-            order.length
-                ? `合并清单（按选择顺序）：<b>${order.map((x, i) => `${i + 1}. ${escapeHtml(x.name || x.file || x.id)}`).join("　→　")}</b>${escapeHtml(fileSum)}`
-                : `<b>还没选素材</b>：点右边「🗂 从素材库选」挑要拼接的素材（点击顺序就是合并顺序）`);
-        mbar.append(sum);
-        const pickBtn = el("button", "h3d-btn h3d-btn-cyan", "🗂 从素材库选");
-        pickBtn.title = "打开素材库（合并模式）：点一个素材就按顺序排进去，"
-            + "瓦片角标 1/2/3/4 就是合并顺序；再点一次取消";
-        pickBtn.onclick = () => openMergeLibrary();
-        const upBtn = el("button", "h3d-btn", "＋ 上传视频");
-        upBtn.title = "上传外部视频追加到合并清单末尾（input 目录；建议 24fps、画幅与项目一致，"
-            + "不同画幅会自动缩放裁剪到项目画幅）";
-        upBtn.onclick = pickMergeVideo;
-        const goBtn = el("button", "h3d-btn h3d-btn-cta", "⧉ 合并导出");
-        goBtn.title = "按清单顺序（1→N）流式拼接为 merged_*.mp4"
-            + "（PyAV 编码，分钟级耗时，期间界面可用）";
-        goBtn.disabled = !mergeCount();
-        goBtn.onclick = () => doMergeExport(goBtn);
-        const exitBtn = el("button", "h3d-btn", "✕ 退出");
-        exitBtn.title = "退出合并模式并清空清单（不影响链与存档）";
-        exitBtn.onclick = () => {
-            mergeSel.on = false;
-            resetMergeSel();
-            scheduleRefresh(0);
-        };
-        mbar.append(pickBtn, upBtn, goBtn, exitBtn);
-        wrap.append(mbar);
-    }
-
+    /* 合并清单条已删：整套合并 UI 搬到素材库（见 web/h3_library.js）。
+     * 导演台只保留 mergeJob 互斥标记与状态条上的一句「合并导出进行中」。 */
     /* 未填写提示 */
     if (drafts && drafts.length) {
         wrap.append(el("div", "h3d-drafts",
@@ -9577,7 +9431,7 @@ function renderFooter(z, data) {
     }
     if (state?.review) infos.push("逐段审片：每次排队只生成下一段");
     if (!node) infos.push("只读模式：画布上未找到 H3 Seamless Chain 节点");
-    if (mergeSel.running) infos.push("合并导出进行中：生成按钮暂时不可用（跑完自动恢复）");
+    if (mergeJob.running) infos.push("合并导出进行中：生成按钮暂时不可用（跑完自动恢复）");
     z.footInfo.innerHTML = infos.map((s) => `<span>${s}</span>`).join("");
 
     const run = z.run;
@@ -9586,7 +9440,7 @@ function renderFooter(z, data) {
      * 以为哪里坏了。判定跟顶栏那盏灯同源（提交那一刻置 running）。 */
     if (z.stop) z.stop.style.display = ledPhase === "running" ? "" : "none";
     const pend = redoPending(data), queued = redoQueued(data);
-    if (mergeSel.running) {
+    if (mergeJob.running) {
         run.disabled = true;
         run.textContent = "⧉ 合并导出进行中（跑完可生成）";
     } else if (!total) {

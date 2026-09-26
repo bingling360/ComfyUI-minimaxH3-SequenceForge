@@ -1,19 +1,18 @@
-/* 合并模式重构（R7）守卫：**点击顺序 = 合并顺序**，且在素材库里选。
+/* 合并导出（R7 定稿：**整套住在素材库里**）守卫。
  *
- * 背景（为什么要改）：合并模式原先藏在状态条的 `if (done > 0)` 里 —— 一段都没
- * 生成时根本看不到入口；选素材的方式是"回到段卡上勾分段"，而段卡是**链**的视图，
- * 不是素材的视图（成片/全局库里的东西根本没段号可选）。现在：
- *   · 状态条按钮常显；
- *   · 到**素材库**点素材，点击顺序就是拼接顺序，瓦片上画 1/2/3/4 角标；
- *   · 退出合并模式立即清空清单。
+ * 定稿口径（2026-09-27 用户拍板，别改）：
+ *   · 合并**只在素材库出现**，导演台一个入口都不留 —— 同一个功能两处入口、
+ *     两份清单状态，必然漂移成"我在这儿选好了，那边却显示没选"；
+ *   · 素材库工具条有专门按钮 `⧉ 合并导出` 进选材模式；点素材排顺序，
+ *     瓦片角标 1→N 就是拼接顺序；
+ *   · **只收视频**：进选材模式即把类型筛选强制成 video，非视频瓦片标灰且点不动
+ *     （混进清单的话后端会把整单拒掉，用户看到的是莫名其妙的整体失败）；
+ *   · 退出合并模式（或合并成功）立即清空清单；
+ *   · 导演台只剩一个互斥标记 `window.H3Merge`：拼接期间挡住生成按钮。
  *
- * 本文件钉这几件事（都是容易悄悄坏掉、坏了不报错的地方）：
- *   ① 素材库在 merge 上下文里：标题/提示变、批量区换成合并区、老批量区不出现；
- *   ② 点瓦片 = 排进清单，**数组顺序就是顺序**（不许排序），再点一次移出且角标重排；
- *   ③ 角标登记进 tileKeepers()：缩略图懒加载 replaceChildren 后角标必须还在
- *      （漏登记 = 滚动一次角标整批消失，本仓库踩过这个坑）；
- *   ④ 「⧉ 开始合并」把清单交回导演台（onMergeCommit），空清单不许提交；
- *   ⑤ 导演台：段卡上的勾选框已删、互斥守卫只看"合并导出进行中"（不看合并模式开关）。
+ * 本文件用**真 h3_api.js + 真 h3_library.js** 跑（jsdom 里 stub 掉
+ * `comfyAPI.api.api.fetchApi`），所以顺带钉住了错误回显那条：后端 `_err` 的字段名是
+ * `message`，不是 `error` —— 读错字段会让所有失败都只剩一句"HTTP 400"。
  *
  * 用法：node tests/js/merge_library_check.js
  */
@@ -30,16 +29,17 @@ try {
     process.exit(2);
 }
 
+const API_SRC = fs.readFileSync(path.join(ROOT, "web", "h3_api.js"), "utf8");
 const LIB_SRC = fs.readFileSync(path.join(ROOT, "web", "h3_library.js"), "utf8");
 const DIR_SRC = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");
 
-/* 三个不同 scope 的素材：合并清单要能混着排（顺序就是点击顺序）。 */
-const ITEMS = [
-    { id: "finals:finals/a.mp4", scope: "finals", kind: "video", name: "A", file: "finals/a.mp4" },
-    { id: "global:video/b.mp4", scope: "global", kind: "video", name: "B", file: "video/b.mp4" },
-    { id: "project:assets/c.mp4", scope: "project", kind: "video", name: "C", file: "assets/c.mp4" },
-];
+/* 三个不同 scope 的视频 + 一张图片（图片用来验"合并只收视频"这道闸）。 */
+const V_A = { id: "finals:finals/a.mp4", scope: "finals", kind: "video", name: "A", file: "finals/a.mp4" };
+const V_B = { id: "global:video/b.mp4", scope: "global", kind: "video", name: "B", file: "video/b.mp4" };
+const V_C = { id: "project:assets/c.mp4", scope: "project", kind: "video", name: "C", file: "assets/c.mp4" };
+const IMG = { id: "project:assets/pic.png", scope: "project", kind: "image", name: "PIC", file: "assets/pic.png" };
 
+/** 装一个 jsdom 环境：真 h3_api.js（走 stub 的 fetchApi）+ 真 h3_library.js。 */
 function mkWin(opts) {
     const o = opts || {};
     const dom = new JSDOM("<!doctype html><html><body></body></html>", {
@@ -56,21 +56,43 @@ function mkWin(opts) {
         constructor(cb, opts2) { this.cb = cb; this.opts = opts2; observers.push(this); }
         observe() {} unobserve() {} disconnect() {}
     };
-    const merged = [];
-    const committed = [];
-    w.H3Api = {
-        async libList() {
-            return { body: { ok: true, counters: {},
-                data: { items: ITEMS, total: ITEMS.length, total_pages: 1, page: 1 } } };
-        },
-        async libStatus() { return { body: { ok: true, counters: {} } }; },
-        async libCollections() { return { body: { ok: true, collections: [] } }; },
-        libRawUrl: () => "raw://x",
-        libThumbUrl: () => "thumb://x",
-        errText: (r, d) => d || "err",
+
+    const calls = [];
+    const mergeReplies = [];
+    /* lib_list 的返回：**真的按 kind 过滤**（后端就是这么做的）。
+     * `leakKinds` 用来模拟"筛选器被改回 all"这类漏网，验前端的第二道闸。 */
+    const allItems = () => [V_A, V_B, V_C, IMG];
+    const route = (p, body) => {
+        calls.push({ path: String(p || ""), body });
+        const q = new URLSearchParams(String(p).split("?")[1] || "");
+        if (p.indexOf("/h3chain/lib_list") >= 0) {
+            const kind = q.get("kind") || "all";
+            let items = allItems();
+            if (!o.leakKinds && kind !== "all") items = items.filter((x) => x.kind === kind);
+            return { status: 200, body: { ok: true, counters: {},
+                data: { items, total: items.length, total_pages: 1, page: 1 } } };
+        }
+        if (p.indexOf("/h3chain/lib_status") >= 0) {
+            return { status: 200, body: { ok: true, counters: {} } };
+        }
+        if (p.indexOf("/h3chain/lib_collections") >= 0) {
+            return { status: 200, body: { ok: true, collections: [] } };
+        }
+        if (p.indexOf("/h3chain/merge") >= 0) {
+            return mergeReplies.shift()
+                || { status: 200, body: { ok: true, file: "finals/merged_x.mp4" } };
+        }
+        return { status: 200, body: { ok: true } };
     };
-    w.eval(LIB_SRC);
-    return { w, errors, observers, merged, committed };
+    w.comfyAPI = { api: { api: { fetchApi: async (p, init) => {
+        const body = init && init.body ? JSON.parse(String(init.body)) : null;
+        const r = route(String(p || ""), body);
+        return { status: r.status, ok: r.status < 400, json: async () => r.body };
+    } } } };
+
+    w.eval(API_SRC);            // 真 H3Api（含真 errText）
+    w.eval(LIB_SRC);            // 真 H3Lib
+    return { w, errors, observers, calls, mergeReplies };
 }
 
 let ok = true;
@@ -80,78 +102,137 @@ async function t(name, fn) {
     catch (e) { ok = false; results.push("  FAIL " + name + " :: " + e.message); }
 }
 
-const tilesOf = (w) => [...w.document.querySelectorAll(".h3l-tile")];
+const ov = (w) => w.document.querySelector(".h3l-overlay");
+const tilesOf = (w) => [...ov(w).querySelectorAll(".h3l-tile")];
 const badgeOf = (w, i) => {
     const b = tilesOf(w)[i].querySelector(".h3l-order");
     return b ? b.textContent : null;
 };
-const click = (w, n) => tilesOf(w)[n].dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+const clickTile = (w, n) => tilesOf(w)[n]
+    .dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+const clickBtn = (w, sel) => ov(w).querySelector(sel)
+    .dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+const tick = () => new Promise((r) => setTimeout(r, 30));
+/** 素材库里"合并导出"入口（普通模式工具条上的那个 CTA）。 */
+const entryBtn = (w) => [...ov(w).querySelectorAll(".h3l-bar .h3l-only-normal")]
+    .find((n) => n.tagName === "BUTTON" && n.textContent.indexOf("合并导出") >= 0);
+const mergeBtn = (w) => [...ov(w).querySelectorAll(".h3l-mergebox button")]
+    .find((b) => b.textContent.indexOf("开始合并") >= 0);
+const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0 : false);
 
 (async () => {
-    console.log("\n== 合并模式（素材库侧） ==");
+    console.log("\n== 合并导出：入口在素材库（不在导演台） ==");
 
-    await t("merge 上下文：overlay 带 h3l-merging、标题与提示都换了", async () => {
-        const { w } = mkWin();
-        await w.H3Lib.open({ dir: "PROJ", merge: true, order: [],
-            onMergeChanged: (x) => { w.__merged = x; } });
-        const ov = w.document.querySelector(".h3l-overlay");
-        assert.ok(ov, "素材库没打开");
-        assert.ok(ov.classList.contains("h3l-merging"), "缺 h3l-merging 标记");
-        assert.ok(ov.querySelector(".h3l-head strong").textContent.indexOf("选择要合并的素材") >= 0,
-            "标题没换：" + ov.querySelector(".h3l-head strong").textContent);
-        assert.ok(ov.querySelector(".h3l-hint").textContent.indexOf("角标") >= 0,
-            "没告诉用户角标就是顺序");
-    });
-
-    await t("合并模式下不摆批量区，摆的是合并区（调入项目/删除跟拼接无关）", async () => {
-        const { w } = mkWin();
-        await w.H3Lib.open({ dir: "PROJ", merge: true });
-        const ov = w.document.querySelector(".h3l-overlay");
-        const boxes = [...ov.querySelectorAll(".h3l-batch")];
-        assert.strictEqual(boxes.length, 1, "工具条上该只有一个区，实际 " + boxes.length);
-        assert.ok(boxes[0].classList.contains("h3l-mergebox"), "那个区该是合并区");
-        assert.ok(ov.querySelector(".h3l-mergebox button").textContent.indexOf("开始合并") >= 0,
-            "缺「开始合并」按钮");
-        for (const w2 of ["调入项目", "存入全局库", "删除"]) {
-            assert.ok(ov.querySelector(".h3l-bar").textContent.indexOf(w2) < 0,
-                "合并模式不该出现批量动作：" + w2);
+    await t("导演台一个合并入口都不留（按钮 / 清单条 / 勾选框全删）", () => {
+        /* ⚠ 判据一律带「调用括号」或「CSS 规则」：删除处的墓碑注释里写着这些名字
+         * （"openMergeLibrary / doMergeExport 已删…"），拿 indexOf 裸字符串断言
+         * 只会命中注释，变成假失败。 */
+        for (const gone of ["h3d-mergecb", "mergeable-off"]) {
+            assert.ok(DIR_SRC.indexOf('"' + gone + '"') < 0, "导演台又出现已删的合并勾选：" + gone);
         }
+        for (const re of [/\.h3d-mergebar\s*\{/, /\.h3d-merge-sum\s*\{/, /\.h3d-mergecb\s*\{/]) {
+            assert.ok(!re.test(DIR_SRC), "导演台又出现已删的合并样式：" + re);
+        }
+        for (const fn of ["openMergeLibrary", "doMergeExport", "pickMergeVideo", "resetMergeSel",
+            "mergeCount"]) {
+            assert.ok(!new RegExp(fn + "\\s*\\(").test(DIR_SRC),
+                "导演台又出现了已删的合并函数：" + fn);
+        }
+        assert.ok(DIR_SRC.indexOf("⧉ 合并模式") < 0, "状态条的「⧉ 合并模式」按钮又回来了");
+        assert.ok(DIR_SRC.indexOf("const mergeSel") < 0, "导演台又在存合并清单了（mergeSel）");
     });
 
-    await t("非合并模式仍是批量区（R4 的行为不许被改掉）", async () => {
+    await t("导演台只留互斥标记：window.H3Merge 暴露 begin/end/running", () => {
+        assert.ok(/window\.H3Merge\s*=/.test(DIR_SRC), "没暴露 window.H3Merge");
+        for (const m of ["begin()", "end(ok)"]) {
+            assert.ok(DIR_SRC.indexOf(m) >= 0, "H3Merge 缺 " + m);
+        }
+        /* 只数**守卫**（带 alert 的那几处）：footer 里还有一处 `if (mergeJob.running)`
+         * 是改按钮文案的，不是守卫，别一起数进来。 */
+        const hits = [...DIR_SRC.matchAll(/if \(mergeJob\.running\) \{ alert\(/g)];
+        assert.strictEqual(hits.length, 4,
+            "该有 4 处互斥守卫（二采提交 / 提交生成 / 提交重摇 / 标记重摇），实际 " + hits.length);
+    });
+
+    await t("普通模式：工具条上有专门的「⧉ 合并导出」按钮，批量区也在", async () => {
         const { w } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        const ov = w.document.querySelector(".h3l-overlay");
-        assert.ok(!ov.classList.contains("h3l-merging"), "普通模式不该带 merging 标记");
-        assert.ok(!ov.querySelector(".h3l-mergebox"), "普通模式不该有合并区");
-        assert.ok(ov.querySelector(".h3l-batch"), "普通模式该有批量区");
-        assert.ok(ov.querySelector(".h3l-bar").textContent.indexOf("调入项目") >= 0, "批量区内容丢了");
+        const b = entryBtn(w);
+        assert.ok(b, "找不到「⧉ 合并导出」入口按钮");
+        assert.ok(ov(w).querySelector(".h3l-batch:not(.h3l-mergebox)"), "普通模式该有批量区");
+        assert.ok(ov(w).querySelector(".h3l-kindsel, select"), "普通模式该有类型下拉");
+        assert.strictEqual(w.document.querySelectorAll(".h3l-mergebox").length, 1, "合并区该在 DOM 里");
+    });
+
+    await t("点入口进选材模式：标题换、批量区藏、合并区出、latent 页签消失", async () => {
+        const { w } = mkWin();
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        assert.ok(ov(w).classList.contains("h3l-merging"), "overlay 没带 h3l-merging");
+        assert.ok(ov(w).querySelector(".h3l-head strong").textContent
+            .indexOf("选择要合并的素材") >= 0, "标题没换");
+        assert.ok(ov(w).querySelector(".h3l-hint").textContent.indexOf("角标") >= 0,
+            "没告诉用户角标就是顺序");
+        assert.ok(mergeBtn(w), "缺「开始合并」按钮");
+        assert.ok(ov(w).querySelector(".h3l-bar").textContent.indexOf("调入项目") >= 0,
+            "批量区被删了（只是该被 CSS 藏起来）");
+        const scopeNames = [...ov(w).querySelectorAll(".h3l-scope")].map((n) => n.textContent);
+        assert.ok(!scopeNames.some((s) => s.indexOf("latent") >= 0),
+            "合并模式下 latent 页签该消失（类型被强制成 video，点进去必然为空）：" + scopeNames);
+    });
+
+    await t("只收视频：类型筛选被强制成 video，图片根本不出现在列表里", async () => {
+        const { w, calls } = mkWin();
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        const last = calls.filter((c) => c.path.indexOf("lib_list") >= 0).pop();
+        assert.ok(last && last.path.indexOf("kind=video") >= 0,
+            "进合并模式后没把类型筛选切成 video：" + (last && last.path));
+        const names = tilesOf(w).map((t) => t.querySelector(".h3l-name").textContent);
+        assert.ok(names.indexOf("PIC") < 0, "图片混进合并列表了：" + names);
+    });
+
+    await t("第二道闸：漏网的图片点不动，且给出人话（不许悄悄进清单）", async () => {
+        const { w } = mkWin({ leakKinds: true });   // 模拟筛选器失效，图片混进列表
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        const pic = tilesOf(w).find((t) => t.querySelector(".h3l-name").textContent === "PIC");
+        assert.ok(pic, "（桩没造出图片瓦片，用例失效）");
+        assert.ok(pic.classList.contains("h3l-nomerge"), "非视频瓦片该标成不可选");
+        pic.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+        assert.strictEqual(pic.querySelector(".h3l-order"), null, "图片被排进清单了");
+        assert.ok(ov(w).querySelector(".h3l-msg").textContent.indexOf("只能合并视频") >= 0,
+            "点非视频该给一句说明：" + ov(w).querySelector(".h3l-msg").textContent);
     });
 
     await t("点击顺序 = 合并顺序：角标 1/2/3 与清单顺序一致", async () => {
         const { w } = mkWin();
-        const got = [];
-        await w.H3Lib.open({ dir: "PROJ", merge: true,
-            onMergeChanged: (x) => got.push(x.map((i) => i.id).join(">")) });
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
         assert.strictEqual(badgeOf(w, 0), null, "还没点就有角标");
-        click(w, 1);            // 先点 B
-        click(w, 2);            // 再点 C
-        click(w, 0);            // 最后点 A
+        clickTile(w, 1);            // 先点 B
+        clickTile(w, 2);            // 再点 C
+        clickTile(w, 0);            // 最后点 A
         assert.strictEqual(badgeOf(w, 1), "1", "B 该是第 1 个");
         assert.strictEqual(badgeOf(w, 2), "2", "C 该是第 2 个");
         assert.strictEqual(badgeOf(w, 0), "3", "A 该是第 3 个");
-        assert.strictEqual(got[got.length - 1],
-            "global:video/b.mp4>project:assets/c.mp4>finals:finals/a.mp4",
-            "回调拿到的顺序不对：" + got[got.length - 1]);
-        assert.ok(w.document.querySelector(".h3l-foot").textContent.indexOf("已排 3 个") >= 0,
+        assert.ok(ov(w).querySelector(".h3l-foot").textContent.indexOf("已排 3 个") >= 0,
             "页脚没回显数量");
+        assert.ok(mergeBtn(w).textContent.indexOf("1→3") >= 0,
+            "按钮文案该带上顺序长度：" + mergeBtn(w).textContent);
     });
 
     await t("再点一次 = 移出，后面的角标整体前移（1/2 重排）", async () => {
         const { w } = mkWin();
-        await w.H3Lib.open({ dir: "PROJ", merge: true });
-        click(w, 0); click(w, 1); click(w, 2);
-        click(w, 1);            // 移出 B
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        clickTile(w, 0); clickTile(w, 1); clickTile(w, 2);
+        clickTile(w, 1);            // 移出 B
         assert.strictEqual(badgeOf(w, 0), "1", "A 该前移成 1");
         assert.strictEqual(badgeOf(w, 2), "2", "C 该前移成 2");
         assert.strictEqual(badgeOf(w, 1), null, "B 的角标该消失");
@@ -160,8 +241,10 @@ const click = (w, n) => tilesOf(w)[n].dispatchEvent(new w.MouseEvent("click", { 
 
     await t("角标登记进 tileKeepers：懒加载离屏卸载后角标还在", async () => {
         const { w, observers } = mkWin();
-        await w.H3Lib.open({ dir: "PROJ", merge: true });
-        click(w, 2);
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        clickTile(w, 2);
         const th = tilesOf(w)[2].querySelector(".h3l-thumb");
         assert.ok(th.querySelector(".h3l-order"), "点击后该有角标");
         /* 造一个"已加载"的缩略图，再喂一条"离开视野"——真实链路里这里会
@@ -175,105 +258,126 @@ const click = (w, n) => tilesOf(w)[n].dispatchEvent(new w.MouseEvent("click", { 
         assert.strictEqual(b.textContent, "1", "角标数字也不该变");
     });
 
-    await t("「⧉ 开始合并」把清单交回导演台；空清单只提示、不提交", async () => {
+    await t("退出合并模式：清单与角标立即清空、类型筛选还原、latent 页签回来", async () => {
         const { w } = mkWin();
-        let committed = null;
-        await w.H3Lib.open({ dir: "PROJ", merge: true,
-            onMergeCommit: (x) => { committed = x; } });
-        const btn = w.document.querySelector(".h3l-mergebox button");
-        btn.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
-        assert.strictEqual(committed, null, "空清单不该提交");
-        click(w, 2); click(w, 0);
-        btn.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
-        assert.ok(Array.isArray(committed), "点了开始合并却没交回清单");
-        /* ⚠ 必须 Array.from：committed 是 jsdom 窗口里的 Array，原型与 node 的不是
-         * 同一个，deepStrictEqual 会因为「原型不同」判不等（内容一模一样也挂）。 */
-        assert.deepStrictEqual(Array.from(committed, (x) => x.id),
-            ["project:assets/c.mp4", "finals:finals/a.mp4"], "交回的顺序不对");
-        assert.ok(btn.textContent.indexOf("1→2") >= 0, "按钮文案该带上顺序长度：" + btn.textContent);
-    });
-
-    await t("「✕ 清空顺序」清干净且通知导演台（不整片重画，滚动位置不跳）", async () => {
-        const { w } = mkWin();
-        const got = [];
-        await w.H3Lib.open({ dir: "PROJ", merge: true,
-            onMergeChanged: (x) => got.push(x.length) });
-        click(w, 0); click(w, 1);
-        const clear = [...w.document.querySelectorAll(".h3l-mergebox button")][1];
-        clear.dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        clickTile(w, 0); clickTile(w, 1);
+        clickBtn(w, ".h3l-mergebox button:not(.h3l-btn-cta)");
+        await tick();
+        assert.ok(!ov(w).classList.contains("h3l-merging"), "没退出合并模式");
         assert.strictEqual(badgeOf(w, 0), null, "角标没清");
         assert.strictEqual(badgeOf(w, 1), null, "角标没清");
-        assert.strictEqual(got[got.length - 1], 0, "没通知导演台清单已空");
+        assert.ok(ov(w).querySelector(".h3l-head strong").textContent.indexOf("素材库") >= 0,
+            "标题没还原");
+        const scopeNames = [...ov(w).querySelectorAll(".h3l-scope")].map((n) => n.textContent);
+        assert.ok(scopeNames.some((s) => s.indexOf("latent") >= 0), "latent 页签没还原");
     });
 
-    await t("重开素材库能带回已排的清单与角标（清单活在导演台那边）", async () => {
+    await t("空清单点「开始合并」只提示、不发请求", async () => {
+        const { w, calls } = mkWin();
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+        await tick();
+        assert.strictEqual(calls.filter((c) => c.path.indexOf("merge") >= 0).length, 0,
+            "空清单不该发合并请求");
+        assert.ok(ov(w).querySelector(".h3l-msg").textContent.indexOf("先点") >= 0,
+            "该提示先选素材");
+    });
+
+    await t("发起合并：请求体按角标顺序、带 asset id，且不排序", async () => {
+        const { w, calls } = mkWin();
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        clickTile(w, 2); clickTile(w, 0);      // C 在前、A 在后
+        mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+        await tick();
+        const m = calls.filter((c) => c.path.indexOf("/h3chain/merge") >= 0).pop();
+        assert.ok(m, "没发合并请求");
+        assert.strictEqual(m.body.dir, "PROJ", "没带项目目录");
+        assert.deepStrictEqual(Array.from(m.body.items, (x) => x.asset),
+            ["project:assets/c.mp4", "finals:finals/a.mp4"],
+            "顺序或 asset id 不对（顺序就是数据，不许排序）");
+    });
+
+    await t("合并成功：清清单 / 退模式 / 跳到「成片」/ 放开互斥（end(true)）", async () => {
+        const { w, calls } = mkWin();
+        const life = [];
+        w.H3Merge = { begin: () => life.push("begin"), end: (o) => life.push("end:" + o) };
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        clickTile(w, 0);
+        mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+        await tick(); await tick();
+        assert.deepStrictEqual(life, ["begin", "end:true"], "互斥标记没配对："
+            + JSON.stringify(life));
+        assert.ok(!ov(w).classList.contains("h3l-merging"), "成功后该退出选材模式");
+        assert.strictEqual(badgeOf(w, 0), null, "成功后清单该清空");
+        const lastList = calls.filter((c) => c.path.indexOf("lib_list") >= 0).pop();
+        assert.ok(lastList.path.indexOf("scope=finals") >= 0,
+            "成功后该跳到「成片」看产物：" + lastList.path);
+        assert.ok(ov(w).querySelector(".h3l-msg").textContent.indexOf("已合并") >= 0,
+            "没有成功回执：" + ov(w).querySelector(".h3l-msg").textContent);
+    });
+
+    /* ★ 这条钉的是真 bug：后端 `_err` 的字段名是 `message`，前端曾读 `error`，
+     * 于是所有失败都只剩一句"HTTP 400"，真正的原因（素材没了 / 不是视频 /
+     * 路径越界）全被吞掉 —— 用户看到的正是截图里那个无语的弹窗。 */
+    await t("合并失败：显示后端原话（message），不是「HTTP 400」", async () => {
+        const { w, mergeReplies } = mkWin();
+        mergeReplies.push({ status: 400, body: { ok: false, code: "BAD_REQUEST",
+            message: "只能合并视频：pic.png 是图片（音频/图片/latent 拼接没有意义）" } });
+        const life = [];
+        w.H3Merge = { begin: () => life.push("begin"), end: (o) => life.push("end:" + o) };
+        await w.H3Lib.open({ dir: "PROJ" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        clickTile(w, 0);
+        mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+        await tick(); await tick();
+        const txt = ov(w).querySelector(".h3l-msg").textContent;
+        assert.ok(txt.indexOf("只能合并视频") >= 0, "后端原话没显示出来：" + txt);
+        assert.ok(txt.indexOf("HTTP 400") < 0, "又只剩一句 HTTP 400 了：" + txt);
+        assert.deepStrictEqual(life, ["begin", "end:false"], "失败也要放开互斥，否则生成按钮永远点不动");
+        assert.ok(ov(w).classList.contains("h3l-merging"), "失败不该退出选材模式（清单还在，方便重试）");
+    });
+
+    await t("h3_api 里 libMerge 指向 /h3chain/merge，且 errText 优先读 message", () => {
+        assert.ok(/libMerge:\s*\(dir, items\)\s*=>\s*_json\("POST",\s*"\/h3chain\/merge"/.test(API_SRC),
+            "libMerge 没接 /h3chain/merge");
+        const i = API_SRC.indexOf("function errText(");
+        const body = API_SRC.slice(i, i + 400);
+        assert.ok(body.indexOf("body?.message") >= 0 && body.indexOf("body?.error") >= 0,
+            "errText 该先读 message、再回落 error");
+        assert.ok(body.indexOf("body?.message") < body.indexOf("body?.error"),
+            "message 必须排在 error 前面（后端 _err 用的是 message）");
+    });
+
+    await t("独立打开（没有导演台）时用 onChanged 通知宿主", async () => {
         const { w } = mkWin();
-        await w.H3Lib.open({ dir: "PROJ", merge: true });
-        click(w, 2);
-        const order = [{ id: ITEMS[2].id, file: ITEMS[2].file, name: ITEMS[2].name,
-            scope: ITEMS[2].scope, kind: ITEMS[2].kind }];
-        w.document.querySelector(".h3l-overlay").remove();
-        await w.H3Lib.open({ dir: "PROJ", merge: true, order });
-        assert.strictEqual(badgeOf(w, 2), "1", "重开后角标没回来");
+        let changed = 0;
+        await w.H3Lib.open({ dir: "PROJ", onChanged: () => { changed++; } });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        clickTile(w, 0);
+        mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
+        await tick(); await tick();
+        assert.strictEqual(changed, 1, "没有 H3Merge 时该走 onChanged 通知宿主");
     });
 
-    await t("合并模式下双击仍能预览（挑片子前要能看一眼内容）", () => {
-        /* 挑选模式不能开双击（单击就选中并关窗）；合并模式**必须**开 ——
-         * 否则用户只能靠文件名猜哪个是哪个。 */
-        assert.ok(LIB_SRC.indexOf('if (!S.pick && !S.merge) openViewer') < 0,
-            "合并模式又把双击预览禁掉了");
-        assert.ok(/addEventListener\("dblclick", \(\) => \{ if \(!S\.pick\) openViewer\(it\); \}\)/
-            .test(LIB_SRC), "双击预览的守卫变了，请确认合并模式仍可预览");
-    });
-
-    console.log("\n== 合并模式（导演台侧，源码契约） ==");
-
-    await t("段卡上的「外面选分段」已删干净（checkbox 与死样式都不在）", () => {
-        /* ⚠ 判据用「CSS 规则 / 类名赋值」而不是纯字符串：删除处的墓碑注释里
-         * 必然写着这些类名（.h3d-mergecb / .mergeable-off 都留了说明），
-         * 拿 indexOf 断言只会命中注释，变成假失败。 */
-        for (const re of [/\.h3d-mergecb\s*\{/, /\.mergeable-off\s*\{/,
-            /\.h3d-card\.mergeable\s*[,{]/]) {
-            assert.ok(!re.test(DIR_SRC), "又出现了已删的合并勾选样式：" + re);
-        }
-        for (const cls of ['"h3d-mergecb"', '"mergeable-off"', '"mergeable"']) {
-            assert.ok(DIR_SRC.indexOf(cls) < 0, "又出现了已删的合并勾选类名：" + cls);
-        }
-    });
-
-    await t("合并模式按钮常显（不再被 done > 0 包着）", () => {
-        const i = DIR_SRC.indexOf("const mergeBtn = el(\"button\", \"h3d-btn\"");
-        assert.ok(i > 0, "找不到状态条合并按钮");
-        /* 往上找 600 字符：这段不该再被 `if (done > 0)` 之类的条件裹住 */
-        const before = DIR_SRC.slice(Math.max(0, i - 600), i);
-        assert.ok(before.indexOf("if (done > 0)") < 0,
-            "合并按钮又被 done>0 包起来了 —— 一段没生成时用户就看不到入口");
-    });
-
-    await t("互斥守卫只看「合并导出进行中」，不看合并模式开关", () => {
-        /* 常显之后"开着但清单为空"是常态：拿 mergeSel.on 当守卫会变成
-         * "随手开了个合并模式，结果生成按钮点了没反应"。 */
-        const hits = [...DIR_SRC.matchAll(/if \(mergeSel\.running\) \{\s*alert\("合并导出进行中/g)];
-        assert.strictEqual(hits.length, 4,
-            "该有 4 处守卫（提交生成 / 提交重摇 / 标记重摇 / 二采提交），实际 " + hits.length);
-        assert.ok(DIR_SRC.indexOf("合并模式进行中") < 0, "旧的「合并模式进行中」守卫又回来了");
-    });
-
-    await t("退出合并模式立即清空清单（resetMergeSel 挂在退出与成功两条路上）", () => {
-        const resets = [...DIR_SRC.matchAll(/resetMergeSel\(\)/g)];
-        assert.ok(resets.length >= 3, "resetMergeSel 调用点太少：" + resets.length);
-        assert.ok(/function resetMergeSel\(\) \{[\s\S]{0,400}?mergeSel\.running = false;/
-            .test(DIR_SRC), "resetMergeSel 该把 running 也放下来");
-    });
-
-    await t("合并导出按清单顺序组装，且不再 sort（顺序就是数据）", () => {
-        const i = DIR_SRC.indexOf("async function doMergeExport(btn)");
-        assert.ok(i > 0, "找不到 doMergeExport");
-        const body = DIR_SRC.slice(i, i + 1800);
-        assert.ok(body.indexOf("mergeSel.order") >= 0, "没按 mergeSel.order 组装");
-        assert.ok(body.indexOf("asset: String(x.id") >= 0, "清单项没带 asset id（全局库素材就解析不了）");
-        assert.ok(body.indexOf(".sort(") < 0, "又给合并顺序排序了");
-        assert.ok(body.indexOf("mergeSel.running = true") >= 0, "导出期间没立互斥标记");
+    await t("没有项目目录时进不去合并模式（产物要有地方落）", async () => {
+        const { w } = mkWin();
+        await w.H3Lib.open({ dir: "" });
+        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        await tick();
+        assert.ok(!ov(w).classList.contains("h3l-merging"), "没项目目录不该进合并模式");
+        assert.ok(ov(w).querySelector(".h3l-msg").textContent.indexOf("先打开一个项目") >= 0,
+            "该说清为什么进不去");
     });
 
     results.forEach((r) => console.log(r));

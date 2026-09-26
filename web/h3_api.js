@@ -243,6 +243,12 @@
     libZip: (dir, ids) => _json("POST", "/h3chain/lib_zip", { dir, ids }),
     libRef: (dir, id, seg) => _json("POST", "/h3chain/lib_ref", { dir, id, seg }),
     libRole: (dir, id, role) => _json("POST", "/h3chain/lib_role", { dir, id, role }),
+    /* 合并导出：按 items 顺序流式拼成 merged_*.mp4（PyAV，分钟级，后端放线程池）。
+     * items = [{asset:"<scope>:<file>", file, name}] —— `asset` 是素材库条目 id，
+     * 后端按它精确解析（**全局库素材只有这条能认**：文件既不在项目目录也不在
+     * input 目录）；`file` 是回落路径。只收视频，混进图片/音频后端整单拒。
+     * 失败信息一定读 `body.message`（后端 `_err` 的字段名），别读 `error`。 */
+    libMerge: (dir, items) => _json("POST", "/h3chain/merge", { dir, items }),
     isConflict,
     isBusy,
     errText,

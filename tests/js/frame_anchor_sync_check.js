@@ -80,11 +80,13 @@ function envWith(frameImg) {
 }
 
 
-/* ---------- 3) 端到端：清锚后**锚定栏的对齐指令预览**要跟着变 ----------
- * 结构化提示词已下线（弹窗与 .h3d-v2out 都没了），对齐预览改由锚定栏的
- * mkAlignPreview 渲染进 .h3d-alignprev —— 断言随之下移到那里。 */
-const alignText = (doc) => [...doc.querySelectorAll(".h3d-alignprev")]
-    .map((n) => n.textContent || "").join(" | ");
+/* ---------- 3) 端到端：清锚后段卡要跟着变；对齐指令**不再**在前端露出 ----------
+ * 结构化提示词已下线（弹窗与 .h3d-v2out 都没了）；再往后「对齐指令预览」
+ * （mkAlignPreview / .h3d-alignprev）也整块删掉了 —— 它只是"提交时会自动拼什么"
+ * 的只读预览，用户改不了也用不上，占着锚定栏一整行，现在统一由后端注入。
+ * 所以这里改成**反向断言**：DOM 里不许再出现对齐指令预览，正文里的对齐句
+ * 也不许被前端渲染出来。清锚后的联动改看首尾帧按钮（.h3d-frm）。 */
+const alignNodes = (doc) => [...doc.querySelectorAll(".h3d-alignprev")];
 
 (async () => {
     const { w, dom, node } = envWith({ first: "assets/A.png" });
@@ -92,18 +94,20 @@ const alignText = (doc) => [...doc.querySelectorAll(".h3d-alignprev")]
     w.eval("openDesk")();
     await new Promise((r) => setTimeout(r, 60));
 
-    const before = alignText(doc);
-    ok(before.indexOf("0.00-second mark") >= 0 || before.indexOf("fully referenced") >= 0,
-        `有首帧锚时对齐预览应含对齐指令，实际：${before}`);
+    /* 前端不再渲染对齐指令预览（后端注入，不占 UI） */
+    ok(alignNodes(doc).length === 0,
+        `锚定栏不得再渲染 .h3d-alignprev（对齐指令已由后端注入），实际找到 `
+        + `${alignNodes(doc).length} 个`);
+    const bodyText = doc.body.textContent || "";
+    ok(bodyText.indexOf("0.00-second mark") < 0,
+        "对齐指令不得出现在前端任何可见文本里（后端注入即可）");
 
     /* 清锚 */
     w.eval("setSegmentFrameImg")(node, 0, "first", "");
     await w.eval("refresh")();
     await new Promise((r) => setTimeout(r, 30));
 
-    const after = alignText(doc);
-    ok(after.indexOf("fully referenced") < 0 && after.indexOf("0.00-second mark") < 0,
-        `清锚后预览不得再显示对齐指令，实际：${after}`);
+    ok(alignNodes(doc).length === 0, "清锚后也不得出现对齐指令预览");
     const frBtn = [...doc.querySelectorAll(".h3d-frm")].map((b) => b.textContent).join(" | ");
     ok(frBtn.indexOf("A.png") < 0, `清锚后按钮不得再显示文件名，实际：${frBtn}`);
 

@@ -364,11 +364,13 @@ def test_library_scope_and_move_actions():
     # 三个方向各就各位：全局→项目、项目→全局、成片→项目 + 成片→全局
     assert "function actArchive(" in lib and "function actArchiveMany(" in lib
     assert "function actToAssets(" in lib
-    finals_block = ('if (it.scope === "finals") {\n'
-                    '      if (!isBlocked(it, "project")) mk("调入项目", false, () => actToAssets(it));\n'
-                    '      if (!isBlocked(it, "global")) mk("存入全局库", false, () => actArchive(it));\n'
-                    '    }')
-    assert finals_block in lib, "成片瓦片必须同时有「调入项目」和「存入全局库」"
+    # 库间动作已从**瓦片**迁到工具条的批量操作区（常显）：瓦片只留「改名」，
+    # 缩略图不再被按钮糊满；批量动作对**选中项**生效，成片的两个方向都要在。
+    for gone in ['mk("调入项目"', 'mk("存入全局库"', 'mk("删除"']:
+        assert gone not in lib, f"瓦片不该再画这个按钮（已迁到工具条批量区）：{gone}"
+    for need in ['mkBatch("⇩ 调入项目"', 'mkBatch("⬆ 存入全局库"',
+                 "x.scope === \"global\"", "x.scope === \"finals\""]:
+        assert need in lib, f"批量操作区缺：{need}"
     # 成片不再打开就自动存一份进全局库（那段静默复制已删）
     assert "autoArchiveFinals" not in lib
     # 目标库同名 -> 该方向按钮不画（判定在后端，前端只认 it.blocked）

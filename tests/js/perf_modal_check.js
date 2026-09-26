@@ -121,7 +121,10 @@ async function t(name, fn) {
     await t("一个渲染主人：右栏不再有 param-perf / paintPerfPane", () => {
         assert.ok(SRC.indexOf("param-perf") < 0, "右栏旧折叠 id 还在");
         assert.ok(SRC.indexOf("paintPerfPane") < 0, "旧渲染函数还有残留引用");
-        assert.ok(/right\.append\(fixFocus, perfBtn,/.test(SRC), "顶栏挂载点没带上 perfBtn");
+        /* 不写死"紧跟 fixFocus"：顶栏后来又加了「⚙ AI 优化设置」在 perfBtn 左边，
+         * 硬钉相对位置会让任何一次顶栏增补都把这条断言撞红。只要 perfBtn 仍在
+         * 顶栏挂载点里（没被挪回右栏折叠）就算过。 */
+        assert.ok(/right\.append\(fixFocus,[^)]*perfBtn/.test(SRC), "顶栏挂载点没带上 perfBtn");
     });
 
     await t("已迁走的性能控件不在右栏二采区复活", () => {

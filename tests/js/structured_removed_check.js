@@ -62,7 +62,7 @@ ok(!projectsPy.includes("prompt_v2"), "projects.py 的 prompt_v2 透存应已下
 /* ---------- ② 正向：不许删过头 ---------- */
 const KEEP_DIRECTOR = [
     "defaultV2Mode", "v2InstrLines", "segAlignSeconds", "framesToSeconds",
-    "snapSecondsToFrames", "mkAlignPreview", "framePictureNumbers",
+    "snapSecondsToFrames", "framePictureNumbers",
     "v2RefsFromSchedule", "segHasFrames", "segHasFrames",
     "paintOptbar", "optToggle", "optRestoreMaps", "optKey", "_optShown",
     "stripAlignmentLines", "runOptForSegment", "collectSegMedia",

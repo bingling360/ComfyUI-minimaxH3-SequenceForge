@@ -219,6 +219,11 @@
 .h3l-thumb .h3l-ico{font-size:34px;line-height:1;opacity:.75}
 .h3l-star{position:absolute;left:5px;top:5px;padding:1px 6px;border-radius:9px;background:#000000b3;color:#e9c07a;font-size:10.5px}
 .h3l-role{position:absolute;right:5px;top:5px;padding:1px 6px;border-radius:9px;background:#12291fcc;color:#7fe0b0;font-size:10.5px}
+    /* 合并顺序角标：数字就是拼接位次。放左下角（左上/右上已被评分与角色角标占住），
+     * 必须登记进 tileKeepers() —— 缩略图懒加载会 replaceChildren，漏了它滚动一次就没了。 */
+    .h3l-order{position:absolute;left:5px;bottom:5px;min-width:21px;height:21px;padding:0 5px;border-radius:11px;background:#316dca;color:#fff;font-size:12px;font-weight:700;line-height:21px;text-align:center;box-shadow:0 2px 8px #000a;pointer-events:none}
+    .h3l-merging .h3l-tile.sel{border-color:#316dca;box-shadow:0 0 0 2px #316dca inset}
+    .h3l-merging .h3l-hint{color:#9ecbff}
 .h3l-name{font-weight:600;font-size:12.5px;word-break:break-all;color:#f0ece2}
 .h3l-meta{font-size:10.5px;color:#8a857b;word-break:break-all;display:flex;gap:5px;flex-wrap:wrap}
 .h3l-badges{display:flex;gap:3px;flex-wrap:wrap}
@@ -227,6 +232,11 @@
 .h3l-tbtn:hover{border-color:#46604f;color:#d9d4c9}
 .h3l-tbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
 .h3l-tbtn.danger:hover{border-color:#9a4144;color:#f0a0a4}
+    /* 工具条批量操作区：与筛选控件同排但**常显**（不选也看得见），
+     * 分隔符把它和前面的搜索/筛选隔开，避免误读成"筛选条件"。 */
+    .h3l-batch{display:flex;gap:6px;align-items:center;flex-wrap:wrap;
+        margin-left:2px;padding-left:10px;border-left:1px solid #3a352c}
+    .h3l-btn-danger:hover{border-color:#9a4144;color:#f0a0a4}
 .h3l-chip{padding:1px 7px;border:1px solid #2f6e57;border-radius:9px;background:#12291f;color:#7fe0b0;font-size:10px}
 .h3l-tag{padding:1px 7px;border:1px solid #3a352c;border-radius:9px;color:#a8a294;font-size:10px}
 .h3l-tag.dim{border-style:dashed;border-color:#4d4333;color:#9c8a63;cursor:help}
@@ -337,7 +347,13 @@
     return Array.isArray(it.blocked) && it.blocked.indexOf(target) >= 0;
   }
 
-  /** 瓦片上的常驻动作：只留真正常用的几个（其余进右键菜单，别糊满瓦片）。 */
+  /** 瓦片上的常驻动作：**只留「改名」**。
+   *
+   *  「调入项目 / 存入全局库 / 删除」原本都在这里，结果每张瓦片被按钮糊满、
+   *  缩略图只剩一条缝，而它们真正的使用场景是"对一批素材做同一件事"——
+   *  一件一件点反而更慢。这三个已迁到工具条的批量操作区（常显，见 open 里的
+   *  batchBox），选中谁就作用于谁；右键菜单里也还留着同样的入口。
+   *  改名是唯一"只跟这一张有关"的动作，留在瓦片上。 */
   function tileButtons(it) {
     const box = el("div", "h3l-tbtns");
     const mk = (label, on, fn, danger) => {
@@ -353,22 +369,9 @@
       mk(`✓ ${roles.join("·")}`, true,
         () => say(`「${it.name}」带有旧的首尾帧标注：现在请在导演台每段的「资产引用」栏指定首/尾帧图`));
     }
-    /* 库间搬运：全局库 → 项目（复制文件），项目 / 成片 → 全局库（存入复用）。
-     * 每个方向只留一个按钮，语义就是字面意思，没有"链接引用"这种第二种形态。 */
-    if (it.scope === "global") {
-      if (!isBlocked(it, "project")) mk("调入项目", false, () => actBring(it));
-    }
-    if (it.scope === "finals") {
-      if (!isBlocked(it, "project")) mk("调入项目", false, () => actToAssets(it));
-      if (!isBlocked(it, "global")) mk("存入全局库", false, () => actArchive(it));
-    }
-    if (it.scope === "project" && !it.linked && !isBlocked(it, "global")) {
-      mk("存入全局库", false, () => actArchive(it));
-    }
     if (it.scope === "project" || it.scope === "global") {
       mk("改名", false, () => actAlias(it));
     }
-    mk("删除", false, () => actDelete([it.id]), true);
     return box;
   }
 
@@ -395,6 +398,12 @@
     th.dataset.thumb = api().libThumbUrl(S.dir, it.id);
     if ((it.roles || []).length) {
       th.append(el("span", "h3l-role", esc(it.roles.join("·"))));
+    }
+    /* 合并模式：已在清单里的瓦片，角标立即出现（关掉窗口再打开也认得）。
+     * 这个角标必须登记进 tileKeepers()，否则缩略图懒加载 replaceChildren 会把它抹掉。 */
+    if (S.merge) {
+      const n = S.mergeOrder.findIndex((x) => x.id === it.id);
+      if (n >= 0) th.append(el("span", "h3l-order", String(n + 1)));
     }
     t.append(th);
     t.append(el("div", "h3l-name", esc(it.name)));
@@ -427,6 +436,9 @@
     // 常用动作直接摆在瓦片上（不要藏进"双击才出现"的界面）
     t.append(tileButtons(it));
 
+    /* 双击预览：挑选模式不能开（单击就选中并关窗了），**合并模式要开** ——
+     * 挑要拼接的片子时更需要先看一眼内容。双击会连带触发两次单击，
+     * 而合并清单里"push 一次再 splice 一次"正好抵消，顺序不受影响。 */
     t.addEventListener("dblclick", () => { if (!S.pick) openViewer(it); });
     t.addEventListener("click", (e) => {
       // 挑选模式：单击即选中并关闭（瓦片上的按钮/星级都 stopPropagation，
@@ -436,6 +448,20 @@
         t.classList.add("sel");
         if (typeof done === "function") done();
         cb(it);
+        return;
+      }
+      /* 合并模式：点击 = 排进/移出合并清单。**顺序就是 S.mergeOrder 的数组顺序**，
+       * 所以移除一个之后后面的角标要整体重排（paintMergeBadges 全片重画）。 */
+      if (S.merge) {
+        const i = S.mergeOrder.findIndex((x) => x.id === it.id);
+        if (i >= 0) S.mergeOrder.splice(i, 1);
+        else S.mergeOrder.push({
+          id: it.id, file: it.file, name: it.name, scope: it.scope, kind: it.kind,
+        });
+        t.classList.toggle("sel", i < 0);
+        paintMergeBadges();
+        if (S.onMergeChanged) S.onMergeChanged(S.mergeOrder.slice());
+        renderFoot();
         return;
       }
       if (S.multi) {
@@ -462,12 +488,31 @@
     return t;
   }
 
-  /* 瓦片上除了缩略图/视频之外要留住的东西：类型图标 + 角色角标 + 星级。
-   * replaceChildren 会一并抹掉，每次「加载 / 卸载」都要把它们带回来。 */
+  /* 瓦片上除了缩略图/视频之外要留住的东西：类型图标 + 角色角标 + 星级 + 合并顺序角标。
+   * replaceChildren 会一并抹掉，每次「加载 / 卸载」都要把它们带回来。
+   * （合并角标漏登记的话，滚动触发懒加载后角标会整批消失 —— 本仓库踩过这个坑。） */
   function tileKeepers(d) {
     return [...d.children].filter((n) => n.classList && (
       n.classList.contains("h3l-ico") || n.classList.contains("h3l-role")
-      || n.classList.contains("h3l-star")));
+      || n.classList.contains("h3l-star") || n.classList.contains("h3l-order")));
+  }
+
+  /** 合并顺序角标：数字 = 在清单里的位次。顺序一变就**整片重画** ——
+   *  删掉第 2 个，后面的 3/4 都要往前挪成 2/3，逐个改反而更容易漏。 */
+  function paintMergeBadges() {
+    if (!S.grid || !S.merge) return;
+    const pos = new Map((S.mergeOrder || []).map((x, i) => [x.id, i + 1]));
+    for (const t of S.grid.querySelectorAll(".h3l-tile")) {
+      const n = pos.get(t.dataset.id);
+      let b = t.querySelector(".h3l-order");
+      if (!n) { if (b) b.remove(); continue; }
+      if (!b) {
+        b = el("span", "h3l-order", "");
+        const th = t.querySelector(".h3l-thumb");
+        (th || t).append(b);
+      }
+      b.textContent = String(n);
+    }
   }
 
   function renderGrid() {
@@ -517,10 +562,18 @@
   }
 
   function renderFoot() {
+    const mn = (S.mergeOrder || []).length;
     S.footInfo.textContent =
       `第 ${S.page}/${S.totalPages} 页 · 共 ${S.total} 项` +
-      (S.sel.size ? ` · 已选 ${S.sel.size}` : "");
+      (S.merge
+        ? (mn ? ` · 已排 ${mn} 个（合并顺序 1→${mn}）` : " · 合并清单为空：点素材开始排")
+        : (S.sel.size ? ` · 已选 ${S.sel.size}` : ""));
     S.moreBtn.style.display = S.page < S.totalPages ? "" : "none";
+    /* 「☑ 全选 / ☐ 全不选」跟着当前页的实际勾选状态走：翻页/换筛选后列表换了，
+     * 按钮上写的还是上一页的状态就会点反。 */
+    if (typeof S.paintSelAll === "function") S.paintSelAll();
+    /* 合并按钮同理：清单数量变了，文案里的「按 1→N 顺序」也得跟着变。 */
+    if (typeof S.paintMergeBtn === "function") S.paintMergeBtn();
   }
 
   /* ---------- 右键菜单 ---------- */
@@ -928,24 +981,44 @@
     if (document.querySelector(".h3l-overlay")) return;
     injectStyles();
     const pickMode = typeof o.onPick === "function";
+    /* 合并模式（o.merge）：点瓦片 = 按**点击顺序**排进合并清单，瓦片上画 1/2/3/4
+     * 角标。与挑选模式（o.onPick，单击即返回）是**两套独立上下文**，别混用状态位：
+     * 挑选是"选一个就走"，合并是"累加排序"。 */
+    const mergeMode = !!o.merge;
     S = {
       dir: String(o.dir || ""), seg: Number(o.seg) || 1,
       onChanged: o.onChanged,
       scope: "project", kind: "all", sort: "mtime", order: "desc", minRating: "0",
       q: "", page: 1, pageSize: 60,
       items: [], total: 0, totalPages: 1, counters: {},
-      sel: new Set(), multi: false, collections: [], collection: "",
+      /* multi 恒为 true：素材库**默认就是多选**，点瓦片即勾选/取消勾选。
+       * 原来要先点「☑ 多选」才能多选，那个按钮已经删了——它唯一的作用是
+       * 让人以为"只能选一个"，而批量操作（调入项目/存入全局库/删除）本来就
+       * 靠多选才成立。挑选模式（onPick）单击即返回，不受这项影响。 */
+      sel: new Set(), multi: true, collections: [], collection: "",
       pick: pickMode ? o.onPick : null,
       pickKinds: Array.isArray(o.pickKinds) ? o.pickKinds : null,
       cur: null,
+      /* 合并上下文：mergeOrder 是**数组**（顺序即数据，别用 Set）。 */
+      merge: mergeMode,
+      mergeOrder: mergeMode && Array.isArray(o.order)
+        ? o.order.filter((x) => x && x.id).map((x) => ({ ...x })) : [],
+      onMergeChanged: typeof o.onMergeChanged === "function" ? o.onMergeChanged : null,
+      onMergeCommit: typeof o.onMergeCommit === "function" ? o.onMergeCommit : null,
     };
 
-    const overlay = el("div", "h3l-overlay" + (pickMode ? " h3l-picking" : ""));
+    const overlay = el("div", "h3l-overlay"
+      + (pickMode ? " h3l-picking" : "") + (mergeMode ? " h3l-merging" : ""));
     const box = el("div", "h3l-box");
     const head = el("div", "h3l-head");
-    head.append(el("strong", "", pickMode ? "🗂 选择素材" : "🗂 素材库"));
+    head.append(el("strong", "", mergeMode ? "🗂 选择要合并的素材"
+      : (pickMode ? "🗂 选择素材" : "🗂 素材库")));
     if (pickMode) {
       head.append(el("span", "h3l-hint", "点一下素材就选中，窗口自动关闭"));
+    }
+    if (mergeMode) {
+      head.append(el("span", "h3l-hint",
+        "点素材排进合并清单：瓦片角标 1 / 2 / 3 / 4 就是拼接顺序（再点一次取消；双击可预览）"));
     }
     S.scopeBox = el("div", "h3l-scopes");
     head.append(S.scopeBox, el("div", "h3l-spacer"));
@@ -988,17 +1061,117 @@
     };
     bar.append(ordBtn);
 
-    const multiBtn = el("button", "h3l-btn", "☑ 多选");
-    multiBtn.type = "button";
-    multiBtn.onclick = () => {
-      S.multi = !S.multi;
-      multiBtn.classList.toggle("on", S.multi);
-      if (!S.multi) S.sel.clear();
+    /* ---- 批量操作区（常显） ----
+     * 「全选 / 调入项目 / 存入全局库 / 删除」原本分散在每张瓦片上：瓦片被按钮
+     * 糊满（缩略图只剩一条），而"对一批素材做同一件事"反而要一张张点。
+     * 现在统一收到工具条，**不选也一直看得见**——选中态只是决定它作用于谁，
+     * 不是决定这个按钮存不存在（藏起来只会让人以为功能没了）。 */
+    const batchBox = el("div", "h3l-batch");
+    const selAllBtn = el("button", "h3l-btn", "☑ 全选");
+    selAllBtn.type = "button";
+    selAllBtn.title = "选中当前页全部素材；再点一次取消全选（只作用于当前页，不跨页）";
+    const paintSelAll = () => {
+      const allOn = S.items.length > 0 && S.items.every((x) => S.sel.has(x.id));
+      selAllBtn.textContent = allOn ? "☐ 全不选" : "☑ 全选";
+      selAllBtn.classList.toggle("on", allOn);
+    };
+    selAllBtn.onclick = () => {
+      const allOn = S.items.length > 0 && S.items.every((x) => S.sel.has(x.id));
+      if (allOn) S.sel.clear();
+      else for (const x of S.items) S.sel.add(x.id);
+      paintSelAll();
       renderGrid();
       renderFoot();
     };
-    // 挑选模式单击就返回，不存在"选中一批"这回事
-    if (!pickMode) bar.append(multiBtn);
+    batchBox.append(selAllBtn);
+
+    /** 批量动作的公共前置：没选任何东西时**说清楚**，而不是把按钮灰掉。
+     *  按钮常显（用户要求），所以"为什么点了没反应"必须靠这句话回答。 */
+    const needSel = () => {
+      if (S.sel.size) return true;
+      say("先点素材选中（可多选，或用「☑ 全选」选当前页），再执行这个操作");
+      return false;
+    };
+    const mkBatch = (label, title, fn, danger) => {
+      const b = el("button", "h3l-btn" + (danger ? " h3l-btn-danger" : ""), label);
+      b.type = "button";
+      b.title = title;
+      b.onclick = () => { if (needSel()) fn(); };
+      batchBox.append(b);
+      return b;
+    };
+    mkBatch("⇩ 调入项目",
+      "把选中的全局库/成片素材复制进本项目 assets/（源库那份还在）。"
+      + "目标库已有同名的会被自动跳过",
+      () => {
+        const gl = S.items.filter((x) => S.sel.has(x.id) && x.scope === "global"
+          && !isBlocked(x, "project"));
+        const fi = S.items.filter((x) => S.sel.has(x.id) && x.scope === "finals"
+          && !isBlocked(x, "project"));
+        const all = [...gl, ...fi];
+        if (!all.length) { say("选中的素材都不在全局库/成片里（项目资产本来就已在项目里）"); return; }
+        for (const x of gl) actBring(x);
+        for (const x of fi) actToAssets(x);
+      });
+    mkBatch("⬆ 存入全局库",
+      "把选中的项目/成片素材存进全局库（跨项目可复用）。"
+      + "latent 不能入库，会自动跳过",
+      () => {
+        const up = S.items.filter((x) => S.sel.has(x.id)
+          && (x.scope === "project" || x.scope === "finals") && !x.linked
+          && !isBlocked(x, "global"));
+        if (!up.length) { say("选中的素材没有可存入全局库的（已是全局素材 / latent / 目标库已有同名）"); return; }
+        actArchiveMany(up);
+      });
+    mkBatch("🗑 删除", "删除选中的素材（不可撤销）",
+      () => actDelete([...S.sel]), true);
+    S.paintSelAll = paintSelAll;
+
+    /* ---- 合并清单区（只在合并模式出现） ----
+     * 合并模式下**不摆**批量区：那三个按钮（调入项目 / 存入全局库 / 删除）跟拼接
+     * 没关系，并排放在一起只会让人点错。这里换成合并自己的两个按钮。
+     * 「开始合并」只是把清单交回导演台 —— 合并请求 / 进度条 / LED / 历史都长在
+     * 那边，素材库再实现一份必然漂移。 */
+    const mergeBox = el("div", "h3l-batch h3l-mergebox");
+    const mergeBtn = el("button", "h3l-btn h3l-btn-cta", "⧉ 开始合并");
+    mergeBtn.type = "button";
+    const paintMergeBtn = () => {
+      const n = (S.mergeOrder || []).length;
+      mergeBtn.textContent = n ? `⧉ 开始合并（按 1→${n} 顺序）` : "⧉ 开始合并";
+      mergeBtn.title = n
+        ? `按瓦片角标顺序拼接这 ${n} 个素材（与导演台「⧉ 合并导出」是同一件事）`
+        : "先点素材排进清单：瓦片角标 1 / 2 / 3 就是拼接顺序（再点一次取消）";
+      mergeBtn.classList.toggle("on", n > 0);
+    };
+    mergeBtn.onclick = () => {
+      if (!S.mergeOrder.length) {
+        say("先点素材排进合并清单：瓦片角标 1 / 2 / 3 就是拼接顺序（再点一次取消）");
+        return;
+      }
+      const items = S.mergeOrder.slice();
+      if (typeof S.onMergeCommit === "function") S.onMergeCommit(items);
+      else say(`已选 ${items.length} 个素材，请回导演台点「⧉ 合并导出」`);
+    };
+    const clearOrderBtn = el("button", "h3l-btn", "✕ 清空顺序");
+    clearOrderBtn.type = "button";
+    clearOrderBtn.title = "清空合并清单（角标全部消失；不影响素材本身）";
+    clearOrderBtn.onclick = () => {
+      if (!S.mergeOrder.length) { say("合并清单本来就是空的"); return; }
+      S.mergeOrder = [];
+      /* 只重画角标与勾选，**不 renderGrid** —— 整片重建会把滚动位置也重置，
+       * 刚翻到第 8 页点一下就被弹回顶部。 */
+      if (S.grid) S.grid.querySelectorAll(".h3l-tile.sel").forEach((n) => n.classList.remove("sel"));
+      paintMergeBadges();
+      renderFoot();
+      if (S.onMergeChanged) S.onMergeChanged([]);
+    };
+    mergeBox.append(mergeBtn, clearOrderBtn);
+    S.paintMergeBtn = paintMergeBtn;
+    paintMergeBtn();
+
+    // 挑选模式单击就返回，不存在"选中一批"这回事；合并模式用合并清单，不摆批量区
+    if (mergeMode) bar.append(mergeBox);
+    else if (!pickMode) bar.append(batchBox);
 
     /* 上传落点 = 当前所在库，**上传到哪里就是哪里，不顺手复制**：
      *   全局库 → 只进全局库（跨项目复用）

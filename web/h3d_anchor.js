@@ -192,6 +192,10 @@
     s.id = "h3d-anchor-style";
     s.textContent = [
       ".h3d-anchorpanel .h3d-anchor-grid{display:flex;flex-direction:column;gap:10px;margin-top:8px}",
+      // 锚条可以无限加，不套一层滚动容器就会把整栏撑得很长、只能靠中栏外层滚，
+      // 「＋ 新增锚定」被顶出视口（加第二条要先滚半天）。summary 与新增按钮留在
+      // 滚动区**外**，标题和入口始终看得见。
+      ".h3d-anchor-scroll{max-height:46vh;overflow-y:auto;overscroll-behavior:contain;padding-right:3px}",
       ".h3d-anchor-card{border:1px solid #3f4854;border-radius:9px;background:#1b2027;padding:10px;display:flex;flex-direction:column;gap:10px}",
       ".h3d-anchor-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
       ".h3d-anchor-head .h3d-anchor-id{font:700 11px ui-monospace,Consolas;color:var(--h3d-copper)}",
@@ -305,7 +309,10 @@
           getSources, loadSources, getPrev: prevSegment, rebuildList: renderList })));
     };
     renderList();
-    box.append(empty, grid);
+    /* 空提示 + 锚条列表进滚动区，新增按钮留在外面（见 ensureStyles 的 .h3d-anchor-scroll）。 */
+    const scroll = el("div", "h3d-anchor-scroll");
+    scroll.append(empty, grid);
+    box.append(scroll);
 
     const addWrap = el("div", "h3d-anchor-add");
     const add = el("button", "h3d-btn", "＋ 新增锚定");

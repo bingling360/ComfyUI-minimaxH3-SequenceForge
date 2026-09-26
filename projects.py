@@ -1660,8 +1660,15 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
 # 新项目里不存在的文件。用黑名单就得穷举"所有该丢的键"，日后新加一个进度键
 # 没人记得补，就会静默漏带；名单是开放的，白名单是封闭的。
 # （checkpoint.truncate 不能复用：它是"重做第 N 段"的语义，会连 prompts 一起截掉。）
+#
+# **params 明确不在列**（2026-09-27 改）。它是"这条链是用什么分辨率/步数/CFG
+# 跑出来的"的运行指纹，不是内容。带过去会怎样：新项目 manifest 一落地就带着
+# 旧项目的画幅，而后端 assert_match 拿它跟画布控件比对，不一致就硬报错——
+# 于是"新建的项目改不了分辨率"，用户会以为分辨率被锁死，实际是复制时被旧档
+# 钉住了。params 留空则由首跑按**当前画布值**写入，正是"新项目用新参数"该有的
+# 语义；想沿用旧参数请用「套用参数」按钮显式套一次。
 _COPY_CONTENT_KEYS = ("prompts", "seg_fields", "inserts", "assets", "asset_links",
-                      "params", "has_prologue", "upscale", "total")
+                      "has_prologue", "upscale", "total")
 
 
 def _seg_latent_files(manifest):
@@ -1700,7 +1707,8 @@ def create_project(name: str, copy_from=None):
     已存在（含跑过一段以上的正式项目）直接幂等返回现 manifest，不重写。
 
     copy_from：给了就按「复制当前项目」建 —— 只继承 _COPY_CONTENT_KEYS
-    （提示词 / 分段字段 / 插入段 / 素材清单 / 资产链接 / 共享参数 / 二采设置），
+    （提示词 / 分段字段 / 插入段 / 素材清单 / 资产链接 / 二采设置；
+    **不含 params**，理由见该常量的注释），
     并把 assets/ 目录与被引用到的 latent 文件整份复制。**文件必须跟着走**：
     段级 frame_img 存的是项目相对路径（assets/xxx.png），只带清单不带文件的话，
     新项目挂的就是一份指向空气的引用 —— 看着有锚、跑起来找不到。
@@ -1855,12 +1863,74 @@ def redo_cancel(name, slot):
     return manifest
 
 
+def _allowed_merge_roots(root: str) -> list:
+    """合并来源允许落在哪些根目录下：本项目目录 + 全局素材库。"""
+    out = [os.path.realpath(root)]
+    try:
+        from . import asset_store
+    except ImportError:
+        import asset_store
+    try:
+        lr = asset_store.try_library_root()
+    except Exception:
+        lr = None
+    if lr:
+        out.append(os.path.realpath(lr))
+    return out
+
+
+def _merge_asset_source(root: str, item: dict) -> str:
+    """`{"asset": "<scope>:<file>"}` -> 存在的绝对路径，非法/缺失抛 ValueError。
+
+    为什么需要这条分支：素材库的「全局库」素材文件在
+    `user/minimax_h3/library/` 下，**既不在项目目录也不在 input 目录**，
+    走 `{"file": f}` 那条分支必然报"文件不存在"。合并清单现在由素材库产出，
+    所以必须能按素材 id 解析。
+
+    安全性：不自己拼 id（`scope:file` 的生成规则只有 `library._entry` 一份），
+    用 `library.find_by_id` 反查条目，再交给 `library.resolve_item_path` 解析
+    （内部走 `safe_rel`，`..` / 盘符 / 点开头一律拒绝）。最后再 realpath 复核
+    一次"结果确实落在项目目录或全局库内"，与 `{"file": f}` 分支同口径。
+    """
+    try:
+        from . import library
+    except ImportError:
+        import library
+    aid = str(item.get("asset") or "").strip()
+    if not aid:
+        raise ValueError("合并清单里的素材 id 为空")
+    # find_by_id 要的是**项目目录名**（不是绝对路径）——root 就是
+    # h3_projects/<name>，取 basename 即可，与 merge_project 的构造方式一致。
+    proj = os.path.basename(os.path.normpath(root))
+    ent = library.find_by_id(proj, aid)
+    if not ent:
+        raise ValueError(f"素材不存在或已被删除：{aid}")
+    label = ent.get("name") or aid
+    kind = str(ent.get("kind") or "")
+    if kind != "video":
+        cn = library.KIND_CN.get(kind, kind or "未知类型")
+        raise ValueError(f"只能合并视频：{label} 是{cn}"
+                         f"（音频/图片/latent 拼接没有意义）")
+    path = library.resolve_item_path(ent, project=proj)
+    if not path:
+        raise ValueError(f"素材的文件找不到了（可能已被移动或删除）：{label}")
+    real = os.path.realpath(path)
+    if not any(real == a or real.startswith(a + os.sep)
+               for a in _allowed_merge_roots(root)):
+        raise ValueError(f"素材路径越界（不在项目目录或全局库内）：{aid}")
+    if not os.path.isfile(real):
+        raise ValueError(f"素材文件不存在：{label}")
+    return real
+
+
 def _merge_sources(root: str, manifest: dict, items):
     """合并清单 -> 按序绝对路径列表。非法/缺失抛 ValueError。
 
     - {"seg": n}：n 为 1-based 全局槽位（含序章），映射
       manifest.videos[n-1]（seg_NNN.mp4 文件名，裸名/finals/ 前缀双兼容）——
       前端段落卡片链位即此编号。
+    - {"asset": id}：素材库条目 id（`<scope>:<file>`）。**合并清单现在由素材库
+      产出**，全局库素材只有这条能解析（见 `_merge_asset_source`）。只收视频。
     - {"file": f}：先查项目目录（final_* / merged_* / 任意 mp4，finals/优先），
       再查 input 目录（上传外部素材）。f 允许至多两级子目录，
       每段过 safe_name 防穿越；input 命中再以 realpath+startswith 复核。
@@ -1872,6 +1942,9 @@ def _merge_sources(root: str, manifest: dict, items):
     for it in items:
         if not isinstance(it, dict):
             raise ValueError(f"清单项必须是对象：{it!r}")
+        if it.get("asset"):
+            sources.append(_merge_asset_source(root, it))
+            continue
         if "seg" in it:
             try:
                 n = int(it["seg"])

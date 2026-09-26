@@ -484,7 +484,7 @@ def test_structured_removal_kept_the_right_things():
     d = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     p = open(os.path.join(ROOT, "web", "h3_prompts.js"), encoding="utf-8").read()
     for kept in ["defaultV2Mode", "v2InstrLines", "segAlignSeconds", "framesToSeconds",
-                 "mkAlignPreview", "v2RefsFromSchedule", "segHasFrames"]:
+                 "v2RefsFromSchedule", "segHasFrames"]:
         assert kept in d, f"前端误删保留项：{kept}"
     for kept in ["paintOptbar", "optToggle", "optRestoreMaps", "stripAlignmentLines"]:
         assert kept in d, f"优化链路误删：{kept}"

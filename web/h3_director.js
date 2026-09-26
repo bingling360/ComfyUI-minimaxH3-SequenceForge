@@ -120,7 +120,28 @@ let apiErrorText = "";
 let lastDir = "";            // 最近一次数据刷新解析出的当前项目目录（合并导出用）
 /* 合并模式（纯内存勾选态，不落 ds / 不触发重做）：勾选已完成段
  * 按链顺序）+ 可追加上传外部素材 -> 拼接出新 merged_*.mp4，不动链与存档 */
-const mergeSel = { on: false, segs: [], files: [] };
+/* 合并模式的内存清单（不落盘、不动链与存档）。
+ *   order —— 素材库里点选的素材，**数组顺序就是合并顺序**（Q1 口径：点击顺序即
+ *            合并顺序，不做拖拽排序）。用数组不用 Set，就是因为顺序本身就是数据。
+ *   files —— 追加上传的外部视频（永远排在 order 之后）。
+ *   segs  —— 旧"勾选段号"通道。段卡上的勾选框已删，这里**保留字段但不再写入**，
+ *            只为兼容可能的旧调用点，别在别处读它。
+ *   running —— **合并导出进行中**。互斥守卫只看这一个标记，不看 on：
+ *            `on` 现在是个常显的开关，随手开着不该拦住生成。 */
+const mergeSel = { on: false, order: [], segs: [], files: [], running: false };
+
+/** 退出合并模式 = 清空全部清单（退出立即 reset，无副作用：清单不落盘）。 */
+function resetMergeSel() {
+    mergeSel.order = [];
+    mergeSel.segs = [];
+    mergeSel.files = [];
+    mergeSel.running = false;
+}
+
+/** 合并清单总项数（素材 + 外部视频）。 */
+function mergeCount() {
+    return (mergeSel.order || []).length + (mergeSel.files || []).length;
+}
 /* 拖拽调序进行中（{idx: 提示词数组下标, fromP: 当前 plan 位}）：
  * 重建锁定 + drop 目标计算用；dragend 后置 null */
 let dragSeg = null;
@@ -2755,7 +2776,7 @@ function upTargetCanvas(node, up) {
 async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出"); return; }
+    if (mergeSel.running) { alert("合并导出进行中：等它跑完再操作"); return; }
     const ds = getDs(node);
     if (!ds.upscale?.model) {
         alert("请先在右栏「二采面板」选择放大模型，再对本段执行二采。");
@@ -2957,17 +2978,49 @@ function pickMergeVideo() {
     input.click();
 }
 
+/** 打开素材库的「合并模式」上下文：点一个素材就按选择顺序排进去。
+ *  顺序与角标都由素材库那边维护，这里只收结果；两边共用同一个 mergeSel.order，
+ *  所以关掉窗口再打开，之前选好的顺序与角标还在。 */
+function openMergeLibrary() {
+    if (!window.H3Lib?.open) { alert("素材库模块未加载（请刷新页面）"); return; }
+    window.H3Lib.open({
+        dir: getDirValue(findNode()) || lastDir || "",
+        merge: true,
+        order: (mergeSel.order || []).slice(),
+        onMergeChanged: (order) => {
+            mergeSel.order = Array.isArray(order) ? order.slice() : [];
+            scheduleRefresh(0);
+        },
+        /* 素材库里的「⧉ 开始合并」= 导演台的「⧉ 合并导出」：收掉素材库窗口，
+         * 回导演台跑（进度/LED/历史都长在这边，素材库不自己发合并请求）。 */
+        onMergeCommit: (order) => {
+            mergeSel.order = Array.isArray(order) ? order.slice() : [];
+            const lb = document.querySelector(".h3l-overlay");
+            if (lb) lb.remove();
+            scheduleRefresh(0);
+            doMergeExport(null);
+        },
+    });
+}
+
+/** `btn` 可以为 null：素材库里点「开始合并」时导演台的清单条可能根本没渲染
+ *  （合并模式开着但中栏没画到那一条），没有按钮可改文案就直接跑。 */
 async function doMergeExport(btn) {
     const dir = lastDir;
     if (!dir) { alert("没有当前项目目录（先读档或运行一次）"); return; }
+    /* 顺序 = 用户在素材库里点选的顺序（mergeSel.order）。**这里绝对不能 sort**：
+     * 合并顺序就是数据本身，排一下就把用户点出来的顺序改掉了。
+     * asset 给后端按 id 精确解析（全局库素材也认），file 是回落路径。 */
     const items = [
-        ...[...mergeSel.segs].sort((a, b) => a - b).map((s) => ({ seg: s })),
+        ...(mergeSel.order || []).map((x) => ({
+            asset: String(x.id || ""), file: String(x.file || ""), name: String(x.name || ""),
+        })),
         ...(mergeSel.files || []).map((f) => ({ file: f })),
     ];
-    if (!items.length) { alert("先勾选要合并的段（或上传外部视频）"); return; }
-    const oldTxt = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "合并中…";
+    if (!items.length) { alert("先到素材库里点选要合并的素材（或上传外部视频）"); return; }
+    const oldTxt = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = "合并中…"; }
+    mergeSel.running = true;                 // 互斥守卫只看这个（不看 on）
     setLed("running", `合并 ${items.length} 项拼接中`);
     try {
         const r = await api.fetchApi("/h3chain/merge", {
@@ -2978,7 +3031,9 @@ async function doMergeExport(btn) {
         const j = await r.json().catch(() => ({}));
         if (r.ok && j.ok) {
             setLed("done", `已合并 → ${j.file}`);
-            mergeSel.on = false; mergeSel.segs = []; mergeSel.files = [];
+            /* 合并成功即收摊：退出模式并清空清单（与手动「✕ 退出」同一条路径）。 */
+            mergeSel.on = false;
+            resetMergeSel();
             refresh();
             return;
         }
@@ -2990,8 +3045,8 @@ async function doMergeExport(btn) {
     } catch (e) {
         alert("合并请求失败：" + e);
     } finally {
-        btn.disabled = false;
-        btn.textContent = oldTxt;
+        mergeSel.running = false;      // 成功路径已 reset，这里兜底失败/异常
+        if (btn) { btn.disabled = false; btn.textContent = oldTxt; }
     }
 }
 
@@ -5105,7 +5160,9 @@ function redoQueued(data) {
 }
 
 function queuePrompt() {
-    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再提交生成"); return; }
+    /* 互斥只看**合并导出进行中**，不看 `mergeSel.on`：合并模式现在是个常显开关，
+     * 随手开着但清单空着时不该拦住生成。 */
+    if (mergeSel.running) { alert("合并导出进行中：等它跑完再提交生成"); return; }
     const node = findNode();
     if (node) {
         const ds = getDs(node);
@@ -5122,6 +5179,58 @@ function scheduleRefresh(delay = 900) {
     refreshTimer = setTimeout(refresh, delay);
 }
 
+/** 终止当前生成 —— 语义与 ComfyUI 顶上那个「终止运行」**完全一致**（都是
+ *  POST /interrupt：服务端在当前节点收尾后停下，已生成完的段保留在存档里，
+ *  未生成的段不跑）。唯一区别是它摆在导演台内部，不用为了取消一次生成先退出
+ *  面板去外面找按钮。
+ *
+ *  二次确认里必须写清「会中断 ComfyUI 当前所有作业」：/interrupt 是**全局**的，
+ *  一台机器多人/多标签共用时不说清楚，点一下会把别人的作业一起停掉。 */
+async function stopGeneration() {
+    if (!window.confirm("终止当前生成？\n\n"
+        + "· 已生成完的段会保留在存档里，未生成的段不跑；\n"
+        + "· 这一下等同 ComfyUI 顶上的「终止运行」，会中断 ComfyUI 当前正在跑的\n"
+        + "  **所有**作业（不只是这一条链）；\n"
+        + "· 正在写的提示词不会被清掉。")) {
+        return;
+    }
+    let sent = false;
+    /* 三条路都试：ComfyUI 新前端挂在 comfyAPI，老版本挂在 app.api，
+     * 两者都没有就直接打 /interrupt。全失败也要如实报出来 —— 静默失败
+     * 会让用户以为"点了没反应、还在跑"。 */
+    const tries = [
+        async () => {
+            const a = window.comfyAPI?.api?.api;
+            if (a && typeof a.interrupt === "function") { await a.interrupt(); return true; }
+            return false;
+        },
+        async () => {
+            if (typeof app !== "undefined" && typeof app.api?.interrupt === "function") {
+                await app.api.interrupt();
+                return true;
+            }
+            return false;
+        },
+        async () => {
+            const r = await fetch("/interrupt", { method: "POST" });
+            return !!r.ok;
+        },
+    ];
+    for (const fn of tries) {
+        try { if (await fn()) { sent = true; break; } } catch (e) { /* 换下一条路 */ }
+    }
+    if (!sent) {
+        setLed("err", "终止请求没发出去（请用 ComfyUI 自带的「终止运行」）");
+        alert("没能连上 ComfyUI 的中断接口。\n请改用 ComfyUI 界面上自带的「终止运行」。");
+        return;
+    }
+    setLed("idle", "已请求终止（等当前节点收尾）");
+    scheduleRefresh(600);
+    /* 中断不是瞬时的（服务端要等当前节点收尾），隔一会儿再按后端真实状态
+     * 校正一次灯：终止生效后不该还挂着「running」。 */
+    setTimeout(() => { syncRunLed(); }, 1500);
+}
+
 /* ---------- 项目动作（游戏式存读档） ---------- */
 
 /** 提交重摇（页脚 CTA）：随机种子 + 临时开审片（逐段推进：每重摇一段暂停审看），
@@ -5133,7 +5242,7 @@ function scheduleRefresh(delay = 900) {
 async function submitRedo() {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再提交重摇"); return; }
+    if (mergeSel.running) { alert("合并导出进行中：等它跑完再提交重摇"); return; }
     let restored = [];
     if (lastDir) {
         const mf = await fetchManifest(lastDir);
@@ -5174,7 +5283,7 @@ async function submitRedo() {
 function openRerollModal(idx, data) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
-    if (mergeSel.on) { alert("合并模式进行中：请先完成或退出合并导出，再标记重摇"); return; }
+    if (mergeSel.running) { alert("合并导出进行中：等它跑完再标记重摇"); return; }
     if (document.querySelector(".h3d-overlay")) return;
 
     const { mf, plan, ds, state } = data;
@@ -5918,7 +6027,9 @@ function injectStyles() {
     .h3d-statusbar .h3d-st-text{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .h3d-statusbar .h3d-chip{align-self:center;font-size:10px;padding:1px 7px}
     .h3d-statusbar .h3d-btn{padding:2px 8px;font-size:11px}
-    .h3d-refresh{padding:2px 8px;flex:none;font-size:11px}
+    /* 顶栏「↻ 刷新」：原来挂在状态条里，被压到 11px 挤在一行；现在上顶栏，
+     * 按 .h3d-btn 的常规尺寸走，跟旁边「⌨ 输入修复 / ⚡ 性能优化」一个规格。 */
+    .h3d-refresh{flex:none}
     /* ---- 横向分段选择条（状态条下方）：pill 先压缩、极限后横滑 ---- */
     .h3d-segstrip{display:flex;gap:6px;margin:8px 0 10px;overflow-x:auto;padding:2px 1px 6px;scrollbar-width:thin}
     .h3d-segpill{flex:1 1 0;min-width:44px;max-width:120px;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:5px 8px;border:1px solid #3a352c;border-radius:14px;background:#1b1a16;color:#a8a294;cursor:pointer;font-size:11.5px;font-family:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;user-select:none;transition:border-color .12s,background .12s}
@@ -5945,8 +6056,8 @@ function injectStyles() {
     .h3d-card{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;padding:10px;border:1px solid #3f4854;border-radius:9px;background:#262c36}
     .h3d-card.todo{opacity:.72}
     .h3d-card.todo:hover{opacity:1}
-    .h3d-card.mergeable{grid-template-columns:auto minmax(0,1fr);align-items:start}
-    .h3d-card.mergeable-off{opacity:.4}
+    /* .h3d-card.mergeable / .mergeable-off 已删：段卡上的合并勾选框随合并模式
+     * 重构一起下线，合并清单改在素材库里点选（见 h3_library.js 的合并模式）。 */
     /* 拖拽调序：把手 / 拖动中的源卡 / 插入线（线画在目标位卡片的上沿或链尾卡的下沿） */
     .h3d-grip{flex:none;width:18px;height:20px;display:inline-grid;place-items:center;border-radius:5px;color:#8794a3;font-size:13px;letter-spacing:-1px;cursor:grab;user-select:none}
     .h3d-grip:hover{color:var(--h3d-cyan);background:#1c2128}
@@ -5962,7 +6073,7 @@ function injectStyles() {
     /* 段禁用（不上链）：半透明虚线框，与待生成 todo 区分 */
     .h3d-card.offchain{opacity:.5;border-style:dashed;border-color:#59626f}
     .h3d-card.offchain:hover{opacity:.85}
-    .h3d-mergecb{width:15px;height:15px;margin:4px 0 0 2px;accent-color:#6cb6ff;cursor:pointer;flex:none}
+    /* .h3d-mergecb 已删（段卡合并勾选框下线）。 */
     .h3d-mergebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:-2px 0 14px;padding:9px 12px;border:1px solid #7a5f36;border-radius:8px;background:linear-gradient(90deg,#352a19,#2d333b)}
     .h3d-merge-sum{flex:1;min-width:200px;color:#e9c07a;font-size:11.5px;line-height:1.7;word-break:break-all}
     .h3d-merge-sum b{color:#f5d9a0}
@@ -6142,8 +6253,9 @@ function injectStyles() {
 .h3d-setsec{display:flex;flex-direction:column;gap:7px;margin-top:10px}
 .h3d-setsec-title{font-size:11px;font-weight:600;color:var(--h3d-copper);letter-spacing:.3px;border-bottom:1px solid #37332b;padding-bottom:4px}
 .h3d-setrow{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}
-/* 段级两个开关的外框行（不在任何页签里）：与下方 AI 优化设置条留一点间距 */
-.h3d-pubswitch{margin:0 0 8px}
+/* 段级两个开关的外框行：并进**页签行**里（提示词 / 锚定设置 同一栏），
+ * margin-left:auto 把它顶到行尾，跟页签共用一行不再单独占一行。 */
+.h3d-pubswitch{margin:0 0 0 auto;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 .h3d-refrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px;padding:7px 8px;border:1px solid #37332b;border-radius:7px;background:#181712}
     .h3d-refrow>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
     /* 有引用 → 整条转绿：chip 一多，"本段到底挂没挂素材"靠逐个找太慢 */
@@ -6185,11 +6297,8 @@ function injectStyles() {
     .h3d-frm.on{border-color:#316dca;background:#1f2f45;color:#9ecbff}
     .h3d-frm{display:inline-flex;align-items:center;gap:5px}
     .h3d-frmthumb{width:18px;height:18px;object-fit:cover;border-radius:3px;flex:0 0 auto;background:#0f1316}
-    .h3d-alignprev{display:flex;gap:6px;align-items:flex-start;flex-wrap:wrap;flex:1 1 100%;margin-top:3px;padding:5px 7px;border:1px dashed #3a352c;border-radius:6px;background:#14130f}
-    .h3d-alignprev>label{color:var(--h3d-muted);font-size:10.5px;font-weight:600;flex:none}
-    .h3d-alignline{display:block;flex:1 1 100%;font-family:var(--h3d-mono,ui-monospace,Menlo,Consolas,monospace);font-size:10.5px;line-height:1.5;color:#9ecbff;word-break:break-word;white-space:pre-wrap}
-    .h3d-alignnone{font-size:10.5px;color:#8a8478}
-    .h3d-alignhint{flex:1 1 100%;font-size:10px;color:#6f6a60}
+    /* 对齐指令预览（.h3d-alignprev / -alignline / -alignnone / -alignhint）随
+     * mkAlignPreview 一起删：对齐指令由后端注入，前端不再展示。 */
     .h3d-frmpic{font-size:9px;padding:0 4px;border-radius:7px;background:rgba(49,109,202,.28);
         border:1px solid #316dca;color:#bcd9ff;line-height:14px}
     .h3d-frmmap{display:flex;flex-direction:column;gap:2px;margin:2px 0}
@@ -6262,6 +6371,10 @@ function injectStyles() {
     .h3d-footinfo{display:flex;gap:16px;color:var(--h3d-muted);flex-wrap:wrap;min-width:0;font-size:11.5px;align-items:center}
     .h3d-footinfo b{color:var(--h3d-bone)}
     .h3d-run{min-width:150px;padding:11px 18px}
+    /* ✕ 终止：比普通 danger 更实心的红 —— 它是页脚里唯一"会打断正在跑的东西"
+     * 的按钮，必须一眼就跟旁边黄色的「开始生成」区分开，不能误点。 */
+    .h3d-stop{border:1px solid #c2565f;background:#7d2b33;color:#ffe0e3;font-weight:700}
+    .h3d-stop:hover{background:#932f39;border-color:#e06b74;filter:brightness(1.08)}
 
     /* ---- 素材与参考 / 链参数 ---- */
     .h3d-lsec,.h3d-rsec{display:flex;flex-direction:column;min-height:0}
@@ -6351,11 +6464,9 @@ function injectStyles() {
      * 现在按真实类名选（.h3d-mpbox 由 JS 加在编辑器根上，也是单框用例的句柄），
      * 并顺手解开 40vh 封顶：高度交给 flex 分配，正文填满整块。 */
     .h3d-mpboxwrap>.h3d-mpbox{flex:1;min-height:0;max-height:none;width:100%;overflow:auto;resize:none;border:0;box-shadow:none;background:transparent;color:var(--h3d-bone);padding:0;font:12.5px/1.7 ui-monospace,Consolas,monospace;outline:none}
-    /* 段卡：AI 优化设置条（三页之外的公共区，区别于「锚定设置」页的本段设置）
-     * 注：总提示词框曾经的「模式 / 缺省时长」行与「参考素材（AI 可见）」chips 的
-     * 样式已随那一跳一起删掉——工作台不做 AI，就没有它们的服务对象。 */
-    .h3d-optsetbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:2px 0 4px;
-        padding:5px 8px;border:1px dashed #2a3438;border-radius:7px;background:#0f1418}
+    /* 「.h3d-optsetbar」已删：AI 优化设置条从段卡挪到顶栏（与 ⚡ 性能优化 同级），
+     * 段卡里不再有这个容器。总提示词框曾经的「模式 / 缺省时长」行与「参考素材
+     * （AI 可见）」chips 更早前已随那一跳一起删掉。 */
 
     .h3d-fab{position:fixed;right:16px;top:120px;z-index:80;width:44px;height:44px;border-radius:50%;border:1px solid #46604f;background:#1f2a23;color:#c2e0cd;cursor:pointer;font-size:17px}
     .h3d-fab:hover{filter:brightness(1.2)}
@@ -6370,7 +6481,10 @@ function injectStyles() {
     .h3d-v2group[open]>summary::before{content:"▾ "}
     .h3d-ppane{margin-bottom:8px}
     .h3d-ppane>.h3d-v2grid{padding:2px 8px 8px}
-    .h3d-ppane .h3d-rta{min-height:150px;max-height:55vh}
+    /* 段卡提示词框：自己一条垂直滚动条，不靠中栏外层滚。
+     * 上限压到 38vh —— 中栏可视高约 78vh，上面还压着状态条 / 进度轨 / 选段条 /
+     * 锚定栏 / 页签，框再高就得先滚中栏才看得全，"框内独立滚"等于白给。 */
+    .h3d-ppane .h3d-rta{min-height:170px;max-height:38vh;overflow-y:auto}
     .h3d-v2grid{display:grid;gap:7px;padding:0 10px 10px}
     .h3d-v2f{width:100%;border:1px solid #2a3438;border-radius:6px;background:#1b2126;color:var(--h3d-bone);padding:6px 8px;font-size:12px;outline:none;font-family:inherit}
     .h3d-v2f:focus{border-color:#6cb6ff;box-shadow:0 0 0 2px #6cb6ff33}
@@ -6504,6 +6618,29 @@ function openDesk() {
         const ed = desk?.page?.querySelector(".h3d-rta, textarea, input");
         if (ed) { try { ed.focus(); } catch (e) { /* 忽略 */ } }
     };
+    /* 全面刷新：紧挨「输入修复」——两个都是"界面卡住了先点它"的兜底动作。
+     * 它比状态条里那个旧的 ↻ 多做两件事：校正状态灯 + 无条件重挂三栏
+     * （详见 refreshAll / syncRunLed）。 */
+    const refreshBtn = el("button", "h3d-btn h3d-refresh", "↻ 刷新");
+    refreshBtn.title = "全面刷新：重读节点 / 存档 / 素材库，并按后端真实状态校正右上角的状态灯"
+        + "（报错或被中断后不再一直挂着「已提交队列」）。\n"
+        + "不会取消正在跑的生成 —— 要取消请用页脚「✕ 终止」。";
+    refreshBtn.onclick = () => { refreshAll(); };
+    /* AI 优化设置也是**全链共用**的一套（服务商 / 模型 / 输出语言 / 规则文件），
+     * 跟性能优化同级。以前它挂在每段卡里 —— 每段都长一个按钮，看着像"本段设置"，
+     * 而且必须翻到某一段才点得到。放顶栏后位置固定，不用先找段。
+     * 节点在打开时现取：顶栏是常驻 DOM，建台那一刻画布上未必已经有节点。 */
+    const optBtn = el("button", "h3d-btn h3d-optbtn", "⚙ AI 优化设置");
+    optBtn.title = "AI 提示词优化设置（服务商 / 模型 / 输出语言 / 规则文件）——"
+        + "全链共用，不是某一段的设置";
+    optBtn.onclick = () => {
+        const n = findNode();
+        if (!n) {
+            alert("画布上没找到 H3 链节点：请先添加节点，或点「⚡ 一键载入配套工作流」。");
+            return;
+        }
+        openOptSettings(n);
+    };
     /* 性能优化是**机器级**设置（这台卡多大、内存多少），不属于某个项目、也不属于
      * 某一段，所以和上面两个兜底按钮一样放在顶栏；点开是独立弹窗（openPerfSettings）
      * —— 右栏那种窄折叠装不下「控件 + 整段说明」，说明会被挤没。 */
@@ -6540,7 +6677,7 @@ function openDesk() {
      * 无从判断是没数据还是代码挂了。这里把区名与错误一行摆到顶栏。 */
     const zoneErr = el("span", "h3d-zoneerr", "");
     zoneErr.style.display = "none";
-    right.append(fixFocus, perfBtn, vramBtn, ledWrap, sub, zoneErr, close);
+    right.append(fixFocus, refreshBtn, optBtn, perfBtn, vramBtn, ledWrap, sub, zoneErr, close);
     topbar.append(left, right);
 
     /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */
@@ -6573,8 +6710,15 @@ function openDesk() {
     /* 页脚 */
     const footer = el("footer", "h3d-footer");
     const footInfo = el("div", "h3d-footinfo", "");
+    /* ✕ 终止：就是 ComfyUI 顶上那个「终止运行」搬进导演台（同一次 POST
+     * /interrupt），省得为了取消一次生成先退出面板去外面找按钮。
+     * 默认隐藏，renderFooter 按运行状态显隐。 */
+    const stop = el("button", "h3d-btn h3d-stop", "✕ 终止");
+    stop.title = "终止当前生成（等同 ComfyUI 的「终止运行」）：已生成完的段保留在存档，"
+        + "未生成的段不跑。会中断 ComfyUI 当前正在跑的所有作业";
+    stop.onclick = () => stopGeneration();
     const run = el("button", "h3d-btn h3d-btn-cta h3d-run", "▶ 开始生成");
-    footer.append(footInfo, run);
+    footer.append(footInfo, stop, run);
 
     page.append(topbar, banner, stage, footer);
     document.body.append(page);
@@ -6587,7 +6731,7 @@ function openDesk() {
             colC,
             lProj,
             rParams, rBridge, rUpscale, rHist,
-            footInfo, run,
+            footInfo, run, stop,
             zoneErr,
         },
         cardsSig: "",
@@ -6645,7 +6789,7 @@ function cardsSignature(data) {
         redo: [(ds?.redo_segs || []).map((x) => `${x.slot}:${x.mode}`).join(","),
                (mf?.redo_queue || []).map((x) => (Array.isArray(x) ? x.join(":") : "")).join(",")],
         dur: String(getWidgetValue(data.node, W_DUR) ?? ""),
-        merge: [mergeSel.on, [...mergeSel.segs].sort((a, b) => a - b).join(","),
+        merge: [mergeSel.on, (mergeSel.order || []).map((x) => x.id).join(","),
                 (mergeSel.files || []).join(",")],
     });
 }
@@ -7018,8 +7162,8 @@ function setSegmentFrameImg(node, idx, key, file) {
     } else delete cur[key];
     seg.frame_img = (cur.first || cur.end) ? cur : null;
     setDs(node, ds);
-    /* 对齐指令**不写进正文**：它是编译产物，由锚定栏展示、实跑时由后端注入
-     * （见 stripAlignmentLines / mkAlignPreview）。正文保持"用户视角的纯文本"。 */
+    /* 对齐指令**不写进正文**：它是编译产物，实跑时由后端注入（见
+     * stripAlignmentLines）。正文保持"用户视角的纯文本"。 */
     return true;
 }
 
@@ -7056,8 +7200,8 @@ function syncPromptEditor(node, idx, text) {
 
 /** 把正文里的对齐指令行**剥掉** —— 正文只存"用户视角的纯文本"。
  *
- * 对齐指令是**编译产物**：由锚定栏按当前锚实时展示（mkAlignPreview）、实跑时由
- * 后端注入正文前（nodes.py L2VA_HEAD / keyframe_line）。它一旦落进 ds.prompts 就会：
+ * 对齐指令是**编译产物**：实跑时由后端注入正文前（nodes.py L2VA_HEAD /
+ * keyframe_line），前端不展示、不落盘。它一旦落进 ds.prompts 就会：
  * ① 跟实跑注入的那句重复；② 锚一变就成了指向不存在图片的陈旧指令；
  * ③ AI 扩写/优化把它当正文改写或抄走；④ 飘在字段前缀之前的那些根本清不掉
  * （老逻辑只处理 `integrated_...:` 之后的行，前缀之前的永远留着）。
@@ -7157,42 +7301,11 @@ function mkFrameBtns(node, segIdx, onChange) {
     return box;
 }
 
-/** 首尾帧锚定栏里的「对齐指令预览」—— **正文里不存这一句**，这里只回答
- *  "提交时会自动往正文前拼什么"。
- *
- *  与后端实跑注入同句式（prompts.L2VA_HEAD / FL2VA_HEAD / keyframe_line）、
- *  同时间口径（S.SS 由段长帧数反算，见 segAlignSeconds），所以这里看到的
- *  就是模型收到的那句。混合模式（有参考素材）下官方六段式不带对齐句，
- *  帧锚改由 <Picture 1>/<Picture 2> 在 subject_definitions 里声明。 */
-function mkAlignPreview(node, idx) {
-    const box = el("div", "h3d-alignprev");
-    const paint = () => {
-        box.replaceChildren();
-        const ds = getDs(node);
-        const seg = (ds.segments || [])[idx] || {};
-        const fr = segHasFrames(ds, idx);
-        const mode = defaultV2Mode(ds, idx);
-        /* 镜数从**正文**数 [Shot N] —— 与后端实跑 nodes.py 的 _last_shot 同一口径。
-         * 结构化下线后前端不再持有镜数结构，正文才是唯一真相。 */
-        const nShots = (String((ds?.prompts || [])[idx] || "")
-            .match(/\[Shot\s+\d+\]/g) || []).length || 1;
-        const secs = segmentSeconds(node, seg);      // 段级留空 → 跟随节点默认
-        const lines = v2InstrLines(mode, secs, fr.has_start, fr.has_end, nShots);
-        box.append(el("label", "", "对齐指令"));
-        if (!lines.length) {
-            box.append(el("span", "h3d-alignnone", mode === "Ref2VA"
-                ? "混合模式：不生成对齐句，首尾帧锚作为 <Picture 1>/<Picture 2> 写进 subject_definitions"
-                : "无首尾帧锚 → 不注入对齐指令"));
-            return;
-        }
-        for (const l of lines) box.append(el("code", "h3d-alignline", l));
-        box.append(el("span", "h3d-alignhint",
-            `（提交时自动拼到正文最前；S.SS=${segAlignSeconds({ seconds: secs }).toFixed(2)}s`
-            + ` = ${snapSecondsToFrames(secs)} 帧 @24fps）`));
-    };
-    paint();
-    return box;
-}
+/* 「对齐指令预览」（原 mkAlignPreview / .h3d-alignprev）已整块删除：它只是
+ * "提交时会自动往正文前拼什么"的一句只读预览，用户既不能改也不用看，却占着
+ * 锚定栏一整行。对齐指令改由后端 nodes.py 注入，前端只管锚点本身。
+ * v2InstrLines / segAlignSeconds / defaultV2Mode 仍被后端口径的其它入口使用，
+ * 一并保留（tests/js/alignment_lines_check.js 锁着它们）。 */
 
 /** 本段首尾帧锚在对齐指令里各占几号（首帧→1，FL2VA 尾帧→2；L2VA 只有尾帧且是 1 号）。
  *  与后端 prompts.compile_segment / 前端 v2InstrLines 同口径；无锚或 Ref2VA 返回 0。
@@ -7453,24 +7566,26 @@ function buildCenterBody(data) {
     if (state?.review) bar.insertAdjacentHTML("beforeend", badge("逐段审片", "cyan"));
     if (state?.reroll > 0) bar.insertAdjacentHTML("beforeend", badge(`重跑起始段=${state.reroll}`, "warn"));
     if (mergeSel.on) bar.insertAdjacentHTML("beforeend", badge("合并模式", "media"));
-    /* 合并模式：勾选已完成段按链顺序拼接导出（纯内存勾选态，不动链与存档） */
-    if (done > 0) {
+    /* 合并模式：到**素材库**点选素材，点击顺序即合并顺序（纯内存清单，不动链与存档）。
+     *  **常显** —— 以前被 `done > 0` 包着，一段都没生成时根本看不到这个入口，而
+     *  "把已有素材拼一条片子"本来就该是随时可用的独立动作。 */
+    {
+        const nSel = mergeCount();
         const mergeBtn = el("button", "h3d-btn" + (mergeSel.on ? " h3d-btn-cyan" : ""),
-            mergeSel.on ? "⧉ 合并模式·开" : "⧉ 合并模式");
-        mergeBtn.title = "开启后勾选若干已完成段（可追加上传外部视频），按链顺序流式拼接成"
-            + " merged_*.mp4 导出到项目文件夹；不动链、不动存档，随时可退出";
+            mergeSel.on ? `⧉ 合并模式·开${nSel ? `（${nSel}）` : ""}` : "⧉ 合并模式");
+        mergeBtn.title = "开启后到素材库里点选要合并的素材（**点击顺序 = 合并顺序**），"
+            + "可再追加外部视频，按 1→N 流式拼接成 merged_*.mp4 导出到项目文件夹；"
+            + "不动链、不动存档，随时可退出（退出即清空清单）";
         mergeBtn.onclick = () => {
             mergeSel.on = !mergeSel.on;
-            if (!mergeSel.on) { mergeSel.segs = []; mergeSel.files = []; }
+            if (!mergeSel.on) resetMergeSel();
             scheduleRefresh(0);
         };
         bar.append(mergeBtn);
     }
-    const refreshBtn = el("button", "h3d-btn h3d-refresh", "↻");
-    refreshBtn.title = "重新读取节点与存档数据";
-    refreshBtn.onclick = refresh;
-    bar.append(refreshBtn);
     wrap.append(bar);
+    /* 状态条上那个 ↻ 已挪到顶栏「⌨ 输入修复」旁边并升级成 refreshAll ——
+     * 摆在这儿容易被当成"只刷这一条状态"，而用户点刷新想要的是全局重刷。 */
 
     /* 段落进度轨（按各段时长加权，宽度≈时长比例） */
     if (total > 0) {
@@ -7499,33 +7614,40 @@ function buildCenterBody(data) {
     /* 横向分段选择条（点选看一段；＋ 横向加段；pill 可拖调序） */
     if (total > 0) wrap.append(renderSegStrip(data));
 
-    /* 合并清单条：已勾段号（链序）+ 外部上传 + 导出/退出 */
+    /* 合并清单条：素材（按 1→N 顺序）+ 外部上传 + 导出/退出。
+     * 清单内容全在**素材库**里点选（本条的「从素材库选」是唯一入口），
+     * 这里只回显顺序与总数 —— 段卡上那套"逐段切屏勾选"已删。 */
     if (mergeSel.on) {
         const mbar = el("div", "h3d-mergebar");
-        const segsSorted = [...mergeSel.segs].sort((a, b) => a - b);
-        const segSum = segsSorted.length
-            ? segsSorted.map((s) => `段${Math.max(1, s - off)}`).join("＋") : "未勾选段";
+        const order = mergeSel.order || [];
         const fileSum = (mergeSel.files || []).length
             ? ` ＋ 外部视频×${mergeSel.files.length}` : "";
         const sum = el("div", "h3d-merge-sum",
-            `合并清单（按链顺序）：<b>${escapeHtml(segSum + fileSum)}</b>`
-            + (mergeSel.files || []).map((f) => `<small>${escapeHtml(f)}</small>`).join(""));
+            order.length
+                ? `合并清单（按选择顺序）：<b>${order.map((x, i) => `${i + 1}. ${escapeHtml(x.name || x.file || x.id)}`).join("　→　")}</b>${escapeHtml(fileSum)}`
+                : `<b>还没选素材</b>：点右边「🗂 从素材库选」挑要拼接的素材（点击顺序就是合并顺序）`);
         mbar.append(sum);
+        const pickBtn = el("button", "h3d-btn h3d-btn-cyan", "🗂 从素材库选");
+        pickBtn.title = "打开素材库（合并模式）：点一个素材就按顺序排进去，"
+            + "瓦片角标 1/2/3/4 就是合并顺序；再点一次取消";
+        pickBtn.onclick = () => openMergeLibrary();
         const upBtn = el("button", "h3d-btn", "＋ 上传视频");
         upBtn.title = "上传外部视频追加到合并清单末尾（input 目录；建议 24fps、画幅与项目一致，"
             + "不同画幅会自动缩放裁剪到项目画幅）";
         upBtn.onclick = pickMergeVideo;
         const goBtn = el("button", "h3d-btn h3d-btn-cta", "⧉ 合并导出");
-        goBtn.title = "按链顺序把勾选项流式拼接为 merged_*.mp4（PyAV 编码，分钟级耗时，期间界面可用）";
-        goBtn.disabled = !(mergeSel.segs.length || (mergeSel.files || []).length);
+        goBtn.title = "按清单顺序（1→N）流式拼接为 merged_*.mp4"
+            + "（PyAV 编码，分钟级耗时，期间界面可用）";
+        goBtn.disabled = !mergeCount();
         goBtn.onclick = () => doMergeExport(goBtn);
         const exitBtn = el("button", "h3d-btn", "✕ 退出");
-        exitBtn.title = "退出合并模式并清空勾选（不影响链与存档）";
+        exitBtn.title = "退出合并模式并清空清单（不影响链与存档）";
         exitBtn.onclick = () => {
-            mergeSel.on = false; mergeSel.segs = []; mergeSel.files = [];
+            mergeSel.on = false;
+            resetMergeSel();
             scheduleRefresh(0);
         };
-        mbar.append(upBtn, goBtn, exitBtn);
+        mbar.append(pickBtn, upBtn, goBtn, exitBtn);
         wrap.append(mbar);
     }
 
@@ -7538,13 +7660,12 @@ function buildCenterBody(data) {
     /* 段落卡片 */
     wrap.append(buildCardsSafe(data));
 
-    /* 添加行 */
+    /* 添加行：只留「一键载入配套工作流」这一个兜底（画布上没节点时）。
+     * 「＋ 添加一段」已删 —— 加段的入口是顶部横向选段条右侧的 ＋，两个按钮做
+     * 同一件事只会让人分不清该点哪个（而且这个还藏在卡片下方要滚到底才看见）。 */
     const addrow = el("div", "h3d-addrow");
     if (node) {
-        const addSeg = el("button", "h3d-btn", "＋ 添加一段");
-        addSeg.title = "新增一段提示词到导演台状态（最多 64 段），新增后自动选中";
-        addSeg.onclick = () => addPromptSegment(node);
-        addrow.append(addSeg);
+        /* 有节点时这一行就没有内容了：加段走选段条，不再重复摆一个按钮。 */
     } else if (window.H3_DEFAULT_WORKFLOW) {
         const wf = el("button", "h3d-btn h3d-btn-cyan", "⚡ 一键载入配套工作流");
         wf.title = "画布上还没有 H3 链节点：载入官方风格预置工作流（模型加载 + 主节点 + 常驻连线的素材池）";
@@ -7572,7 +7693,9 @@ function renderSegStrip(data) {
     const off = planOff(mf);
     const done = Math.max(0, (mf?.done ?? state?.done ?? 0) - off);
     const sel = clampSelSeg(plan.length);
-    const canDrag = !!(node && !mergeSel.on && plan.length > 1);
+    /* 拖拽调序不再被合并模式挡住：合并顺序现在由素材库的选择顺序决定，跟链顺序
+     * 已经解耦，拖 pill 只改链、不影响合并清单。 */
+    const canDrag = !!(node && plan.length > 1);
     plan.forEach((it, idx) => {
         if (it.kind !== "prompt") return;
         const seg = (data.ds.segments || [])[it.idx] || defaultSegment();
@@ -7695,28 +7818,8 @@ function buildCards(data) {
             pv.onclick = () => openSegViewer(mediaInfo, `段 ${idx + 1} 成片`);
             title.append(pv);
         }
-        /* 合并模式：已完成段可勾选拼接进 merged_*.mp4（勾选值=全局 1-based 段号，
-         *  跨段勾选经顶部 strip 逐一切段勾选，勾选态常驻内存）；
-         *  已禁用段不进成片（与自动成片/二采拼接同口径），不给勾选 */
-        if (mergeSel.on) {
-            if (isDone && !isDisabled) {
-                const cb = document.createElement("input");
-                cb.type = "checkbox";
-                cb.className = "h3d-mergecb";
-                const g1 = idx + off + 1;
-                cb.checked = mergeSel.segs.includes(g1);
-                cb.title = `勾选后并入合并导出（链位 ${idx + 1}，按链顺序拼接）`;
-                cb.onchange = () => {
-                    mergeSel.segs = cb.checked
-                        ? [...mergeSel.segs, g1] : mergeSel.segs.filter((x) => x !== g1);
-                    scheduleRefresh(0);
-                };
-                card.classList.add("mergeable");
-                card.prepend(cb);
-            } else {
-                card.classList.add("mergeable-off");
-            }
-        }
+        /* 段卡上**不再有**合并勾选框：合并清单改在素材库里点选（点击顺序即合并
+         * 顺序），不再需要"逐段切屏勾选"。段卡只负责链本身。 */
 
         /* 每段时长（秒）：留空=跟随节点默认；显示吸附后的帧数 */
         let secsHint = null;
@@ -7775,10 +7878,9 @@ function buildCards(data) {
             anchorBar.append(el("span", "h3d-secs-hint",
                 "本段的起手帧 / 终点锚（段级，三栏共用）；选为锚即领一个「图片N」编号，"
                 + "占本段 <Picture k> 最前，参考素材顺延"));
-            /* 对齐指令在这里**展示**，不进提示词框正文（提交时由后端注入）。
-             * 以前它写在正文里：AI 产出会抄走它、清了锚还留着指向不存在的图、
-             * 飘在字段前缀之前的那些永远摘不掉。 */
-            anchorBar.append(mkAlignPreview(node, it.idx));
+            /* 对齐指令**不再在前端露出**（原 mkAlignPreview 已删）：它从来只是
+             * "提交时会自动往正文前拼什么"的一句预览，用户既不能改也不需要看，
+             * 占着锚定栏一整行。现在统一由后端 nodes.py 注入，前端只管锚点本身。 */
             body.append(anchorBar);
         }
 
@@ -7897,22 +7999,14 @@ function buildCards(data) {
              * 公共区：它们既不是「提示词的引用」，也不是「锚定设置」页里的锚点参数，
              * 而是"本段是否参与链路"的开关 —— 藏进页签里就要翻页才看得见。
              * 容器先挂上，内容在下方 seg 快照就绪处填（那里才有本段状态）。 */
+            /* 两个跳过开关挂在**页签行里**（提示词 / 锚定设置 同一栏，靠右）：
+             * 它们以前单独占一行，把段卡撑高一大截，而这两个勾选项跟页签同属
+             * "这一段怎么跑"的开关组，并成一栏更顺手。
+             * 容器先挂上，内容在下方 seg 快照就绪处填（那里才有本段状态）。 */
             const pubSwitchRow = el("div", "h3d-setrow h3d-pubswitch");
-            body.append(pubSwitchRow);
-            /* AI 优化设置放在**三页之外**的公共区：它是全链共用的一套（服务商 /
-             * 输出语言 / 规则文件），跟「锚定设置」页里的本段开关不是一回事。
-             * 以前挂在意图框里，既容易误点，也让人以为只对这段生效。 */
-            if (node) {
-                const optBar = el("div", "h3d-optsetbar");
-                const bOptSet = el("button", "h3d-btn", "⚙ AI 优化设置");
-                bOptSet.type = "button";
-                bOptSet.title = "AI 提示词优化设置（服务商 / 模型 / 输出语言 / 规则文件）"
-                    + "—— 全链共用，不是本段设置（本段设置在上面的「锚定设置」页）";
-                bOptSet.onclick = () => openOptSettings(node);
-                optBar.append(bOptSet, el("span", "h3d-secs-hint",
-                    "全链共用：服务商 / 输出语言 / 规则文件（本段参数在「锚定设置」页）"));
-                body.append(optBar);
-            }
+            tabbar.append(pubSwitchRow);
+            /* 「⚙ AI 优化设置」已挪到顶栏（与 ⚡ 性能优化 同级）：它是全链共用的一套，
+             * 挂在段卡里每段长一个按钮，看着像本段设置。 */
             /* 三栏各自独立的引用条：意图 / 剧本 / 结果 各一条，谁也不改谁。
              * 唯一的引用条直接进模型（ds.prompts + seg.refs，走官方 9/3/3）；
              * ①② 只是标注，写完只落在自己的正文里。 */
@@ -9483,15 +9577,18 @@ function renderFooter(z, data) {
     }
     if (state?.review) infos.push("逐段审片：每次排队只生成下一段");
     if (!node) infos.push("只读模式：画布上未找到 H3 Seamless Chain 节点");
-    if (mergeSel.on) infos.push("合并模式进行中：生成按钮已暂停（退出合并模式后恢复）");
+    if (mergeSel.running) infos.push("合并导出进行中：生成按钮暂时不可用（跑完自动恢复）");
     z.footInfo.innerHTML = infos.map((s) => `<span>${s}</span>`).join("");
 
     const run = z.run;
     run.onclick = queuePrompt;
+    /* 终止按钮只在"认为正在跑"时露出来：没在跑却摆一个醒目的红叉，只会让人
+     * 以为哪里坏了。判定跟顶栏那盏灯同源（提交那一刻置 running）。 */
+    if (z.stop) z.stop.style.display = ledPhase === "running" ? "" : "none";
     const pend = redoPending(data), queued = redoQueued(data);
-    if (mergeSel.on) {
+    if (mergeSel.running) {
         run.disabled = true;
-        run.textContent = "⧉ 合并模式进行中（退出后可生成）";
+        run.textContent = "⧉ 合并导出进行中（跑完可生成）";
     } else if (!total) {
         run.disabled = true;
         run.textContent = "▶ 开始生成（先配置段落）";
@@ -9537,7 +9634,9 @@ function openNewProjectModal() {
         <p class="h3d-lead">新开一条视频链：换存档目录名即换链，旧链原样保留可随时切回。
         点「创建项目」会在 output/h3_projects/ 下立即建好文件夹（游戏存档槽：创建即可见）。
         默认建<b>空白项目</b>（0 段起跑，零继承）；勾选下方<b>复制当前项目</b>则把提示词、
-        分段设置、共享参数与参考图整份带过来。</p>`;
+        分段设置与参考图整份带过来。<br><b>分辨率 / 步数 / CFG 等链参数不继承</b>：
+        那是"这条链用什么设置跑出来的"指纹，跟过来会把新项目钉在旧画幅上
+        （改了就与存档不符、跑不动）。新项目按画布当前值起跑。</p>`;
     const input = document.createElement("input");
     input.type = "text";
     input.value = def;
@@ -9988,6 +10087,47 @@ async function refresh() {
     } catch (e) {
         console.warn("[h3-director] refresh failed:", e);
         renderMiniFallback(e);   // 出错也保住入口按钮，不留空白标签
+    }
+}
+
+/** 按后端**真实**生成锁校正顶栏那盏灯。
+ *
+ *  缺口在这里：LED 只在提交那一刻 setLed("running","已提交队列")，之后**没有
+ *  任何人**负责把它放下来。链在服务端跑完 / 报错 / 被中断，灯都一直亮着
+ *  running —— 用户看到的是"还在跑"，实际早就结束了（报错尤其如此）。
+ *  这里用 GET /h3chain/busy 补上：后端说"不忙"而灯还停在 running，说明这一轮
+ *  已经收场，把灯放下来。
+ *
+ *  只做校正，**不做任何取消动作** —— 取消生成是页脚「✕ 终止」的事，刷新
+ *  绝不能顺手把别人正在跑的链给停了。 */
+async function syncRunLed() {
+    if (ledPhase !== "running") return false;      // 不是 running 就别乱盖（err/done 是有信息的）
+    let busy = null;
+    try {
+        const r = await window.H3Api?.busy?.();
+        const b = r?.body;
+        if (b && typeof b.busy === "boolean") busy = b.busy;
+    } catch (e) {
+        return false;      // 接口不可用就保持原状，不猜、不误报
+    }
+    if (busy !== false) return false;
+    setLed("idle", "已结束（刷新校正）");
+    return true;
+}
+
+/** 顶栏 ↻：一次真正的"全面"刷新。
+ *  refresh() 是给 900ms 轮询用的那条路：签名没变就不重挂、编辑中还会主动跳过
+ *  （防丢焦丢草稿）。所以"自动刷新看着没反应"是设计使然。用户**手动**点时
+ *  想要的是无条件全量重挂 —— 这里把三栏的签名缓存清掉强制重画，并先按后端
+ *  真实状态把灯校正。 */
+async function refreshAll() {
+    await syncRunLed();
+    if (desk) { desk.cardsSig = ""; desk.histSig = ""; }
+    await refresh();
+    /* 手动刷新时若焦点正停在某个输入框里，updateDesk 仍会刻意跳过卡片重建
+     * （防打断输入）。这种情况必须说出来，否则用户以为"点了刷新没反应"。 */
+    if (desk && desk.page.querySelector(".h3d-ta:focus, .h3d-v2f:focus, input:focus")) {
+        setLed("idle", "已刷新数据（正编辑的框保持不动，未打断输入）");
     }
 }
 

@@ -171,9 +171,10 @@ const SOURCE = require("fs").readFileSync(
 
 t("源码：rBridge 区块建好并挂进右栏", () => {
     assert.ok(SOURCE.indexOf('const rBridge = el("section"') >= 0, "缺少 rBridge 区块");
-    assert.ok(SOURCE.indexOf("colR.append(rParams, rBridge, rUpscale, rHist)") >= 0,
+    /* 2026-09-27 成片区（rHist）挪去左栏底部（lHist），右栏只剩参数/语义桥/二采。 */
+    assert.ok(SOURCE.indexOf("colR.append(rParams, rBridge, rUpscale)") >= 0,
         "rBridge 没挂进右栏顺序里");
-    assert.ok(SOURCE.indexOf("rParams, rBridge, rUpscale, rHist,") >= 0,
+    assert.ok(SOURCE.indexOf("rParams, rBridge, rUpscale,") >= 0,
         "rBridge 没登记进 desk.zones（不登记就永远不渲染）");
 });
 

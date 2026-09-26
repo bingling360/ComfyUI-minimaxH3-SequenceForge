@@ -6616,7 +6616,11 @@ function openDesk() {
     const stage = el("div", "h3d-stage");
     const colL = el("aside", "h3d-col left");
     const lProj = el("section", "h3d-lsec h3d-projsec");
-    colL.append(lProj);
+    /* 成片区住左栏底部（2026-09-27 从右栏底部挪来）：右栏是「参数/语义桥/二采」
+     * 一排设置区，成片是**结果**不是设置，放设置堆里越放越深；左栏只有项目存档，
+     * 成片贴在其下面 = 左下角一眼可见，生成完不用去右栏翻。 */
+    const lHist = el("section", "h3d-lsec h3d-hsec");
+    colL.append(lProj, lHist);
     const colC = el("section", "h3d-col center");
     const cHead = el("div", "h3d-sechead",
         "<strong>段落流水线</strong><small>顶部横向选段（点选看一段，＋ 加段，pill 可拖调序）；✏ 改词 · 🎲 重摇 · 🎬 锚定设置</small>");
@@ -6630,8 +6634,7 @@ function openDesk() {
     const rParams = el("section", "h3d-rsec h3d-psec");
     const rBridge = el("section", "h3d-rsec h3d-psec");
     const rUpscale = el("section", "h3d-rsec h3d-upsec");
-    const rHist = el("section", "h3d-rsec h3d-hsec");
-    colR.append(rParams, rBridge, rUpscale, rHist);
+    colR.append(rParams, rBridge, rUpscale);
     stage.append(colL, colC, colR);
 
     /* 页脚 */
@@ -6656,8 +6659,8 @@ function openDesk() {
         zones: {
             project: sub,
             colC,
-            lProj,
-            rParams, rBridge, rUpscale, rHist,
+            lProj, lHist,
+            rParams, rBridge, rUpscale,
             footInfo, run, stop,
             zoneErr,
         },
@@ -6757,13 +6760,13 @@ function updateDesk(data) {
     z.project.textContent = `项目 · ${dirName}`;
     paintLeds();
 
-    /* 左栏：项目与链（含「素材库」入口，见 renderV2Section） */
+    /* 左栏：项目与链（含「素材库」入口，见 renderV2Section）+ 成片（左栏底部） */
     runZone("项目与链", () => renderLeftColumn(z.lProj, data));
 
     /* 中栏：状态条 + 进度轨 + 段落卡片（有编辑器/播放中时跳过重渲） */
     runZone("段落流水线", () => renderCenterColumn(z.colC, data));
 
-    /* 右栏：链参数（编辑中不重建）+ 语义桥 + 二采面板（编辑中不重建）+ 成片历史（播放中不重建） */
+    /* 右栏：链参数（编辑中不重建）+ 语义桥 + 二采面板（编辑中不重建）；成片在左栏（z.lHist） */
     const psig = paramsSig(node);
     const pgrid = z.rParams.querySelector(".h3d-params");
     if (!(pgrid && pgrid.contains(document.activeElement)) && z.rParams.dataset.sig !== psig) {
@@ -6782,10 +6785,10 @@ function updateDesk(data) {
     }
         const histSig = (state?.dir ?? "") + "|" + (mf?.finals || []).join(",")
             + "|" + (mf?.merges || []).map((m) => m?.file || "").join(",");
-    if (histSig !== desk.histSig || !z.rHist.querySelector(".h3d-hist")) {
-        if (!isVideoPlaying(z.rHist)) {
+    if (histSig !== desk.histSig || !z.lHist.querySelector(".h3d-hist")) {
+        if (!isVideoPlaying(z.lHist)) {
             desk.histSig = histSig;
-            runZone("成片历史", () => renderHistoryZone(z.rHist, data));
+            runZone("成片历史", () => renderHistoryZone(z.lHist, data));
         }
     }
 

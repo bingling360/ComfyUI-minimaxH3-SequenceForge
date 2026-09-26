@@ -291,7 +291,11 @@
 .h3l-input{border:1px solid #3a352c;border-radius:8px;background:#211f1a;color:#d9d4c9;padding:8px 10px;font-size:13px;font-family:inherit;outline:none}
 .h3l-input:focus{border-color:#a8d8bd}
 .h3l-modalrow{display:flex;gap:8px;justify-content:flex-end;margin-top:2px}
-.h3l-toast{position:fixed;right:22px;top:22px;z-index:1000009;max-width:min(460px,80vw);padding:11px 15px;border:1px solid #46604f;border-radius:10px;background:#16241c;color:#c9f0d8;font:13px/1.55 "Microsoft YaHei UI","Segoe UI",sans-serif;box-shadow:0 8px 28px #000b;white-space:pre-wrap;word-break:break-word}
+    /* 位置：底部居中。不能放顶部右侧 —— 标题栏最右就是「合并导出 / 开始合并 /
+     * 退出合并」按钮区（.h3l-mergearea），顶部浮层一弹出来正好盖住它们，
+     * 用户刚点完「合并导出」就找不到「退出合并」了。底部居中只临时压住
+     * 状态行（.h3l-msg，内容与 toast 相同，本来就重复）。 */
+    .h3l-toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:1000009;max-width:min(460px,80vw);padding:11px 15px;border:1px solid #46604f;border-radius:10px;background:#16241c;color:#c9f0d8;font:13px/1.55 "Microsoft YaHei UI","Segoe UI",sans-serif;box-shadow:0 8px 28px #000b;white-space:pre-wrap;word-break:break-word;text-align:center}
 .h3l-toast.err{border-color:#9a4144;background:#2c1618;color:#f3b6ba}
 `;
     const s = document.createElement("style");

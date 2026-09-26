@@ -222,13 +222,26 @@
     /* 合并顺序角标：数字就是拼接位次。放左下角（左上/右上已被评分与角色角标占住），
      * 必须登记进 tileKeepers() —— 缩略图懒加载会 replaceChildren，漏了它滚动一次就没了。 */
     .h3l-order{position:absolute;left:5px;bottom:5px;min-width:21px;height:21px;padding:0 5px;border-radius:11px;background:#316dca;color:#fff;font-size:12px;font-weight:700;line-height:21px;text-align:center;box-shadow:0 2px 8px #000a;pointer-events:none}
-    /* 合并模式的显隐切换：**靠类切**，不重建 DOM（重建会丢滚动位置与已选清单）。
-     * 两条 .h3l-merging 规则的选择器权重更高，压得住 .h3l-batch / .h3l-btn 自带的
-     * display；.h3l-only-merge 的 display:none 写在 .h3l-batch 之后，同权重时后者生效。 */
+    /* 合并模式的显隐切换：靠类切，不重建 DOM（重建会丢滚动位置与已选清单）。
+     *
+     * ⚠ 这里踩过一个真坑：h3l-mergebox 曾和 h3l-batch 挂在同一个元素上，两者都是
+     * (0,1,0) 权重，而 .h3l-batch{display:flex} 在源码里更靠后 —— 于是它压掉了下面
+     * 这条 .h3l-only-merge{display:none}，"开始合并 / 退出合并"从打开素材库起就常显。
+     * 现在的规矩：.h3l-mergebox 只给布局、不给 display，display 由下面两条独占；
+     * 隐藏 (0,1,0) 与显示 (0,2,0) 之间也不靠源码顺序决胜。
+     * （本注释在模板字符串里，所以全篇不用反引号 —— 会截断字面量。） */
     .h3l-only-merge{display:none}
     .h3l-merging .h3l-only-normal{display:none}
     .h3l-merging .h3l-only-merge{display:flex}
     .h3l-merging .h3l-hint{color:#9ecbff}
+    /* 合并区席位：标题栏最右、✕ 左边。margin-left:auto 是给"标题栏换行"兜底 ——
+     * 头栏有 flex-wrap，提示语太长时这个区会掉到第二行，那时靠它自己右对齐。 */
+    .h3l-mergearea{display:flex;gap:6px;align-items:center;margin-left:auto;flex-wrap:wrap}
+    .h3l-mergebox{gap:6px;align-items:center;flex-wrap:wrap}
+    /* 合并 CTA 用蓝色：绿色 CTA 已被工具条的「＋ 上传」占了，两个同款绿按钮互相稀释；
+     * 蓝色又正好和瓦片上的 1/2/3 顺序角标同色，一眼能连起来。 */
+    .h3l-btn-merge{padding:7px 15px;border:1px solid #316dca;background:#1f2f45;color:#9ecbff;font-weight:600}
+    .h3l-btn-merge:hover{border-color:#4d8bea;background:#243a55;color:#c3ddff}
     /* 合并模式下的非视频瓦片：看得见但点不动（点了给一句说明） */
     .h3l-nomerge{opacity:.42;cursor:not-allowed}
     .h3l-nomerge:hover{border-color:#37332b;background:#181712}
@@ -1133,6 +1146,12 @@
     close.onclick = () => overlay.remove();
     head.append(close);
     S.close = () => overlay.remove();
+    /* 合并区的**固定席位**：标题栏最右侧、✕ 左边。
+     * 为什么不放工具条：那一行已经挤了搜索 + 4 个筛选控件 + 批量区 + 上传 + 重新扫描，
+     * 合并入口埋在里面既不显眼，还会随 flex-wrap 换行到处乱跳（位置不固定 = 找不着）。
+     * 挑选模式（锚源）没有合并这回事，那时不建这个槽。 */
+    const mergeArea = pickMode ? null : el("div", "h3l-mergearea");
+    if (mergeArea) head.insertBefore(mergeArea, close);
 
     const bar = el("div", "h3l-bar");
     const search = el("input", "h3l-search");
@@ -1239,14 +1258,17 @@
       () => actDelete([...S.sel]), true);
     S.paintSelAll = paintSelAll;
 
-    /* ---- 合并导出：入口 + 清单区（都住在素材库里） ----
+    /* ---- 合并导出：入口 + 清单区（都住在素材库里，席位在标题栏最右） ----
      *
      * 合并**整套**在这里：入口按钮 → 选材模式 → 点素材排顺序 → 就地发起拼接。
      * 导演台不再有合并入口、也不再存清单（只留一个互斥标记 `window.H3Merge`）。
      *
      * 两个区靠 CSS 类切换（`.h3l-only-normal` / `.h3l-only-merge` 配
-     * `.h3l-merging`），**不重建 DOM** —— 重建会把滚动位置和已选清单一起丢掉。 */
-    const mergeEntry = el("button", "h3l-btn h3l-btn-cta h3l-only-normal", "⧉ 合并导出");
+     * `.h3l-merging`），**不重建 DOM** —— 重建会把滚动位置和已选清单一起丢掉。
+     * 入口与「开始合并 / 退出合并」占**同一个席位**：点入口后入口自己让位，
+     * 两个按钮才出现（同一处、同一大小，视线不用重新找）。 */
+    const mergeEntry = el("button", "h3l-btn h3l-btn-merge h3l-merge-entry h3l-only-normal",
+      "⧉ 合并导出");
     mergeEntry.type = "button";
     mergeEntry.title = "把多个视频按顺序拼成一条（不改链、不动存档）："
       + "进入选材模式后点素材排顺序，瓦片角标 1→N 就是拼接顺序；"
@@ -1256,8 +1278,14 @@
       setMergeMode(true);
     };
 
-    const mergeBox = el("div", "h3l-batch h3l-mergebox h3l-only-merge");
-    const mergeBtn = el("button", "h3l-btn h3l-btn-cta", "⧉ 开始合并");
+    /* ⚠ `.h3l-mergebox` **不能**挂 `.h3l-batch`（曾经挂了，于是常显）：
+     * 两者同为 (0,1,0) 权重，`.h3l-batch{display:flex}` 在源码里靠后，
+     * 会把 `.h3l-only-merge{display:none}` 压掉 —— 表现就是"刚打开素材库，
+     * 开始合并/退出合并就挂在那儿了"。这里只给布局、**不给 display**，
+     * display 由 `.h3l-only-merge` / `.h3l-merging .h3l-only-merge` 独占，
+     * 后者权重 (0,2,0)，与源码顺序无关。 */
+    const mergeBox = el("div", "h3l-mergebox h3l-only-merge");
+    const mergeBtn = el("button", "h3l-btn h3l-btn-merge h3l-merge-go", "⧉ 开始合并");
     mergeBtn.type = "button";
     const paintMergeBtn = () => {
       const n = (S.mergeOrder || []).length;
@@ -1275,7 +1303,7 @@
       mergeBtn.classList.toggle("on", n > 0);
     };
     mergeBtn.onclick = () => doMerge();
-    const exitMergeBtn = el("button", "h3l-btn", "✕ 退出合并");
+    const exitMergeBtn = el("button", "h3l-btn h3l-merge-exit", "✕ 退出合并");
     exitMergeBtn.type = "button";
     exitMergeBtn.title = "退出选材模式并清空清单（素材本身不受影响）";
     exitMergeBtn.onclick = () => setMergeMode(false);
@@ -1284,7 +1312,10 @@
     if (typeof S.paintMergeBtn === "function") S.paintMergeBtn();
 
     // 挑选模式单击就返回，不存在"选中一批"这回事，也没有合并这回事
-    if (!pickMode) bar.append(batchBox, mergeEntry, mergeBox);
+    if (!pickMode) {
+      bar.append(batchBox);
+      if (mergeArea) mergeArea.append(mergeEntry, mergeBox);
+    }
 
     /* 上传落点 = 当前所在库，**上传到哪里就是哪里，不顺手复制**：
      *   全局库 → 只进全局库（跨项目复用）

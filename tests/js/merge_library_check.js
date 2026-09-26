@@ -113,11 +113,14 @@ const clickTile = (w, n) => tilesOf(w)[n]
 const clickBtn = (w, sel) => ov(w).querySelector(sel)
     .dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
 const tick = () => new Promise((r) => setTimeout(r, 30));
-/** 素材库里"合并导出"入口（普通模式工具条上的那个 CTA）。 */
-const entryBtn = (w) => [...ov(w).querySelectorAll(".h3l-bar .h3l-only-normal")]
-    .find((n) => n.tagName === "BUTTON" && n.textContent.indexOf("合并导出") >= 0);
-const mergeBtn = (w) => [...ov(w).querySelectorAll(".h3l-mergebox button")]
-    .find((b) => b.textContent.indexOf("开始合并") >= 0);
+/** 素材库里「合并导出」入口（**标题栏最右、✕ 左边**的那个 CTA）。 */
+const entryBtn = (w) => ov(w).querySelector(".h3l-merge-entry");
+const mergeBtn = (w) => ov(w).querySelector(".h3l-merge-go");
+const exitBtn = (w) => ov(w).querySelector(".h3l-merge-exit");
+const mergeBoxOf = (w) => ov(w).querySelector(".h3l-mergebox");
+/** 用 jsdom 的**层叠计算**读 display —— 这是唯一能抓住"显隐规则被别的
+ *  display 声明压掉"这类 bug 的办法（源码里两条规则都在，只是有一条不生效）。 */
+const disp = (w, n) => (n ? w.getComputedStyle(n).display : "none");
 const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0 : false);
 
 (async () => {
@@ -154,20 +157,58 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
             "该有 4 处互斥守卫（二采提交 / 提交生成 / 提交重摇 / 标记重摇），实际 " + hits.length);
     });
 
-    await t("普通模式：工具条上有专门的「⧉ 合并导出」按钮，批量区也在", async () => {
+    await t("入口在**标题栏最右**（✕ 左边），不在工具条；两个按钮此刻还不出现", async () => {
         const { w } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
         const b = entryBtn(w);
         assert.ok(b, "找不到「⧉ 合并导出」入口按钮");
+        const head = ov(w).querySelector(".h3l-head");
+        const bar = ov(w).querySelector(".h3l-bar");
+        assert.ok(head.contains(b), "入口该在标题栏里（工具条控件太挤，埋着看不见）");
+        assert.ok(!bar.contains(b), "入口不该再放工具条里");
+        assert.ok(head.contains(mergeBoxOf(w)), "合并区该和入口同处标题栏（同一席位换内容）");
+        /* 席位固定：标题栏里入口之后只剩关闭键 —— 也就是最右。 */
+        const kids = [...head.children];
+        const after = kids.slice(kids.indexOf(entryBtn(w).parentNode) + 1);
+        assert.ok(after.some((n) => n.classList.contains("h3l-close")),
+            "合并区该紧挨在 ✕ 关闭键左边（最右边）");
         assert.ok(ov(w).querySelector(".h3l-batch:not(.h3l-mergebox)"), "普通模式该有批量区");
-        assert.ok(ov(w).querySelector(".h3l-kindsel, select"), "普通模式该有类型下拉");
-        assert.strictEqual(w.document.querySelectorAll(".h3l-mergebox").length, 1, "合并区该在 DOM 里");
+        assert.strictEqual(ov(w).querySelectorAll(".h3l-mergebox").length, 1, "合并区该在 DOM 里");
+        /* 合并区**不许**再挂 .h3l-batch —— 那条 display:flex 就是压制显隐规则的元凶。 */
+        assert.ok(!mergeBoxOf(w).classList.contains("h3l-batch"),
+            "合并区又挂上 h3l-batch 了（它就是常显的成因）");
+        /* ★ 这条钉的是真 bug：还没点入口，「开始合并 / 退出合并」就已经挂在那儿了。 */
+        assert.strictEqual(disp(w, mergeBoxOf(w)), "none",
+            "还没点「合并导出」合并区就显示了 —— 显隐规则被别的 display 声明压掉");
+        assert.notStrictEqual(disp(w, b), "none", "普通模式该看得见入口");
+    });
+
+    await t("显隐只由 .h3l-only-* 决定：.h3l-mergebox 不许自带 display", () => {
+        /* 成因复盘：.h3l-mergebox 曾和 .h3l-batch 挂在同一个元素上，两者都是 (0,1,0)
+         * 权重，而 .h3l-batch{display:flex} 在源码里更靠后 —— 于是它压掉了
+         * .h3l-only-merge{display:none}，两个按钮从打开素材库起常显。
+         * 这条不变量把成因钉死：合并区只给布局，display 由 .h3l-only-* 独占。
+         * （必须先剥掉 CSS 注释再扫 —— 注释里提到过这些选择器，会假命中。） */
+        const raw = (LIB_SRC.match(/const css = `([\s\S]*?)`;/) || [])[1] || "";
+        assert.ok(raw, "没抽到素材库的 CSS 块");
+        const css = raw.replace(/\/\*[\s\S]*?\*\//g, "");
+        const bad = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+            .filter((m) => /\.h3l-mergebox\b/.test(m[1]) && /(?:^|[;\s])display\s*:/.test(m[2]));
+        assert.deepStrictEqual(bad.map((m) => m[1].trim()), [],
+            ".h3l-mergebox 又自己声明 display 了 —— 会和 .h3l-only-merge 抢权重");
+        assert.ok(/\.h3l-only-merge\s*\{\s*display\s*:\s*none\s*\}/.test(css),
+            "缺 .h3l-only-merge{display:none}");
+        assert.ok(/\.h3l-merging\s+\.h3l-only-merge\s*\{\s*display\s*:\s*flex\s*\}/.test(css),
+            "缺 .h3l-merging .h3l-only-merge{display:flex}");
+        /* 模板字符串里的注释不许出现反引号：会当场截断 CSS 字面量，整个脚本语法错误。 */
+        const commentArea = raw.slice(raw.indexOf("/*"), raw.indexOf(".h3l-name{"));
+        assert.ok(commentArea.indexOf("`") < 0, "CSS 注释里又出现反引号了（会截断模板字符串）");
     });
 
     await t("点入口进选材模式：标题换、批量区藏、合并区出、latent 页签消失", async () => {
         const { w } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         assert.ok(ov(w).classList.contains("h3l-merging"), "overlay 没带 h3l-merging");
         assert.ok(ov(w).querySelector(".h3l-head strong").textContent
@@ -175,6 +216,10 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
         assert.ok(ov(w).querySelector(".h3l-hint").textContent.indexOf("角标") >= 0,
             "没告诉用户角标就是顺序");
         assert.ok(mergeBtn(w), "缺「开始合并」按钮");
+        assert.ok(exitBtn(w), "缺「退出合并」按钮");
+        /* 点了入口，两个按钮才出现；入口自己让位（同一席位换内容，视线不用重找）。 */
+        assert.strictEqual(disp(w, mergeBoxOf(w)), "flex", "进了选材模式合并区该出现");
+        assert.strictEqual(disp(w, entryBtn(w)), "none", "入口该让位给「开始合并 / 退出合并」");
         assert.ok(ov(w).querySelector(".h3l-bar").textContent.indexOf("调入项目") >= 0,
             "批量区被删了（只是该被 CSS 藏起来）");
         const scopeNames = [...ov(w).querySelectorAll(".h3l-scope")].map((n) => n.textContent);
@@ -185,7 +230,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("只收视频：类型筛选被强制成 video，图片根本不出现在列表里", async () => {
         const { w, calls } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         const last = calls.filter((c) => c.path.indexOf("lib_list") >= 0).pop();
         assert.ok(last && last.path.indexOf("kind=video") >= 0,
@@ -197,7 +242,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("第二道闸：漏网的图片点不动，且给出人话（不许悄悄进清单）", async () => {
         const { w } = mkWin({ leakKinds: true });   // 模拟筛选器失效，图片混进列表
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         const pic = tilesOf(w).find((t) => t.querySelector(".h3l-name").textContent === "PIC");
         assert.ok(pic, "（桩没造出图片瓦片，用例失效）");
@@ -211,7 +256,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("点击顺序 = 合并顺序：角标 1/2/3 与清单顺序一致", async () => {
         const { w } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         assert.strictEqual(badgeOf(w, 0), null, "还没点就有角标");
         clickTile(w, 1);            // 先点 B
@@ -229,7 +274,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("再点一次 = 移出，后面的角标整体前移（1/2 重排）", async () => {
         const { w } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         clickTile(w, 0); clickTile(w, 1); clickTile(w, 2);
         clickTile(w, 1);            // 移出 B
@@ -242,7 +287,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("角标登记进 tileKeepers：懒加载离屏卸载后角标还在", async () => {
         const { w, observers } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         clickTile(w, 2);
         const th = tilesOf(w)[2].querySelector(".h3l-thumb");
@@ -261,16 +306,18 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("退出合并模式：清单与角标立即清空、类型筛选还原、latent 页签回来", async () => {
         const { w } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         clickTile(w, 0); clickTile(w, 1);
-        clickBtn(w, ".h3l-mergebox button:not(.h3l-btn-cta)");
+        clickBtn(w, ".h3l-merge-exit");
         await tick();
         assert.ok(!ov(w).classList.contains("h3l-merging"), "没退出合并模式");
         assert.strictEqual(badgeOf(w, 0), null, "角标没清");
         assert.strictEqual(badgeOf(w, 1), null, "角标没清");
         assert.ok(ov(w).querySelector(".h3l-head strong").textContent.indexOf("素材库") >= 0,
             "标题没还原");
+        assert.strictEqual(disp(w, mergeBoxOf(w)), "none", "退出后合并区该收起来");
+        assert.notStrictEqual(disp(w, entryBtn(w)), "none", "退出后入口该回到原位");
         const scopeNames = [...ov(w).querySelectorAll(".h3l-scope")].map((n) => n.textContent);
         assert.ok(scopeNames.some((s) => s.indexOf("latent") >= 0), "latent 页签没还原");
     });
@@ -278,7 +325,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("空清单点「开始合并」只提示、不发请求", async () => {
         const { w, calls } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
         await tick();
@@ -291,7 +338,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("发起合并：请求体按角标顺序、带 asset id，且不排序", async () => {
         const { w, calls } = mkWin();
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         clickTile(w, 2); clickTile(w, 0);      // C 在前、A 在后
         mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
@@ -309,7 +356,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
         const life = [];
         w.H3Merge = { begin: () => life.push("begin"), end: (o) => life.push("end:" + o) };
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         clickTile(w, 0);
         mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
@@ -335,7 +382,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
         const life = [];
         w.H3Merge = { begin: () => life.push("begin"), end: (o) => life.push("end:" + o) };
         await w.H3Lib.open({ dir: "PROJ" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         clickTile(w, 0);
         mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
@@ -362,7 +409,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
         const { w } = mkWin();
         let changed = 0;
         await w.H3Lib.open({ dir: "PROJ", onChanged: () => { changed++; } });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         clickTile(w, 0);
         mergeBtn(w).dispatchEvent(new w.MouseEvent("click", { bubbles: true }));
@@ -373,7 +420,7 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
     await t("没有项目目录时进不去合并模式（产物要有地方落）", async () => {
         const { w } = mkWin();
         await w.H3Lib.open({ dir: "" });
-        clickBtn(w, ".h3l-only-normal.h3l-btn-cta");
+        clickBtn(w, ".h3l-merge-entry");
         await tick();
         assert.ok(!ov(w).classList.contains("h3l-merging"), "没项目目录不该进合并模式");
         assert.ok(ov(w).querySelector(".h3l-msg").textContent.indexOf("先打开一个项目") >= 0,

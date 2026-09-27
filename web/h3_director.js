@@ -10395,9 +10395,9 @@ function removeFab() {
  * 同一条路径描一圈 2px 渐变边。机身**底色一律不动** —— 它跟主题走，浅色深色都不打架。
  *
  * 端口免打扰：drawSlots 只对「控件型输入槽」自动隐身，真端口没有开关，只能包一层：
- *   _measureSlots 收窄 → 藏起来的端口不占行高（按钮随之上移、节点跟着收矮）
- *   drawSlots     收窄 → 藏起来的端口不画（连了线也不画，那根线会停在节点边缘）
- *   computeSize   收窄 → 尺寸按**可见**端口算，否则底部会白留几行
+ *   getInputPos / getOutputPos 换下标 → 藏起来的端口不占行（按钮随之上移、节点收矮）
+ *   drawSlots                 换 draw → 藏起来的端口不画（连了线也不画）
+ *   computeSize               收窄   → 尺寸按**可见**端口算，否则底部会白留几行
  * 一律**按名字认，不按位次认**：位次会随控件增删漂移（输出位次还是连线的坐标），名字不会。
  * 端口本身留在 inputs/outputs 里没删 —— 删「帧率」会把「报告」从第 3 位挤到第 2 位，
  * 老工作流里连「报告」的线会静默接到「帧率」上，那是真事故。
@@ -10440,20 +10440,26 @@ function paintDeskNode(node) {
         ctx.restore();
     };
 
-    /* 收窄手法：临时把 concrete 槽位换成滤过的再交给原生实现，完事换回来。
-     * 换回来只是让本帧其它环节看到原样 —— concrete 槽位每帧由 _setConcreteSlots()
-     * 重建，这里就算没换回去也脏不了。 */
-    const filterHidden = (arr) => arr.filter((s) => !H3_DESK_HIDE_SLOTS.has(s.name));
+    /* 端口紧凑：把藏起来的槽从排布里摘掉，同时保证**标注与连线用的是同一套坐标**。
+     * 前端查槽位坐标全都要过 getInputPos / getOutputPos —— 量标签的 _measureSlot、画连线的
+     * drawConnections、鼠标命中的 getNodeInputOnPos，三处都是它们 —— 所以只在这一个地方把
+     * 「原始下标」换成「它前面还剩几个可见槽」，三处就永远一致。
+     * ⚠ 踩过的坑：最早是去过滤 _measureSlots。那会儿标签量算按紧凑下标、连线仍按原始下标，
+     * 两套坐标并存 →「二采模型」的标签在第 5 行、接线点却画在第 7 行。别再动 _measureSlots。 */
+    const shiftIndex = (arr, i) => {
+        let n = 0;
+        for (let k = 0; k < i; k++) if (!H3_DESK_HIDE_SLOTS.has(arr[k].name)) n += 1;
+        return n;
+    };
 
-    const origMeasure = node._measureSlots;
-    node._measureSlots = function () {
-        const keepIn = this._concreteInputs, keepOut = this._concreteOutputs;
-        this._concreteInputs = filterHidden(keepIn);
-        this._concreteOutputs = filterHidden(keepOut);
-        const bounds = origMeasure.call(this);
-        this._concreteInputs = keepIn;
-        this._concreteOutputs = keepOut;
-        return bounds;
+    const origInputPos = node.getInputPos;
+    node.getInputPos = function (i) {
+        return origInputPos.call(this, shiftIndex(this.inputs, i));
+    };
+
+    const origOutputPos = node.getOutputPos;
+    node.getOutputPos = function (i) {
+        return origOutputPos.call(this, shiftIndex(this.outputs, i));
     };
 
     const origDrawSlots = node.drawSlots;
@@ -10465,6 +10471,8 @@ function paintDeskNode(node) {
         }
         return origDrawSlots.call(this, ctx, opts);
     };
+
+    const filterHidden = (arr) => arr.filter((s) => !H3_DESK_HIDE_SLOTS.has(s.name));
 
     const origComputeSize = node.computeSize;
     node.computeSize = function () {

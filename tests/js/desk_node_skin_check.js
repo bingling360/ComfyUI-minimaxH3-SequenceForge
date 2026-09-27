@@ -50,17 +50,23 @@ if (hide) {
     const want = ["起始视频", "起始视频音轨", "帧率", "分段图像", "分段音频"].sort();
     ok(JSON.stringify(got) === JSON.stringify(want), `免打扰名单应为 5 个端口，实际：${got.join("/")}`);
 }
-for (const h of ["node._measureSlots =", "node.drawSlots =", "node.computeSize ="]) {
+for (const h of ["node.getInputPos =", "node.getOutputPos =", "node.drawSlots =", "node.computeSize ="]) {
     ok(director.includes(h), `端口免打扰钩子缺失：${h}`);
 }
+/* 反向钉一次踩过的坑：坐标必须只在 getInputPos/getOutputPos 一处换下标。
+ * 包 _measureSlots 会让「量标签」与「画连线」各用一套下标 → 端口的接线点画到别的行去。 */
+ok(!director.includes("node._measureSlots ="),
+   "不许包 _measureSlots —— 标签与连线会各算一套坐标（二采模型错位就是这么来的）");
 ok(director.includes("paintDeskNode(node);"), "mountDeskButton 未调用 paintDeskNode");
 ok(director.includes("if (node.__h3DeskPainted) return;"), "paintDeskNode 必须幂等（重复挂会层层套娃）");
 
 /* ---------- ③ 按名字认，不按位次认 ---------- */
 ok(director.includes("H3_DESK_HIDE_SLOTS.has(s.name)"),
    "端口必须按 name 命中，不许按下标/位次认");
-ok(!/H3_DESK_HIDE_SLOTS\.has\((?!s\.name)/.test(director),
-   "H3_DESK_HIDE_SLOTS 的命中键只能是 s.name");
+ok(director.includes("H3_DESK_HIDE_SLOTS.has(arr[k].name)"),
+   "换下标那处也必须按 name 认");
+ok(!/H3_DESK_HIDE_SLOTS\.has\((?!s\.name|arr\[k\]\.name)/.test(director),
+   "H3_DESK_HIDE_SLOTS 的命中键只能是槽位名");
 
 /* ---------- ④ 反向：后端与工作流的端口一个都不许删 ---------- */
 for (const out of ['io.Int.Output("帧率")', 'io.String.Output("报告")']) {

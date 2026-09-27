@@ -102,6 +102,20 @@ DEFAULT_PERF = {
     "blocks_swap_on": False,       # 块交换总开关（关 = 恢复 baseline，不干预官方）
     "blocks_to_swap": -1,          # -1 = 跟随 profile（suggest_blocks 反解）；0..50
     "blocks_prefetch": True,       # 官方块级预取（官方深度固定 1 块，只能开关）
+    # 「显存预留」——**直接填 GB**（0 = 不干预）。2026-09-27 加。
+    #
+    # ⚠ 它与 `blocks_to_swap` 写的是**同一个 aimdo 值**（`simple_vram_headroom`），
+    # 只是单位不同：块数 × 块大小 = GB。两者都填时**以本项为准**（见 apply_blockswap），
+    # 且会在 note 里如实说明「交换块数本次未参与」。
+    #
+    # 为什么允许并存、而不是只留一个：用户真实的诉求单位是 GB
+    # （「给二采留 1GB 余量」），而块数得自己乘块大小反算（6GB 卡上块大小 ≈ 0.42GB，
+    # 想留 1GB 得填 3 块 —— 没人算得出来）。**单一真源仍在 aimdo 那一个值上**，
+    # 这里只是两种单位 + 一条写死的优先级，不会互相打架。
+    #
+    # 本项**独立于 `blocks_swap_on`**：那个开关的语义是「把块换出去」，
+    # 而本项的语义是「留出余量」，是两件事（虽然底层同一个值）。
+    "vram_reserve_gb": 0.0,
 
     # 显存：常驻
     #
@@ -119,12 +133,16 @@ DEFAULT_PERF = {
     # 参数在开关关掉时仍保留数值、只是不生效 —— 免得用户来回开关时得重填。
     # 开关本身不进指纹（它们是显存手段，不是画质手段，见 upscale._hash_params）。
     "ff_chunk_on": False,             # FFN token 分块总开关
-    # 每块 token 数（数学等价，零画质损失）。⚠ **宁大勿小**：块数 = 序列 token ÷ 此值，
-    # 而开销 ∝ 块数 —— 每个 Linear 每块都要取一次权重、同步一次流，块数一多就线性
-    # 拖慢采样。H3 常见序列 5–10 万 token，填 4096 会切出 20+ 块；16384 只需约 7 块，
-    # 单块激活代价 ≈ 16384×28672×2B ≈ 0.9GB，压峰效果依然充分。
+    # 每块 token **上限**（数学等价，零画质损失）。参数语义 = 峰值上限：
+    # 单块激活代价 = 此值 × 28672 × 2B，与序列长度无关，填一次就锁死峰值。
+    # 块数 = ⌈序列 token ÷ 此值⌉（序列只有跑到前向才知道），再按块数**均分**
+    # → 实际最大块 ≤ 此值。⚠ **宁大勿小**：开销 ∝ 块数 —— 每个 Linear 每块都要取一次
+    # 权重、同步一次流，块数一多就线性拖慢采样。H3 常见序列 5–10 万 token，
+    # 填 4096 会切出 20+ 块；32768 只需 2–4 块，单块激活代价 ≤ 1.9GB，压峰依然充分。
     # 2026-09-25 由 4096 上调：旧值是按 S=8192 设计的，与 H3 真实序列长度差一个量级。
-    "ff_chunk_tokens": 16384,
+    # 2026-09-27 等步长改均分：消掉瘦尾块（末块曾只有 848 行），峰值从「= 此值」变「≤ 此值」。
+    # 2026-09-27 由 16384 上调到 32768：块数再砍一半，换更少的权重取用与流同步。
+    "ff_chunk_tokens": 32768,
     "ff_chunk_min_tokens": 8192,      # 序列 token 低于此值不切（对齐 KJ seq_threshold 语义）
     "attn_head_on": False,            # 注意力头分块总开关
     "attn_head_chunks": 8,            # 注意力头分几组（1=关）；精确无损（2026-09-24 实测平台期起点）
@@ -138,10 +156,11 @@ DEFAULT_PERF = {
     # `frames = min(frames, chunk_frames + 2)` 只按单块算）。外面再套一层是与官方 tile
     # 叠加 → 更慢更糊、显存一点不多省。留着只会让人以为勾了有用。
     "refine_temporal_on": False,      # 精化时序分块总开关
-    "refine_temporal_chunk": 0,       # 精化每段帧数（0 = 不分块）
+    # 124 帧 ≈ 5.17 秒 = 与主链「每段时长」默认同宽（即整段不切）。0 也是「不分块」。
+    "refine_temporal_chunk": 124,
     "refine_temporal_overlap": 8,     # 段间重叠 latent token（单位：latent token，非像素）
     "refine_tile_on": False,          # 精化空间分块总开关
-    "refine_tile": "off",             # off / 2x2 / 3x3 / 4x4 / 2x1 / 1x2
+    "refine_tile": "2x1",             # off / 2x2 / 3x3 / 4x4 / 2x1（横向 2 条）/ 1x2
     "refine_tile_overlap": 32,        # 块间重叠像素
     "refine_tile_feather": 16,        # 接缝羽化宽度（像素）
 
@@ -278,6 +297,8 @@ PERF_TYPES = {
     "blocks_swap_on": (bool,),
     "blocks_to_swap": (int,),
     "blocks_prefetch": (bool,),
+    # 显存：预留（直接给 GB；与 blocks_to_swap 同一个 aimdo 值的另一种单位）
+    "vram_reserve_gb": (float, int, str),
     # 显存：分块（每类 = 开关 + 参数两件套）
     "ff_chunk_on": (bool,),
     "ff_chunk_tokens": (int,),
@@ -501,6 +522,12 @@ def suggest_blocks(unet_gb, vram_gb, block_count=H3_DOUBLE_BLOCK_COUNT,
 # Python 侧的 `EXTRA_RESERVED_VRAM`（`load_models_gpu` 的「最低必须留空」地板）同样能
 # 改变「留多少在卡上」。
 BLOCKSWAP_HEADROOM_CAP = 0.5   # 预留最多占到显存总量的这一比例（再高没有意义）
+# aimdo 的**编译期地板**：官方 `set_simple_vram_headroom` docstring 原文 ——
+# 「the measured poll term keeps its own compile time floor of 256 MB (VRAM_HEADROOM)
+#  and the budget takes the larger of the two, so raising this above 256 MB is honoured
+#  but **lowering it below 256 MB changes nothing**」。
+# 所以面板上填 0.1 / 0.2 与填 0.26 等效 —— 必须如实告诉用户，别让他以为填小了更省。
+AIMDO_HEADROOM_FLOOR_GB = 0.25
 
 # 进程启动时的预留基线：**只读一次并缓存**。第二次读到的可能已被我们自己改过，用它
 # 当基线会让「关掉开关 = 恢复原样」变成「关掉开关 = 保持我上次设的值」。
@@ -584,6 +611,47 @@ def blockswap_headroom(n_blocks, unet_gb, vram_gb, baseline_gb=0.0,
     return {"extra_gb": float(extra), "blocks_eff": eff, "clamped": clamped, "note": note}
 
 
+def reserve_headroom(want_gb, vram_gb, baseline_gb=0.0, cap=BLOCKSWAP_HEADROOM_CAP):
+    """「直接给 GB 的显存预留」→ 需要额外预留多少（**纯函数**，2026-09-27 加）。
+
+    与 `blockswap_headroom` **同一条夹取口径**（预留不可能超过显存总量；超过
+    ``vram × cap`` 的部分夹掉并如实报出），只是入口单位是 GB 而不是块数。
+
+    为什么保留同一个 cap：6GB 卡上把预留拉到 5GB 只剩 1GB 给权重与激活，
+    采样会退化成「每步全量重读」，比 OOM 还慢 —— 夹取是为了别让用户把自己
+    调死，而不是为了保守。
+
+    ⚠ **它写的是 aimdo 的 `simple_vram_headroom`（进程级），与 `--vram-headroom`
+    的「每设备 `extra_vram_headroom`」是两项独立预留**（aimdo 官方 docstring 原文：
+    "It is separate from the per device extra_vram_headroom given to init_devices()"）。
+    所以两者**不是替代关系、可以叠加**；本项胜在**运行时可写**。
+    ⚠ 官方还有一条编译期地板：实测轮询项固定 256MB，预算取两者**较大者** →
+    **填到 256MB 以下等于没填**（官方原文 "lowering it below 256 MB changes nothing"）。
+    """
+    try:
+        want = float(want_gb)
+    except (TypeError, ValueError):
+        want = 0.0
+    if want <= 0:
+        return {"extra_gb": 0.0, "clamped": False,
+                "note": "显存预留 0 —— 不额外预留（权重全部允许常驻）"}
+    if not vram_gb:
+        return {"extra_gb": 0.0, "clamped": False,
+                "note": "显存体量未探明 → 本次不干预"}
+    room = max(0.0, float(vram_gb) * float(cap) - float(baseline_gb or 0.0))
+    extra = min(want, room)
+    clamped = extra < want - 1e-9
+    note = f"显存预留 +{extra:.2f}GB"
+    if clamped:
+        note += (f"；⚠ 你要的 {want:.2f}GB 超过显存可让出的一半（{room:.2f}GB），"
+                 f"已夹到 {extra:.2f}GB")
+    elif want < AIMDO_HEADROOM_FLOOR_GB:
+        # 不是「夹取」而是「地板」：aimdo 的轮询项固定 256MB、预算取两者较大者
+        note += (f"；⚠ 低于 aimdo 的 256MB 编译期地板 → 实际生效 ≈ "
+                 f"{AIMDO_HEADROOM_FLOOR_GB:.2f}GB，填更小不会更省")
+    return {"extra_gb": float(extra), "clamped": clamped, "note": note}
+
+
 def _blockswap_baseline():
     """进程启动时的两份预留基线（**只读一次**，见 `_BS_BASELINE` 注释）。"""
     if _BS_BASELINE:
@@ -623,14 +691,18 @@ def _set_extra_reserved(headroom_gb):
 
 
 def apply_blockswap(table, hw=None):
-    """把块交换应用到当前进程 → 状态 dict（note 供报告 / 面板显示）。
+    """把块交换 / 显存预留应用到当前进程 → 状态 dict（note 供报告 / 面板显示）。
 
     - 总开关关 → **恢复 baseline**（别把上次设的值留在进程里）
     - ``blocks_to_swap = -1`` → 用 ``suggest_blocks(unet_gb, vram_gb)`` 反解真实块数
+    - ``vram_reserve_gb > 0`` → **直接按 GB 预留，优先于块数换算**（两者写的是同一个
+      aimdo 值，见 DEFAULT_PERF 里 ``vram_reserve_gb`` 那一段）。本项独立于
+      ``blocks_swap_on``：那个开关管「把块换出去」，本项管「留出余量」。
     - ``blocks_prefetch`` 是**模型侧**的（要给具体模型打包装），由
       ``upscale.install_block_prefetch`` 在拿到模型时装 —— 这里只回声，不假装做了。
 
-    返回 ``{"on","path","blocks","extra_gb","clamped","headroom_gb","applied","note"}``。
+    返回 ``{"on","path","blocks","reserve_gb","extra_gb","clamped","headroom_gb",
+    "applied","note"}``。
     """
     t = dict(table or {})
     hw = hw or {}
@@ -649,17 +721,39 @@ def apply_blockswap(table, hw=None):
         n = suggest_blocks(hw.get("unet_gb"), hw.get("vram_total_gb"))
     out["blocks"] = n
 
+    # 「显存预留」直接给 GB：与 blocks_to_swap 写的是**同一个 aimdo 值**，
+    # 两者都填时**本项优先**（理由见 DEFAULT_PERF 里那一段）。
+    # ⚠ 本项**独立于** `blocks_swap_on` —— 那个开关的语义是「把块换出去」，
+    # 本项的语义是「留出余量」，是两件事（虽然底层是同一个值）。
+    try:
+        reserve_gb = max(0.0, float(t.get("vram_reserve_gb") or 0.0))
+    except (TypeError, ValueError):
+        reserve_gb = 0.0
+    out["reserve_gb"] = reserve_gb
+
     if st["path"] == "aimdo":
         base_gb = base.get("aimdo_gb")
         if base_gb is None:
             out["note"] = "读不到 aimdo 当前显存预留（版本不支持读回）→ 未干预"
             return out
         target = float(base_gb)
-        if out["on"] and n > 0:
-            pl = blockswap_headroom(n, hw.get("unet_gb"), hw.get("vram_total_gb"), base_gb)
-            # 算不出目标就别写：面板打开时拿不到 UNET 体量（没加载模型），此时若照
+        if reserve_gb > 0:
+            # 「显存预留」优先：直接给 GB，**跳过块数换算**（见 DEFAULT_PERF 说明）
+            pl = reserve_headroom(reserve_gb, hw.get("vram_total_gb"), base_gb)
+            # 算不出目标就别写：面板打开时拿不到显存体量（没加载模型），此时若照
             # 「extra=0」去写，会把上一次渲染设好的预留**悄悄抹掉** —— 读接口不该
             # 改进程状态。
+            if pl["extra_gb"] <= 0:
+                out["note"] = pl["note"]
+                return out
+            target = base_gb + pl["extra_gb"]
+            out.update(extra_gb=pl["extra_gb"], clamped=pl["clamped"],
+                       blocks=0, note=pl["note"])
+            if out["on"]:
+                out["note"] += "；⚠ 已按「显存预留」计算，「交换块数」本次未参与"
+        elif out["on"] and n > 0:
+            pl = blockswap_headroom(n, hw.get("unet_gb"), hw.get("vram_total_gb"), base_gb)
+            # 算不出目标就别写（同上）
             if pl["blocks_eff"] <= 0:
                 out["note"] = pl["note"]
                 return out
@@ -673,7 +767,9 @@ def apply_blockswap(table, hw=None):
             return out
         out["applied"] = True
         out["headroom_gb"] = got
-        if not out["on"]:
+        if reserve_gb > 0:
+            out["note"] += f"；aimdo 预留现为 {got:.2f}GB（读回核验）"
+        elif not out["on"]:
             out["note"] = f"关闭 → 已恢复进程启动时的预留（{got:.2f}GB）"
         elif n <= 0:
             out["note"] = f"交换块数 0 → 预留保持基线 {got:.2f}GB，权重全允许常驻"
@@ -687,7 +783,17 @@ def apply_blockswap(table, hw=None):
         out["note"] = "拿不到 ComfyUI 的预留基线 → 未干预"
         return out
     target = float(base_gb)
-    if out["on"] and n > 0:
+    if reserve_gb > 0:
+        pl = reserve_headroom(reserve_gb, hw.get("vram_total_gb"), base_gb)
+        if pl["extra_gb"] <= 0:         # 同上：算不出目标 → 不写（读接口不许改状态）
+            out["note"] = pl["note"]
+            return out
+        target = base_gb + pl["extra_gb"]
+        out.update(extra_gb=pl["extra_gb"], clamped=pl["clamped"],
+                   blocks=0, note=pl["note"])
+        if out["on"]:
+            out["note"] += "；⚠ 已按「显存预留」计算，「交换块数」本次未参与"
+    elif out["on"] and n > 0:
         pl = blockswap_headroom(n, hw.get("unet_gb"), hw.get("vram_total_gb"), base_gb)
         if pl["blocks_eff"] <= 0:       # 同上：算不出目标 → 不写（读接口不许改状态）
             out["note"] = pl["note"]
@@ -701,8 +807,9 @@ def apply_blockswap(table, hw=None):
         return out
     out["applied"] = True
     out["headroom_gb"] = got
+    _did = reserve_gb > 0 or (out["on"] and n > 0)
     tail = (f"本机无 DynamicVRAM（legacy ModelPatcher）：已把 ComfyUI 的「最低留空」"
-            f"设成 {got:.2f}GB —— 装不下时由它按模块流动" if (out["on"] and n > 0)
+            f"设成 {got:.2f}GB —— 装不下时由它按模块流动" if _did
             else f"本机无 DynamicVRAM：已恢复 ComfyUI 预留基线（{got:.2f}GB）")
     out["note"] = (out["note"] + "；" if out["note"] else "") + tail
     return out
@@ -818,14 +925,22 @@ def resolve_encoder(name, cq=20, crf=20):
 # ---- FFN 分块 ----
 
 def plan_ff_chunks(tokens, chunk_tokens):
-    """把 `tokens` 个 token 按 `chunk_tokens` 切块 -> 边界列表 [[s,e), ...]。
+    """把 `tokens` 个 token 切成若干块 -> 边界列表 [[s,e), ...]。
+
+    块数 K = ⌈tokens / chunk_tokens⌉（`chunk_tokens` 是**每块上限**），再按 K **均分**
+    （前 `tokens % K` 块各多 1 行）→ 两条不变量：**最大块 ≤ chunk_tokens**、**块大小差 ≤ 1**。
+
+    为什么是均分，而不是「每块凑满 chunk_tokens、尾巴兜底」（KJ 的 `torch.chunk` 也是均分）：
+    等步长必然留瘦尾块（50000 ÷ 16384 的末块只有 848 行），而它照样要付一次
+    「取权重 + 同步流」——块数一块没少，却有一块 kernel 根本打不满。均分下块数不变、
+    最大块从「= c」变成「≤ c」（峰值更低）、每块都吃得饱。
 
     chunk_tokens<=0 / 非法 -> **单块**（等价于不分块）；tokens<=0 -> []。
     纯函数，零 torch 依赖：接线端（upscale/nodes）只拿边界，自己切片。
 
     为什么分块能救 OOM：主干 OOM 实测崩在 FFN 的 `F.linear(x, down)`（rank256
     中间张量）+ `F.linear(…, up)`（满 hidden 输出），**单次请求 6.13GB**。
-    这两步沿 token 维完全可分离 —— 切块后每块的中间张量降到 1/n，
+    这两步沿 token 维完全可分离 —— 切块后每块的中间张量降到 1/K，
     数学结果与不分块逐位相同（**唯一**的有代价项只是 GPU 利用率略降）。
     """
     try:
@@ -837,10 +952,8 @@ def plan_ff_chunks(tokens, chunk_tokens):
         return []
     if c <= 0:
         return [(0, n)]
-    out = []
-    for s in range(0, n, c):
-        out.append((s, min(n, s + c)))
-    return out
+    # 块数只由「上限」定，大小交给 `_split`（本模块**唯一**的均分实现）
+    return _split(n, -(-n // c))
 
 
 # ---- 精化时序分块（扩散采样循环的切段）----
@@ -1354,7 +1467,7 @@ RUNTIME_LATER_KEYS = (
     "upscale_temporal_chunk", "upscale_chunk_frames", "upscale_overlap",
     "refine_temporal_on", "refine_temporal_chunk", "refine_temporal_overlap",
     "refine_tile_on", "refine_tile", "refine_tile_overlap", "refine_tile_feather",
-    "blocks_swap_on", "blocks_to_swap", "blocks_prefetch",
+    "blocks_swap_on", "blocks_to_swap", "blocks_prefetch", "vram_reserve_gb",
     "keep_upscaler_resident", "vram_shuffle",
     "final_mode", "frames_dtype", "guard_action", "nvenc_cq", "encode_hq",
     "x264_crf",
@@ -1932,13 +2045,19 @@ def vram_slack_hint(peak_gb, total_gb):
     return None
 
 
-def vram_headroom_advice(hw, policy=None):
+def vram_headroom_advice(hw, policy=None, reserve_gb=0.0):
     """余量策略是否「有风险」——有则回一行可执行的中文建议，否则 None。
 
     纯函数（只吃 dict）。判定刻意保守：**只有「DynamicVRAM 开着 + headroom 为 0
     + 没给 --reserve-vram」同时成立**才提示。这三条都满足时，0.35 的默认行为会
     把显存吃到接近 100%，靠 `unload_all_models()` 这类手动腾挪才勉强活下来
     ——那正是本项目二采路径一堆腾挪代码的由来。
+
+    ``reserve_gb``（2026-09-27 加）：**面板「显存预留」当前设的值**。它不是启动
+    参数，所以**不改判定**（上面三项确实仍然缺），但必须在建议里说清楚 —— 否则
+    用户已经留了 1GB、报告却还在喊「建议加 --vram-headroom 1」，会以为自己的
+    设置没生效。两者是 aimdo 的**两项独立预留**（进程级 simple budget vs 每设备
+    extra_vram_headroom，官方 docstring 原文 "separate"），**可叠加、不互相替代**。
     """
     if not policy or not policy.get("dynamic_vram"):
         return None
@@ -1949,14 +2068,29 @@ def vram_headroom_advice(hw, policy=None):
     bits = []
     if policy.get("comfy_compiler"):
         bits.append("Comfy 编译器在跑（0.35 新增，官方定位就是拉高 H3 显存利用率）")
+    try:
+        _rsv = float(reserve_gb or 0.0)
+    except (TypeError, ValueError):
+        _rsv = 0.0
+    if _rsv > 0:
+        tail = (f"⚠ 你已用面板的「显存预留」在运行时段留了 {_rsv:g}GB —— 那是 aimdo 的"
+                f"**进程级 simple budget**，与 `--vram-headroom` 的**每设备**预留是"
+                f"**两项独立预留**（官方 docstring 原文 separate），不能互相替代："
+                f"启动再加 `--vram-headroom 1` 仍能把余量再抬一档。")
+    else:
+        tail = ("建议启动加 `--vram-headroom 1`；仍不稳再加 `--disable-comfy-compiler`"
+                "（实测显存 100% → ~77%，代价约 5% 耗时）。"
+                "⚠ 不想重启也能先救：面板的「显存预留（GB，直接填）」写的是 aimdo "
+                "**运行时可写**的进程级预留，改完立即生效。"
+                "注意：运行时改 EXTRA_RESERVED_VRAM 的第三方节点只影响 Python 侧记账，"
+                "盖不到 aimdo 原生预留。")
     return ("⚠ 显存余量策略为默认：DynamicVRAM 已启用但 `--vram-headroom` 为 0、"
             "也未给 `--reserve-vram`——0.35 起显存会被吃到接近 100%，二采"
             "（高清采样 + 放大网络）最先炸。"
             + ("；".join(bits) + "。" if bits else "")
-            + "建议启动加 `--vram-headroom 1`；仍不稳再加 `--disable-comfy-compiler`"
-              "（实测显存 100% → ~77%，代价约 5% 耗时）。"
-              "注意：运行时改 EXTRA_RESERVED_VRAM 的第三方节点只影响 Python 侧记账，"
-              "盖不到 aimdo 原生预留。")
+            + tail)
+
+
 # ---- 启动参数体检（**只读**）----
 #
 # ⚠ 为什么是「只读 + 给一行命令」而不是做成面板开关（2026-09-27 定，别再试图接线）：

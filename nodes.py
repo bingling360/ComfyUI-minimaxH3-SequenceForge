@@ -2077,8 +2077,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         print("[H3性能] 落盘守卫=block：本次运行的二采精化前全卸已禁用"
                               "（无 swap 机器上全卸会被 OOM killer 杀掉）", flush=True)
                 # 余量策略：0.35 起 DynamicVRAM 会把显存吃到接近 100%，
-                # 二采这种「同卡再插一段高清采样」最先炸——先把根因说清楚
-                _hr_msg = perf.vram_headroom_advice(_hw, _hw.get("vram_policy")) or ""
+                # 二采这种「同卡再插一段高清采样」最先炸——先把根因说清楚。
+                # ⚠ 要把**面板当前设的「显存预留」**一起传进去（2026-09-27）：否则
+                # 用户已经运行时段留了 1GB，报告还在喊「建议加 --vram-headroom 1」，
+                # 会以为自己的设置没生效（两者是 aimdo 的两项独立预留，可叠加）。
+                _hr_msg = perf.vram_headroom_advice(
+                    _hw, _hw.get("vram_policy"), _pf.get("vram_reserve_gb") or 0.0) or ""
                 if _hr_msg:
                     print(f"[H3性能] 余量策略：{_hr_msg}", flush=True)
                 # 显存预算账：主动留空多少 / 能给权重缓存多少 / 每步要重读多少。
@@ -2112,9 +2116,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 头分块一起装。
                 _bs = perf.apply_blockswap(_pf, _hw)
                 _bs_note = ""
-                if _bs["on"]:
+                # ⚠ 条件是 `on or reserve_gb`，不能只写 `on`（2026-09-27 修）：
+                # 「显存预留（直接填 GB）」**独立于块交换开关** —— 只写 `on` 会让
+                # 这个新旋钮生效时**日志完全静默**，用户改了看不到任何反馈。
+                if _bs["on"] or _bs.get("reserve_gb"):
                     _bs_note = _bs["note"]
-                    print(f"[H3性能] 块交换：{_bs_note}", flush=True)
+                    _tag = "显存预留" if _bs.get("reserve_gb") else "块交换"
+                    print(f"[H3性能] {_tag}：{_bs_note}", flush=True)
                 # 落盘：被 OOM kill 时 stdout 可能一起没了，JSONL 是唯一留存
                 perf.emit({"kind": "overview", "line": _line,
                            "guard": _guard_msg, "headroom": _hr_msg,
@@ -3032,7 +3040,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seg_prompts[it[1]] for it in exec_items]
         thumbs, videos, seams, bridge_scores = [], [], [], []
         all_frames = []
-        seg_frames = []
         seg_wavs = []
         trims = []
         seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
@@ -3115,10 +3122,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seams.append(None)
             bridge_scores.append(None)
             seam_metrics_rows.append(None)
-            # 双列表共享同一份 CPU 帧（全程只读），长链累积内存减半
+            # 全链帧只此一份：它就是「等拼成片」的唯一持有者（float32 时即原帧
+            # 本身；uint8 时是量化后的副本）——别再另存一份，否则 ¼ 的收益被抵掉
             _cf = pframes.cpu()
             all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
-            seg_frames.append(_cf)
             seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
             all_wav = pwav.cpu()
             prev_tail_frame = pframes[-1].cpu()
@@ -3612,8 +3619,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 帧存 uint8（内存 ×¼）：全链帧 tensor 是内存峰值的大头（D3：
             # 8 段 ×107 帧 1312×736 = 9.9GB）。接缝测量用的是同一份 float 帧
             # （prev_tail_* / metrics），不受影响——uint8 只进「等拼成片」的那一份。
+            # ⚠ 这一份必须是全链帧的**唯一**持有者：以前另有 seg_frames 列表存
+            # 同一份 float 帧（只被 len() 用），uint8 开着时那份 float 没省掉、
+            # 白加一份 uint8 副本 → 常驻反而 1.25×。已删，勿复活。
             all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
-            seg_frames.append(_cf)
             seg_wav = wav.cpu()
             seg_wavs.append({"waveform": seg_wav, "sample_rate": sample_rate})
             all_wav = seg_wav if all_wav is None else torch.cat([all_wav, seg_wav], dim=-1)
@@ -3775,7 +3784,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                        "trims": trims}, done),
             })
             if review:
-                if len(seg_frames) == _final_segs:
+                if len(all_frames) == _final_segs:
                     report.append("审片：本链已全部完成")
                 if reroll > 0:
                     report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
@@ -3799,7 +3808,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 禁用段两路同口径剔除：高清拼接传 skip_slots，内存帧本就不含禁用段
         if autosave_final:
             if not (up_cfg and upscale.try_final(root, up_cfg, report, skip_slots=_off_slots)):
-                if _redo_started and len(seg_frames) < _final_segs:
+                if _redo_started and len(all_frames) < _final_segs:
                     # 重摇审片中段 break：内存帧只有已处理段，编码会产出半截成片污染
                     # finals；重摇段 mp4 已覆盖、保留段沿用，全部分段都在盘——下次
                     # 全链运行（redo 队列清空）自动重拼全片，或用合并导出即时取片

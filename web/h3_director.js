@@ -4017,7 +4017,13 @@ const OPT_PROVIDERS = {
  * 「一采的、放大的、精化的」分散在三个地方，用户想找「我现在卡在哪一段」时
  * 无从下手。改成按**处理阶段**分，与用户脑子里的模型一致。
  *
- * 一级阶段：一采采样 → VAE 解码 → 放大网络 → 精化二采 → 成片与编码 → 通用与机器
+ * 一级阶段：全局分块 → 放大网络 → 精化二采 → 成片与编码 → 通用与机器
+ *
+ * ⚠ 「全局分块」是**唯一不按处理链阶段**分的一级 —— 2026-09-27 由「一采采样」
+ * 改名而来，因为里面的东西**一采二采都在用**，挂在「一采」名下会误导：
+ *   · FFN / 注意力头分块：`nodes.py` 会把它们**同时装到一采模型和二采模型**上；
+ *   · 块交换 / 显存预留：写的是进程级的 aimdo 预留，与阶段无关。
+ * 所以这里按「作用范围」命名，其余四个仍按阶段。
  * 二级用途：分块 / 注意力 / 权重流动 / 自救 …
  *
  * 每条一级标题带 stage 元信息：
@@ -4033,7 +4039,7 @@ const OPT_PROVIDERS = {
 /* 阶段元信息表：一级标题 -> { 说明, 生效时机 }。
  * 为什么不写在字段的 group 里：那时 6 个阶段会重复出现 30 次，改一处要改 30 行。 */
 const H3_PERF_STAGES = {
-    "一采采样": { when: "下次渲染", note: "主干扩散采样：UNET 权重流动 + FFN / 注意力的显存峰值" },
+    "全局分块": { when: "下次渲染", note: "一采与二采共用的显存手段：FFN / 注意力分块 + 权重流动与显存预留" },
     "放大网络": { when: "下次渲染", note: "潜空间神经放大（T 不变，只放大 H/W）+ 网络的加载常驻" },
     "精化二采": { when: "下次渲染", note: "在高清 latent 上低步数重采样：细节增益与接缝的主要来源" },
     "成片与编码": { when: "混合", note: "全链帧合成与 mp4 编码；编码器改动**立即生效**" },
@@ -4041,19 +4047,21 @@ const H3_PERF_STAGES = {
 };
 
 const H3_PERF_FIELDS = [
-    /* ═══ ① 一采采样 ═══ */
-    { key: "ff_chunk_on", label: "FFN 分块（Chunk FeedForward）", kind: "bool", group: "一采采样 · 分块",
+    /* ═══ ① 全局分块（一采 + 二采共用）═══ */
+    { key: "ff_chunk_on", label: "FFN 分块（Chunk FeedForward）", kind: "bool", group: "全局分块 · FFN",
       hint: "按 token 切块算 MLP —— **主干 OOM 正崩在这里**（HyperFlow bypass 单次请求 6.13GB，占 24GB 卡的 26%）。"
           + "`nn.Linear` 沿 token 行可分离，所以**数学等价、零画质损失**，是本项目唯一无损的分块。装之前会先自测，不一致就不装" },
-    { key: "ff_chunk_tokens", label: "　　每块 token 数", kind: "num", enable: "ff_chunk_on", group: "一采采样 · 分块",
-      hint: "切成多大一块。**块数 = 序列 token ÷ 此值**，而开销 ∝ 块数 —— 每个 Linear 每块都要取一次权重、"
-          + "同步一次流，块数一多就线性拖慢采样。所以**宁大勿小**：H3 常见序列 5–10 万 token，"
-          + "填 4096 会切出 20 多块。显存代价 = 每块 token × 28672 × 2 字节（16384 ≈ 0.9GB）。"
-          + "建议 16384 起，还 OOM 再减半；实际块数会在日志里打出来（`[H3分块] FFN 实际切块`）。"
-          + "⚠ 单位是「每块的 token 数」，与 KJNodes 的「切成几份」不是同一口径" },
-    { key: "ff_chunk_min_tokens", label: "　　低于多少 token 不切", kind: "num", enable: "ff_chunk_on", group: "一采采样 · 分块",
+    { key: "ff_chunk_tokens", label: "　　每块 token 上限", kind: "num", enable: "ff_chunk_on", group: "全局分块 · FFN",
+      hint: "单块最多吃多少 token —— 这就是**峰值上限**（与序列长度无关，填一次锁死峰值）。"
+          + "块数 = ⌈序列 token ÷ 此值⌉，再按块数**均分**（实际每块还比它小一点，也不会留瘦尾块）。"
+          + "**宁大勿小**：开销 ∝ 块数 —— 每个 Linear 每块都要取一次权重、同步一次流，"
+          + "块数一多就线性拖慢采样。H3 常见序列 5–10 万 token，填 4096 会切出 20 多块。"
+          + "显存代价 ≤ 此值 × 28672 × 2 字节（32768 ≈ 1.9GB）。"
+          + "默认 32768（5–10 万 token 只切 2–4 块），还 OOM 再减半；实际块数会在日志里打出来（`[H3分块] FFN 实际切块`）。"
+          + "⚠ 单位是「每块的 token 上限」，与 KJNodes 的「切成几份」不是同一口径" },
+    { key: "ff_chunk_min_tokens", label: "　　低于多少 token 不切", kind: "num", enable: "ff_chunk_on", group: "全局分块 · FFN",
       hint: "短序列切块只增加开销、省不了多少。序列 token 数低于此值就整段直通（对齐 KJNodes 的 seq_threshold，其默认 4096）" },
-    { key: "attn_head_on", label: "注意力头分块（Low VRAM Attention）", kind: "bool", group: "一采采样 · 注意力",
+    { key: "attn_head_on", label: "注意力头分块（Low VRAM Attention）", kind: "bool", group: "全局分块 · 注意力",
       hint: "把注意力按 head 分组逐组算。**head 之间独立 → 分组本身精确无损**；装之前会自测（拿小输入跑"
           + "「分组 vs 整段」对比），不一致就不装。收益**完全取决于后端内核**："
           + "**int8 kitchen 内核下实测有效** —— S=8192 时省 25.7% 的 kernel 临时量、耗时与整段持平"
@@ -4061,28 +4069,45 @@ const H3_PERF_FIELDS = [
           + "（**未实测**），此时主要是多 n 次 kernel 调用的开销。"
           + "⚠ 要拿 kitchen 收益必须**启动加 `--use-ck-attention` 并重启** —— 面板的「Attention 后端」只在"
           + "已加载的后端之间切换，切不到它" },
-    { key: "attn_head_chunks", label: "　　切成几组头", kind: "num", enable: "attn_head_on", group: "一采采样 · 注意力",
+    { key: "attn_head_chunks", label: "　　切成几组头", kind: "num", enable: "attn_head_on", group: "全局分块 · 注意力",
       hint: "把注意力按 head 分组逐组算：kernel 内部的临时量（int8 q/k 副本、fp32 累加器）按组数缩小，"
           + "融合 qkv buffer 也被拆成小组随用随放 —— **省的就是这两处**。1=关，上限 = 头数。"
           + "⚠ 下面这组实测的前提是 **int8 kitchen 内核**：8 组省 25.7%、耗时与整段持平，14 组只多省 1.5 个点"
           + "（S=8192）→ 8 是平台期起点。⚠ 默认 sdpa 后端下这两处收益**未实测**，见上面总开关的说明。"
           + "数学等价（head 之间独立），装前自测不一致就不装。移植自 KJNodes MiniMaxLowVRAMAttention" },
-    { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "一采采样 · 注意力",
+    { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "全局分块 · 注意力",
       opts: [["auto", "跟随 ComfyUI（推荐）"], ["sdpa", "sdpa"], ["sage", "SageAttention"], ["flash", "FlashAttention"]],
       hint: "auto = 不动。Sage 在 30 系上有失败报告；环境里拿不到该后端时会保持现状而不是置空" },
-    { key: "blocks_swap_on", label: "块交换（Blockswap）", kind: "bool", group: "一采采样 · 权重流动",
-      hint: "**显存装不下时的活路**：让 block 权重在 GPU / CPU 之间流动起来。"
+    { key: "blocks_swap_on", label: "块交换（Blockswap）", kind: "bool", group: "全局分块 · 权重流动",
+      hint: "★ 二采 OOM 时**先看下面那项「显存预留（GB，直接填）」** —— 那个更直观，"
+          + "也不必先开这个开关。本项管的是「把块换出去」：打开后按「交换块数」折算成"
+          + "显存预留交给 aimdo；两者写的是**同一个 aimdo 值**（`simple_vram_headroom`）。"
+          + "**它本身也是显存装不下时的活路**：让 block 权重在 GPU / CPU 之间流动起来。"
           + "H3 = 50 个 double block，每块 ≈ 0.4GB —— 6GB 卡只放得下约 13 块，靠它才能跑起来。"
           + "**它换的是显存、代价是时间**（每块每次前向都要来回搬一趟），装得下（≥24GB 卡）就别开。"
           + "⚠ 本项接的是 **ComfyUI 官方**的块级流动（DynamicVRAM 的 vbar 换入 + 官方 block 循环里的预取队列），"
           + "插件**不自己搬权重**：手工搬会与官方按需换入抢同一批参数、并打坏 LoRA 的权重账。"
           + "开关的作用是把下面「交换块数」折算成**显存预留**交给 aimdo —— 抬高预留 = 逼官方把更多块换出去" },
     { key: "blocks_to_swap", label: "　　交换块数（0–50）", kind: "num", enable: "blocks_swap_on",
-      autoWhen: -1, group: "一采采样 · 权重流动",
+      autoWhen: -1, group: "全局分块 · 权重流动",
       hint: "放出多少块到 CPU，等价于「多留出 N × 每块大小 的显存」。参考：16GB→19–25 块；12GB→31–38；8GB→44–50。"
           + "-1 = 跟随档位（按本机**真实 UNET 体量**反解，只有渲染开始拿到模型时才算得准）。"
-          + "⚠ 会被**夹取**：预留不可能超过显存总量，超过「显存一半」的部分会被夹掉并在报告行里说明" },
-    { key: "blocks_prefetch", label: "　　块级预取", kind: "bool", group: "一采采样 · 权重流动",
+          + "⚠ 会被**夹取**：预留不可能超过显存总量，超过「显存一半」的部分会被夹掉并在报告行里说明。"
+          + "⚠ 本项与下面的「显存预留」写的是**同一个 aimdo 值**，两者都填时**以「显存预留」为准**"
+          + "（理由：想留 1GB 得先自己乘块大小反算块数，没人算得出来）" },
+    { key: "vram_reserve_gb", label: "显存预留（GB，直接填）", kind: "num", step: 0.5,
+      group: "全局分块 · 权重流动",
+      hint: "★ **二采 OOM 时最该先动的一项**：直接按 GB 留出显存，**改完立即生效、不用重启**。"
+          + "0 = 不干预（默认）。建议：6GB 卡先给 **1**，还 OOM 再给 1.5。"
+          + "它写的是 aimdo 的 `simple_vram_headroom`（**进程级**那一项），也就是 `--reserve-vram` 多喂的"
+          + "那一处 —— 官方 docstring 明确它与 `--vram-headroom` 的**每设备** `extra_vram_headroom`"
+          + "**是两项独立预留**，所以两者**不互相替代、可以叠加**；本项胜在**运行时可写**。"
+          + "⚠ 与上面「交换块数」是**同一个值的两种单位**，两个都填时以本项为准。"
+          + "⚠ 会被**夹取**到「显存的一半」以内 —— 留太多会让权重只剩一点点地方、"
+          + "采样退化成每步全量重读，比 OOM 还慢。"
+          + "⚠ 官方还有一条 256MB 的**编译期地板**：填到 0.25 以下等于没填（不会更省）。"
+          + "实际生效值在日志的 `[H3性能] 显存预留：…` 行里读回核验" },
+    { key: "blocks_prefetch", label: "　　块级预取", kind: "bool", group: "全局分块 · 权重流动",
       hint: "提前把下一块搬上来，用搬运的空闲时间盖住一部分开销（**本项独立生效，不受总开关影响**"
           + " —— 官方那套块级流动不管总开关开不开都在跑）。"
           + "⚠ 只能是开关：官方预取队列的深度写死为「提前 1 块」，**没有「预取 N 块」这个旋钮**。"
@@ -4108,7 +4133,7 @@ const H3_PERF_FIELDS = [
           + "那个是纯前馈（一次 forward，切开算再融合即可）；这个是**扩散采样循环**，段与段之间没有注意力交互 → "
           + "接缝两侧各自收敛到不同局部解 → **接缝逐帧闪烁**（不是一条静止的缝）。必须配合接缝医生" },
     { key: "refine_temporal_chunk", label: "　　每段帧数", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
-      hint: "0=关。每段多少帧。越小越省显存，接缝也越多。建议先给 16–24（一段 5 秒 ≈ 120 帧 → 5–8 段）" },
+      hint: "0=关。每段多少帧。越小越省显存，接缝也越多。默认 124 ≈ 5.17 秒（与主链「每段时长」默认同宽，等于整段不切）；想切细再给 16–24（一段 5 秒 ≈ 120 帧 → 5–8 段）" },
     { key: "refine_temporal_overlap", label: "　　段间重叠（latent token）", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
       hint: "**单位是 latent token，不是像素**（与下面空间那个 overlap 不是一个量纲）。至少 8，不够会明显闪烁。"
           + "视频模型的 latent 时间压缩比通常为 4 或 8，所以 8 个 latent token 约等于 32–64 帧" },
@@ -4362,8 +4387,16 @@ async function openPerfSettings() {
     }
     for (const head of tree) {
         const total = head.subs.reduce((a, s) => a + s.fields.length, 0);
+        /* ★ 接线 H3_PERF_STAGES（2026-09-27 修，之前定义了从未渲染）：
+         * 徽章是「什么时候生效」（立即 / 下次渲染），note 是「这一段在干什么」——
+         * 之前都只活在源码注释里。挂到 summary 里 + summary 下面。 */
+        const stage = H3_PERF_STAGES[head.name] || null;
+        const badge = stage && stage.when
+            ? `<span class="h3d-perf-stage-when">${escapeHtml(stage.when)}</span>` : "";
+        const note = stage && stage.note
+            ? `<div class="h3d-perf-stage-note">${escapeHtml(stage.note)}</div>` : "";
         const group = foldSection("perf-g-" + head.name, true,
-            "<summary>" + escapeHtml(head.name) + "<small>" + total + " 项</small></summary>");
+            `<summary>${escapeHtml(head.name)}${badge}<small>${total} 项</small></summary>` + note);
         group.classList.add("h3d-perf-group");
         body.append(group);
         for (const sub of head.subs) {
@@ -4404,6 +4437,11 @@ async function openPerfSettings() {
                 } else {
                     ctl = document.createElement("input");
                     ctl.type = "number";
+                    /* step：分块类都是整数（不写 = 默认 step 1），但「显存预留」要小数。
+                     * 不写 step 的 number 框默认 step=1，输 1.5 会被判 :invalid
+                     * （`value` 仍读得到，但浏览器画红框、上下箭头也跳不动）→
+                     * 让字段表能按需指定步进。 */
+                    if (f.step != null) ctl.step = String(f.step);
                     ctl.value = String(draft[f.key] ?? 0);
                 }
                 /* 开关两件套（f.enable 绑定一个 bool 开关 key）：开关关掉时参数控件
@@ -4454,8 +4492,7 @@ async function openPerfSettings() {
                 row.append(top);
                 if (f.hint) {
                     /* 说明里的 **强调** 转真加粗：原实现当纯文本渲染，星号直接露在界面上 */
-                    row.append(el("div", "h3d-perf-hint",
-                        String(f.hint).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")));
+                    row.append(el("div", "h3d-perf-hint", mdBold(f.hint)));
                 }
                 host.append(row);
             }
@@ -6397,6 +6434,13 @@ function injectStyles() {
     .h3d-perf-body .h3d-perf-group[open]>summary{border-bottom:1px solid #302c25;color:var(--h3d-copper)}
     .h3d-perf-body .h3d-perf-group[open]>summary::before{transform:rotate(90deg)}
     .h3d-perf-body .h3d-perf-group>summary small{margin-left:auto;font-size:11px;font-weight:400;color:var(--h3d-muted)}
+    /* ★ H3_PERF_STAGES 接线（2026-09-27 加）—— 见文件头那块注释。
+     * 徽章「下次渲染 / 立即 / 混合」放在 summary 里、标题和 N 项之间；note 是
+     * 「这一段在干什么」一句话说明，放在 summary 下面、字段之上。 */
+    .h3d-perf-body .h3d-perf-group>summary .h3d-perf-stage-when{display:inline-block;font-size:10.5px;padding:1px 6px;margin-left:8px;border-radius:3px;background:#2d333b;color:#cdd9e1;font-weight:500;letter-spacing:.2px}
+    .h3d-perf-body .h3d-perf-group>.h3d-perf-stage-note{font-size:11.5px;color:#909dab;line-height:1.55;padding:6px 12px 9px;border-bottom:1px solid #302c25;background:#191612}
+    /* 启动参数体检：「★ 复制下面这一行」那个提示（2026-09-27 加） */
+    .h3d-perf-args-hint{margin:6px 0 4px;font-size:11.5px;color:var(--h3d-bone);font-weight:500}
     .h3d-perf-body .h3d-perf-sub{border:0;border-left:2px solid #302c25;border-radius:0;background:transparent;margin:0 0 0 10px}
     .h3d-perf-body .h3d-perf-sub>summary{display:flex;align-items:center;gap:7px;padding:7px 10px;font-size:11.5px;font-weight:600;color:var(--h3d-muted)}
     .h3d-perf-body .h3d-perf-sub>summary::before{content:"▸";font-size:9px;color:#5f5a4f;transition:transform .15s}

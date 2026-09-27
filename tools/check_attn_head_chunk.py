@@ -237,12 +237,43 @@ def main():
     check("n > heads 时按 heads 夹住", t_clamp)
 
     # ⑤ 自测：干净的通过
-    check("装前自测：干净 attn 通过", lambda: (
-        _assert(up._attn_head_selfcheck(StubAttention(), 4) is True, "自测该通过")))
+    #    ⚠ 2026-09-27 起 `_attn_head_selfcheck` 返回 `(ok, why)`（旧版只返回 bool）。
+    #    改签名的原因见 upscale 里的注释：旧版把「跑不起来」和「结果不等价」都
+    #    压成 False，导致输入维写错被误报成「含跨 head 操作」。这里锁住新行为。
+    check("装前自测：干净 attn 通过（(True, \"\")）", lambda: (
+        _assert(up._attn_head_selfcheck(StubAttention(), 4) == (True, ""),
+                "自测该通过且不给理由")))
 
-    # ⑥ 自测：跨 head 的拒绝
-    check("装前自测：跨 head 耦合被拒绝", lambda: (
-        _assert(up._attn_head_selfcheck(CrossHeadAttention(), 4) is False, "自测该拒绝")))
+    # ⑥ 自测：跨 head 的拒绝（理由必须指明是「跨 head」这一档）
+    check("装前自测：跨 head 耦合被拒绝且理由指明跨 head", lambda: (
+        _assert(up._attn_head_selfcheck(CrossHeadAttention(), 4)[0] is False, "自测该拒绝"),
+        _assert("跨 head" in up._attn_head_selfcheck(CrossHeadAttention(), 4)[1],
+                "拒绝理由该指出跨 head")))
+
+    # ⑥b ★ 回归：`hidden != heads * head_dim` 时自测**仍必须通过**。
+    #     2026-09-27 真 bug：旧实现拿 `heads * head_dim` 当输入维，只有
+    #     `hidden == heads * head_dim` 时才碰巧对 —— 而 ⑤ 的桩 `hidden=64/
+    #     heads=8/head_dim=8` 恰好 `8*8 == 64`，所以这条回归**只有换一个
+    #     hidden ≠ inner 的桩才能暴露**。真 H3 主干是 5376 vs 7168。
+    def t_hidden_ne_inner():
+        attn = StubAttention(hidden=96, heads=8, head_dim=8)     # 96 ≠ 8*8
+        assert attn.qkv_proj.in_features == 96, "桩没造对"
+        ok, why = up._attn_head_selfcheck(attn, 4)
+        assert ok, f"hidden≠heads×head_dim 时自测该通过，实际被拒：{why}"
+        # 顺带验等价性（自测通过的前提下，分组确实逐元素等于整段）
+        x = torch.randn(6, 96)
+        assert torch.allclose(up._attn_forward_chunked(attn, x, None, 4), attn(x),
+                              atol=1e-5, rtol=1e-5), "hidden≠inner 时分组不等价"
+    check("回归：hidden ≠ heads×head_dim（真 H3 口径）自测仍通过", t_hidden_ne_inner)
+
+    # ⑥c 回归：探针取不到输入维 → 拒绝，且**不能**悄悄回退到 heads*head_dim
+    def t_no_inf():
+        attn = StubAttention()
+        del attn.qkv_proj
+        ok, why = up._attn_head_selfcheck(attn, 4)
+        assert ok is False, "取不到输入维该拒绝"
+        assert "输入维" in why, f"理由该说输入维，实际：{why}"
+    check("回归：取不到 qkv_proj 输入维 → 拒绝并说明", t_no_inf)
 
     # ⑦ 关闭语义
     check("n<=1 / None = 关（返回 (0, \"\")）", lambda: (

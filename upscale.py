@@ -2271,8 +2271,50 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     return up_out_v, tw, th, seed, bridged, hf_gain, retried
 
 
+def _attn_head_probe_in_features(attn):
+    """自测输入的特征维 —— **必须是 `qkv_proj` 的输入维**，不是 `heads * head_dim`。
+
+    ⚠ 2026-09-27 修（本机实测，取证见 `docs/二采OOM与解码耗时_取证分析_2026-09-27.md`）：
+    原实现把输入维写死成 `heads * head_dim`，**只有当 `hidden == heads * head_dim`
+    时才碰巧正确**。而自带校验脚本的桩 `StubAttention(hidden=64, heads=8, head_dim=8)`
+    正好满足 `8 * 8 == 64`，所以 `tools/check_attn_head_chunk.py` 从写出来那天起
+    就**不可能**发现这个 bug。
+
+    真实 H3 主干是 `hidden=5376 / heads=56 / head_dim=128` → `56 * 128 = 7168 ≠ 5376`，
+    于是 `qkv_proj(x)` 当场抛
+    `RuntimeError: mat1 and mat2 shapes cannot be multiplied (8x7168 and 5376x21504)`，
+    被下面那个兜底 `except Exception` 吞成 False → **统一误报成「attn.forward 里含
+    跨 head 操作，不是纯分组可分离」**。后果：头分块在本机 **100% 装不上**，
+    而且报了一个完全错误的原因（实测把输入维改对后，整段 vs 分 8 组
+    `max|diff| = 0.0`，逐元素完全相同）。
+
+    对照组：**同一个文件里 FFN 分块的自测一直是对的** ——
+    `_ff_chunk_selfcheck_run` 用的是 `inf = int(w.shape[1])`。
+    所以这是头分块这一处单独的疏漏，不是系统性设计问题。
+
+    取不到就返回 0（由调用方报成「结构不匹配」），**不回退到 `heads * head_dim`**
+    —— 那等于把刚修掉的 bug 又埋回去。
+    """
+    proj = getattr(attn, "qkv_proj", None)
+    v = getattr(proj, "in_features", None)
+    if isinstance(v, int) and v > 0:
+        return v
+    w = getattr(proj, "weight", None)
+    if w is not None and getattr(w, "dim", lambda: 0)() >= 2:
+        return int(w.shape[1])
+    return 0
+
+
 def _attn_head_selfcheck(attn, n_chunks):
     """头分块前后是否**逐元素一致**（装之前必须自测，不通过就别装）。
+
+    返回 `(ok, why)`：通过时 `why == ""`；不通过时 `why` 是一句**说清到底哪一步
+    失败**的短说明，由 `install_low_vram_attention` 原样透进节点报告。
+
+    ⚠ 为什么必须分开报（2026-09-27 修）：旧实现只返回 bool，并用一个
+    `except Exception: return False` 兜底 —— 于是「输入维写错导致 kernel 抛 shape 错」
+    与「真的掺了跨 head 操作」在报告里长得**一模一样**，前者被误诊成后者，
+    把排查方向整个带偏。异常路径现在原样带出 `类型: 消息`。
 
     头之间独立是**架构事实**（H3 的 `Attention.forward` 里每个 head 共享 qkv_proj
     的切片、各自做 norm+rope+attention，最后 concat 回 out_proj），但这份 forward
@@ -2280,30 +2322,40 @@ def _attn_head_selfcheck(attn, n_chunks):
     序列做的稀疏注意力重排），按 head 切组就不再等价。与其赌，不如拿一份小输入
     跑「整段 vs 分组」对比。用 CPU 小张量（S=8）跑，代价可忽略。
     """
+    heads = int(getattr(attn, "heads", 0) or 0)
+    head_dim = int(getattr(attn, "head_dim", 0) or 0)
+    if heads <= 1 or head_dim <= 0 or n_chunks <= 1 or n_chunks > heads:
+        return False, (f"分块参数不可用（heads={heads} head_dim={head_dim} "
+                       f"n_chunks={n_chunks}）")
+    inf = _attn_head_probe_in_features(attn)
+    if inf <= 0:
+        return False, "取不到 qkv_proj 的输入维（in_features / weight.shape[1] 都没有）"
+    dev = None
+    for p in attn.parameters():
+        dev = p.device
+        break
+    if dev is None:
+        return False, "attn 没有任何参数，取不到设备"
+    s = 8
+    x = torch.randn((s, inf), device=dev, dtype=torch.float32)
     try:
-        heads = int(getattr(attn, "heads", 0) or 0)
-        head_dim = int(getattr(attn, "head_dim", 0) or 0)
-        if heads <= 1 or head_dim <= 0 or n_chunks <= 1 or n_chunks > heads:
-            return False
-        dev = None
-        for p in attn.parameters():
-            dev = p.device
-            break
-        if dev is None:
-            return False
-        s = 8
-        x = torch.randn((s, heads * head_dim), device=dev, dtype=torch.float32)
         with torch.no_grad():
             full = _attn_forward_reference(attn, x, None)
             chunked = _attn_forward_chunked(attn, x, None, n_chunks)
-        if full is None or chunked is None:
-            return False
-        if full.shape != chunked.shape:
-            return False
-        return bool(torch.allclose(full.detach().float(), chunked.detach().float(),
-                                   atol=1e-3, rtol=1e-3))
-    except Exception:
-        return False
+    except Exception as e:      # 跑不起来 ≠ 结果不等价，两者必须分开报
+        return False, f"自测前向跑不起来（{type(e).__name__}: {e}）"
+    if full is None or chunked is None:
+        return False, "自测前向返回了 None"
+    if full.shape != chunked.shape:
+        return False, (f"分组与整段输出形状不一致（{tuple(full.shape)} vs "
+                       f"{tuple(chunked.shape)}）")
+    _a = full.detach().float()
+    _b = chunked.detach().float()
+    if not bool(torch.allclose(_a, _b, atol=1e-3, rtol=1e-3)):
+        _d = (_a - _b).abs().max().item()
+        return False, (f"分组与整段结果不等价（max|diff|={_d:.3g}）——"
+                       f"attn.forward 里含跨 head 操作，不是纯分组可分离")
+    return True, ""
 
 
 def _attn_forward_reference(attn, x, rope_freqs, transformer_options=None):
@@ -2474,9 +2526,9 @@ def install_low_vram_attention(model, head_chunks, targets=None):
                                 "_h3_attn_head_chunks", 0) == eff)
         return n_done, ""
     # 只对第一个 block 自测（同一份代码、同一结构，逐个测纯浪费）
-    if not _attn_head_selfcheck(attn0, eff):
-        return 0, ("注意力头分块自测不通过（attn.forward 里含跨 head 操作，"
-                   "不是纯分组可分离）——本次不装，输出保持原样")
+    _ok, _why = _attn_head_selfcheck(attn0, eff)
+    if not _ok:
+        return 0, (f"注意力头分块自测不通过（{_why}）——本次不装，输出保持原样")
     installed = 0
     for blk in blocks:
         attn = getattr(blk, "attn", None)
@@ -2572,20 +2624,20 @@ def _report_ff_blocks(tokens, chunk, blocks):
     _FF_BLOCK_REPORTED.add(key)
     n_lin = _FF_INSTALLED_LINEARS
     extra = f" × {n_lin} 个 Linear ≈ {blocks * n_lin} 次权重取用" if n_lin else ""
-    print(f"[H3分块] FFN 实际切块：序列 {tokens} token ÷ 每块 {chunk} = {blocks} 块{extra}",
-          flush=True)
+    print(f"[H3分块] FFN 实际切块：序列 {tokens} token ÷ 每块上限 {chunk} = {blocks} 块"
+          f"（已均分）{extra}", flush=True)
     if blocks <= _FF_BLOCK_WARN_AT:
         return
     # 建议值：从当前值翻倍，直到块数降到 8 以内（或到 32768 封顶）。
     # ⚠ 方向 —— **调大**才降块数。块数少了固定开销才下来，而显存代价只是
-    # 「每块 token × ffn×2 × 2 字节」，长序列下依然远小于整段激活。
+    # 「每块 token 上限 × ffn×2 × 2 字节」，长序列下依然远小于整段激活。
     want = int(chunk)
     while want < 32768 and tokens // want > 8:
         want *= 2
     cost_gb = want * _FF_FFN2 * 2 / (1024 ** 3)
     print(f"[H3分块] ⚠ 块数偏多（{blocks} 块）：固定开销按块数线性增长 —— "
-          f"建议把「每块 token 数」从 {chunk} 提到 {want}（→ 约 {tokens // want} 块，"
-          f"单块激活代价 ≈ {cost_gb:.2f}GB）；还 OOM 再减半", flush=True)
+          f"建议把「每块 token 上限」从 {chunk} 提到 {want}（→ 约 {tokens // want} 块，"
+          f"单块激活代价 ≤ {cost_gb:.2f}GB）；还 OOM 再减半", flush=True)
 
 
 def _ff_chunk_selfcheck(sub, orig, chunk_tokens, stats=None):
@@ -2793,7 +2845,7 @@ def install_ff_chunking(model, chunk_tokens, targets=("fc1", "fc2"), min_tokens=
                     return __orig(x, *a, **k)
                 # 块数先算出来（顺带报一次观测，见 _report_ff_blocks）：
                 # 这个数字直接决定「每块的固定开销 × 块数」有多大 —— 它就是
-                # 用户填的「每块 token 数」唯一的反馈信号。
+                # 用户填的「每块 token 上限」唯一的反馈信号（块大小见 plan_ff_chunks 均分）。
                 _plan_ = __plan(int(x.shape[0]), __ct)
                 _report_ff_blocks(int(x.shape[0]), __ct, len(_plan_))
                 outs = [__orig(x[s:e], *a, **k) for s, e in _plan_]

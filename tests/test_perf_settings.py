@@ -213,7 +213,7 @@ def test_plan_ff_chunks_boundaries():
     assert perf.plan_ff_chunks(0, 4) == []
     assert perf.plan_ff_chunks(-3, 4) == []
     assert perf.plan_ff_chunks(10, 0) == [(0, 10)], "0 = 关，必须等价于不分块"
-    assert perf.plan_ff_chunks(10, 4) == [(0, 4), (4, 8), (8, 10)]
+    assert perf.plan_ff_chunks(10, 4) == [(0, 4), (4, 7), (7, 10)]   # ⌈10/4⌉=3 块均分
     assert perf.plan_ff_chunks(8, 4) == [(0, 4), (4, 8)]
     assert perf.plan_ff_chunks(3, 100) == [(0, 3)]
     assert perf.plan_ff_chunks("x", 4) == [(0, 0)]

@@ -33,6 +33,14 @@ const SRC = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");
 const STAGES_START = SRC.indexOf("const H3_PERF_STAGES = {");
 const STAGES_BLOCK = SRC.slice(STAGES_START, SRC.indexOf("\nconst H3_PERF_FIELDS", STAGES_START));
 const STAGE_NAMES = [...STAGES_BLOCK.matchAll(/^\s{4}"([^"]+)":\s*\{/gm)].map((m) => m[1]);
+/* 一级名 -> {when, note}：2026-09-27 起 H3_PERF_STAGES 真的被渲染了（之前
+ * 定义了没人读），所以要能把两个字段取出来逐字比对，不能只看名字。 */
+const STAGES = {};
+for (const m of STAGES_BLOCK.matchAll(/^\s{4}"([^"]+)":\s*\{([^}]*)\}/gm)) {
+    const w = m[2].match(/when:\s*"([^"]*)"/);
+    const n = m[2].match(/note:\s*"([^"]*)"/);
+    STAGES[m[1]] = { when: w ? w[1] : "", note: n ? n[1] : "" };
+}
 
 const BLOCK_START = SRC.indexOf("const H3_PERF_FIELDS = [");
 const BLOCK = SRC.slice(BLOCK_START, SRC.indexOf("\n];", BLOCK_START));
@@ -56,6 +64,18 @@ const labelOf = (k) => {
     const v = LABELS[k];
     if (!v) throw new Error("字段表里没有 key：" + k);
     return v;
+};
+/* key -> **本条目自己**的 group。
+ * ⚠ 不能写成 `GROUPS[FIELD_KEYS.indexOf(k)]` —— GROUPS 是**去重后的 Set**，
+ *   与 FIELD_KEYS 不同标，按下标取会串行（2026-09-27 加断言时踩过）。
+ * 这里从 key 的位置往后取**第一个** group：字段表里 group 一定在同一个条目内、
+ * 且在 key 之后；showWhen 的内层对象只带 key/values、不带 group，不会串到下一个条目。 */
+const GROUP_OF = (k) => {
+    const i = BLOCK.indexOf('key: "' + k + '"');
+    if (i < 0) throw new Error("字段表里没有 key：" + k);
+    const m = BLOCK.slice(i).match(/group: "([^"]+)"/);
+    if (!m) throw new Error(k + " 的条目里没有 group");
+    return m[1];
 };
 const ENABLE_PAIRS = [...BLOCK.matchAll(/\{ key: "([^"]+)"[^\n]*?enable: "([^"]+)"/g)]
     .map((m) => [m[1], m[2]]);
@@ -94,6 +114,41 @@ async function t(name, fn) {
             assert.ok(FIELD_KEYS.includes(master),
                 key + " 绑的开关 " + master + " 不在字段表里");
         }
+    });
+
+    await t("★ 分块归「全局分块」：一采二采共用，不许再挂「一采采样」名下", () => {
+        /* 2026-09-27 用户拍板：FFN / 注意力头分块在 nodes.py 里会**同时装到一采模型
+         * 和二采模型**上（nodes.py:2156 / 2183 / 2201 / 2208），块交换与显存预留写的
+         * 又是**进程级**的 aimdo 值 —— 挂在「一采采样」名下会让人以为二采不生效。
+         * 所以这一组改按**作用范围**命名。本条同时钉住旧名不许回来。 */
+        assert.ok(HEADS.indexOf("全局分块") >= 0,
+            "一级阶段里没有「全局分块」：" + HEADS.join(","));
+        assert.strictEqual(HEADS.indexOf("一采采样"), -1,
+            "「一采采样」不该再作为一级阶段存在（分块是全局的）");
+        const subs = SUBS_OF("全局分块");
+        for (const want of ["FFN", "注意力", "权重流动"]) {
+            assert.ok(subs.indexOf(want) >= 0,
+                "「全局分块」下缺二级用途 " + want + "（现有 " + subs.join(",") + "）");
+        }
+        /* 真的改了 group 字段，不是只在注释里改了名 */
+        assert.ok(GROUP_OF("ff_chunk_on").indexOf("全局分块") === 0,
+            "ff_chunk_on 的 group 还是 " + GROUP_OF("ff_chunk_on"));
+        assert.ok(GROUP_OF("attn_head_on").indexOf("全局分块") === 0,
+            "attn_head_on 的 group 还是 " + GROUP_OF("attn_head_on"));
+    });
+
+    await t("★ 「显存预留（GB）」与块交换同组，且是**独立项**（不绑总开关）", () => {
+        /* 它与 blocks_to_swap 写的是**同一个 aimdo 值**（两种单位）→ 必须同组，
+         * 否则用户看不出两者的关系与优先级。
+         * 但它必须**独立于 blocks_swap_on** —— 绑上去会让「只想留余量」的用户
+         * 被迫顺带改掉权重流动行为，那不是他要的（后端 apply_blockswap 同此口径）。 */
+        assert.ok(FIELD_KEYS.indexOf("vram_reserve_gb") >= 0,
+            "字段表里没有 vram_reserve_gb");
+        assert.strictEqual(GROUP_OF("vram_reserve_gb"), GROUP_OF("blocks_to_swap"),
+            "显存预留该与「交换块数」同组：" + GROUP_OF("vram_reserve_gb")
+            + " vs " + GROUP_OF("blocks_to_swap"));
+        assert.ok(!ENABLE_PAIRS.some((p) => p[0] === "vram_reserve_gb"),
+            "显存预留不该绑任何总开关（它独立生效）");
     });
 
     await t("三态名单不许回潮（后端无名单、前端无判态、无「接线中」徽章）", () => {
@@ -232,6 +287,37 @@ async function t(name, fn) {
         for (const g of groups) {
             assert.strictEqual(g.tagName, "DETAILS", "一级阶段该是可折叠的 details");
             assert.strictEqual(g.open, true, "一级阶段默认该展开");
+        }
+    });
+
+    await t("★ H3_PERF_STAGES 接线：徽章 + 说明真的渲染出来了", () => {
+        /* 2026-09-27 修：这张表**定义了但全文件无人消费** —— `when` / `note`
+         * 只活在源码注释里，注释承诺的「生效时机徽章」实际不存在。
+         * 这条钉住「它被真的渲染出来」，别再退回去。 */
+        const groups = groupEls(overlay);
+        const badges = overlay.querySelectorAll(".h3d-perf-stage-when");
+        const notes = overlay.querySelectorAll(".h3d-perf-stage-note");
+        assert.strictEqual(badges.length, groups.length,
+            "每个一级阶段都该有一个生效时机徽章，实际 " + badges.length);
+        assert.strictEqual(notes.length, groups.length,
+            "每个一级阶段都该有一条说明，实际 " + notes.length);
+        /* 文案必须**来自阶段表**（不是硬编码在渲染里）—— 逐字比对 */
+        for (const g of groups) {
+            const name = titleOf(g);
+            const st = STAGES[name];
+            assert.ok(st, name + " 在阶段表里没有条目");
+            assert.strictEqual(g.querySelector(".h3d-perf-stage-when").textContent,
+                st.when, name + " 的徽章文案不对");
+            assert.strictEqual(g.querySelector(".h3d-perf-stage-note").textContent,
+                st.note, name + " 的说明文案不对");
+        }
+        /* 徽章得在 summary 里（点标题才看得见）、说明得在 summary 外
+         * （否则会被算进可点击区、折叠态也会怪） */
+        for (const g of groups) {
+            assert.ok(g.querySelector("summary .h3d-perf-stage-when"),
+                "徽章该在 summary 里");
+            assert.ok(g.querySelector("summary .h3d-perf-stage-note") === null,
+                "说明不该塞进 summary（会被算进点击区）");
         }
     });
 

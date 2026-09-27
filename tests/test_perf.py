@@ -794,6 +794,29 @@ def test_vram_headroom_advice_fires_on_default_policy():
     assert "EXTRA_RESERVED_VRAM" in msg
 
 
+def test_vram_headroom_advice_acknowledges_runtime_reserve():
+    """★ 面板已经留了余量时，建议里必须**承认它**，而不是继续喊「加 --vram-headroom」。
+
+    两者是 aimdo 的**两项独立预留**（进程级 simple budget vs 每设备
+    extra_vram_headroom，官方 docstring 原文 separate），可叠加、不互相替代 ——
+    所以判定不变（CLI 那两项确实还缺），但话要说清，否则用户会以为自己的设置没生效。
+    """
+    pol = {"dynamic_vram": True, "vram_headroom_gb": 0.0, "reserve_vram_gb": None,
+           "comfy_compiler": True}
+    msg = perf.vram_headroom_advice({}, pol, 1.0)
+    assert msg, "判定不该因为「运行时预留」而静默（CLI 那两项确实还缺）"
+    assert "1GB" in msg and "显存预留" in msg
+    assert "独立预留" in msg and "不能互相替代" in msg
+    # 没给运行时预留 → 走另一套话（推荐启动参数 + 指出运行时那条路）
+    msg2 = perf.vram_headroom_advice({}, pol, 0.0)
+    assert "disable-comfy-compiler" in msg2
+    assert "立即生效" in msg2
+    assert "1GB" not in msg2
+    # 脏输入不该抛
+    for bad in (None, "x", -1):
+        assert perf.vram_headroom_advice({}, pol, bad)
+
+
 # ---- 启动参数体检（只读；2026-09-27 加）----
 #
 # 为什么只读而不是做成开关：`--vram-headroom` 是 aimdo `init_devices()` 的每设备
@@ -1138,15 +1161,17 @@ def test_chunk_param_defaults_are_sane():
     """参数默认值要「开开关即合理」：该非零的非零，该给建议值的给建议值。"""
     d = perf.DEFAULT_PERF
     # 建议起点。⚠ 必须够大：块数 = 序列 token ÷ 此值，而 H3 常见序列 5–10 万 token
-    # —— 4096 会切出 20+ 块、把采样拖慢（2026-09-25 由 4096 上调到 16384）。
-    assert d["ff_chunk_tokens"] == 16384
-    assert d["ff_chunk_tokens"] >= 8192, "太小会在长序列下切出过多块（代价 ∝ 块数）"
+    # —— 4096 会切出 20+ 块、把采样拖慢（2026-09-25 由 4096 上调到 16384，
+    # 2026-09-27 再上调到 32768）。
+    assert d["ff_chunk_tokens"] == 32768
+    assert d["ff_chunk_tokens"] >= 16384, "太小会在长序列下切出过多块（代价 ∝ 块数）"
     assert d["ff_chunk_min_tokens"] == 8192      # 对齐 KJ seq_threshold 语义
     assert d["attn_head_chunks"] == 8            # 建议起点（实测平台期起点；1 = 不分块）
     assert d["upscale_chunk_frames"] == 32       # 上游同款默认
     assert d["upscale_overlap"] == 0             # 0 = 自动取卷积核宽（只增不减）
+    assert d["refine_temporal_chunk"] == 124     # ≈ 5.17 秒，与主链「每段时长」同宽
     assert d["refine_temporal_overlap"] == 8     # 至少 8 latent token
-    assert d["refine_tile"] == "off"
+    assert d["refine_tile"] == "2x1"             # 横向 2 条（总开关仍默认关）
     assert d["refine_tile_overlap"] == 32 and d["refine_tile_feather"] == 16
     # blocks_to_swap = -1 是「跟随档位」哨兵，不是 0 —— 0 会被读成「真的一块都不换」
     # 从而覆盖掉档位表按显存算出来的建议值（16GB→25 等）。见 resolve_perf。
@@ -1221,10 +1246,27 @@ def test_plan_ff_chunks_boundaries():
     assert perf.plan_ff_chunks(4096, 0) == [(0, 4096)]      # 0 = 不分块
     # 整除
     assert perf.plan_ff_chunks(8192, 4096) == [(0, 4096), (4096, 8192)]
-    # 不整除：末块要收在 n 上，且块间无缝无叠
-    assert perf.plan_ff_chunks(10000, 4096) == [(0, 4096), (4096, 8192), (8192, 10000)]
+    # 不整除：块数 = ⌈n/c⌉，大小均分（前 n%k 块各多 1 行），末块收在 n 上、块间无缝无叠
+    assert perf.plan_ff_chunks(10000, 4096) == [(0, 3334), (3334, 6667), (6667, 10000)]
     # 单块
     assert perf.plan_ff_chunks(100, 4096) == [(0, 100)]
+
+
+def test_plan_ff_chunks_is_even_not_step():
+    """按**块数均分**，不是「每块凑满 c、尾巴兜底」。
+
+    2026-09-27 改：等步长必留瘦尾块（50000÷16384 的末块只有 848 行），它照样要付
+    一次「取权重 + 同步流」——块数一块没少，还白搭一次打不满的 kernel。
+    均分后块数不变，但最大块从「= c」变成「≤ c」→ 峰值更低。
+    """
+    assert perf.plan_ff_chunks(50000, 32768) == [(0, 25000), (25000, 50000)]
+    assert perf.plan_ff_chunks(50000, 16384) == [(0, 12500), (12500, 25000),
+                                                 (25000, 37500), (37500, 50000)]
+    # 均分的两条不变量：最大块 ≤ 上限、块间大小差 ≤ 1
+    for n, c in ((50000, 16384), (66000, 32768), (100000, 8192), (7, 3), (1, 4096)):
+        sizes = [e - s for s, e in perf.plan_ff_chunks(n, c)]
+        assert max(sizes) <= c, f"n={n} c={c}: 最大块 {max(sizes)} 超过上限 {c}"
+        assert max(sizes) - min(sizes) <= 1, f"n={n} c={c}: 块大小不均 {sizes}"
 
 
 def test_plan_ff_chunks_covers_all_tokens_exactly_once():
@@ -1535,6 +1577,45 @@ def test_blockswap_headroom_bad_block_count():
         assert r["extra_gb"] == 0.0 and r["blocks_eff"] == 0
 
 
+# ---- 显存预留：直接给 GB（2026-09-27 加）----
+#
+# 与 `blockswap_headroom` 是**同一个 aimdo 值**的两种单位：块数 × 块大小 = GB。
+# 之所以要这一项：用户真实的诉求单位是 GB（「给二采留 1GB 余量」），而块数得自己
+# 乘块大小反算（6GB 卡上块大小 ≈ 0.42GB，想留 1GB 得填 3 块 —— 没人算得出来）。
+
+def test_reserve_headroom_math():
+    """不夹取时就是原值；0 / 未探明 → 不干预（**不编数字**）。"""
+    r = perf.reserve_headroom(1.0, 6.0, 0.6)
+    assert abs(r["extra_gb"] - 1.0) < 1e-9 and r["clamped"] is False
+    assert "1.00GB" in r["note"]
+    r = perf.reserve_headroom(0, 6.0, 0.6)
+    assert r["extra_gb"] == 0.0 and "不额外预留" in r["note"]
+    r = perf.reserve_headroom(1.0, None, 0.0)
+    assert r["extra_gb"] == 0.0 and "未探明" in r["note"]
+
+
+def test_reserve_headroom_clamps_to_half_vram():
+    """★ 夹到「显存一半 − 基线」并如实报出。
+
+    不夹的后果：6GB 卡上留 5GB，权重只剩 1GB → 采样退化成每步全量重读，
+    **比 OOM 还慢**。静默夹的后果：用户以为自己填的 5GB 生效了。
+    """
+    r = perf.reserve_headroom(5.0, 6.0, 0.6)
+    assert r["clamped"] is True
+    assert abs(r["extra_gb"] - (6.0 * perf.BLOCKSWAP_HEADROOM_CAP - 0.6)) < 1e-9
+    assert "夹" in r["note"] and "⚠" in r["note"]
+    # 基线已吃满「一半」→ 一点都留不出
+    r = perf.reserve_headroom(1.0, 6.0, 3.0)
+    assert r["extra_gb"] == 0.0 and r["clamped"] is True
+
+
+def test_reserve_headroom_bad_input_never_raises():
+    """面板输入框什么都可能传来 —— 脏输入不该抛，也不该算出负数预留。"""
+    for bad in (None, "x", -3, [], {}):
+        r = perf.reserve_headroom(bad, 16.0, 0.5)
+        assert r["extra_gb"] == 0.0 and r["clamped"] is False
+
+
 def test_blockswap_baseline_is_read_once():
     """★ 基线只读一次：第二次读到的可能已被我们自己改过，用它当基线会让
     「关掉开关 = 恢复原样」变成「关掉开关 = 保持我上次设的值」。"""
@@ -1661,14 +1742,116 @@ def test_apply_blockswap_legacy_path(monkeypatch):
         perf._BS_BASELINE.update(saved)
 
 
+def test_apply_blockswap_reserve_gb_wins_over_blocks(monkeypatch):
+    """★★ 「显存预留」优先于「交换块数」—— 两者写的是同一个 aimdo 值。
+
+    优先级必须写死且可验证：想留 1GB 得先自己乘块大小反算块数（块大小 ≈ 0.42GB），
+    没人算得出来，所以「直接填 GB」这一项赢，且必须在 note 里说明块数未参与 ——
+    不然用户会以为两个值叠加了。
+    """
+    seen = []
+    monkeypatch.setattr(perf, "_set_aimdo_headroom",
+                        lambda gb: (seen.append(gb), round(gb, 3))[1])
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "aimdo", "headroom_gb": 0.0})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": 0.5, "extra_gb": 0.6})
+        hw = {"unet_gb": 20.0, "vram_total_gb": 16.0}
+        # 两项都填 → 按 GB 走，块数不参与
+        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10,
+                                    "vram_reserve_gb": 1.0}, hw)
+        assert out["reserve_gb"] == 1.0
+        assert abs(seen[-1] - 1.5) < 1e-9, seen      # 0.5 基线 + 1.0
+        assert out["blocks"] == 0, "按 GB 算时块数该归零"
+        assert "未参与" in out["note"]
+        # 只填块数 → 旧行为**逐字不变**（回归保护）
+        seen.clear()
+        out2 = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10}, hw)
+        assert out2["reserve_gb"] == 0.0
+        assert abs(seen[-1] - 4.5) < 1e-9, seen      # 0.5 + 10 × 0.4
+        assert out2["blocks"] == 10
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_apply_blockswap_reserve_gb_is_independent_of_switch(monkeypatch):
+    """★ 「显存预留」**不依赖** `blocks_swap_on`。
+
+    两个开关是两件事：`blocks_swap_on` 管「把块换出去」（改变权重流动行为），
+    `vram_reserve_gb` 管「留出余量」。若把后者挂在前者名下，用户想留 1GB 还得
+    先开块交换 —— 那会顺带改掉他不想要的东西。
+    """
+    monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: round(gb, 3))
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "aimdo", "headroom_gb": 0.0})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": 0.5, "extra_gb": 0.6})
+        out = perf.apply_blockswap({"blocks_swap_on": False, "blocks_to_swap": 10,
+                                    "vram_reserve_gb": 1.0},
+                                   {"unet_gb": 20.0, "vram_total_gb": 16.0})
+        assert out["applied"] is True
+        assert abs(out["headroom_gb"] - 1.5) < 1e-9
+        assert "预留" in out["note"]
+        assert "关闭" not in out["note"], "给了预留就不该再报「已恢复基线」"
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_apply_blockswap_reserve_gb_unknown_vram_does_not_touch(monkeypatch):
+    """预留也一样：显存体量没探明 → 一次 `_set_*` 都不许调（读接口无副作用）。"""
+    calls = []
+    monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: calls.append(gb) or 7.0)
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "aimdo", "headroom_gb": 7.0})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": 7.0, "extra_gb": 0.6})
+        out = perf.apply_blockswap({"vram_reserve_gb": 1.0}, {})
+        assert calls == [], f"体量未知却写了预留：{calls}"
+        assert out["applied"] is False and "未探明" in out["note"]
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
+def test_apply_blockswap_legacy_reserve_gb(monkeypatch):
+    """legacy 路径（无 DynamicVRAM）同样支持「直接给 GB」。"""
+    seen = []
+    monkeypatch.setattr(perf, "_set_extra_reserved",
+                        lambda gb: (seen.append(gb), round(gb, 3))[1])
+    monkeypatch.setattr(perf, "probe_blockswap",
+                        lambda: {"path": "legacy", "headroom_gb": None})
+    saved = dict(perf._BS_BASELINE)
+    try:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update({"aimdo_gb": None, "extra_gb": 0.6})
+        out = perf.apply_blockswap({"vram_reserve_gb": 1.0}, {"vram_total_gb": 16.0})
+        assert out["applied"] is True and abs(seen[-1] - 1.6) < 1e-9
+        assert "预留" in out["note"]
+    finally:
+        perf._BS_BASELINE.clear()
+        perf._BS_BASELINE.update(saved)
+
+
 def test_apply_blockswap_keys_are_stable():
-    """返回结构是接口（前端诊断区与 nodes 报告都按它读），键名不许漂。"""
+    """返回结构是接口（前端诊断区与 nodes 报告都按它读），键名不许漂。
+
+    `reserve_gb` 是 2026-09-27 随「显存预留（直接填 GB）」加的：它与 `blocks` 并列，
+    表示**这次实际按哪个口径算的**（`reserve_gb > 0` 时 `blocks` 归零）。
+    """
     saved = dict(perf._BS_BASELINE)
     try:
         perf._BS_BASELINE.clear()
         out = perf.apply_blockswap({}, None)
-        assert set(out) == {"on", "path", "blocks", "extra_gb", "clamped",
-                            "headroom_gb", "applied", "note"}
+        assert set(out) == {"on", "path", "blocks", "reserve_gb", "extra_gb",
+                            "clamped", "headroom_gb", "applied", "note"}
     finally:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update(saved)

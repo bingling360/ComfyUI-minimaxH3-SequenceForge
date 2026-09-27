@@ -10384,6 +10384,100 @@ function removeFab() {
     if (fabEl) { fabEl.remove(); fabEl = null; }
 }
 
+/* ---- 节点外观：Gemini 彩虹 + 端口免打扰（2026-09-27）----
+ *
+ * 为什么自己画：ComfyUI 的节点只有 node.color / node.bgcolor 两个**纯色**，渐变没有
+ * 官方入口。但前端在节点本体绘制里留了两个稳定钩子（本机 1.45.21 与 1.52.7 两版逐字
+ * 核对，签名与调用点一致）：
+ *   onDrawTitleBar(ctx, title_height, size, scale) —— 一旦定义就整条接管标题栏背景
+ *   onDrawBackground(ctx)                          —— 机身刚填完底色、那条路径还开着
+ * 于是：标题栏铺满四停渐变 + 一层暗罩（把最亮的琥珀段压下来，白字才立得住），机身复用
+ * 同一条路径描一圈 2px 渐变边。机身**底色一律不动** —— 它跟主题走，浅色深色都不打架。
+ *
+ * 端口免打扰：drawSlots 只对「控件型输入槽」自动隐身，真端口没有开关，只能包一层：
+ *   _measureSlots 收窄 → 藏起来的端口不占行高（按钮随之上移、节点跟着收矮）
+ *   drawSlots     收窄 → 藏起来的端口不画（连了线也不画，那根线会停在节点边缘）
+ *   computeSize   收窄 → 尺寸按**可见**端口算，否则底部会白留几行
+ * 一律**按名字认，不按位次认**：位次会随控件增删漂移（输出位次还是连线的坐标），名字不会。
+ * 端口本身留在 inputs/outputs 里没删 —— 删「帧率」会把「报告」从第 3 位挤到第 2 位，
+ * 老工作流里连「报告」的线会静默接到「帧率」上，那是真事故。
+ */
+const H3_DESK_GRADIENT = ["#4285F4", "#9B72CB", "#D96570", "#F2A60C"];   // Gemini 图标四停
+const H3_DESK_HIDE_SLOTS = new Set(["起始视频", "起始视频音轨", "帧率", "分段图像", "分段音频"]);
+const H3_DESK_TITLE_SCRIM = 0.16;   // 暗罩强度：白字压在四停最亮的琥珀段上也要够对比
+const H3_DESK_NOOP_DRAW = () => {};
+
+function deskGradient(ctx, w) {
+    const g = ctx.createLinearGradient(0, 0, w, 0);
+    const last = H3_DESK_GRADIENT.length - 1;
+    H3_DESK_GRADIENT.forEach((c, i) => g.addColorStop(i / last, c));
+    return g;
+}
+
+function paintDeskNode(node) {
+    if (node.__h3DeskPainted) return;
+    // 非画布环境（前端测试 mock 节点）没有这套内部方法，只挂按钮不碰外观
+    if (typeof node.drawSlots !== "function" || typeof node._measureSlots !== "function") return;
+    node.__h3DeskPainted = true;
+
+    node.onDrawTitleBar = function (ctx, titleHeight, size) {
+        const w = size[0];
+        ctx.save();
+        ctx.beginPath();
+        ctx.roundRect(0, -titleHeight, w, titleHeight, this.collapsed ? [8] : [8, 8, 0, 0]);
+        ctx.fillStyle = deskGradient(ctx, w);
+        ctx.fill();
+        ctx.fillStyle = "rgba(0,0,0," + H3_DESK_TITLE_SCRIM + ")";
+        ctx.fill();
+        ctx.restore();
+    };
+
+    node.onDrawBackground = function (ctx) {
+        ctx.save();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = deskGradient(ctx, this.size[0]);
+        ctx.stroke();      // 复用机身刚填完色的那条路径 → 整机描一圈彩虹边
+        ctx.restore();
+    };
+
+    /* 收窄手法：临时把 concrete 槽位换成滤过的再交给原生实现，完事换回来。
+     * 换回来只是让本帧其它环节看到原样 —— concrete 槽位每帧由 _setConcreteSlots()
+     * 重建，这里就算没换回去也脏不了。 */
+    const filterHidden = (arr) => arr.filter((s) => !H3_DESK_HIDE_SLOTS.has(s.name));
+
+    const origMeasure = node._measureSlots;
+    node._measureSlots = function () {
+        const keepIn = this._concreteInputs, keepOut = this._concreteOutputs;
+        this._concreteInputs = filterHidden(keepIn);
+        this._concreteOutputs = filterHidden(keepOut);
+        const bounds = origMeasure.call(this);
+        this._concreteInputs = keepIn;
+        this._concreteOutputs = keepOut;
+        return bounds;
+    };
+
+    const origDrawSlots = node.drawSlots;
+    node.drawSlots = function (ctx, opts) {
+        /* 把命中的 concrete 槽位的 draw 换成空函数，而不是重写整个循环 ——
+         * 循环里那套「悬停/是否控件槽/透明度」的判定留给原生，少抄一遍就少一处漂移 */
+        for (const s of [...this._concreteInputs, ...this._concreteOutputs]) {
+            if (H3_DESK_HIDE_SLOTS.has(s.name)) s.draw = H3_DESK_NOOP_DRAW;
+        }
+        return origDrawSlots.call(this, ctx, opts);
+    };
+
+    const origComputeSize = node.computeSize;
+    node.computeSize = function () {
+        const keepIn = this.inputs, keepOut = this.outputs;
+        this.inputs = filterHidden(keepIn);
+        this.outputs = filterHidden(keepOut);
+        const size = origComputeSize.call(this);
+        this.inputs = keepIn;
+        this.outputs = keepOut;
+        return size;
+    };
+}
+
 /* ---- 节点本体：全部参数控件隐藏，只留一个「打开导演台」按钮（2026-09-27）----
  * 为什么藏而不删：widgets_values 是**按位**序列化的（30 值布局被
  * tests/test_workflows_frozen.py 与迁移判据钉死），删控件=布局迁移全套跟进，
@@ -10415,12 +10509,20 @@ function mountDeskButton(node) {
     btn.__h3DeskBtn = true;
     btn.serialize = false;
     if (btn.options) btn.options.serialize = false;
+    // 彩虹配色 + 藏 5 个端口（幂等，只在首次挂上钩子）
+    paintDeskNode(node);
     // 隐藏后 computeSize 忽略全部控件行，尺寸当场收缩（旧存档带着大尺寸载入也一并校正）
     try { node.setSize(node.computeSize()); } catch (e) { /* 尺寸收缩失败不影响功能 */ }
 }
 
 app.registerExtension({
     name: "H3SeamlessChain.DirectorDesk",
+    /* 标题栏走彩虹后字必须转白：白字配上我们压的那层暗罩，才压得住四停里最亮的琥珀段。
+     * title_text_color 是节点类的属性（drawTitleText 读 this.constructor.title_text_color），
+     * 所以只能在注册期挂在 nodeType 上，挂不到单个实例。 */
+    beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData && nodeData.name === NODE_TYPE) nodeType.title_text_color = "#fff";
+    },
     /* 画布节点就绪即刷新：面板首刷可能早于工作流载入（节点未就绪 → 各区渲染
      * 「画布上未找到节点」），之后没有任何事件再触发刷新——这里在节点载入/
      * 新建时主动补一刷，mini 卡与参数/二采区随之恢复可用 */

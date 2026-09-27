@@ -113,6 +113,7 @@ function ok(cond, msg) {
      */
     const REGISTRY = {
         MP_BODY_KEYS: { scope: "const" },
+        H3_DESK_HIDE_SLOTS: { scope: "const" },   // 节点上藏哪几个端口：写死的名字表，与项目无关
         _refTpl: { scope: "dir", key: "tplKey" },
         _cardPainters: { scope: "ui" },
         miniBox: { scope: "ui" },

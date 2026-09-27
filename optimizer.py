@@ -4,7 +4,8 @@
 规则文件注入、媒体引用），实现全部自写，避免 GPL 原样拷贝：
 
 - 配置归一 + 公开展示（api_key 脱敏，只给 has_api_key）
-- prompt/*.txt 规则文件只读下发，由调用方按 rule_file=auto/指定/none 注入
+- prompt/*.txt 规则文件只读下发，由调用方按 rule_file=auto（英文）/ zh（中文）/ none 注入；
+  段型（常规三字段 / 全参考六段式）**自动分流**，语言是唯一需要选的维度
 - 云通道：OpenAI 兼容（openai/openrouter/百炼/SiliconFlow/RunningHub 走兼容路径）、
   Gemini GenerateContent、Responses 路径；同步 urllib 实现，调用方放线程池
 - 本地通道：Transformers 视觉模型 / GGUF（llama-cpp-python），每次生成完即关句柄、
@@ -75,10 +76,13 @@ DEFAULT_CONFIG = {
     # 思考强度（仅智谱 GLM-5 系支持）：""=不指定（服务商用默认，通常 max）
     # / low / high / max。5.3 系只认这三档，别的值会报错。
     "reasoning_effort": "",
+    # 提示词规则：auto = 官方英文规则（默认）/ zh = 中文规则 / none = 不注入。
+    # 段型（常规 base / 全参考 ref）自动分流，用户只选语言。见 RULE_OPTIONS。
     "rule_file": "auto",
-    # 「AI 扩写优化设置」：单框提示词主按钮「AI 扩写 + 优化」的参数。
-    # sec_min/sec_max = 0 表示"跟随本段时长 ±2 秒"（前端 optExpandSettings 负责换算）。
-    "expand": {"sec_min": 0, "sec_max": 0, "style": "balanced", "run_optimize": True},
+    # 「AI 扩写优化设置」：单框提示词主按钮「✨ AI 扩写+优化」的参数，**只剩扩写风格**。
+    # 后端不读它（真正的 style 由前端在请求体顶层下发，直通 screenplay_via_config），
+    # 这里只为与前端持久化的形状对齐。见 _clean_expand 的说明。
+    "expand": {"style": "balanced"},
 }
 
 PROVIDERS = {
@@ -148,28 +152,69 @@ def default_config() -> dict:
             cur[k] = v
     return cur
 
-# 规则文件 = **官方 h3-prompt-writing 的 base-en.txt / ref-en.txt 逐字副本**。
-# 只有这两份，不再有中文版、不再有「自定义四字段版」（`<@名字>` / `<#名字:对话>`
-# 是自造语法，官方 tokenizer 根本不认，模型收到它只会写出非官方格式）。
+# 规则文件 = 官方 h3-prompt-writing 的 base / ref 两份原文，各出中英两版，共 4 份：
+#   minimaxh3_base_prompt_writing.txt              常规三字段（T2VA/I2VA/FL2VA/L2VA）· 英文
+#   minimaxh3_base_prompt_writing_zh.txt           同上 · 中文
+#   minimaxh3_official_ref2v_prompt_writing.txt    全参考六段式（Ref2VA）· 英文
+#   minimaxh3_official_ref2v_prompt_writing_zh.txt 同上 · 中文
 #
-# 官方 Open Rules（SKILL.md 的 Output Rules + 两份 references 自身）就要求
-# **正文英文**、只有 `<d>` 里的对白 / 歌词与画面可见文字保原语言 —— 所以
-# 「输出语言」这个概念在官方口径下不存在，字段已整体删除。历史教训：以前
-# auto + 中文注入的是一份**全参考四字段**规则，注释还写着"此规则优先于其他
-# 通用格式要求"，于是给常规段优化时模型同时收到两条互斥的最高优先级指令，
-# 产出 summary/detailed_description + `<Subject N>` 混排的非官方语法。
-RULE_OPTIONS = (
-    "auto",
-    "minimaxh3_base_prompt_writing.txt",
-    "minimaxh3_official_ref2v_prompt_writing.txt",
-    "none",
-)
+# **两个维度必须分开看**：
+#   1. **段型（task）** —— 官方 base（三字段）与全参考（六段式）是两套完全不同的字段集
+#      与标签体系，串用必出非官方格式。这一维**自动判定**（有参考素材 → 全参考；
+#      首尾帧 → FL2VA/I2VA/L2VA；都没有 → T2VA），用户不用选。
+#   2. **语言** —— 骨架（字段名 / `[Shot N]` / `<d>` / 标签 / 保留标记 / 运镜词表）
+#      一律英文逐字；正文写中文还是英文。**只有这一维需要用户选**，默认英文。
+#
+# 「输出语言」那个独立配置字段已删：语言由**规则文件**唯一决定（选中文规则就出中文正文），
+# 两个控件各说一套只会互相打架。历史教训：以前 auto + 中文注入的是一份**全参考四字段**
+# 规则，注释还写着"此规则优先于其他通用格式要求"，于是给常规段优化时模型同时收到两条
+# 互斥的最高优先级指令，产出 summary/detailed_description + `<Subject N>` 混排的非官方语法。
+RULE_OPTIONS = ("auto", "zh", "none")
 
-# 规则按 **task** 分流：官方 base（T2VA/I2VA/FL2VA/L2VA，三字段）与全参考
-# （Ref2VA，六段式）是两套完全不同的字段集与标签体系，串用必出非官方格式。
+# 规则按 **task** 分流（不按语言）：base / ref 各一份，中文版再加 `_zh` 后缀。
 REF_TASKS = ("REF2VA", "HYBRID")
 RULE_BASE_FILE = "minimaxh3_base_prompt_writing.txt"
 RULE_REF_FILE = "minimaxh3_official_ref2v_prompt_writing.txt"
+RULE_BASE_ZH_FILE = "minimaxh3_base_prompt_writing_zh.txt"
+RULE_REF_ZH_FILE = "minimaxh3_official_ref2v_prompt_writing_zh.txt"
+
+# 正文语言取值（与前端「提示词规则」下拉的 zh 档、以及 `_zh.txt` 后缀同口径）
+RULE_LANG_EN = "en"
+RULE_LANG_ZH = "zh"
+
+
+def _is_ref_task(task: str | None) -> bool:
+    """该 task 是否走全参考（六段式）规则。"""
+    return str(task or "").upper() in REF_TASKS
+
+
+def rule_language(settings: dict | None) -> str:
+    """当前规则选择对应的**正文语言**：`"zh"` 或 `"en"`。
+
+    两条判据任一命中即中文：
+      1. `rule_file == "zh"` —— 前端三档里的「中文规则」；
+      2. 显式选中的文件名以 `_zh.txt` 结尾 —— 老存档 / 手写配置 / 直接指定文件。
+
+    语言必须由**这里唯一推导**，再喂给 `build_system_prompt`。否则会出现
+    "规则文件要中文、系统提示词要英文" 这种互斥指令 —— 历史上正是这么翻车的。
+    """
+    sel = str((settings or {}).get("rule_file") or "auto").strip()
+    if sel == RULE_LANG_ZH or sel.lower().endswith("_zh.txt"):
+        return RULE_LANG_ZH
+    return RULE_LANG_EN
+
+
+def rule_file_name(settings: dict | None, task: str | None = None) -> str:
+    """当前「规则 × 段型」该用哪一份文件名（不读盘，只算名字）。
+
+    给 `pick_rule_text` 与测试/诊断共用，保证"选中的文件"与"推导出的语言"同源。
+    """
+    sel = str((settings or {}).get("rule_file") or "auto").strip()
+    zh = rule_language({"rule_file": sel}) == RULE_LANG_ZH
+    ref = _is_ref_task(task)
+    if zh:
+        return RULE_REF_ZH_FILE if ref else RULE_BASE_ZH_FILE
+    return RULE_REF_FILE if ref else RULE_BASE_FILE
 
 
 def prompt_dir() -> str:
@@ -194,22 +239,26 @@ def load_rule_files() -> dict:
 
 
 def pick_rule_text(settings: dict | None, files: dict | None, task: str | None = None) -> str | None:
-    """按「显式选择 > task 分流」选规则文件（只剩两份官方英文规则）。
+    """按「语言 × 段型」选规则文件（4 份：base/ref × 中/英）。
+
+    - `zh`   → 中文版规则（按 task 取 base_zh / ref_zh）
+    - `auto` → 官方英文规则（按 task 取 base / ref）
+    - `none` → 不注入（返回 None）
+    - 其它值 → 当作**显式文件名**；文件不存在就回落 auto。老工作流存档里存着已删除的
+      旧文件名（`*_custom_ref2v*` / `prompt_translate_to_en`），原样透传只会让规则
+      **静默不注入**，模型拿不到官方格式约束。
 
     task 为 None 时按常规（base）处理 —— 调用方应显式传 task（见 optimize_once）。
-    显式选择里历史遗留的中文 / 自定义四字段文件名（老工作流存档里存着）一律
-    回落 auto：那两个文件已经不存在，原样透传只会让规则**静默不注入**，
-    模型拿不到官方格式约束。
+    文件名与语言的推导都走 `rule_file_name`，与 `rule_language` 同源，不会各算各的。
     """
-    sel = str((settings or {}).get("rule_file") or "auto")
+    sel = str((settings or {}).get("rule_file") or "auto").strip()
     if sel == "none":
         return None
     files = files if isinstance(files, dict) else load_rule_files()
-    if sel != "auto":
-        return files.get(sel) or files.get(
-            RULE_REF_FILE if str(task or "").upper() in REF_TASKS else RULE_BASE_FILE)
-    name = RULE_REF_FILE if str(task or "").upper() in REF_TASKS else RULE_BASE_FILE
-    return files.get(name)
+    name = rule_file_name({"rule_file": sel}, task)
+    if sel in ("auto", RULE_LANG_ZH):
+        return files.get(name)
+    return files.get(sel) or files.get(name)
 
 
 def normalize_config(raw: dict | None) -> dict:
@@ -279,31 +328,25 @@ def normalize_config(raw: dict | None) -> dict:
 
 
 def _clean_expand(raw, cur=None) -> dict:
-    """「AI 扩写优化设置」收敛：秒数 0=跟随本段时长、风格白名单、布尔开关。
+    """「AI 扩写优化设置」收敛：**只剩扩写风格**。
 
     风格取值与 tools/h3_prompt_expander/h3_expand.STYLES 对齐（strict/balanced/creative），
     非法值一律回落 balanced，绝不把脏值原样透给扩写器。
+
+    ⚠ 这里只是把**前端持久化的形状**镜像一份，后端**不读**这些值 —— 真正的 style 由前端在
+    `/h3chain/expand_optimize*` 的请求体**顶层** `style` 下发，直通 `screenplay_via_config`。
+    曾经的 `sec_min` / `sec_max`（每段时长范围）与 `run_optimize`（扩写后是否接优化）
+    **都没有任何消费方**：时长在按钮里锁死为本段时长，「扩写+优化」按钮无条件跑两步。
+    已删除 —— 别再往这里加"存了没人读"的键，加之前先找出消费方，否则就是又一个假开关
+    （同类前科：「运行前自动优化提示词」、前端那个「扩写后自动接提示词优化」勾选框）。
     """
-    base = {"sec_min": 0, "sec_max": 0, "style": "balanced", "run_optimize": True}
+    base = {"style": "balanced"}
     base.update(cur if isinstance(cur, dict) else {})
     r = raw if isinstance(raw, dict) else {}
-
-    def _sec(v, d):
-        try:
-            n = int(float(v))
-        except (TypeError, ValueError):
-            return d
-        return max(0, min(15, n))
-
     style = str(r.get("style") or base["style"]).lower()
     if style not in ("strict", "balanced", "creative"):
         style = "balanced"
-    return {
-        "sec_min": _sec(r.get("sec_min"), base["sec_min"]),
-        "sec_max": _sec(r.get("sec_max"), base["sec_max"]),
-        "style": style,
-        "run_optimize": bool(r.get("run_optimize", base["run_optimize"])),
-    }
+    return {"style": style}
 
 
 def public_config(cfg: dict) -> dict:
@@ -448,7 +491,7 @@ def scan_mmproj_models() -> list:
 
 
 def build_system_prompt(task: str, duration: float, labels: list,
-                        context: dict | None = None) -> str:
+                        context: dict | None = None, lang: str = RULE_LANG_EN) -> str:
     """自写的系统提示词：只定**结构与标签纪律**，文风细则由 prompt/*.txt 规则注入。
 
     ⛔ 这里写下的每条结构要求都必须能在官方 `base-en.txt` / `ref-en.txt` 里找到
@@ -476,9 +519,32 @@ def build_system_prompt(task: str, duration: float, labels: list,
       3. `("image", "名字")` 二元组 —— 带类别。
     带类别的会写成 `@名字（视频）`，模型才能选对 `<Video N>` / `<Audio N>`；
     不带类别的按图片算（旧调用方语义不变）。
+
+    ⚠ `lang` 决定**正文语言**（`"en"` / `"zh"`，由 `rule_language()` 从规则选择推导，
+    默认英文）。它只改一句话：「正文用哪种语言写」。骨架（字段名 / `[Shot N]` /
+    `At MM:SS.mmm` / `(Sx)` / `<d>` / 官方标签 / 保留标记 / 运镜词表）**两种语言下
+    都是英文逐字** —— 那是官方 tokenizer 认的契约，翻译了就废。
+    规则文件与系统提示词的语言必须**同源**，否则模型收到两条互斥的最高优先级指令
+    （历史 bug：规则要中文、系统提示词要英文，产出中英混排正文）。
     """
     t = str(task or "T2VA").upper()
     dur = max(0.5, min(30.0, float(duration or 5.0)))
+    # 语言那一句**只生成一次**，三个分支共用。以前三个分支各写一遍
+    # "Write ... in English"，加中文版时必然漏掉一处 —— 那正是当初加不了中文的原因之一。
+    _zh = str(lang or RULE_LANG_EN).lower() == RULE_LANG_ZH
+    _sections = "all six sections" if _is_ref_task(t) else "the body"
+    lang_line = (
+        "Write %s in Chinese (简体中文); keep the English skeleton verbatim — field / "
+        "section names, [Shot N], At MM:SS.mmm, speaker IDs (Sx), <d>[language] ...</d>, "
+        "<Subject N> / <Picture N> / <Video N> / <Audio N>, retention markers, task-type "
+        "prefixes and the camera-motion vocabulary — and preserve the original language "
+        "only inside <d>[language] ...</d> for dialogue/lyrics and for text visibly "
+        "present on screen. " % _sections
+    ) if _zh else (
+        "Write %s in English; preserve the original language only inside "
+        "<d>[language] ...</d> for dialogue/lyrics and for text visibly present on "
+        "screen. " % _sections
+    )
     # 归一 (kind, name)：kind 决定模型该用哪一类官方标签
     _kinds = {"image": "图片", "video": "视频", "audio": "音频"}
     norm = []
@@ -513,9 +579,8 @@ def build_system_prompt(task: str, duration: float, labels: list,
         # 都是官方硬契约，逐条对应原文，不自造。
         return (
             "You are a MiniMax H3 full-reference (Ref2VA) prompt rewriter. "
-            "Write all six sections in English; preserve the original language only "
-            "inside <d>[language] ...</d> for dialogue/lyrics and for text visibly "
-            "present on screen. Output exactly six sections, in this order, each "
+            + lang_line +
+            "Output exactly six sections, in this order, each "
             "section name on its own line followed by a colon: subject_definitions, "
             "summary, retention_analysis, detailed_description, overall_soundscape, "
             "non_diegetic_music. "
@@ -543,21 +608,22 @@ def build_system_prompt(task: str, duration: float, labels: list,
             "marker - explanation`; visible content uses fully_preserved / partially_preserved "
             "/ attribute_transfer / weak_reference, audio uses fully_copy / partially_copy / "
             "reference / weak_reference; never write (Sx) in this section. "
-            "detailed_description: Style is established in one or two English sentences "
+            "detailed_description: Style is established in one or two sentences "
             "BEFORE [Shot 1]. Then [Shot 1] with no timestamp; later shots use "
             "[Shot N] At MM:SS.mmm, strictly increasing and within duration. At the first "
             "appearance of an important <Subject N>, describe its referenced characteristics, "
             "position in frame, and current action; keep using the same label later without "
             "redefining it. Never write a bare @素材名 inside the description — that is only "
-            "for the subject_definitions definition lines. Aim for 350-500 English words. "
+            "for the subject_definitions definition lines. Aim for 350-500 words "
+            "(when the body language is Chinese, roughly 500-750 characters). "
             "Speakers use stable (S1)/(S2) IDs, written as `<Subject N> (Sx)` when the speaker "
             "is a referenced subject; dialogue goes in <d>[Language] verbatim text</d>. "
             "Shared rules with base mode: camera motion written as a natural clause with "
             "type/amplitude/speed (never a tag stacked at the end); on-screen text inside "
             "English double quotes, untranslated; a single-shot segment ends with "
             "`One continuous shot with no cuts.` "
-            "overall_soundscape: 1-4 English sentences of ambience, physical action sounds, "
-            "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 English "
+            "overall_soundscape: 1-4 sentences of ambience, physical action sounds, "
+            "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 "
             "sentences of instrumentation, tempo and dynamics only; write N/A when absent. "
             "Target duration %.1fs. %s. Freedom: enrich the scene freely — camera angles, "
             "lighting, texture, micro-actions, breathing, ambient sound sources, set dressing "
@@ -572,9 +638,8 @@ def build_system_prompt(task: str, duration: float, labels: list,
         # 规则未注入时模型自己编一句更差的。
         return (
             "You are a MiniMax H3 first-and-last-frame (FL2VA) prompt rewriter. "
-            "Write the body in English; preserve the original language only inside "
-            "<d>[language] ...</d> for dialogue/lyrics and for text visibly present on "
-            "screen. Output exactly three fields, in this order, each field name on its "
+            + lang_line +
+            "Output exactly three fields, in this order, each field name on its "
             "own line followed by a colon: integrated_multimodal_description, "
             "overall_soundscape, non_diegetic_music. "
             "The first-and-last-frame alignment instruction is injected by the backend as "
@@ -589,8 +654,8 @@ def build_system_prompt(task: str, duration: float, labels: list,
             "stable (S1)/(S2) IDs; dialogue goes in <d>[Language] verbatim text</d>. "
             "On-screen text goes inside English double quotes, untranslated. A single-shot "
             "segment ends with `One continuous shot with no cuts.` "
-            "overall_soundscape: 1-4 English sentences of ambience, physical action sounds, "
-            "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 English "
+            "overall_soundscape: 1-4 sentences of ambience, physical action sounds, "
+            "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 "
             "sentences of instrumentation, tempo and dynamics only; write N/A when absent. "
             "Target duration %.1fs. Freedom: enrich the scene freely — camera angles, "
             "lighting, texture, micro-actions, breathing and ambient sound sources are all "
@@ -601,9 +666,9 @@ def build_system_prompt(task: str, duration: float, labels: list,
     # T2VA / I2VA / L2VA：官方 base-en.txt §2 三字段 + §3.1/§3.3 关键帧语义。
     # I2VA 与 L2VA 的对齐句同样由后端注入（见 prompts.alignment_lines）。
     return (
-        "You are a MiniMax H3 prompt rewriter (%s). Write the body in English; preserve "
-        "the original language only inside <d>[language] ...</d> for dialogue/lyrics and "
-        "for text visibly present on screen. Output exactly three fields, in this order, "
+        "You are a MiniMax H3 prompt rewriter (%s). " % t
+        + lang_line +
+        "Output exactly three fields, in this order, "
         "each field name on its own line followed by a colon: "
         "integrated_multimodal_description, overall_soundscape, non_diegetic_music. "
         "The keyframe alignment instruction (if this mode has one) is injected by the "
@@ -616,14 +681,14 @@ def build_system_prompt(task: str, duration: float, labels: list,
         "in <d>[Language] verbatim text</d>. On-screen text goes inside English double "
         "quotes, untranslated. A single-shot segment ends with "
         "`One continuous shot with no cuts.` "
-        "overall_soundscape: 1-4 English sentences of ambience, physical action sounds, "
-        "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 English "
+        "overall_soundscape: 1-4 sentences of ambience, physical action sounds, "
+        "and non-verbal human sounds; no dialogue. non_diegetic_music: 1-3 "
         "sentences of instrumentation, tempo and dynamics only; write N/A when absent. "
         "Target duration %.1fs. %s. Freedom: enrich the scene freely — camera angles, "
         "lighting, texture, micro-actions, breathing, ambient sound sources and set dressing "
         "are all fair game. The ONLY hard constraint is fidelity: do not change the "
         "user-named characters, key props, quoted lines (verbatim) or the ending they "
-        "specified." % (t, dur, lbl)
+        "specified." % (dur, lbl)
     )
 
 
@@ -1665,8 +1730,11 @@ def optimize_once(config_in: dict | None, payload: dict | None, on_progress=None
     labels = [{"name": str(m.get("label")), "kind": str(m.get("kind") or "image")}
               for m in media if isinstance(m, dict) and m.get("label")]
     context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
-    system = build_system_prompt(task, duration, labels, context)
-    # 规则文件强注入（最高优先级）：官方 base-en / ref-en 按 task 分流，
+    # 正文语言**只从规则选择推导**（rule_language），再喂给系统提示词 ——
+    # 规则文件与系统提示词必须同语言，否则模型同时收到两条互斥的最高优先级指令。
+    lang = rule_language(cfg)
+    system = build_system_prompt(task, duration, labels, context, lang)
+    # 规则文件强注入（最高优先级）：base / ref 按 task 自动分流，中英按 rule_file 选。
     # 别再给常规段喂全参考规则（那是历史上非官方格式的根因之一）。
     rule_text = pick_rule_text(cfg, None, task)
     if rule_text:

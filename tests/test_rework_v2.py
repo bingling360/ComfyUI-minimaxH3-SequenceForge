@@ -505,30 +505,48 @@ def test_optimizer_backend():
         "h3optimizer", os.path.join(ROOT, "optimizer.py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    # 规则文件：只剩两份官方英文版（中文 / 自研四字段已于 279cad0 整体下线，
-    # 口径同 tests/test_optimizer_rules.py::test_rule_files_exist）
+    # 规则文件：base / ref 各一中一英，共 4 份（自研四字段口径已于 279cad0 下线，
+    # 中文版按官方原文重写后回归；口径同 tests/test_optimizer_rules.py）
     files = m.load_rule_files()
     assert {"minimaxh3_base_prompt_writing.txt",
-            "minimaxh3_official_ref2v_prompt_writing.txt"} <= set(files)
-    assert not [k for k in files if "custom" in k or k.endswith("_zh.txt")]
-    # 老工作流存档里存着的 custom 文件名必须回落 auto —— 静默不注入规则等于没有约束
+            "minimaxh3_base_prompt_writing_zh.txt",
+            "minimaxh3_official_ref2v_prompt_writing.txt",
+            "minimaxh3_official_ref2v_prompt_writing_zh.txt"} <= set(files)
+    assert not [k for k in files if "custom" in k]
+    # 老工作流存档里存着的 custom 文件名必须回落（不炸）—— 静默不注入规则等于没有约束
     assert m.pick_rule_text({"rule_file": "minimaxh3_custom_ref2v_prompt_writing.txt"},
                             files, "Ref2VA")
-    # 规则选择
+    # 规则选择：默认英文（auto），zh 档换中文版；语言只由 rule_file 推导
     assert m.pick_rule_text({"rule_file": "none"}, files) is None
-    assert m.pick_rule_text({"rule_file": "auto", "output_language": "中文"}, files)
+    assert m.pick_rule_text({"rule_file": "auto"}, files)
+    assert "subject_definitions" in m.pick_rule_text({"rule_file": "zh"}, files, "Ref2VA")
+    assert m.rule_language({"rule_file": "zh"}) == "zh"
+    assert m.rule_language({"rule_file": "auto"}) == "en"
     # 配置归一+脱敏
     cfg = m.normalize_config({"provider": "openai", "api_key": "sk-x"})
     pub = m.public_config(cfg)
     assert pub["has_api_key"] is True and pub["api_key"] == ""
+    # 「AI 扩写优化设置」**只剩 style** —— 死键不许复活。
+    # 历史：`sec_min`/`sec_max`（每段时长范围，时长在按钮里锁死为本段时长）与
+    # `run_optimize`（扩写后是否接优化，按钮无条件跑两步）都零消费方，
+    # 2026-09-27 连同前端那个「扩写后自动接提示词优化」勾选框一起删掉。
+    # 加键之前先找出消费方，否则就是又一个假开关。
+    assert set(m._clean_expand({"style": "creative"})) == {"style"}
+    assert m._clean_expand({"style": "creative"})["style"] == "creative"
+    assert m._clean_expand({"style": "bogus"})["style"] == "balanced"
+    assert m._clean_expand({"sec_min": 9, "run_optimize": False}) == {"style": "balanced"}
+    assert set(m.normalize_config({})["expand"]) == {"style"}
+    assert set(m.default_config()["expand"]) == {"style"}
     # 空提示词/无key报清晰错误（不抛 Traceback 穿透）
     with pytest.raises(ValueError, match="为空"):
         m.optimize_once({"mode": "api", "provider": "openai", "api_key": "sk-x"}, {"prompt": "  "})
     with pytest.raises(ValueError, match="API Key"):
         m.optimize_once({"mode": "api", "provider": "openai", "api_key": ""}, {"prompt": "hi"})
-    # 系统提示词双模式
-    assert "subject_definitions" in m.build_system_prompt("Ref2VA", 5.0, [], "中文")
-    assert "integrated_multimodal_description" in m.build_system_prompt("T2VA", 5.0, [], "中文")
+    # 系统提示词双模式（lang 是第 5 个参数：正文语言）
+    assert "subject_definitions" in m.build_system_prompt("Ref2VA", 5.0, [], None, "zh")
+    assert "Write all six sections in Chinese" in m.build_system_prompt(
+        "Ref2VA", 5.0, [], None, "zh")
+    assert "integrated_multimodal_description" in m.build_system_prompt("T2VA", 5.0, [], None, "zh")
 
 
 def test_optimizer_routes_mount(routes):

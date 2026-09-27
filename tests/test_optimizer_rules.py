@@ -30,21 +30,24 @@ prompts = _load("h3prompts_rules", "prompts.py")
 
 
 def test_rule_files_exist():
-    """规则文件只剩**两个官方英文版**（语言分歧已整体下线）。
+    """规则文件 = base / ref **各一中一英**，共 4 份；语言是可选维度，默认英文。
 
     历史：曾按 output_language 分成中英两套（`*_zh.txt` / 无后缀 = en），
-    还额外自研过一套四字段 ref 规则。中文产物混进英文正文会导致严重问题，
-    已全部删除并逐字换成官方 base-en / ref-en。
+    还额外自研过一套四字段 ref 规则（`<@名字>` / `<#名字:对话>` —— 自造语法，
+    官方 tokenizer 根本不认），两套都被 279cad0 删掉。现在中文版**按官方原文
+    重写后回归**，但：① 默认仍是英文；② 语言只由 `rule_file` 一个字段决定
+    （独立的 `output_language` 配置字段已整体删除）。
     """
     files = optimizer.load_rule_files()
     for name in ("minimaxh3_base_prompt_writing.txt",
-                 "minimaxh3_official_ref2v_prompt_writing.txt"):
+                 "minimaxh3_base_prompt_writing_zh.txt",
+                 "minimaxh3_official_ref2v_prompt_writing.txt",
+                 "minimaxh3_official_ref2v_prompt_writing_zh.txt"):
         assert name in files, name
-    for gone in ("minimaxh3_base_prompt_writing_zh.txt",
-                 "minimaxh3_custom_ref2v_prompt_writing.txt",
+    for gone in ("minimaxh3_custom_ref2v_prompt_writing.txt",
                  "minimaxh3_custom_ref2v_prompt_writing_zh.txt",
                  "prompt_translate_to_en.txt"):
-        assert gone not in files, f"{gone} 应已删除（中文生成链路已下线）"
+        assert gone not in files, f"{gone} 应已删除（自研四字段口径已下线）"
 
 
 def test_pick_rule_split_by_task():
@@ -62,7 +65,7 @@ def test_pick_rule_split_by_task():
     assert "detailed_description" in ref and "summary" in ref
     assert "fully_preserved" in ref and "<Subject " in ref
     assert "<#" not in ref, "旧的 <#名字:对话> 语法应已下线"
-    # 语言已不再是分流维度：任何模式拿到的都是官方英文规则。
+    # **auto（默认）拿到的必须是英文规则**：正文语言默认英文，不许悄悄变中文。
     # 注意：官方示例里**允许**出现中文 —— 那是"屏幕上可见文字要照抄"的正面例子
     # （`A red neon sign reading "营业中"`），不是中文指令。所以只禁"指令性中文"：
     # 中文出现在正文/字段说明里必然带这些高信号词，官方示例一个都不带。
@@ -72,17 +75,78 @@ def test_pick_rule_split_by_task():
         t = optimizer.pick_rule_text({"rule_file": "auto"}, files, task) or ""
         assert t, task
         bad = [w for w in zh_cmd if w in t]
-        assert not bad, f"{task} 的规则文件里混进了中文指令词：{bad}"
+        assert not bad, f"auto 下 {task} 的规则文件里混进了中文指令词：{bad}"
+    # **zh 档**：同一套 task 分流，只把文件换成中文版 —— 且必须是中文指令
+    for task in ("T2VA", "FL2VA", "Ref2VA"):
+        zt = optimizer.pick_rule_text({"rule_file": "zh"}, files, task) or ""
+        assert zt, task
+        assert any(w in zt for w in zh_cmd), f"zh 档 {task} 应拿到中文规则"
+        assert zt != optimizer.pick_rule_text({"rule_file": "auto"}, files, task), task
+    # zh 档也要按 task 分流：常规段不许拿到六段式（历史上正是这么串味的）
+    zh_base = optimizer.pick_rule_text({"rule_file": "zh"}, files, "T2VA") or ""
+    zh_ref = optimizer.pick_rule_text({"rule_file": "zh"}, files, "Ref2VA") or ""
+    assert "integrated_multimodal_description" in zh_base
+    assert "subject_definitions" not in zh_base
+    # 六段式：六个段名一个不少，且顺序固定（`subject_definitions` 在最前）
+    ref_order = ["subject_definitions", "summary", "retention_analysis",
+                 "detailed_description", "overall_soundscape", "non_diegetic_music"]
+    assert all(sec in zh_ref for sec in ref_order)
+    # 顺序固定看「1. 整体结构」那张表（全文首个 `detailed_description` 出现在引言里，
+    # 拿全文下标比会被它带偏）
+    tbl = zh_ref.split("## 1. 整体结构", 1)[1].split("## 2.", 1)[0]
+    idx = [tbl.index(sec) for sec in ref_order]
+    assert idx == sorted(idx), "六段顺序必须固定"
+    # 注意：ref 规则里**会出现** `integrated_multimodal_description` —— 那是 5.2 节
+    # 「全参考 vs T2VA」对照表里对 T2VA 主体字段的正常引用，不是"串味"。
+    assert "detailed_description" in zh_ref
     # 显式选择优先于自动分流
     forced = optimizer.pick_rule_text(
         {"rule_file": "minimaxh3_official_ref2v_prompt_writing.txt"}, files, "T2VA")
     assert "subject_definitions" in forced
-    # 老存档里的中文文件名静默回落 auto（不炸）
-    legacy = optimizer.pick_rule_text(
+    # 老存档里已删除的文件名静默回落（不炸）：带 _zh 后缀的落到中文档，其余落到英文档
+    legacy_zh = optimizer.pick_rule_text(
         {"rule_file": "minimaxh3_custom_ref2v_prompt_writing_zh.txt"}, files, "Ref2VA")
-    assert legacy is not None and "subject_definitions" in legacy
+    assert legacy_zh is not None and "subject_definitions" in legacy_zh
+    assert optimizer.rule_language(
+        {"rule_file": "minimaxh3_custom_ref2v_prompt_writing_zh.txt"}) == "zh"
+    legacy_en = optimizer.pick_rule_text(
+        {"rule_file": "minimaxh3_custom_ref2v_prompt_writing.txt"}, files, "Ref2VA")
+    assert legacy_en is not None and "subject_definitions" in legacy_en
     # none 不注入
     assert optimizer.pick_rule_text({"rule_file": "none"}, files, "Ref2VA") is None
+
+
+def test_language_follows_rule_selection():
+    """正文语言**只由 rule_file 推导**，且系统提示词与规则文件必须同语言。
+
+    历史 bug：规则文件要中文、系统提示词却写死 "Write ... in English"，模型同时
+    收到两条互斥的最高优先级指令 → 产出中英混排正文。所以语言只有一个来源
+    （`rule_language`），再由它同时驱动规则文件与系统提示词。
+    """
+    assert optimizer.rule_language({"rule_file": "auto"}) == "en"
+    assert optimizer.rule_language({}) == "en"                      # 缺省 = 英文
+    assert optimizer.rule_language({"rule_file": "zh"}) == "zh"
+    assert optimizer.rule_language({"rule_file": "minimaxh3_base_prompt_writing_zh.txt"}) == "zh"
+    # 默认参数就是英文（老调用方不传 lang 时行为不变）
+    assert optimizer.build_system_prompt("T2VA", 5.0, []) == \
+        optimizer.build_system_prompt("T2VA", 5.0, [], None, "en")
+    en = optimizer.build_system_prompt("T2VA", 5.0, [], None, "en")
+    zh = optimizer.build_system_prompt("T2VA", 5.0, [], None, "zh")
+    assert "Write the body in English" in en and "in Chinese" not in en
+    assert "Write the body in Chinese" in zh and "in English" not in zh
+    # 全参考分支说的是 "all six sections"，同样跟着语言走
+    assert "Write all six sections in Chinese" in optimizer.build_system_prompt(
+        "Ref2VA", 5.0, [], None, "zh")
+    assert "Write all six sections in English" in optimizer.build_system_prompt(
+        "Ref2VA", 5.0, [], None, "en")
+    # 骨架两种语言下都保持英文：字段名 / 标签 / 单镜句不许被翻译
+    for t in (en, zh):
+        for token in ("integrated_multimodal_description", "overall_soundscape",
+                      "non_diegetic_music", "<d>[language]", "At MM:SS.mmm",
+                      "One continuous shot with no cuts."):
+            assert token in t, token
+    # 也不许残留 "N English sentences / English words" 这类会把中文档带偏的硬口径
+    assert "English sentences" not in zh and "English words" not in zh
 
 
 def test_all_base_modes_never_get_ref_rule():

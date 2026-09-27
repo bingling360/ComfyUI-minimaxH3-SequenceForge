@@ -391,8 +391,94 @@ const checkOf = (dlg, label) => {
         assert.strictEqual(await w.optNeedsSetup(mkNode({}), st), false);
     });
 
+    console.log("\n== 9 提示词规则：只选语言，段型自动分流（「输出语言」已删） ==");
+    /* 2026-09-27：语言从「输出语言」单选框搬进「提示词规则」下拉，且**只留语言维度**
+     * —— 段型（常规三字段 / 全参考六段式）由后端按段自动判定，用户不选。
+     * 后端读的字段也只有 rule_file 一个（`output_language` 已从 normalize_config 删除），
+     * 所以这里钉死四件事：① 输出语言行不存在；② 下拉正好三档且默认英文；
+     * ③ 选中文存进去的是 rule_file=zh；④ 老存档里的死文件名回落 auto（不显示成空）。 */
+    /* 带内置 Key 的 mock：不带的话「保存」会被 Key 校验拦下、配置根本不落盘，
+     * 后面那条断言就变成在验一个从没保存过的值。 */
+    const { w: wr, errors: errorsR } = load({
+        H3Api: {
+            async getOptimizerConfig() {
+                return { body: { ok: true, has_default_key: true, has_api_key: true,
+                                 api_key: "", models: [], mmproj_models: [],
+                                 providers: { glm: { url: "https://open.bigmodel.cn/api/paas/v4",
+                                                    model: "glm-4.6v", protocol: "openai" } } } };
+            },
+        },
+    });
+    const rNode = mkNode({});
+    const rDlg = () => wr.document.querySelector(".h3d-opt-dialog");
+    await ta("面板上没有「输出语言」这一行（已删，语言只由规则决定）", async () => {
+        await wr.openOptSettings(rNode);
+        assert.ok(!rowOf(rDlg(), "输出语言"), "「输出语言」行应已删除");
+        assert.strictEqual(wr.optDefaultSettings().output_language, undefined,
+            "默认配置里不该再有 output_language");
+    });
+    await ta("「提示词规则」正好三档，默认 auto（英文）", async () => {
+        const sel = ctrlOf(rDlg(), "提示词规则");
+        assert.deepStrictEqual([...sel.options].map((o) => o.value), ["auto", "zh", "none"]);
+        assert.strictEqual(sel.value, "auto");
+        const labels = [...sel.options].map((o) => o.textContent);
+        assert.ok(labels.some((l) => /英文/.test(l)), "该有一档写明英文：" + labels.join(" / "));
+        assert.ok(labels.some((l) => /中文/.test(l)), "该有一档写明中文：" + labels.join(" / "));
+    });
+    await ta("选中文规则保存 -> rule_file=zh，且不写 output_language", async () => {
+        const sel = ctrlOf(rDlg(), "提示词规则");
+        sel.value = "zh";
+        sel.dispatchEvent(new wr.Event("change"));
+        rDlg().querySelector(".h3d-opt-save").onclick();
+        const saved = wr.optGetSettings(rNode);
+        assert.strictEqual(saved.rule_file, "zh");
+        assert.strictEqual(saved.output_language, undefined);
+    });
+    await ta("老存档里的已删除文件名 -> 下拉回落 auto（不显示成空）", async () => {
+        const { w: wl, errors: errorsL } = load({});
+        const lNode = mkNode({
+            optimizer: { rule_file: "minimaxh3_custom_ref2v_prompt_writing_zh.txt" },
+        });
+        await wl.openOptSettings(lNode);
+        const dlg = wl.document.querySelector(".h3d-opt-dialog");
+        assert.strictEqual(ctrlOf(dlg, "提示词规则").value, "auto",
+            "已删除的文件名必须回落 auto，否则下拉是空的、用户以为规则没了");
+        errorsR.push(...errorsL);
+    });
+
+    console.log("\n== 10 扩写设置：只剩「扩写风格」（假开关已删） ==");
+    /* 「扩写后自动接提示词优化」勾选框 2026-09-27 删：段卡只有一个「✨ AI扩写+优化」按钮，
+     * 后端 expand_optimize_via_config **无条件**跑「扩写 → 优化」两步，这个开关零消费方
+     * （存进 expand.then_optimize 后没有任何地方读它）。「每段时长范围」更早就删了
+     * （时长在按钮里锁死为本段时长）。这里钉住：面板不再出现这些假开关，
+     * 且 expand 配置只剩 style 一个键 —— 别再往这里加"存了没人读"的键。 */
+    await ta("面板上没有「扩写后自动接提示词优化」勾选框", async () => {
+        await wr.openOptSettings(rNode);
+        const dlg = rDlg();
+        const labels = [...dlg.querySelectorAll(".h3d-opt-checks label")]
+            .map((l) => l.textContent || "");
+        assert.ok(!labels.some((t) => /自动接|只扩写/.test(t)),
+            "死开关应已删除，现存的勾选项：" + labels.join(" | "));
+        assert.ok(!/自动接/.test(dlg.textContent || ""), "面板文案里还留着这个开关");
+    });
+    await ta("「扩写风格」仍在（三档），默认 balanced", async () => {
+        const sel = ctrlOf(rDlg(), "扩写风格");
+        assert.deepStrictEqual([...sel.options].map((o) => o.value),
+            ["strict", "balanced", "creative"]);
+        assert.strictEqual(sel.value, "balanced");
+    });
+    await ta("保存后 expand 只剩 style（死键不落盘）", async () => {
+        const sel = ctrlOf(rDlg(), "扩写风格");
+        sel.value = "creative";
+        sel.dispatchEvent(new wr.Event("change"));
+        rDlg().querySelector(".h3d-opt-save").onclick();
+        const saved = wr.optGetSettings(rNode);
+        assert.deepStrictEqual(Object.keys(saved.expand).sort(), ["style"]);
+        assert.strictEqual(saved.expand.style, "creative");
+    });
+
     results.forEach((r) => console.log(r));
-    const allErr = [...errors, ...errors2, ...errorsC, ...errorsP];
+    const allErr = [...errors, ...errors2, ...errorsC, ...errorsP, ...errorsR];
     if (allErr.length) { console.log("\n页面错误: " + allErr.join(" | ")); ok = false; }
     console.log(ok ? "\nopt_provider_default_check 全部通过" : "\nopt_provider_default_check 失败");
     process.exit(ok ? 0 : 1);

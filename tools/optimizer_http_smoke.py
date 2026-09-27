@@ -105,13 +105,12 @@ def _frontend_config(overrides: dict | None = None) -> dict:
         "api_url": "https://open.bigmodel.cn/api/paas/v4",
         "api_key": "", "api_keys": {"glm": ""},
         "model": "glm-5.3-flashx", "provider_models": {"glm": "glm-5.3-flashx"},
-        "protocol": "openai", "read_media": True, "output_language": "中文",
+        "protocol": "openai", "read_media": True,
         "local_model": "", "local_mmproj": "", "local_device": "cuda",
         "max_tokens": 8192, "timeout": 300, "thinking": "disabled",
         "reasoning_effort": "",
         "rule_file": "auto", "cfg_ver": 2,
-        "expand": {"style": "balanced", "seconds_min": 4, "seconds_max": 15,
-                   "then_optimize": True},
+        "expand": {"style": "balanced"},
     }
     cfg.update(overrides or {})
     return cfg

@@ -6,13 +6,13 @@
 
 ## 第一步：定模式（决定字段集，选错全篇作废）
 
-| 模式 | 何时用 | 输出 |
-|---|---|---|
-| T2VA | 纯文字生成 | 三字段 |
-| I2VA | 有首帧图 | 三字段 + 首帧对齐指令 |
-| FL2VA | 有首尾帧 | 三字段 + 首尾帧对齐指令 |
-| L2VA | 有尾帧 | 三字段 + 尾帧对齐指令 |
-| **Ref2VA** | **有参考素材（角色/场景/道具/风格），或要编辑/续写已有视频** | 六段式 |
+| 模式         | 何时用                                | 输出            |
+| ---------- | ---------------------------------- | ------------- |
+| T2VA       | 纯文字生成                              | 三字段           |
+| I2VA       | 有首帧图                               | 三字段 + 首帧对齐指令  |
+| FL2VA      | 有首尾帧                               | 三字段 + 首尾帧对齐指令 |
+| L2VA       | 有尾帧                                | 三字段 + 尾帧对齐指令  |
+| **Ref2VA** | **有参考素材（角色/场景/道具/风格），或要编辑/续写已有视频** | 六段式           |
 
 - 三字段（顺序固定）：`integrated_multimodal_description`、`overall_soundscape`、`non_diegetic_music`
 - 六段式（顺序固定）：`subject_definitions`、`summary`、`retention_analysis`、`detailed_description`、`overall_soundscape`、`non_diegetic_music`
@@ -20,18 +20,24 @@
 
 ## 第二步：读规则文件（**最高优先级，压过其它一切通用格式要求**）
 
-原文在 `references/06-rules/`。**只有两份**，按模式选，不按语言选：
+原文在 `references/06-rules/`。**只有两份**，按模式选，**不按语言选**：
 
-| 条件 | 文件 |
-|---|---|
-| 常规模式（T2VA / I2VA / FL2VA / L2VA） | `06-rules/minimaxh3_base_prompt_writing.txt` |
-| 全参考模式（Ref2VA） | `06-rules/minimaxh3_official_ref2v_prompt_writing.txt` |
+| 条件                               | 文件                                                     |
+| -------------------------------- | ------------------------------------------------------ |
+| 常规模式（T2VA / I2VA / FL2VA / L2VA） | `06-rules/minimaxh3_base_prompt_writing.txt`           |
+| 全参考模式（Ref2VA）                    | `06-rules/minimaxh3_official_ref2v_prompt_writing.txt` |
 
 ⚠️ **规则文件按模式分流，不许串用**：拿全参考的六段式规则去洗常规段，会产出 `subject_definitions` / `retention_analysis` 这类常规模型不认的字段。
 
 ⚠️ 这两份都是**官方英文原文，逐字不许改**。它们和本文件冲突时，以它们为准。
 
-> 历史包袱（别再用）：曾经存在按语言分的 `*_zh.txt`、自研的四字段 ref 规则（`<@名字>` / `<#名字:对话>`）、以及中译英规则文件。**已全部删除**——中文产物混进英文正文会导致严重问题。如果你在旧笔记里看到这些文件名，忽略。
+> **本 skill 只产出英文正文**（再外加一份中文对照版，见 `SKILL.md`），所以这里按模式选、不按语言选。
+> 插件内部（导演台「AI 优化设置」的「提示词规则」）另有一套**中文规则**（`prompt/*_zh.txt`）：
+> 正文写中文、**骨架仍是英文逐字**，段型同样按模式自动分流 —— 那是给"想直接出中文正文"的用户用的，
+> 本 skill 不引用它。
+>
+> 历史包袱（别再用）：自研的四字段 ref 规则（`<@名字>` / `<#名字:对话>`）与中译英规则文件
+> `prompt_translate_to_en.txt` **已删除** —— 自造语法官方 tokenizer 根本不认。如果你在旧笔记里看到这些文件名，忽略。
 
 ## 第三步：结构硬约束
 
@@ -61,10 +67,10 @@ T2VA 与 Ref2VA 没有对齐指令。
 
 后端会把正文里的 `@素材名` 序列**压成官方的标签**。所以关键不是「写不写 @」，而是**写在哪**。
 
-| 模式 | `@素材名` 写在哪 | 压成的标签 |
-|---|---|---|
-| base（T2VA / I2VA / FL2VA / L2VA） | 直接写进正文。挂哪些素材由正文 `@` 序列决定 | `<Picture N>`（素材图） |
-| Ref2VA | **只**写在 `subject_definitions` 的定义行；`detailed_description` 及以后**一律用标签指代** | `<Subject N>` / `<Picture N>` / `<Video N>` / `<Audio N>` |
+| 模式                               | `@素材名` 写在哪                                                               | 压成的标签                                                     |
+| -------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------- |
+| base（T2VA / I2VA / FL2VA / L2VA） | 直接写进正文。挂哪些素材由正文 `@` 序列决定                                                 | `<Picture N>`（素材图）                                        |
+| Ref2VA                           | **只**写在 `subject_definitions` 的定义行；`detailed_description` 及以后**一律用标签指代** | `<Subject N>` / `<Picture N>` / `<Video N>` / `<Audio N>` |
 
 **Ref2VA 错误写法**（用户报的 bug：正文里冒出图片引用）：
 
@@ -86,25 +92,25 @@ detailed_description: [Shot 1] <Subject 1> stops and looks back; the neon of <Su
 
 定义行是**一句话**：`<标签 N> is … , the source image / file "素材名".`。句子里提到的 `<Picture k>` / `<Video k>` 是这条素材在**定义区**的编号，与正文里的 `<Subject N>` 编号**各算各的**。
 
-| 素材类型 | 官方句式骨架 |
-|---|---|
-| 图片 → 抽象成可复用主体 | `<Subject 1> is the young woman in <Picture 1>, the source image "名字.png".` |
-| 图片 + 视频各供一半 | `<Subject 1> is the woman whose appearance comes from <Picture 1> and whose walking motion comes from <Video 1>, the source image "名字.png".` |
-| 图片当具体帧 / 分镜锚 | `<Picture 2> is the first frame of [Shot 1], showing a woman seated beside a café window, the source image "名字.png".` |
-| 视频当整段结构来源 | `<Video 1> is the source video for the target video edit, the file "名字.mp4".` |
-| 音频信号 | `<Audio 1> is the reference audio signal that is reused in the target video, the file "名字.wav".` |
-| 音频给某个主体的嗓音 | `<Audio 1> is the voice-timbre reference for <Subject 1> (S1), the file "名字.wav".` |
+| 素材类型          | 官方句式骨架                                                                                                                                       |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 图片 → 抽象成可复用主体 | `<Subject 1> is the young woman in <Picture 1>, the source image "名字.png".`                                                                  |
+| 图片 + 视频各供一半   | `<Subject 1> is the woman whose appearance comes from <Picture 1> and whose walking motion comes from <Video 1>, the source image "名字.png".` |
+| 图片当具体帧 / 分镜锚  | `<Picture 2> is the first frame of [Shot 1], showing a woman seated beside a café window, the source image "名字.png".`                        |
+| 视频当整段结构来源     | `<Video 1> is the source video for the target video edit, the file "名字.mp4".`                                                                |
+| 音频信号          | `<Audio 1> is the reference audio signal that is reused in the target video, the file "名字.wav".`                                             |
+| 音频给某个主体的嗓音    | `<Audio 1> is the voice-timbre reference for <Subject 1> (S1), the file "名字.wav".`                                                           |
 
 ⚠️ **标点与空格**：句末素材名**必须带引号**；`<Subject 1>` 标签内侧各一个空格（`<Subject N>`，不是 `<SubjectN>`）；句末一个句点，不留多余空格。
 
 **官方标签的固定含义**（全节通用，别混）：
 
-| 标签 | 指什么 |
-|---|---|
+| 标签            | 指什么                                     |
+| ------------- | --------------------------------------- |
 | `<Subject N>` | 从素材里抽象出来的**可复用可见内容**（角色 / 场景 / 道具 / 风格） |
-| `<Picture N>` | 当**具体帧 / 分镜锚**用的一张参考图 |
-| `<Video N>` | 当**整段时序结构**用的一条参考视频（剪辑 / 续写） |
-| `<Audio N>` | 被复制或参考的音频信号 |
+| `<Picture N>` | 当**具体帧 / 分镜锚**用的一张参考图                   |
+| `<Video N>`   | 当**整段时序结构**用的一条参考视频（剪辑 / 续写）            |
+| `<Audio N>`   | 被复制或参考的音频信号                             |
 
 只在定义里出现、用于说明「这个角色长什么样」的图，**不单独占一行 `<Picture N>`**——把它并进对应的 `<Subject N>` 定义行即可。
 
@@ -133,12 +139,12 @@ detailed_description: [Shot 1] <Subject 1> stops and looks back; the neon of <Su
 
 `integrated_multimodal_description`（Ref2VA 为 `detailed_description`）正文按 **20–40 字/秒**（中文口径换算）；官方口径更严，要求 `detailed_description` 每段 **350–500 英文词**（约合中文 500–750 字）。
 
-| 段时长 | 主描述字数（中文字符） | 全段三/六字段合计 |
-|---|---|---|
-| 4–5 秒 | 80–200 | 约 +20% |
-| 6–8 秒 | 120–320 | 约 +20% |
-| 9–11 秒 | 180–440 | 约 +20% |
-| 12–15 秒 | 240–600 | 约 +20% |
+| 段时长     | 主描述字数（中文字符） | 全段三/六字段合计 |
+| ------- | ----------- | --------- |
+| 4–5 秒   | 80–200      | 约 +20%    |
+| 6–8 秒   | 120–320     | 约 +20%    |
+| 9–11 秒  | 180–440     | 约 +20%    |
+| 12–15 秒 | 240–600     | 约 +20%    |
 
 - 约每 3 秒一个切点；每镜至少 3 秒才能立住东西；10 秒内 4 镜已属激进。
 - 压缩顺序：先合并同类动作 → 再删次要环境细节 → 最后才考虑加时长（由用户决定）。
@@ -162,10 +168,13 @@ detailed_description: [Shot 1] <Subject 1> stops and looks back; the neon of <Su
 
 字段名独占一行 + 冒号，字段间空一行。除此之外不输出任何解释、标题、围栏或多余文字。
 
-````
+> 中文对照版**不在这一步产出** —— 它是交付层的事（见 `SKILL.md`「中文对照版（必出）」）。
+> 这一步只负责把内容压成**英文官方格式**。
+
+```
 integrated_multimodal_description: [Shot 1] …
 
 overall_soundscape: …
 
 non_diegetic_music: N/A
-````
+```

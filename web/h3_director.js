@@ -3227,11 +3227,13 @@ const _optRulesCache = { loaded: false, files: {} };
 /** AI 扩写优化设置的默认值（段卡「AI扩写+优化」按钮用，配置在 AI 优化设置里）。
  *  以前这些参数在扩写弹窗里（填完才跑），现在弹窗没了，统一住进 ds.optimizer。
  *  「每段时长范围」已删：前端只剩单段扩写（segment_count:1），请求里的时长锁死为
- *  本段时长（见 runExpandOptimizeForSegment），这个范围没有任何消费方。 */
+ *  本段时长（见 runExpandOptimizeForSegment），这个范围没有任何消费方。
+ *  「扩写后自动接提示词优化」也已删：段卡只有一个「✨ AI扩写+优化」按钮，它**无条件**
+ *  跑「扩写 → 优化」两步（后端 expand_optimize_via_config 不看任何开关），
+ *  那个勾选框存了没人读 —— 与之前删掉的「运行前自动优化提示词」是同一类假开关。 */
 function optDefaultExpandSettings() {
     return {
-        style: "balanced",            // strict / balanced / creative
-        then_optimize: true,          // 扩写后接着做提示词优化（关掉 = 只扩写不优化）
+        style: "balanced",            // strict / balanced / creative（**唯一有消费方的键**）
     };
 }
 
@@ -3257,10 +3259,13 @@ function optDefaultSettings() {
         mode: "api", provider: "glm",
         api_url: "https://open.bigmodel.cn/api/paas/v4", api_key: "", api_keys: {},
         model: "glm-5.3-flashx", provider_models: {}, protocol: "openai",
-        read_media: true, output_language: "中文",
+        read_media: true,
         local_model: "", local_mmproj: "", local_device: "cuda",
         max_tokens: 8192, timeout: 300, thinking: "disabled", reasoning_effort: "",
-        rule_file: "auto",          // 开关删留见 openOptSettings 注释
+        /* 提示词规则：auto = 官方英文规则（默认）/ zh = 中文规则 / none = 不注入。
+         * 段型（常规三字段 / 全参考六段式）由后端按段自动分流，用户只选语言 ——
+         * 「输出语言」那个独立单选框已删，语言只由这里决定。 */
+        rule_file: "auto",
         cfg_ver: OPT_CFG_VER,
         expand: optDefaultExpandSettings(),
     };
@@ -4839,21 +4844,18 @@ async function openOptSettings(node, onSaved) {
         ? String(current.thinking_level).toLowerCase()
         : (level === "disabled" ? "off" : "high");
 
-    const language = el("div", "h3d-opt-language");
-    for (const value of ["中文", "English"]) {
-        const lb = el("label", ""); const rd = el("input", ""); rd.type = "radio";
-        rd.name = `h3d-opt-lang-${node?.id ?? "x"}`; rd.value = value;
-        rd.checked = (current.output_language || "中文") === value;
-        lb.append(rd, el("span", "", value)); language.append(lb);
-    }
     const readMedia = el("input", ""); readMedia.type = "checkbox"; readMedia.checked = current.read_media !== false;
+    /* 提示词规则 = **只选语言**三档。段型（task）由后端按段自动分流，用户不用选：
+     *   有参考素材 → 全参考六段式；首尾帧 → FL2VA/I2VA/L2VA；都没有 → 常规三字段。
+     * 骨架（字段名 / [Shot N] / <d> / 官方标签 / 保留标记 / 运镜词表）在两种语言下
+     * **都是英文逐字** —— 那是官方 tokenizer 认的契约；中文档只把正文写成中文。
+     * 老存档里可能存着早已删除的文件名（自定义中文版 / 自定义英文版 / 官方版），
+     * 一律回落 auto，别让下拉显示成空。 */
     const ruleSel = el("select", "");
-    for (const [value, label] of [["auto", "自动（中文→自定义中文版 / 其他→自定义英文版）"],
-        ["minimaxh3_custom_ref2v_prompt_writing_zh.txt", "自定义中文版"],
-        ["minimaxh3_custom_ref2v_prompt_writing.txt", "自定义英文版"],
-        ["minimaxh3_official_ref2v_prompt_writing.txt", "官方版（六字段·英文输出）"],
-        ["none", "不注入（用后端内置规则）"]]) ruleSel.append(new Option(label, value));
-    ruleSel.value = current.rule_file || "auto";
+    for (const [value, label] of [["auto", "自动 · 英文（默认）"],
+        ["zh", "中文规则（正文中文）"],
+        ["none", "不注入（用后端内置系统提示词）"]]) ruleSel.append(new Option(label, value));
+    ruleSel.value = ["auto", "zh", "none"].includes(current.rule_file) ? current.rule_file : "auto";
     /* 「运行前自动优化提示词」开关已删：它从来没有消费方（存了就没人读），
      * 是个**不能兑现的承诺** —— 勾了以为运行前会优化一遍，实际什么都没发生。
      * 要么接上要么删掉；接上要动采样链路，这里先删。 */
@@ -4964,8 +4966,11 @@ async function openOptSettings(node, onSaved) {
         thinkingHint.textContent = warns.join(" ");
         thinkingHint.classList.toggle("h3d-opt-hidden", !warns.length);
     };
-    const langRow = el("label", "h3d-opt-row"); langRow.append(el("span", "", "输出语言"), language); dialog.append(langRow);
     const ruleRow = el("label", "h3d-opt-row"); ruleRow.append(el("span", "", "提示词规则"), ruleSel); dialog.append(ruleRow);
+    dialog.append(el("div", "h3d-opt-hint",
+        "段型自动判定，不用选：有参考素材 → 全参考六段式；首尾帧 → FL2VA / I2VA / L2VA；"
+        + "都没有 → 常规三字段。这里只选「正文语言」；骨架（字段名 / [Shot N] / <d> / "
+        + "官方标签 / 保留标记 / 运镜词表）两种语言下都是英文逐字。"));
     const checks = el("div", "h3d-opt-checks");
     const chk = (t, c) => { const lb = el("label", ""); lb.append(c, el("span", "", t)); checks.append(lb); };
     chk("读取视觉参考（图片转 dataURL，最多 8 张）", readMedia);
@@ -4985,16 +4990,10 @@ async function openOptSettings(node, onSaved) {
         ["balanced", "均衡（可补光位与材质）"],
         ["creative", "创意（可补 1 个视觉细节）"]]) exStyle.append(new Option(l, v));
     exStyle.value = ["strict", "creative"].includes(ex.style) ? ex.style : "balanced";
-    const exThen = el("input", ""); exThen.type = "checkbox";
-    exThen.checked = ex.then_optimize !== false;
     row("扩写风格", exStyle);
-    const exChecks = el("div", "h3d-opt-checks");
-    {
-        const lb = el("label", "");
-        lb.append(exThen, el("span", "", "扩写后自动接提示词优化（关掉 = 只扩写，不改格式）"));
-        exChecks.append(lb);
-    }
-    dialog.append(exChecks);
+    /* 「扩写后自动接提示词优化」勾选框已删：段卡只有一个「✨ AI扩写+优化」按钮，
+     * 它无条件跑「扩写 → 优化」两步，这个开关没有任何消费方（存了没人读）。
+     * 同理「每段时长范围」更早就删了（时长锁死为本段时长）。 */
 
     const refreshIcon = '<svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7a5 5 0 0 1 4.9 4H20a8 8 0 0 0-2.35-4.65ZM12 17a5 5 0 0 1-4.9-4H4a8 8 0 0 0 8 7v3l5-5-5-5v4Z"/></svg>';
     const refreshModels = el("button", "h3d-btn h3d-opt-refresh", refreshIcon);
@@ -5149,7 +5148,6 @@ async function openOptSettings(node, onSaved) {
     cancel.onclick = close;
     overlay.addEventListener("pointerdown", (ev) => { if (ev.target === overlay) close(); });
     save.onclick = () => {
-        const outLang = language.querySelector("input:checked")?.value || "中文";
         const preset = OPT_PROVIDERS[provider.value];
         apiKeys[provider.value] = key.value;
         providerModels[provider.value] = model.value;
@@ -5168,7 +5166,7 @@ async function openOptSettings(node, onSaved) {
             model: model.value.trim() || preset?.model || "",
             provider_models: { ...providerModels },
             protocol: protocol.value || preset?.protocol || "openai",
-            read_media: readMedia.checked, output_language: outLang,
+            read_media: readMedia.checked,
             local_model: localModel.value, local_mmproj: mmproj.value, local_device: device.value,
             rule_file: ruleSel.value,
             max_tokens: mt, timeout: to,
@@ -5181,11 +5179,9 @@ async function openOptSettings(node, onSaved) {
                 ? (["off", "low", "medium", "high", "max"].includes(thinking.value)
                     ? thinking.value : tkLevel) : "",
             cfg_ver: OPT_CFG_VER,
-            /* AI 扩写优化设置（段卡「AI扩写+优化」按钮的参数） */
-            expand: {
-                style: exStyle.value,
-                then_optimize: exThen.checked,
-            },
+            /* AI 扩写优化设置（段卡「✨ AI扩写+优化」按钮的参数）——
+             * **只有 style**：段型/时长/是否接优化都不在这里（见 optDefaultExpandSettings） */
+            expand: { style: exStyle.value },
         };
         if (body.mode === "local" && !body.local_model) { alert("请先选择一个本地视觉模型"); return; }
         /* Key 留空**不算错**：服务端可能内置了 Key（hasDefaultKey），此时留空
@@ -6366,9 +6362,6 @@ function injectStyles() {
     .h3d-opt-row>span{flex:none;width:96px;color:#9fb0bd}
     .h3d-opt-row input[type=text],.h3d-opt-row input[type=password],.h3d-opt-row select,.h3d-opt-row input[type=number]{flex:1 1 auto;min-width:0;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:6px 8px;font-size:12px;outline:none;font-family:inherit}
     .h3d-opt-row input:focus,.h3d-opt-row select:focus{border-color:#a8d8bd}
-    .h3d-opt-language{display:flex;gap:16px;flex:1}
-    .h3d-opt-language label{display:flex;align-items:center;gap:5px;white-space:nowrap;color:#c8c2b4;cursor:pointer;font-size:12px}
-    .h3d-opt-language input{accent-color:#7fc79f}
     .h3d-opt-checks{display:flex;gap:18px;flex-wrap:wrap;margin:9px 0 2px}
     .h3d-opt-checks label{display:flex;align-items:center;gap:6px;font-size:12px;color:#c8c2b4;cursor:pointer}
     .h3d-opt-checks input{accent-color:#7fc79f;width:14px;height:14px}
@@ -6868,12 +6861,12 @@ function openDesk() {
         + "（报错或被中断后不再一直挂着「已提交队列」）。\n"
         + "不会取消正在跑的生成 —— 要取消请用页脚「✕ 终止」。";
     refreshBtn.onclick = () => { refreshAll(); };
-    /* AI 优化设置也是**全链共用**的一套（服务商 / 模型 / 输出语言 / 规则文件），
+    /* AI 优化设置也是**全链共用**的一套（服务商 / 模型 / 提示词规则），
      * 跟性能优化同级。以前它挂在每段卡里 —— 每段都长一个按钮，看着像"本段设置"，
      * 而且必须翻到某一段才点得到。放顶栏后位置固定，不用先找段。
      * 节点在打开时现取：顶栏是常驻 DOM，建台那一刻画布上未必已经有节点。 */
     const optBtn = el("button", "h3d-btn h3d-optbtn", "⚙ AI 优化设置");
-    optBtn.title = "AI 提示词优化设置（服务商 / 模型 / 输出语言 / 规则文件）——"
+    optBtn.title = "AI 提示词优化设置（服务商 / 模型 / 提示词规则）——"
         + "全链共用，不是某一段的设置";
     optBtn.onclick = () => {
         const n = findNode();

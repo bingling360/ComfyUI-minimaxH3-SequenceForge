@@ -59,6 +59,44 @@ non_diegetic_music: The low strings turn to dense short-bow tremolo at a faster 
 [END]
 ```
 
+## 中文对照版（只示范第 1 段，第 2 段照同样格式跟上）
+
+交付时接在英文版 `[END]` 之后，用一行醒目分隔标出。**骨架仍是英文逐字，只翻正文。**
+
+```
+———————— 中文对照版（仅供阅读，不要粘进提示词框）————————
+
+[Segment 1]
+Duration: 10
+Standalone: no
+
+Prompt:
+subject_definitions:
+<Subject 1> 是 <Picture 1> 定义的内容，参考图 "雪山主峰_广角.png"。它固定了山脊剪影、雪线高度与天空色调。
+<Subject 2> 是 <Picture 2> 定义的内容，参考图 "藏袍牧民_远景.png"。它固定了远景那群人身上藏袍的裁剪与颜色。
+
+summary: [reference generation] 高原清晨；<Subject 1> 定义的山体露出第一道裂缝，其余部分仍静止不动，雪粒沿陡坡滑落，三名由 <Subject 2> 抽象出的牧民在远处停下脚步抬头望。
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved - 山脊剪影、雪线高度与天空色调全程不变。
+<Subject 2> (appears in [Shot 3]): partially_preserved - 藏袍的裁剪与颜色保留；人物始终保持远景剪影。
+
+detailed_description: CG 三维渲染，具备实拍级的体积光与全局光照。[Shot 1] 一个固定机位的大远景把整座山体压在画面右侧三分之二，山脊线锐利，峰顶折射出一道冷白高光，山脚是灰褐色裸露岩体与碎石，半山腰浮着一层薄薄冰晶雾，雪面在左上来的低角度侧逆光下呈偏蓝的冷白，天空是未经打亮的深板岩灰。镜头以 with small amplitude at slow speed 推近。
+
+[Shot 2] At 00:04.000, 镜头以 with large amplitude at slow speed 向右平移，同时轻微下压。山脊线上裂开一道窄缝；冰碴与雪粒成一条白线沿陡坡滑下，扬起的雪尘在侧光里显出致密的颗粒，裂缝内的阴影呈深蓝，几块碎冰从边缘脱落滚下。
+
+[Shot 3] At 00:07.500, 镜头以 with small amplitude at slow speed 向裂缝推近。裂缝边缘的冰层断面露出分层的蓝色纹理与气泡痕。画面左下，<Subject 2> 的三名牧民站着不动抬头望，每人约占画面高度的十分之一，深红藏袍从雪面接上一道轮廓光，其中一人抬手指向山脊。
+
+overall_soundscape: 持续的低频高原风声，雪粒滑落的细碎摩擦声，远处冰层深处传来一声沉闷的裂响，牧民的轻微呼吸声。
+
+non_diegetic_music: 极慢速的持续低音弦乐，底下垫一声低鼓的轻击，全程不做推进。
+
+[Segment 2]
+…（照英文版逐字段翻，段头 / 标签 / 字段名 / `<Subject N>` / 保留标记全部照抄英文）
+
+[END]
+```
+
 ## 这个范例做对了什么
 
 | 要点 | 体现 |

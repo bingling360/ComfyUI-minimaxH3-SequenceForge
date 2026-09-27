@@ -216,6 +216,9 @@
      * 前端不自己算档位，只做开关 + 显示后端给的只读诊断。 */
     perfGet: () => _call("/h3chain/perf"),
     perfSet: (perf) => _json("POST", "/h3chain/perf", { perf: perf || {} }),
+    /* 启动命令速查（📖 启动命令弹窗）。数据源在后端 launch_ref.py（单一真源），
+     * 与 docs/ComfyUI启动命令速查.txt 同源。 */
+    launchRef: () => _call("/h3chain/launch_ref"),
     /* ---- 素材库（Library）：一个浏览器 + 四个 scope ---- */
     libList: (p) => _call("/h3chain/lib_list?" + _qs(p)),
     libItem: (p) => _call("/h3chain/lib_item?" + _qs(p)),

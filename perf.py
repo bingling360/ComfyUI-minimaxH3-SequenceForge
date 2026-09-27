@@ -30,6 +30,7 @@ import json
 import logging
 import math
 import os
+import sys
 import threading
 import time
 
@@ -1956,6 +1957,200 @@ def vram_headroom_advice(hw, policy=None):
               "（实测显存 100% → ~77%，代价约 5% 耗时）。"
               "注意：运行时改 EXTRA_RESERVED_VRAM 的第三方节点只影响 Python 侧记账，"
               "盖不到 aimdo 原生预留。")
+# ---- 启动参数体检（**只读**）----
+#
+# ⚠ 为什么是「只读 + 给一行命令」而不是做成面板开关（2026-09-27 定，别再试图接线）：
+#
+#   · `--vram-headroom` 的落点是 `main.py` 启动时交给
+#     `comfy_aimdo.control.init_devices` 的**每设备**预留 —— 进程一起来就定死。
+#     aimdo 0.5.5 公开的预留 API 只有两个：`init_devices()`（启动时，每设备）与
+#     `set_simple_vram_headroom()`（**运行时可写**，进程级 simple budget）。
+#     前者**没有**运行时可写的入口 → 「面板里勾一下 = `--vram-headroom 1`」做不到，
+#     硬做就是骗人（写了不生效的开关比不给更糟，见 DEFAULT_PERF 里那批 ⛔ 注释）。
+#   · `--disable-comfy-compiler` 决定的是 `comfy.model_management` 的模块级常量与
+#     CUDA graph 子特性，同样只在启动时读一次。
+#
+# 但**「留出余量」这件事本身运行时可做**：`--reserve-vram` 除了 Python 侧的
+# `EXTRA_RESERVED_VRAM`，还会喂 aimdo 的 `simple_vram_headroom`，而后者有 setter
+# —— 面板上的「块交换 → 交换块数」接的正是它
+# （`apply_blockswap` → `_set_aimdo_headroom`）。所以本函数只负责把
+# 「现在是什么 / 缺什么 / 为什么不能运行时改」如实摆出来，并给一行可直接粘的
+# 启动命令；真要不重启就留余量，走「块交换」那条路。
+
+# 体检表：(flag, 建议值, 是否「运行时有等价旋钮」, 档位)
+# `runtime_ok=True` 目前只有 `--reserve-vram` —— 它的等价旋钮就是面板的「块交换」。
+# 档位决定它**进不进那行推荐命令**：
+#   · ``primary``  —— 直接进（低风险、收益明确）
+#   · ``fallback`` —— 只提示、不进（有代价，插件口径是「仍不稳再加」）
+#   · ``alt``      —— 只标注「有运行时等价物」、从不推荐加（加了要重启，没必要）
+LAUNCH_ARG_ITEMS = (
+    ("--vram-headroom", "1", False, "primary"),
+    ("--use-ck-attention", "", False, "primary"),
+    ("--disable-comfy-compiler", "", False, "fallback"),
+    ("--reserve-vram", "1", True, "alt"),
+)
+
+
+def _argv_has(flag, argv):
+    """argv 里有没有这个 flag（支持 `--x` / `--x=1` 两种写法）。"""
+    f = str(flag)
+    return any(a == f or a.startswith(f + "=") for a in argv)
+
+
+def _quote_arg(a):
+    """命令行引号：只在含空白时加引号（Windows 路径带空格是常态）。"""
+    a = str(a)
+    return f'"{a}"' if (" " in a or "\t" in a) else a
+
+
+def _kitchen_available():
+    """comfy_kitchen 是否可用 —— `--use-ck-attention` 的前提。
+
+    ⚠ **单独抽成函数是为了可测**（2026-09-27）：直接 inline `import comfy_kitchen`
+    会让测试依赖「跑测试的解释器里装没装它」—— 本机 managed venv 里没有、
+    ComfyUI venv 里有，于是同一条断言在两个环境里结果不同（实际踩过）。
+    抽出来后测试 monkeypatch 这一个函数即可，与运行环境解耦。
+    """
+    try:
+        import comfy_kitchen  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def launch_args_report(policy=None, table=None, argv=None, python=None, hw=None):
+    """启动参数体检（**只读 + 适配本机**）→ ``{"items", "missing", "cmdline_flags",
+    "args", "cmdline", "vram_gb", "kitchen_ok", "note"}``。
+
+    每项：``{"flag", "value", "current", "tier", "missing", "runtime_ok", "why"}``。
+    `args` / `cmdline` **只收 `tier == "primary"`** 的缺失项 —— `fallback`（关编译器）
+    有约 5% 耗时代价，口径是「仍不稳再加」，不该默认塞进那行命令里。
+    全部输入可显式传入（policy / table / argv / python / hw），因此是**可测的纯函数**
+    —— 不传才回落到 `probe_vram_policy()` / `sys.argv` / `probe_hardware()`。
+
+    ⚠ 为什么是「只读 + 给一行命令」而不是做成面板开关（2026-09-27 定，别再试图接线）：
+    `--vram-headroom` 的落点是 `main.py` 启动时交给
+    `comfy_aimdo.control.init_devices` 的**每设备**预留 —— 进程一来就定死，
+    aimdo 0.5.5 公开的预留 API 只有 `init_devices()`（启动）与
+    `set_simple_vram_headroom()`（**运行时可写**，进程级 simple budget），
+    前者没有运行时可写的入口 → 「勾一下 = `--vram-headroom 1`」做不到。
+    `--disable-comfy-compiler` 决定的是 `comfy.model_management` 的模块级常量与
+    CUDA graph 子特性，同样只在启动时读一次。
+
+    ``hw``（2026-09-27 加）：**本机的硬件探测结果**（``vram_total_gb``）。
+    之前判定只查「DynamicVRAM 开 + 余量未给」，跟卡大小无关 —— 这导致**在 24GB
+    卡上也喊 `--vram-headroom 1`**，对没余量问题的人毫无意义、还把真紧张的卡那
+    行盖掉。所以现在按 VRAM 分档：
+      · < 12GB → 真的紧张，必须给 `--vram-headroom`；还建议关编译器。
+      · 12–24GB → 边缘，给不给随你，但 why 里如实写清。
+      · ≥ 24GB → 装得下，不该喊这条；标记 ``missing=False``，why 写清「可省」。
+    """
+    pol = policy if isinstance(policy, dict) else (probe_vram_policy() or {})
+    t = table if isinstance(table, dict) else {}
+    av = [str(x) for x in (argv if argv is not None else (getattr(sys, "argv", None) or []))]
+    exe = str(python if python is not None else getattr(sys, "executable", "python"))
+    hw = hw if isinstance(hw, dict) else {}
+    try:
+        vram_gb = float(hw.get("vram_total_gb") or 0.0)
+    except (TypeError, ValueError):
+        vram_gb = 0.0
+    vram_tight = 0 < vram_gb < 12.0        # 6/8/10GB —— 余量是命
+    vram_mid   = 12.0 <= vram_gb < 24.0     # 12/16/20GB —— 边缘
+    vram_big   = vram_gb >= 24.0           # ≥24GB —— 装得下，不该喊
+
+    dynamic = bool(pol.get("dynamic_vram"))
+    try:
+        hr = float(pol.get("vram_headroom_gb") or 0.0)
+    except (TypeError, ValueError):
+        hr = 0.0
+    _rv = pol.get("reserve_vram_gb")
+    try:
+        rv = float(_rv) if _rv is not None else 0.0
+    except (TypeError, ValueError):
+        rv = 0.0
+    comp = bool(pol.get("comfy_compiler"))
+    # 「一点余量都没留」——两个开关都没给
+    no_slack = dynamic and hr <= 0 and rv <= 0
+
+    # 检测 kitchen 是否可用（见 `_kitchen_available` 的注释：抽成函数是为了可测）。
+    # 它是 `--use-ck-attention` 的前提：没装 comfy_kitchen，加这个 flag 也不生效
+    # → 这时标 `missing=False`，并在 why 里如实说明（不然用户加了 flag 重启后
+    # 没区别，会以为又遇到「改了没用」）。
+    kitchen_ok = _kitchen_available()
+
+    _vram_show = ("" if vram_gb <= 0
+                  else ("本机 VRAM {}GB —— ".format(int(vram_gb)
+                          if vram_gb == int(vram_gb) else vram_gb)))
+    why = {
+        "--vram-headroom":
+            ("让 aimdo 多留 1GB。"
+             + (_vram_show
+                + ("装得下时可省（建议只在二采 OOM 时再加）" if vram_big
+                    else "余量紧张，这项**强烈建议加上**" if vram_tight
+                    else "边缘卡，给不给都行 —— 加 1GB 稳一手")
+                if vram_gb > 0 else "")
+             + "⚠ 这是 `init_devices()` 的**每设备**预留，进程一起来就定死，"
+               "aimdo 没有运行时可写的入口 → **必须重启**。"),
+        "--reserve-vram":
+            "与上面作用面重叠，但它**多喂**一处 aimdo 的 `simple_vram_headroom`，"
+            "而那一处**运行时可写** —— 面板「块交换 → 交换块数」接的就是它。"
+            "所以：想不重启就留余量，改那个旋钮，不必加这个参数。",
+        "--disable-comfy-compiler":
+            ("0.35 新增的编译器，官方定位就是拉高 H3 显存利用率。"
+             "实测显存 100% → ~77%，代价约 5% 耗时。"
+             + ("" if vram_gb <= 0 else
+                ("本机 VRAM {}GB，余量足够 → **不建议加**（5% 耗时代价不一定值）。"
+                 .format(int(vram_gb)) if not vram_tight
+                 else "本机 VRAM {}GB，余量紧张 → 建议加。"
+                 .format(int(vram_gb))))
+             + "只在启动时读一次。"),
+        "--use-ck-attention":
+            ("注意力头分块的收益**完全取决于后端内核**：默认 sdpa 下几乎只有"
+             "「多 n 次 kernel 调用」的开销，int8 kitchen 内核下才实测省 25.7%。"
+             "⚠ 面板的「Attention 后端」只在**已加载**的后端之间切，切不到 kitchen "
+             "→ 要拿这份收益只能加启动参数并重启。"
+             + ("（⚠ 当前环境**没装** comfy_kitchen，加这个 flag 也不生效）"
+                if not kitchen_ok else ""))
+    }
+
+    items = []
+    for flag, value, runtime_ok, tier in LAUNCH_ARG_ITEMS:
+        if flag == "--vram-headroom":
+            # ≥24GB 卡 装得下，不该喊这条（why 里仍会写清「可省」）
+            cur, miss = ("未给（默认 0）" if hr <= 0 else f"{hr:g}"), (no_slack and not vram_big)
+        elif flag == "--reserve-vram":
+            # 从不主动推荐：它只是「有运行时等价旋钮」的那一个，标出来给用户看
+            cur, miss = ("未给" if rv <= 0 else f"{rv:g}"), False
+        elif flag == "--disable-comfy-compiler":
+            cur = "已给" if not comp else "未给（编译器在跑）"
+            # 只在余量紧张 + 还没给头卡时喊：≥12GB 上 5% 耗时代价不一定值
+            miss = bool(dynamic) and comp and no_slack and vram_tight
+        else:                                   # --use-ck-attention
+            has = _argv_has(flag, av)
+            cur, miss = ("已给" if has else "未给"), (not has
+                                                      and bool(t.get("attn_head_on"))
+                                                      and kitchen_ok)
+        items.append({"flag": flag, "value": value, "current": cur, "tier": tier,
+                      "missing": bool(miss), "runtime_ok": runtime_ok, "why": why[flag]})
+
+    # 推荐命令只收 `primary`：`fallback` 有代价（编译器关掉约 5% 耗时），
+    # 插件口径是「仍不稳再加」，不该默认塞进那行命令里。
+    _want = [i for i in items if i["missing"] and i["tier"] == "primary"]
+    _flags = [i["flag"] if not i["value"] else f"{i['flag']} {i['value']}" for i in _want]
+    args_str = " ".join(_flags)                            # ★ 仅 flags
+    cmd = " ".join([_quote_arg(exe)] + [_quote_arg(a) for a in av] + _flags)  # 完整命令
+    return {
+        "items": items,
+        "missing": [i["flag"] for i in items if i["missing"]],
+        "cmdline_flags": [i["flag"] for i in _want],
+        "args": args_str,            # 粘贴到 ComfyUI Desktop 的「启动参数」输入框
+        "cmdline": cmd,             # 终端启动用（保留，供高级用户）
+        "vram_gb": vram_gb,
+        "kitchen_ok": kitchen_ok,
+        "note": ("以上几项都是**启动时**定死的，面板改不了（aimdo 的每设备预留没有"
+                 "运行时 setter）。想要「不重启就留余量」，用「块交换 → 交换块数」"
+                 "—— 它写的是 aimdo 的 `simple_vram_headroom`，运行时可写。"),
+    }
 
 
 def probe_attn_backend():

@@ -1,0 +1,798 @@
+==============================================================================
+  ComfyUI 启动命令速查
+  由 ComfyUI-minimaxH3-SequenceForge 生成（单一真源：launch_ref.py）
+  —— 面板里的「📖 启动命令」与本文件内容同源，改一处两处都变。
+==============================================================================
+
+说明：
+  · 标「参数：」的行是「要加在 python main.py 后面的东西」，只列参数本身；
+    标「$」的行是完整命令，可直接跑。
+  · 不重复写基础命令（每条都带一遍 python main.py 是纯噪音）。完整写法示例：
+      python main.py --listen 0.0.0.0 --port 8188
+  · 「⚠」是踩过的坑，建议先看。
+  · 「★」是本插件场景下最常用的几条。
+  · 标 (Linux) 的段落与 ComfyUI 本身无关，是部署环境的事。
+
+
+==============================================================================
+  ① 基础启动
+==============================================================================
+
+  先确认这几条能跑通，再谈性能。所有命令都在 ComfyUI 根目录执行。
+
+  ▸ 最小启动
+    $ python main.py
+    只监听 127.0.0.1:8188，只有本机能访问。开发机上最常用。
+    用虚拟环境时把 python 换成 venv/bin/python（Linux）或 venv\Scripts\python.exe（Windows）。
+
+  ▸ 换端口
+    参数：--port 8189
+    8188 被占了就换一个。端口只是「监听哪个口」，和能不能被外部访问无关 —— 那取决于 --listen。
+
+  ▸ ★ 允许外部访问（远程/云平台必加）
+    参数：--listen 0.0.0.0 --port 8188
+    默认只听 127.0.0.1，局域网和公网都连不上。云平台、Docker、反向代理后面一律要加 --listen 0.0.0.0。
+    ⚠ 等于把这个口暴露出去。公网一定要配合云安全组限制来源 IP，或加 --tls-keyfile/--tls-certfile 上 HTTPS。
+
+  ▸ listen 不带参数
+    参数：--listen
+    --listen 后面不写值，等价于 0.0.0.0,:: —— 同时听 IPv4 和 IPv6 全部网卡。
+
+  ▸ 只听指定的几个地址
+    参数：--listen 127.0.0.1,192.168.1.10 --port 8188
+    逗号分隔多地址。想「本机 + 内网某张网卡」但不想全开时用。
+
+  ▸ 启动后自动开浏览器
+    参数：--auto-launch
+    桌面环境方便；服务器上别加（没有浏览器，还会拖慢启动）。
+
+  ▸ 明确禁止自动开浏览器
+    参数：--disable-auto-launch
+    某些打包版（Windows 独立版）默认会开，服务器上要显式关掉。
+
+==============================================================================
+  ② 网络与远程访问
+==============================================================================
+
+  连不上、白屏、上传失败，基本都在这一节。
+
+  ▸ 最常用的远程组合
+    参数：--listen 0.0.0.0 --port 8188
+    听全部网卡 + 指定端口。局域网内用 http://<机器IP>:8188 访问。
+
+  ▸ 允许跨域（前端被拦时）
+    参数：--listen 0.0.0.0 --enable-cors-header '*'
+    把 ComfyUI 嵌到别的网页 / 用外部工具调 API 时报 CORS 错误时加。
+    * 是允许所有来源，生产环境建议写具体来源（如 https://a.com）。
+
+  ▸ 上 HTTPS
+    参数：--listen 0.0.0.0 --tls-keyfile key.pem --tls-certfile cert.pem
+    两个参数必须同时给，只给一个不生效。之后用 https:// 访问。
+    证书可以是自签的（浏览器会警告），也可以走反向代理（见 ⑭ nginx）。
+
+  ▸ 放大上传上限（单位 MB）
+    参数：--listen 0.0.0.0 --max-upload-size 500
+    默认 100MB。传大视频/大图报「上传失败」时调大。
+    ⚠ 走 nginx 时还要同步改 client_max_body_size，否则会被代理层先掐掉。
+
+  ▸ 多用户独立存储
+    参数：--multi-user
+    每个用户各自的输入输出目录，多人共用一台机器时用。
+
+  ▸ 断开前端的外网访问
+    参数：--disable-api-nodes
+    禁止加载 api 节点，同时阻止前端联网。内网/离线部署时用。
+
+==============================================================================
+  ③ 目录与模型路径
+==============================================================================
+
+  把模型放系统盘之外（云平台数据盘 / 挂载盘）时全靠这一节。
+
+  ▸ ★ 一键改根目录
+    参数：--base-directory /data/comfyui
+    models / custom_nodes / input / output / temp / user 全部以它为基准。云平台上把整份数据挂到大盘上，只加这一个参数。
+
+  ▸ 只改输出目录
+    参数：--output-directory /data/output
+    成片落盘到别处。优先级高于 --base-directory。
+    ⚠ 磁盘写满会让采样「跑到一半失败」且报错很不直观，云平台上优先把 output 挂到大盘。
+
+  ▸ 只改输入目录
+    参数：--input-directory /data/input
+    上传的素材落这里。优先级高于 --base-directory。
+
+  ▸ 只改临时目录
+    参数：--temp-directory /data/temp
+    中间产物落这里。临时目录和输出目录别放同一个盘，否则大任务下两边一起涨、一起写满。
+
+  ▸ ★ 追加模型搜索路径
+    参数：--extra-model-paths-config /data/extra_model_paths.yaml
+    把已有的一堆模型目录接进来，不用搬文件。可重复给多个 yaml（--extra-model-paths-config a.yaml b.yaml）。
+    本机就是用它把 D:\Comfy-Desktop\ComfyUI-Shared\models 接进来的。
+
+  ▸ 只改 models 目录
+    参数：--models-directory /data/models
+    等价于把 models 从 base-directory 下挪走。
+
+  ▸ 只改 user 目录
+    参数：--user-directory /data/user
+    设置、工作流缓存、本插件的 perf.json 都在这下面。容器里想让设置持久化，挂它。
+
+==============================================================================
+  ④ 显存与性能（本插件最相关）
+==============================================================================
+
+  小显存卡上二采 OOM、显存吃到 100%，处方都在这一节。面板「⚡ 性能优化」里的「显存预留」是运行时版，不用重启；这一节是启动参数版，重启后生效。
+
+  ▸ ★ 多留 1GB 显存（二采 OOM 首选）
+    参数：--vram-headroom 1
+    让 aimdo 在总显存里硬留出 1GB 完全不碰。0.35 起 ComfyUI 的定位是「把显存吃满」，实测精化峰值能到 100.0% —— 于是最后一步高清解码连 112MB 都拿不到，regular / tiled 两条路一起死。
+    插件实测：显存 100% → ~77%，代价约 5% 耗时。⚠ 这是每设备预留，只在启动时定死、运行时代码里没有 setter → 面板改不了，必须重启。面板的「显存预留」写的是另一项（进程级 simple budget），两者可叠加。
+
+  ▸ 留 2GB（更保险）
+    参数：--vram-headroom 2
+    1GB 还不够时加码。6GB 卡上不建议超过 2 —— 留太多权重只剩一点点地方，采样会退化成每步全量重读，比 OOM 还慢。
+
+  ▸ ★ 关掉 Comfy 编译器（1GB 还不够时）
+    参数：--disable-comfy-compiler
+    0.35 新增的编译器，官方定位就是拉高 H3 显存利用率。实测显存 100% → ~77%，代价约 5% 耗时。
+    只在余量真紧张时加（<12GB 卡）。24GB 卡上有余量，加它只是白付 5%。
+
+  ▸ 老开关：给系统留 1GB
+    参数：--reserve-vram 1
+    同时喂 Python 侧 EXTRA_RESERVED_VRAM 与 aimdo 的 simple_vram_headroom。后者运行时可写，所以它的效果能在面板里调 —— 不必重启。
+
+  ▸ 优先用磁盘而不是内存做换页
+    参数：--fast-disk
+    模型远大于显存、又装了快 NVMe 时更快：把权重页缓存放盘上，省下宝贵的主机内存给别的东西。
+    ⚠ 本机那种「内存只剩 2GB + swap 已用 10/20GB」的情形，加它反而更糟（磁盘 IO 才是瓶颈）。
+
+  ▸ 关掉 DynamicVRAM（退回估算式加载）
+    参数：--disable-dynamic-vram
+    DynamicVRAM 出诡异行为时的兜底。退回后走 ComfyUI 自己的按模块流动（粒度≈block）。
+    ⚠ 通常更慢。只在确认是 DynamicVRAM 引起的问题时才用。
+
+  ▸ 模型用完不卸载（大显存卡）
+    参数：--highvram
+    默认模型用完会被挪到 CPU 内存；这个参数让它们常驻显存，连续跑多个任务时省掉反复加载。
+    ⚠ 显存装不下就别加 —— 会直接 OOM。
+
+  ▸ 低显存模式
+    参数：--lowvram
+    开了 DynamicVRAM 时本参数不做事；没开时让文本编码器跑在 CPU 上。
+
+  ▸ 低显存还不够时的下一档
+    参数：--novram
+    --lowvram 仍然 OOM 时用。很慢。
+
+  ▸ 全部走 CPU（极慢）
+    参数：--cpu
+    没有可用 GPU / 驱动坏了时的最后手段。H3 这种规模基本不具备可用性，只用来验证「到底是 GPU 的问题还是别的问题」。
+
+  ▸ 全部放显存（含文本编码器）
+    参数：--gpu-only
+    把 TE 也常驻显存。大显存卡上能省掉反复换页。
+    ⚠ 还有一个副作用：intermediate_device() 会返回 cuda 而不是 CPU。本插件二采里有一处「intermediate_device 返回 CPU 但空闲显存充足——放大模型强制上 cuda」的自愈日志，就是给这种情形兜底的。
+
+  ▸ 更激进地把模型挪回内存
+    参数：--disable-smart-memory
+    ComfyUI 的智能内存管理在某些卡上会让显存碎片化，关掉后行为更可预测。
+
+  ▸ 不缓存节点结果（最省内存）
+    参数：--cache-none
+    每次运行都重算所有节点。省内存/显存，代价是慢。
+
+  ▸ 只缓存最近 10 个节点结果
+    参数：--cache-lru 10
+    比 --cache-none 温和，比默认省。
+
+  ▸ 异步权重卸载（默认开，2 条流）
+    参数：--async-offload 2
+    搬运权重与计算重叠，NVIDIA 卡上默认就开着。数字是流的条数。
+
+  ▸ 关掉 pinned memory
+    参数：--disable-pinned-memory
+    pinned 内存能加速 CPU↔GPU 拷贝，但会锁住一部分主机内存。内存本来就紧张时关掉它换回可换页内存。
+
+  ▸ 关掉 CUDA graphs
+    参数：--disable-cuda-graphs
+    CUDA graphs 能省 kernel 启动开销，但显存占用会更高。显存紧时关掉它腾地方。
+
+==============================================================================
+  ⑤ 精度与量化
+==============================================================================
+
+  「显存不够」和「出来是黑图/花屏」两个方向都会用到。
+
+  ▸ 扩散模型用 fp16
+    参数：--fp16-unet
+    比 bf16/fp32 省显存。老卡（没有 bf16 加速）上还能更快。
+
+  ▸ 扩散模型用 bf16
+    参数：--bf16-unet
+    数值范围比 fp16 大，不容易溢出。30/40 系默认就是它。
+
+  ▸ 扩散模型用 fp8（最省显存）
+    参数：--fp8_e4m3fn-unet
+    显存再省一档。需要 sm89+（40 系及以上），老卡会退化成模拟实现、很慢。
+    本机 1660 SUPER 是 sm75，别开。
+
+  ▸ VAE 用 fp16
+    参数：--fp16-vae
+    VAE 解码在 fp32 下很慢（sm75 上没有 fp32 tensor core / TF32）。fp16 能明显提速，但少数 VAE 会出黑图。
+    本机 VAE 日志是 dtype: torch.float32 —— 解码 386s 的一大原因。值得试 fp16，出黑图再退回去。
+
+  ▸ VAE 放 CPU 跑
+    参数：--cpu-vae
+    解码阶段显存最紧张时，把 VAE 挪到 CPU 换出显存。很慢。
+
+  ▸ VAE 强制 fp32
+    参数：--fp32-vae
+    fp16 出黑图时的解法（回到慢但稳）。
+
+  ▸ 全局强制 fp16
+    参数：--force-fp16
+    老卡（如 1660/2080）上整体提速。
+
+  ▸ 全局强制 fp32
+    参数：--force-fp32
+    fp16 出各种诡异数值问题时的排查手段。非常慢。
+
+  ▸ 文本编码器用 fp16
+    参数：--fp16-text-enc
+    TE 很大（本机那个 48GB）时省显存。
+
+  ▸ 文本编码器用 fp8
+    参数：--fp8_e4m3fn-text-enc
+    TE 显存再省一档。同样需要 sm89+。
+
+==============================================================================
+  ⑥ 注意力后端
+==============================================================================
+
+  这一组是互斥的，同时给多个只有第一个生效（ComfyUI 用 mutually_exclusive_group）。
+
+  ▸ ★ 用 comfy-kitchen 的 int8 注意力
+    参数：--use-ck-attention
+    本插件「注意力头分块」的收益完全取决于后端内核：默认 sdpa 下几乎只有「多 n 次 kernel 调用」的开销，int8 kitchen 内核下才实测省 25.7%。
+    ⚠ 面板的「Attention 后端」只在已加载的后端之间切，切不到 kitchen → 要拿这份收益只能加启动参数并重启。需要环境里装了 comfy_kitchen（本机 0.2.35 已装）。
+
+  ▸ SageAttention
+    参数：--use-sage-attention
+    量化注意力，显存和速度都有收益。30 系上有失败报告，需实测。
+
+  ▸ FlashAttention
+    参数：--use-flash-attention
+    经典高效注意力。需要装 flash-attn 且算力匹配。
+
+  ▸ PyTorch 2.0 的 SDPA
+    参数：--use-pytorch-cross-attention
+    不需要额外依赖，通用性好。默认就常走这条。
+
+  ▸ 切分式注意力（省显存）
+    参数：--use-split-cross-attention
+    显存很紧时的老方案，速度慢。装了 xformers 时会被忽略。
+
+  ▸ 禁用 xformers
+    参数：--disable-xformers
+    xformers 版本不匹配导致崩溃时的排查手段。
+
+  ▸ 强制注意力升精度
+    参数：--force-upcast-attention
+    出黑图时先试这个 —— 官方 help 原文就是「please report if it fixes black images」。
+
+  ▸ 禁止注意力升精度
+    参数：--dont-upcast-attention
+    换一点速度，代价是可能出黑图。只在明确知道自己在干什么时用。
+
+==============================================================================
+  ⑦ 多卡与设备选择
+==============================================================================
+
+  多张卡时把实例钉在某一张上，避免和别的进程抢。
+
+  ▸ 只用第 0 张卡
+    参数：--cuda-device 0
+    其余卡对本进程不可见（等价 CUDA_VISIBLE_DEVICES=0，但更彻底）。多实例各占一张卡时必用。
+
+  ▸ 只用第 0、1 张卡
+    参数：--cuda-device 0,1
+    逗号分隔。
+
+  ▸ 默认用第 1 张卡，其余仍可见
+    参数：--default-device 1
+    和 --cuda-device 的区别：其他卡还在，只是默认不往上放。
+
+  ▸ 环境变量法（更通用）
+    $ CUDA_VISIBLE_DEVICES=0 python main.py
+    不改命令行的写法。容器/云平台上常由平台预设。
+    本机日志里 Enabled pinned memory 6488.0 这类行就是启动后自报的环境状态。
+
+==============================================================================
+  ⑧ 排障、日志与安全隔离
+==============================================================================
+
+  「跑不起来 / 不知道卡在哪」时从这一节挑。
+
+  ▸ ★ 打开调试日志
+    参数：--verbose DEBUG
+    看真正的报错。也可以 --verbose DEBUG /var/log/comfy.log 把该级别写进文件（可重复给多个）。
+    日志里 ** Log path: 那行会告诉你默认日志落在哪。
+
+  ▸ 日志走 stdout 而不是 stderr
+    参数：--log-stdout
+    容器/云平台只收 stdout 时，不加这个会什么都看不到。
+
+  ▸ 不打印服务端输出
+    参数：--dont-print-server
+    日志刷屏时的静音开关。
+
+  ▸ Ctrl-C 时打印栈（查卡死）
+    参数：--debug-hang
+    「跑到一半不动了」时按 Ctrl-C，能看到卡在哪一行。
+
+  ▸ 不把提示词写进产物
+    参数：--disable-metadata
+    产物文件里不再带 prompt 元数据。对外交付/公开素材时建议加。
+
+  ▸ ★ 全部禁用第三方节点
+    参数：--disable-all-custom-nodes
+    排查「是不是某个插件搞坏的」的第一招。启动干净了再逐个放回来。
+
+  ▸ 只放行指定插件
+    参数：--disable-all-custom-nodes --whitelist-custom-nodes ComfyUI-minimaxH3-SequenceForge
+    最小可用集。排障时把嫌疑插件单独放行来二分。
+
+  ▸ 禁掉 api 节点 + 前端联网
+    参数：--disable-api-nodes
+    内网隔离部署。
+
+  ▸ 尽量用确定性算法
+    参数：--deterministic
+    排查「同样的种子为什么结果不同」。会变慢。
+
+  ▸ CI 快速自检
+    参数：--quick-test-for-ci
+    启动完就退出，用来验证环境装好没有。
+
+==============================================================================
+  ⑨ Manager 与插件管理
+==============================================================================
+
+  面板截图里的 --enable-manager 就在这一节。
+
+  ▸ 启用 ComfyUI-Manager
+    参数：--enable-manager
+    开插件管理面板（安装/更新节点）。新版本默认不带，要显式开。
+
+  ▸ 只关 Manager 界面
+    参数：--disable-manager-ui
+    后台任务（计划安装等）照旧跑，只是界面没了。
+
+  ▸ 用 Manager 的旧版界面
+    参数：--enable-manager-legacy-ui
+    新界面不习惯时。隐含 --enable-manager。
+
+==============================================================================
+  ⑩ 其它实用开关
+==============================================================================
+
+  ▸ 采样过程显示预览图
+    参数：--preview-method auto
+    长任务时能看到「现在长什么样」，不必等跑完。
+    默认是 NoPreviews（不预览）。预览会占一点显存和时间。
+
+  ▸ 预览图最大边长
+    参数：--preview-size 512
+    默认 512。调小更省。
+
+  ▸ 强制非阻塞拷贝
+    参数：--force-non-blocking
+    某些非 N 卡平台上有提速，但可能让部分工作流出问题。
+
+  ▸ 关掉 cudaMallocAsync
+    参数：--disable-cuda-malloc
+    默认开启（torch 2.0+）。显存碎片异常时关掉试试。
+
+  ▸ 换去重用的哈希算法
+    参数：--default-hashing-function md5
+    默认 sha256。大目录扫描慢时可以换 md5/sha1 提速。
+
+  ▸ ckpt/pt 用 mmap 加载
+    参数：--mmap-torch-files
+    加载大文件时省内存峰值。
+
+  ▸ safetensors 不用 mmap
+    参数：--disable-mmap
+    网络盘/NFS 上 mmap 有问题时关掉。
+
+==============================================================================
+  ⑪ Linux：后台运行
+==============================================================================
+
+  SSH 一断开进程就被杀，是云平台上最常见的「跑一半没了」。三种活法：nohup / screen(tmux) / systemd（见下一节，生产推荐）。
+
+  ▸ nohup 最简单
+    $ nohup python main.py --listen 0.0.0.0 --port 8188 > comfy.log 2>&1 &
+    断开 SSH 后继续跑，输出进 comfy.log。
+    ⚠ --listen 0.0.0.0 不能省，否则外网连不上。⚠ 结尾的 & 不能省，否则还是前台。
+
+  ▸ 看实时日志
+    $ tail -f comfy.log
+    nohup 之后日志只在文件里，用它跟。
+
+  ▸ 确认还活着
+    $ ps -ef | grep main.py
+    找不到就说明已经被杀了。
+
+  ▸ 停掉它
+    $ kill $(pgrep -f 'main.py')
+    按命令行匹配进程号再杀，比手抄 PID 稳。
+    ⚠ 别用 kill -9，ComfyUI 来不及落盘（本插件有分段 mp4 落盘，硬杀可能留下半个文件）。先 kill，等几秒，再考虑 -9。
+
+  ▸ screen 起一个可回看的会话
+    $ screen -dmS comfy bash -c 'cd /opt/ComfyUI && python main.py --listen 0.0.0.0 --port 8188 2>&1 | tee comfy.log'
+    断开后还能 screen -r comfy 回到现场看输出。
+
+  ▸ tmux 同上（更现代）
+    $ tmux new -d -s comfy 'cd /opt/ComfyUI && python main.py --listen 0.0.0.0'
+    tmux attach -t comfy 回看，Ctrl-b d 脱离。
+
+  ▸ 彻底脱离终端（脚本里用）
+    $ setsid python main.py --listen 0.0.0.0 > comfy.log 2>&1 < /dev/null &
+    setsid 新建会话组，比 nohup 更彻底，适合被别的脚本拉起。
+
+==============================================================================
+  ⑫ ★ Linux：开机自启（systemd，生产推荐）
+==============================================================================
+
+  开机自启 + 崩溃自动拉起 + 日志归集，一次配好一劳永逸。下面每一步都是独立命令，逐条复制即可。
+
+  ▸ 第 1 步：新建 service 文件
+    $ sudo nano /etc/systemd/system/comfyui.service
+    把下面的内容整段贴进去，然后按路径改三处：User、WorkingDirectory、ExecStart。
+
+  ▸ 第 2 步：service 文件内容（整段复制）
+    $ [Unit]
+      Description=ComfyUI
+      After=network-online.target
+      Wants=network-online.target
+      
+      [Service]
+      Type=simple
+      User=comfy
+      Group=comfy
+      WorkingDirectory=/opt/ComfyUI
+      Environment="PYTHONUNBUFFERED=1"
+      ExecStart=/opt/ComfyUI/venv/bin/python -u main.py --listen 0.0.0.0 --port 8188
+      Restart=always
+      RestartSec=5
+      OOMScoreAdjust=-500
+      StandardOutput=journal
+      StandardError=journal
+      
+      [Install]
+      WantedBy=multi-user.target
+    Restart=always + RestartSec=5 = 崩了 5 秒后自动拉起；OOMScoreAdjust=-500 = 被 OOM killer 盯上的概率调低（大模型加载吃内存，不给它这个分容易被一刀切）。
+    ⚠ 三处必改：User=（跑 ComfyUI 的账号）、WorkingDirectory=（ComfyUI 根目录）、ExecStart=（python 绝对路径）。⚠ 用 venv 就写 venv 里的 python，别写系统 python。
+
+  ▸ 第 3 步：让 systemd 读到新文件
+    $ sudo systemctl daemon-reload
+    改完 service 文件必须执行，否则不认。
+
+  ▸ 第 4 步：开机自启 + 立刻启动
+    $ sudo systemctl enable --now comfyui
+    enable 写进开机自启，--now 顺手现在就起。两步合一。
+
+  ▸ 看状态
+    $ systemctl status comfyui
+    绿点 active (running) 就是好了。起不来时这里会直接给失败原因。
+
+  ▸ ★ 跟实时日志
+    $ sudo journalctl -u comfyui -f
+    systemd 把 stdout/stderr 都收进 journal，这是唯一看日志的地方（不再有 comfy.log）。
+
+  ▸ 看最近 200 行
+    $ sudo journalctl -u comfyui -n 200 --no-pager
+    排查刚崩的那次。
+
+  ▸ 重启（改完启动参数后）
+    $ sudo systemctl restart comfyui
+    ⚠ 改了 ExecStart 里的参数，要先 daemon-reload 再 restart。
+
+  ▸ 停掉并取消自启
+    $ sudo systemctl stop comfyui && sudo systemctl disable comfyui
+    不想开机自动跑了。
+
+  ▸ 不改原文件地覆盖配置
+    $ sudo systemctl edit comfyui
+    生成一个 override 片段（改端口/环境变量时比直接改原文件干净，升级不会被覆盖）。
+
+  ▸ 直接改完整文件
+    $ sudo systemctl edit comfyui --full
+    和 edit 的区别：--full 给你整份内容。
+
+  ▸ 用户级 systemd 常驻
+    $ sudo loginctl enable-linger comfy
+    用 systemctl --user 配的服务，默认登录后才起；加 linger 让它不登录也自启。
+
+  ▸ 用户级服务状态
+    $ systemctl --user status comfyui
+    没有 root、或不想用 sudo 时走用户级（service 放 ~/.config/systemd/user/）。
+
+==============================================================================
+  ⑬ ★ Linux：端口与防火墙
+==============================================================================
+
+  「本机能打开、外面打不开」= 九成是这一节 + 云平台安全组。注意顺序：安全组 → 系统防火墙 → 进程有没有听对地址。
+
+  ▸ 第 1 步：确认进程听在哪个地址
+    $ ss -lntp | grep 8188
+    关键看 Local Address：127.0.0.1:8188 = 只有本机能连；0.0.0.0:8188 或 *:8188 = 全都能连。
+    ⚠ 如果是 127.0.0.1，问题在启动参数，不是防火墙 —— 回去加 --listen 0.0.0.0。
+
+  ▸ 谁占着这个端口（备用）
+    $ lsof -i :8188
+    没装 ss 时用。起不来报 Address already in use 时找占用者。
+
+  ▸ 释放被占的端口
+    $ sudo kill -15 $(lsof -t -i:8188)
+    先 SIGTERM 让旧进程体面退出。
+    ⚠ 确认那个进程真的是旧的 ComfyUI 再杀。
+
+  ▸ 第 2 步：看防火墙（Ubuntu/Debian）
+    $ sudo ufw status verbose
+    先看状态。inactive 说明 ufw 没开，问题不在它。
+
+  ▸ 放行端口
+    $ sudo ufw allow 8188/tcp
+    ufw 生效中时必须加，否则外面连不上。
+
+  ▸ ★ 只放行指定来源 IP（更安全）
+    $ sudo ufw allow from 203.0.113.7 to any port 8188 proto tcp
+    把 ComfyUI 暴露到公网风险不小（能跑任意工作流/读写文件）。强烈建议只放行你自己的出口 IP，而不是全网开放。
+
+  ▸ 撤销放行
+    $ sudo ufw delete allow 8188/tcp
+    不再需要时收回来。
+
+  ▸ 放行端口（CentOS/RHEL/firewalld）
+    $ sudo firewall-cmd --permanent --add-port=8188/tcp && sudo firewall-cmd --reload
+    CentOS 系用 firewalld。--permanent 才会持久化，加完必须 reload。
+
+  ▸ 看 firewalld 当前规则
+    $ sudo firewall-cmd --list-all
+    确认端口真的进了 rules。
+
+  ▸ iptables 直接放行
+    $ sudo iptables -I INPUT -p tcp --dport 8188 -j ACCEPT
+    没装 ufw/firewalld 时。⚠ 重启会丢，要持久化得装 iptables-persistent。
+
+  ▸ 持久化 iptables 规则
+    $ sudo netfilter-persistent save
+    先把 iptables-persistent 装上再跑这条，否则重启就没了。
+
+  ▸ 第 3 步：本机自测
+    $ curl -I http://127.0.0.1:8188
+    本机通、外面不通 → 一定是防火墙或安全组。本机就不通 → 进程没起来。
+
+  ▸ 从外面自测（在另一台机器上跑）
+    $ curl -I http://<你的公网IP>:8188
+    换一台机器（手机热点也行）跑这条，能立刻区分「是网络层还是应用层」。
+
+  ▸ 看包有没有到（终极手段）
+    $ sudo tcpdump -i any -n port 8188
+    外面 curl 时在这台机器上跑：看得到包 = 防火墙没挡，问题在应用；看不到包 = 被云安全组或上游挡了。
+
+  ▸ 从外部探端口开不开
+    $ nmap -p 8188 <你的公网IP>
+    比 curl 更直接地看端口是否 open。
+
+==============================================================================
+  ⑭ Linux：nginx 反向代理（域名 + HTTPS）
+==============================================================================
+
+  想让 ComfyUI 走 80/443、挂域名、上证书，就用它。⚠ 三个必改点：WebSocket 升级头、上传体积、读超时——漏一个就出怪问题。
+
+  ▸ 新建 nginx 站点配置
+    $ sudo nano /etc/nginx/conf.d/comfyui.conf
+    内容见下一条。
+
+  ▸ ★ nginx 配置内容（整段复制）
+    $ server {
+          listen 80;
+          server_name comfy.example.com;
+      
+          client_max_body_size 500m;
+      
+          location / {
+              proxy_pass http://127.0.0.1:8188;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_read_timeout 3600s;
+              proxy_send_timeout 3600s;
+              proxy_buffering off;
+          }
+      }
+    四个关键行：proxy_http_version 1.1 + Upgrade/Connection = WebSocket 必需（少了进度条不动、执行状态不同步）；client_max_body_size = 上传上限（要和 --max-upload-size 对齐）；proxy_read_timeout 3600s = 长任务别被 60s 默认值掐断；proxy_buffering off = 进度推送要实时。
+    ⚠ ComfyUI 那侧要配合 --listen 0.0.0.0（或至少让 nginx 能连上）。
+
+  ▸ 检查配置语法
+    $ sudo nginx -t
+    改完必跑。写错了 nginx 会拒绝加载，但老进程还在跑，你会以为改生效了其实没有。
+
+  ▸ 热加载（不断连接）
+    $ sudo systemctl reload nginx
+    比 restart 温和。
+
+  ▸ ★ 一键上 Let's Encrypt 证书
+    $ sudo certbot --nginx -d comfy.example.com
+    自动改 nginx 配置 + 自动续期。比手搓自签证书省事得多。
+
+  ▸ 验证证书自动续期
+    $ sudo certbot renew --dry-run
+    证书 90 天过期，续期坏了会在某天突然全站不可用。配好就跑一次验证。
+
+  ▸ 看 nginx 错误日志
+    $ sudo tail -f /var/log/nginx/error.log
+    502/504 的原因在这里，不在 ComfyUI 日志里。
+
+==============================================================================
+  ⑮ Linux：Docker / 容器
+==============================================================================
+
+  容器里三个坑：要 --listen 0.0.0.0、要 --gpus all、数据要挂出来。
+
+  ▸ ★ 最小可用 docker run
+    $ docker run -d --name comfy --gpus all -p 8188:8188 -v /data/models:/opt/ComfyUI/models -v /data/output:/opt/ComfyUI/output comfyui:latest --listen 0.0.0.0 --port 8188
+    --gpus all 不给就看不到卡；-p 8188:8188 把端口映射出来；两个 -v 把模型和输出挂到宿主机（不挂就等于每次重建都白跑）；最后那串 --listen 0.0.0.0 是传给 ComfyUI 的，不是给 docker 的。
+    ⚠ 容器内不听 0.0.0.0 的话，端口映射了也连不上 —— 这是容器里最常见的坑。
+
+  ▸ 看容器日志
+    $ docker logs -f comfy
+    容器里看不到 journalctl，只能看这个。
+
+  ▸ 进容器
+    $ docker exec -it comfy bash
+    进去查文件、跑 nvidia-smi。
+
+  ▸ ★ docker-compose 完整版（推荐）
+    $ services:
+        comfyui:
+          image: comfyui:latest
+          container_name: comfy
+          restart: unless-stopped
+          ports:
+            - "8188:8188"
+          volumes:
+            - /data/models:/opt/ComfyUI/models
+            - /data/output:/opt/ComfyUI/output
+            - /data/input:/opt/ComfyUI/input
+          environment:
+            - PYTHONUNBUFFERED=1
+          command: ["--listen", "0.0.0.0", "--port", "8188", "--vram-headroom", "1"]
+          deploy:
+            resources:
+              reservations:
+                devices:
+                  - driver: nvidia
+                    count: all
+                    capabilities: [gpu]
+    restart: unless-stopped = 崩了/重启机器都自动拉起（等于容器版的开机自启）；command 里可以正常带 ComfyUI 参数。
+
+  ▸ 起 + 跟日志
+    $ docker compose up -d && docker compose logs -f
+    改完 compose 文件后重新 up 即可。
+
+  ▸ 停掉
+    $ docker compose down
+    挂载的数据不会丢。
+
+  ▸ 验证容器能看到 GPU
+    $ docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+    起 ComfyUI 之前先跑这个。看不到卡就别在 ComfyUI 里找了。
+
+==============================================================================
+  ⑯ ★ 云平台部署要点
+==============================================================================
+
+  各家平台（AutoDL / RunPod / Vast.ai / 阿里云 / 腾讯云 / 华为云…）做法不同，但失败原因就那么几条。按这个顺序查，一次到位。
+
+  ▸ 第 1 条：一定要 --listen 0.0.0.0
+    参数：--listen 0.0.0.0 --port 8188
+    云平台的访问都是从外面打进来的，只听 127.0.0.1 永远连不上。这一条能解决大半「部署了但打不开」。
+
+  ▸ 第 2 条：端口要用平台允许的那个
+    参数：--listen 0.0.0.0 --port 6006
+    很多平台只转发特定端口（AutoDL 的 6006、部分平台只开 8080/8888/3000 之类）。ComfyUI 默认 8188 常常不在白名单里。
+    先去平台的「自定义服务 / 端口映射」页面看它允许哪些端口，再挑一个。
+
+  ▸ 第 3 条：数据放数据盘，别放系统盘
+    参数：--base-directory /root/autodl-tmp/comfyui
+    系统盘通常很小（30–50GB），模型几百 GB 一放就满。满了之后报错五花八门（「采样跑到一半失败」），很难联想到磁盘。
+    用 df -h 确认哪个目录是数据盘（AutoDL 上是 /root/autodl-tmp）。
+
+  ▸ 第 4 条：先确认磁盘
+    $ df -h
+    出任何「莫名其妙失败」都先看这个。
+
+  ▸ 第 5 条：确认卡和驱动
+    $ nvidia-smi
+    看不到卡 → 是平台/驱动问题，不是 ComfyUI。⚠ 本机（WDDM）nvidia-smi 不可用是特例，Linux 云平台上是可用的。
+
+  ▸ 第 6 条：小显存实例先加余量
+    参数：--listen 0.0.0.0 --port 8188 --vram-headroom 1
+    云上租的常常是 8/12/16GB 卡，默认策略会把显存吃到 100%，二采这种流程最先炸。开局就带上。
+
+  ▸ 第 7 条：平台套了前置页面时
+    参数：--listen 0.0.0.0 --enable-cors-header '*'
+    有些平台用 iframe / 独立域名嵌进来，会撞 CORS。
+
+  ▸ 第 8 条：让它在会话断开后继续跑
+    $ setsid nohup python main.py --listen 0.0.0.0 --port 8188 > comfy.log 2>&1 < /dev/null &
+    云平台的 Web 终端关掉页面 = 断 SSH = 前台进程被杀。这条能活下来（更正规的用 systemd，见 ⑫）。
+
+  ▸ 第 9 条：系统防火墙
+    $ sudo ufw allow 8188/tcp
+    平台镜像里常自带 ufw/firewalld 且开着。平台安全组 + 系统防火墙两层都要放行，只放一层照样连不上。
+
+  ▸ ⚠ 收工前记得关机（按量计费）
+    $ sudo shutdown -h +60
+    云上按小时计费，跑完不关就一直在烧钱。这条是 60 分钟后关。
+
+==============================================================================
+  ⑰ 常见故障速查表
+==============================================================================
+
+  按「现象 → 先查什么」组织。
+
+  ▸ 浏览器打不开 / 连接被拒绝
+    $ ss -lntp | grep 8188
+    先看听的是 127.0.0.1 还是 0.0.0.0。前者 → 加 --listen 0.0.0.0。
+
+  ▸ 本机能开、外面不能开
+    $ sudo ufw status && sudo iptables -L -n | grep 8188
+    防火墙/安全组。注意两层都要放行。
+
+  ▸ 启动报 Address already in use
+    $ lsof -i :8188 && sudo kill -15 $(lsof -t -i:8188)
+    端口被占。杀掉旧的，或换 --port。
+
+  ▸ 跑一会儿就 OOM / 显存 100%
+    参数：--listen 0.0.0.0 --vram-headroom 1 --disable-comfy-compiler
+    先加余量，还不行再关编译器。
+
+  ▸ 界面显示跑完了但结果不对
+    参数：--verbose DEBUG
+    打开调试日志，然后去看插件自己的报告行（本插件会把「二采失败：…本段按基础分辨率保存」写进报告）。
+    ⚠ prompt 报 success 不等于你要的东西出来了。产物文件的修改时间没更新 = 那一步其实没落盘。
+
+  ▸ 启动就崩 / 卡在导入节点
+    参数：--disable-all-custom-nodes
+    先把第三方节点全禁了。能起来就逐个放回来二分。
+
+  ▸ 容器里什么都看不到
+    参数：--listen 0.0.0.0 --dont-print-server --log-stdout
+    容器只收 stdout，不加 --log-stdout 日志会走 stderr 丢掉。
+
+  ▸ 跑到一半莫名失败
+    $ du -sh /data/output && df -h
+    先排除磁盘写满。云平台系统盘小，输出攒几次就满了。
+
+  ▸ Permission denied
+    $ sudo chown -R $USER:$USER /opt/ComfyUI
+    之前用 sudo 跑过留下的 root 属主文件。⚠ 别用 chmod -R 777，那是在关安全。
+
+  ▸ 想看采样过程长什么样
+    参数：--listen 0.0.0.0 --preview-method auto
+    长任务时开预览，不必干等。
+
+==============================================================================
+  完
+==============================================================================

@@ -168,6 +168,31 @@ async function t(name, fn) {
                         note: "关闭 → 已恢复进程启动时的预留（0.00GB）" } },
                     report: "[H3性能] 显存 24.0GB / 内存 64GB / swap 0.0GB\n档位：balanced",
                     upcast: { effective: false, cli_force_upcast: 0, cli_dont_upcast: 1 },
+                    /* 启动参数体检（2026-09-27 加）：桩里必须给，否则那块 UI
+                     * 整块不渲染、下面的断言就成了空跑。字段照后端真实形状给
+                     * （args 仅 flags、cmdline 是完整命令）。 */
+                    launch_args: {
+                        items: [
+                            { flag: "--vram-headroom", value: "1", current: "未给（默认 0）",
+                              tier: "primary", missing: true, runtime_ok: false,
+                              why: "让 aimdo 多留 1GB。本机 VRAM 6GB —— 余量紧张，这项**强烈建议加上**。" },
+                            { flag: "--use-ck-attention", value: "", current: "未给",
+                              tier: "primary", missing: true, runtime_ok: false,
+                              why: "注意力头分块的收益完全取决于后端内核。" },
+                            { flag: "--disable-comfy-compiler", value: "",
+                              current: "未给（编译器在跑）", tier: "fallback", missing: true,
+                              runtime_ok: false, why: "关掉约 5% 耗时。" },
+                            { flag: "--reserve-vram", value: "1", current: "未给",
+                              tier: "alt", missing: false, runtime_ok: true,
+                              why: "面板「块交换 → 交换块数」接的就是它。" },
+                        ],
+                        missing: ["--vram-headroom", "--use-ck-attention", "--disable-comfy-compiler"],
+                        cmdline_flags: ["--vram-headroom", "--use-ck-attention"],
+                        args: "--vram-headroom 1 --use-ck-attention",
+                        cmdline: "python main.py --vram-headroom 1 --use-ck-attention",
+                        vram_gb: 6.0, kitchen_ok: true,
+                        note: "以上几项都是**启动时**定死的，面板改不了。",
+                    },
                 } };
             },
             async perfSet(perf) {
@@ -208,6 +233,46 @@ async function t(name, fn) {
             assert.strictEqual(g.tagName, "DETAILS", "一级阶段该是可折叠的 details");
             assert.strictEqual(g.open, true, "一级阶段默认该展开");
         }
+    });
+
+    await t("★ 启动参数体检：复制的是「仅 flags」（桌面 GUI 用），完整命令另收一层", () => {
+        /* 2026-09-27 修的真问题：原来的复制按钮给的是 `python main.py --flags` 整行，
+         * 而 ComfyUI Desktop 顶部那个「启动参数」框只吃 flags（没有 python、没有
+         * main.py）→ 用户根本粘不进去。所以现在主按钮复制 `args`，
+         * 完整命令收进折叠层给终端用户。 */
+        const hint = overlay.querySelector(".h3d-perf-args-hint");
+        assert.ok(hint, "缺「复制到哪」的提示");
+        assert.ok(hint.textContent.indexOf("启动参数") >= 0
+            && hint.textContent.indexOf("Desktop") >= 0,
+            "提示必须说清粘到哪里：" + hint.textContent);
+        const pres = [...overlay.querySelectorAll(".h3d-perf-diag pre")]
+            .map((p) => p.textContent);
+        assert.ok(pres.indexOf("--vram-headroom 1 --use-ck-attention") >= 0,
+            "主区该摆仅 flags 的那行，实际 " + JSON.stringify(pres));
+        /* ⚠ 不能断言「全局不许出现 main.py」—— 完整命令**本来就含** main.py，
+         * 它只是被收进折叠层。要验的是「哪一行在折叠层里」。
+         * ⚠ 也不能只按「含 --vram-headroom 且不在 details 里」筛 —— 上面那行
+         * 「缺 X / 现在 Y / 建议 Z」的状态清单同样是 `<pre>`。所以按**整行相等**判。 */
+        const fullPres = [...overlay.querySelectorAll("details pre")]
+            .filter((p) => p.textContent.indexOf("main.py") >= 0);
+        assert.strictEqual(fullPres.length, 1,
+            "完整命令该有且只有一条、且在折叠层里，实际 " + fullPres.length);
+        const bare = [...overlay.querySelectorAll("pre")]
+            .filter((p) => !p.closest("details"))
+            .map((p) => p.textContent);
+        assert.strictEqual(bare.filter(
+            (t) => t === "--vram-headroom 1 --use-ck-attention").length, 1,
+            "主区该有且只有一条「仅 flags」的可复制行，实际 " + JSON.stringify(bare));
+        /* 主按钮文案要指向「启动参数」，不是含糊的「启动命令」 */
+        const btns = [...overlay.querySelectorAll(".h3d-perf-diag .h3d-btn")]
+            .map((b) => b.textContent);
+        assert.ok(btns.indexOf("复制启动参数") >= 0,
+            "缺「复制启动参数」按钮，实际 " + JSON.stringify(btns));
+        assert.ok(btns.indexOf("复制完整命令") >= 0,
+            "缺「复制完整命令」按钮，实际 " + JSON.stringify(btns));
+        /* 判定口径要写出来（本机 VRAM 多少）—— 让用户知道建议不是模板套的 */
+        assert.ok(overlay.textContent.indexOf("本机 VRAM 6GB") >= 0,
+            "该说明「判定口径：本机 VRAM 6GB」");
     });
 
     await t("一级阶段带「N 项」计数，二级用途齐全且默认展开", () => {

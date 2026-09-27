@@ -109,6 +109,7 @@ def routes(projects, library):
                      [("from . import projects", "import projects"),
 ("from . import library as h3lib", "import library as h3lib"),
                       ("from . import perf", "import perf"),
+                      ("from . import launch_ref", "import launch_ref"),
                       ("from . import asset_hub", "import asset_hub"),
                       ("from . import prompts as _prompts", "import prompts as _prompts")])
 

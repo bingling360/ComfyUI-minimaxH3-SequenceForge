@@ -794,6 +794,189 @@ def test_vram_headroom_advice_fires_on_default_policy():
     assert "EXTRA_RESERVED_VRAM" in msg
 
 
+# ---- 启动参数体检（只读；2026-09-27 加）----
+#
+# 为什么只读而不是做成开关：`--vram-headroom` 是 aimdo `init_devices()` 的每设备
+# 预留，没有运行时 setter；`--disable-comfy-compiler` 只在启动时读一次。
+# 见 perf.launch_args_report 的 docstring。这些断言锁住「该报才报 / 不瞎报」。
+
+_POL_DEFAULT = {"dynamic_vram": True, "vram_headroom_gb": 0.0,
+                "reserve_vram_gb": None, "comfy_compiler": True}
+
+
+@pytest.fixture
+def kitchen_ok(monkeypatch):
+    """把 comfy_kitchen 探测钉成「可用」。
+
+    ⚠ **必须钉**：`perf._kitchen_available()` 直接 try-import，而本机 managed venv
+    里没装 comfy_kitchen、ComfyUI venv 里有 → 不钉的话同一条断言在两个环境下结果
+    不同（2026-09-27 实测踩过：带 PYTHONPATH 跑通过、裸跑就挂）。
+    测试要测的是**判定逻辑**，不是运行环境装了什么。
+    """
+    monkeypatch.setattr(perf, "_kitchen_available", lambda: True)
+
+
+@pytest.fixture
+def kitchen_missing(monkeypatch):
+    """把 comfy_kitchen 探测钉成「不可用」（验证 `--use-ck-attention` 会静默）。"""
+    monkeypatch.setattr(perf, "_kitchen_available", lambda: False)
+
+
+def test_launch_args_report_shape_and_purity():
+    """全参传入时是纯函数：只吃 dict/list，不碰进程状态，且键齐全。
+
+    `args` / `vram_gb` / `kitchen_ok` 是 2026-09-27 加的：
+      · `args` —— 仅 flags（粘贴到 ComfyUI Desktop 的「启动参数」输入框），
+                  不含 python / main.py
+      · `vram_gb` —— 本次判定的本机 VRAM（让调用方知道为什么 missing 这个样子）
+      · `kitchen_ok` —— comfy_kitchen 是否可用（影响 `--use-ck-attention` 是否报）
+    """
+    r = perf.launch_args_report(policy=_POL_DEFAULT, table={}, argv=["main.py"],
+                                python="py.exe", hw={"vram_total_gb": 6.0})
+    assert set(r) == {"items", "missing", "cmdline_flags", "args", "cmdline",
+                       "vram_gb", "kitchen_ok", "note"}
+    assert {i["flag"] for i in r["items"]} == {f for f, _v, _o, _t in perf.LAUNCH_ARG_ITEMS}
+    for i in r["items"]:
+        assert set(i) == {"flag", "value", "current", "tier", "missing",
+                          "runtime_ok", "why"}
+        assert i["tier"] in ("primary", "fallback", "alt")
+        assert i["why"], "每一项都必须说清为什么"
+    assert r["vram_gb"] == 6.0
+    assert isinstance(r["kitchen_ok"], bool)
+
+
+def test_launch_args_report_fires_on_default_policy(kitchen_ok):
+    """★ 本机口径（6GB + DynamicVRAM + 编译器在跑 + 没给预留）必须报。
+
+    2026-09-27 加：现在按 VRAM 分档 —— 6GB 卡上 `--vram-headroom` 与
+    `--disable-comfy-compiler` 都要报；24GB+ 则都不报。
+    """
+    hw_6 = {"vram_total_gb": 6.0}
+    r = perf.launch_args_report(policy=_POL_DEFAULT, table={"attn_head_on": True},
+                                argv=["main.py", "--listen"], python="py.exe", hw=hw_6)
+    assert "--vram-headroom" in r["missing"]
+    assert "--disable-comfy-compiler" in r["missing"]      # 兜底档（≥12GB 卡不报）
+    assert "--use-ck-attention" in r["missing"]            # 开了头分块才提
+    assert "--reserve-vram" not in r["missing"]            # 从不主动推荐
+    # 推荐命令只收 primary：兜底的 --disable-comfy-compiler 不该被默认塞进去
+    assert r["cmdline_flags"] == ["--vram-headroom", "--use-ck-attention"]
+    assert "--disable-comfy-compiler" not in r["cmdline"]
+    assert "--reserve-vram" not in r["cmdline"]
+    # 原有 argv 必须保留（用户是「在现有命令上追加」，不是替换）
+    assert "--listen" in r["cmdline"] and r["cmdline"].startswith("py.exe main.py")
+    # ★ 新增：只 flags（桌面 GUI 「启动参数」框粘贴用），不应包含 python / main.py
+    assert r["args"] == "--vram-headroom 1 --use-ck-attention"
+    assert "main.py" not in r["args"] and "py.exe" not in r["args"]
+    # why 里必须带「本机 VRAM NGB —— ...」让用户知道建议是按卡大小算的
+    vrh = next(i for i in r["items"] if i["flag"] == "--vram-headroom")
+    assert "6GB" in vrh["why"] and "强烈建议" in vrh["why"]
+
+
+def test_launch_args_report_silent_when_slack_given(kitchen_ok):
+    """给了 --vram-headroom 或 --reserve-vram 就不该再喊缺余量（同 advice 口径）。
+
+    ⚠ 只针对**余量**那两项断言：`--use-ck-attention` 是另一条独立判据
+    （开了头分块且没带该参数就提），与余量无关，所以这里把它排除在期望之外。
+    2026-09-27 加：测试必须显式给 hw 才能让「6GB 紧张」分支触发 —— 否则 vram_gb=0
+    → 三个档位都不满足，逻辑反而退化为「什么都不知道」。
+    """
+    for pol in (dict(_POL_DEFAULT, vram_headroom_gb=1.0),
+                dict(_POL_DEFAULT, reserve_vram_gb=3.0)):
+        r = perf.launch_args_report(policy=pol, table={"attn_head_on": True},
+                                    argv=["main.py"], hw={"vram_total_gb": 6.0})
+        assert "--vram-headroom" not in r["missing"], pol
+        assert "--disable-comfy-compiler" not in r["missing"], pol
+        assert r["cmdline_flags"] == ["--use-ck-attention"], pol
+
+
+def test_launch_args_report_silent_on_big_vram(kitchen_ok):
+    """★ 24GB+ 卡 装得下，`--vram-headroom` 不该喊（之前不管卡大小都喊，是漏的）。
+
+    判据刻意保守：这条不是「漏报」而是「不该报」—— 24GB 卡有 ~9GB 余量给权重缓存，
+    再多留 1GB 只会让每步多重读、不会更稳。
+    """
+    for hw in ({"vram_total_gb": 24.0}, {"vram_total_gb": 48.0}):
+        r = perf.launch_args_report(policy=_POL_DEFAULT, table={"attn_head_on": True},
+                                    argv=["main.py"], hw=hw)
+        assert "--vram-headroom" not in r["missing"], hw
+        assert "--disable-comfy-compiler" not in r["missing"], hw
+        # 仍按需报 --use-ck-attention（与卡大小无关，只看用户是否开了头分块 + kitchen）
+        assert "--use-ck-attention" in r["missing"], hw
+        # why 里写清「可省」—— 不让用户以为又漏了
+        vrh = next(i for i in r["items"] if i["flag"] == "--vram-headroom")
+        assert "装得下" in vrh["why"] or "可省" in vrh["why"], hw
+
+
+def test_launch_args_report_no_kitchen_ck_hint_silent(kitchen_missing):
+    """★ 没装 comfy_kitchen 时 `--use-ck-attention` **不该报缺**（加了也没用）。
+
+    之前不管有没有都报 → 用户加了 flag、重启后发现没变化，会以为又踩了那个
+    「改了没用」的坑。所以现在按 kitchen_ok 收紧，why 里如实说明。
+    用 `kitchen_missing` fixture 钉住，与运行环境解耦（见该 fixture 的注释）。
+    """
+    pol = dict(_POL_DEFAULT, vram_headroom_gb=1.0)
+    r = perf.launch_args_report(policy=pol, table={"attn_head_on": True},
+                                argv=["main.py"], hw={"vram_total_gb": 6.0})
+    assert r["kitchen_ok"] is False
+    assert "--use-ck-attention" not in r["missing"]
+    ck = next(i for i in r["items"] if i["flag"] == "--use-ck-attention")
+    assert "没装" in ck["why"] or "不生效" in ck["why"]
+
+
+def test_launch_args_report_silent_without_dynamic_vram():
+    """没 DynamicVRAM 就没这个问题 —— 不能误报。"""
+    r = perf.launch_args_report(policy=dict(_POL_DEFAULT, dynamic_vram=False),
+                                table={}, argv=["main.py"])
+    assert r["missing"] == []
+
+
+def test_launch_args_report_ck_only_when_head_chunk_on(kitchen_ok):
+    """--use-ck-attention 只在真开了注意力头分块时才提，否则是噪音。
+
+    `kitchen_ok` fixture 把 kitchen 钉成可用 —— 否则这条会退化成
+    「不管开没开都不报」，测不到「开才报」这半边。
+    """
+    pol = dict(_POL_DEFAULT, vram_headroom_gb=1.0)         # 余量已给 → 只剩这一项
+    off = perf.launch_args_report(policy=pol, table={"attn_head_on": False},
+                                  argv=["main.py"])
+    assert off["missing"] == []
+    on = perf.launch_args_report(policy=pol, table={"attn_head_on": True},
+                                 argv=["main.py"])
+    assert on["missing"] == ["--use-ck-attention"]
+
+
+def test_launch_args_report_detects_already_given_flag():
+    """已经带了 --use-ck-attention（含 `=` 写法）就不该再提。"""
+    pol = dict(_POL_DEFAULT, vram_headroom_gb=1.0)
+    for argv in (["main.py", "--use-ck-attention"],
+                 ["main.py", "--use-ck-attention=1"]):
+        r = perf.launch_args_report(policy=pol, table={"attn_head_on": True}, argv=argv)
+        assert r["missing"] == [], argv
+
+
+def test_launch_args_report_reserve_vram_is_the_runtime_equivalent():
+    """★ `--reserve-vram` 必须标成 runtime_ok=True —— 它是唯一「有运行时等价旋钮」
+    的那一项（面板的「块交换」写的就是同一个 aimdo simple_vram_headroom）。
+    这条是给用户指路用的，标错方向就把人引到「重启」上去了。"""
+    r = perf.launch_args_report(policy=_POL_DEFAULT, table={}, argv=["main.py"])
+    by = {i["flag"]: i for i in r["items"]}
+    assert by["--reserve-vram"]["runtime_ok"] is True
+    assert by["--vram-headroom"]["runtime_ok"] is False
+    assert by["--disable-comfy-compiler"]["runtime_ok"] is False
+    assert "块交换" in by["--reserve-vram"]["why"]
+    assert "必须重启" in by["--vram-headroom"]["why"]
+
+
+def test_launch_args_report_never_raises_on_junk():
+    """体检是诊断设施：任何垃圾输入都不能抛（None / 字符串 / 缺键 / 怪类型）。"""
+    for pol in (None, {}, {"dynamic_vram": "yes"}, {"vram_headroom_gb": "x"},
+                {"reserve_vram_gb": "y"}, {"vram_headroom_gb": None}):
+        for tab in (None, {}, {"attn_head_on": "1"}):
+            for av in (None, [], ["main.py"]):
+                r = perf.launch_args_report(policy=pol, table=tab, argv=av)
+                assert isinstance(r["items"], list) and isinstance(r["cmdline"], str)
+
+
 def test_summarize_shows_headroom_advice(logfile):
     perf.emit({"kind": "overview", "line": "[H3性能] 显存 24.0GB",
                "guard": "", "headroom": "⚠ 显存余量策略为默认"}, path=logfile)

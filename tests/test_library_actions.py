@@ -89,7 +89,8 @@ def routes(projects, h3lib):
                       ("from . import asset_hub", "import asset_hub"),
                       ("from . import asset_store", "import asset_store"),
 ("from . import library as h3lib", "import library as h3lib"),
-                      ("from . import perf", "import perf")])
+                      ("from . import perf", "import perf"),
+                      ("from . import launch_ref", "import launch_ref")])
 
 
 @pytest.fixture()

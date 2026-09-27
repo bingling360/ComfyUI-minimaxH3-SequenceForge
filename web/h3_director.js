@@ -160,6 +160,15 @@ function escapeHtml(s) {
     }[c]));
 }
 
+/* 说明文案里的 `**强调**` → `<b>`。
+ * ⚠ 收口成一个函数（2026-09-27）：原先只有性能面板的字段 hint 那一处做了转换，
+ * 别处（启动参数体检的 note / why、阶段说明）直接把后端文案塞进 innerHTML，
+ * 于是 `**启动时**` 的字面星号就露在界面上了 —— `perf_modal_check` 的
+ * 「说明里还露着字面星号」那条断言抓到过。新文案一律走这里。 */
+function mdBold(s) {
+    return String(s ?? "").replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+}
+
 /** 可折叠编辑区（主提示词框的三段式外观，总提示词工作台段卡复用同一套）。
  *  返回 { g: <details>, body: 内容容器 }。 */
 function h3dPane(title, open) {
@@ -4254,6 +4263,85 @@ async function openPerfSettings() {
                 : "块级权重流动：本机无 DynamicVRAM → 装不下时由 ComfyUI 自己按模块流动（粒度≈block）")
             + (bsAp.note ? "\n" + bsAp.note : "")));
     }
+    /* 启动参数体检（**只读**，2026-09-27 加）。
+     *
+     * 为什么不做成开关：`--vram-headroom` 的落点是 aimdo `init_devices()` 的
+     * **每设备**预留 —— 进程一起来就定死。aimdo 公开的预留 API 只有两个：
+     * `init_devices()`（启动，每设备）与 `set_simple_vram_headroom()`（运行时可写，
+     * **进程级** simple budget）；前者**没有**运行时可写的入口。所以
+     * 「勾一下 = `--vram-headroom 1`」做不到，硬做就是骗人（写了不生效的开关
+     * 比不给更糟，见 perf.py 里那批 ⛔ 注释）。
+     *
+     * 但「留出余量」这件事**运行时可做** —— `--reserve-vram` 多喂的那一处
+     * aimdo simple_vram_headroom 有 setter，面板的「块交换 → 交换块数」接的
+     * 就是它。所以这里给三样：① 如实摆出启动参数现状；② 一行可直接粘的命令；
+     * ③ 标明哪一项**有运行时等价旋钮**（后端 runtime_ok）—— 想不重启就留余量，
+     * 去改块交换，不必加启动参数。 */
+    const la = info.launch_args;
+    if (la && Array.isArray(la.items) && la.items.length) {
+        diag.append(el("div", "h3d-setsec-title", "启动参数（只读）"));
+        const lines = la.items.map((it) => (it.missing ? "缺 " : "   ")
+            + it.flag + "　现在：" + it.current
+            + (it.missing ? "　建议：" + (it.value || "加上") : ""));
+        diag.append(el("pre", null, escapeHtml(lines.join("\n"))));
+        if (la.note) diag.append(el("div", "h3d-perf-hint", mdBold(la.note)));
+        if (Array.isArray(la.cmdline_flags) && la.cmdline_flags.length) {
+            /* ★ 主：仅 flags —— 直接粘到 ComfyUI Desktop 的「启动参数」输入框。
+             * 之前的 cmdline 是「python main.py --flags」整行，Desktop 那个框只吃
+             * flags（没有 `python` 也没有 `main.py`），用户粘不进去 —— 现在多
+             * 一个 `args` 字段专门给这块用，cmdline 保留给终端用户。 */
+            const argsHint = el("div", "h3d-perf-args-hint",
+                "★ 复制下面这一行 → 粘到 ComfyUI Desktop 顶部「启动参数」输入框 → 重启。");
+            diag.append(argsHint);
+            diag.append(el("pre", null, escapeHtml(la.args || "")));
+            const cpArgs = el("button", "h3d-btn", "复制启动参数");
+            const doneArgs = (ok) => {
+                cpArgs.textContent = ok ? "已复制" : "复制失败，请手动选中";
+                setTimeout(() => { cpArgs.textContent = "复制启动参数"; }, 1600);
+            };
+            cpArgs.onclick = () => {
+                try {
+                    navigator.clipboard.writeText(la.args || "").then(
+                        () => doneArgs(true), () => doneArgs(false));
+                } catch (e) { doneArgs(false); }
+            };
+            diag.append(cpArgs);
+            /* 兜底：完整命令行（终端启动用） */
+            const full = foldSection("perf-launch-cmdline", false,
+                "<summary>终端启动用（完整命令）</summary>");
+            full.append(el("pre", null, escapeHtml(la.cmdline || "")));
+            const cpFull = el("button", "h3d-btn", "复制完整命令");
+            const doneFull = (ok) => {
+                cpFull.textContent = ok ? "已复制" : "复制失败，请手动选中";
+                setTimeout(() => { cpFull.textContent = "复制完整命令"; }, 1600);
+            };
+            cpFull.onclick = () => {
+                try {
+                    navigator.clipboard.writeText(la.cmdline || "").then(
+                        () => doneFull(true), () => doneFull(false));
+                } catch (e) { doneFull(false); }
+            };
+            full.append(cpFull);
+            diag.append(full);
+        }
+        const det = foldSection("perf-launch-args", false,
+            "<summary>这几项分别是什么 / 为什么不能运行时改</summary>");
+        /* ★ 头部一行说明本机口径（2026-09-27 加）：VRAM 多少、kitchen 装没装，
+         * 让用户知道建议是按本机卡片大小算的，不是模板套出来的。 */
+        if (la.vram_gb || la.kitchen_ok === false) {
+            const bits = [];
+            if (la.vram_gb) bits.push("本机 VRAM " + la.vram_gb + "GB");
+            if (la.kitchen_ok === false) bits.push("comfy_kitchen 未装");
+            det.append(el("div", "h3d-perf-hint", "★ 判定口径："
+                + (bits.length ? bits.join(" · ") + " · " : "")
+                + "建议是按本机卡片大小算的"));
+        }
+        for (const it of la.items) {
+            det.append(el("div", "h3d-perf-hint", mdBold(it.flag + "：" + it.why
+                + (it.runtime_ok ? "　→ 本项**有运行时等价旋钮**，见「块交换」" : ""))));
+        }
+        diag.append(det);
+    }
     body.append(diag);
 
     /* 分类树：group 形如「显存 · 自救」→ 一级「显存」+ 二级「自救」；不含「 · 」的
@@ -4441,6 +4529,167 @@ async function openPerfSettings() {
             alert("保存失败：" + ((e && e.message) || e));
         }
     };
+}
+
+/* 📖 启动命令速查弹窗（顶栏入口，与 ⚡ 性能优化 同级）。
+ *
+ * 为什么单独一个弹窗：17 个分区、140+ 条命令，每条都要带「为什么要这样」——
+ * 右栏那种窄折叠装不下，塞进去等于把说明吞掉（与性能优化同一个理由）。
+ *
+ * 内容来自后端 `launch_ref.py`（**单一真源**），与 `docs/ComfyUI启动命令速查.txt`
+ * 同源生成 —— 前端**不硬编码任何命令**，改数据两处一起变。
+ *
+ * 两条硬要求（用户明确提的）：
+ *   ① 每条命令一个独立复制按钮（不要「复制全部」那种，用户要的是挑一条粘）；
+ *   ② 得能导出 txt —— 他要拿到云平台的机器上边看边敲，不能只在 ComfyUI 里可见。
+ */
+async function openLaunchRef() {
+    if (document.querySelector(".h3d-lref-overlay")) return;
+    const A = window.H3Api;
+    const overlay = el("div", "h3d-opt-overlay h3d-lref-overlay");
+    const dialog = el("div", "h3d-opt-dialog h3d-perf-dialog");
+    overlay.append(dialog);
+    dialog.append(el("div", "h3d-opt-title", "📖 ComfyUI 启动命令速查"));
+    dialog.append(el("div", "h3d-opt-sub",
+        "启动参数 + Linux 部署（后台运行 / 开机自启 / 端口与防火墙 / 反向代理 / "
+        + "Docker / 云平台）——<b>每条都能单独复制</b>。"
+        + "数据源在后端 launch_ref.py，与仓库里 docs 下那份 txt 同源。"));
+    const body = el("div", "h3d-perf-body");
+    const foot = el("div", "h3d-perf-foot");
+    dialog.append(body, foot);
+    const status = el("div", "h3d-perf-status", "");
+    const actions = el("div", "h3d-opt-actions");
+    const dl = el("button", "h3d-btn", "⬇ 下载 .txt");
+    const cancel = el("button", "h3d-btn", "关闭");
+    actions.append(dl, cancel);
+    foot.append(status, actions);
+    const close = () => overlay.remove();
+    cancel.onclick = close;
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) close(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+    document.body.append(overlay);
+
+    /* 下载：直接用后端的 txt 路由（**实时生成**，不依赖磁盘上那份有没有重跑生成脚本）。
+     * 为什么不用 Blob 拼前端内容：那样就多了一份前端副本，正是「单一真源」要避免的。 */
+    dl.onclick = () => {
+        const a = document.createElement("a");
+        a.href = "/h3chain/launch_ref.txt";
+        a.download = "ComfyUI启动命令速查.txt";
+        document.body.append(a);
+        a.click();
+        a.remove();
+        dl.textContent = "⬇ 已开始下载";
+        setTimeout(() => { dl.textContent = "⬇ 下载 .txt"; }, 1600);
+    };
+
+    if (!A || !A.launchRef) {
+        body.append(el("div", "h3d-perf-hint", "接口不可用（请更新插件）"));
+        return;
+    }
+    body.append(el("div", "h3d-perf-hint", "读取中…"));
+    let data;
+    try { data = (await A.launchRef()).body; }
+    catch (e) {
+        body.replaceChildren(el("div", "h3d-perf-hint",
+            "读取失败：" + ((e && e.message) || e)));
+        return;
+    }
+    if (!data || !data.ok || !data.data) {
+        body.replaceChildren(el("div", "h3d-perf-hint", "读取失败"));
+        return;
+    }
+    const ref = data.data;
+    body.replaceChildren();
+    status.textContent = ref.section_count + " 个分区 · " + ref.entry_count
+        + " 条命令（其中 " + ref.comfy_flag_count + " 个 ComfyUI 参数已逐个核对真实存在）";
+
+    /* 复制按钮：把「复制」抽成一个小工厂 —— 同一段逻辑写 140 遍既啰嗦又容易漏。
+     * 失败时**不静默**：提示用户手动选中（http 下 clipboard API 可能不可用）。 */
+    const makeCopy = (text, label) => {
+        const b = el("button", "h3d-btn h3d-lref-copy", label || "复制");
+        b.onclick = () => {
+            const done = (ok) => {
+                b.textContent = ok ? "✓ 已复制" : "复制失败，请手动选中";
+                setTimeout(() => { b.textContent = label || "复制"; }, 1400);
+            };
+            try {
+                navigator.clipboard.writeText(text).then(
+                    () => done(true), () => done(false));
+            } catch (e) { done(false); }
+        };
+        return b;
+    };
+
+    /* 顶部目录：17 个分区一屏放不下，先给个跳转条。
+     * 用锚点 + scrollIntoView，不引入路由。 */
+    const toc = el("div", "h3d-lref-toc");
+    toc.append(el("span", "h3d-lref-toc-h", "跳转："));
+    for (const sec of ref.sections) {
+        const a = el("button", "h3d-lref-toc-i", sec.title.replace(/^[①-⑳]\s*/, ""));
+        a.onclick = () => {
+            const t = body.querySelector('[data-lref-sec="' + sec.id + '"]');
+            /* ⚠ 判一下再调：`scrollIntoView` 不是所有环境都有（jsdom 就没实现），
+             * 缺了不该让整个弹窗报错 —— 跳转是锦上添花，不是主功能。 */
+            if (t && typeof t.scrollIntoView === "function") {
+                t.scrollIntoView({ block: "start", behavior: "smooth" });
+            }
+        };
+        toc.append(a);
+    }
+    body.append(toc);
+
+    /* 基础命令只在**开头说一次**（2026-09-27 改）：原先挂在每个分区上，
+     * 17 个分区把那句「参数都加在 python main.py 后面」重复了 11 遍 ——
+     * 与「每条都重复基础命令」是同一类噪音，用户连着提了两次。
+     * `base_example` 由后端从数据里拼（本节第一条纯参数的条目），前端不写死。 */
+    if (ref.has_args) {
+        body.append(el("div", "h3d-lref-base",
+            "★ 标「参数」的行都是<b>加在 " + escapeHtml(ref.base_cmd)
+            + " 后面的参数</b>，只列要加的部分；标「完整命令」的行可直接跑。"
+            + (ref.base_example
+                ? "<br>完整写法示例：" + escapeHtml(ref.base_example) : "")));
+    }
+
+    for (const sec of ref.sections) {
+        const det = foldSection("lref-" + sec.id, true,
+            "<summary>" + escapeHtml(sec.title)
+            + '<span class="h3d-perf-stage-when">'
+            + (sec.kind === "external" ? "部署环境" : "ComfyUI")
+            + "</span>"
+            + "<small>" + sec.entries.length + " 条</small></summary>"
+            + (sec.note ? '<div class="h3d-perf-stage-note">'
+                          + escapeHtml(sec.note) + "</div>" : ""));
+        det.classList.add("h3d-perf-group", "h3d-lref-sec");
+        det.dataset.lrefSec = sec.id;
+        body.append(det);
+        for (const e of sec.entries) {
+            /* ⚠ 只读后端的 `show` / `full`，**别在这里剥前缀** ——
+             * 剥的规则只有 launch_ref._entry_cmd 一处，前端再实现一遍迟早不一致。 */
+            const show = e.show != null ? e.show : e.cmd;
+            const isFull = !!e.full;
+            const row = el("div", "h3d-lref-row");
+            const head = el("div", "h3d-lref-head");
+            head.append(el("div", "h3d-lref-title", escapeHtml(e.title)));
+            head.append(el("span", "h3d-lref-kind",
+                isFull ? "完整命令" : "参数"));
+            row.append(head);
+            /* 命令块：多行命令（systemd unit / nginx / compose）整体放进一个 <pre>，
+             * 复制的是**原文**（含换行），不是屏幕上折行的样子。 */
+            const pre = el("pre", "h3d-lref-cmd", escapeHtml(show));
+            row.append(pre);
+            const bar = el("div", "h3d-lref-bar");
+            bar.append(makeCopy(show, isFull ? "复制命令" : "复制参数"));
+            row.append(bar);
+            /* ⚠ 不再写「为什么要这样：」这类标签（2026-09-27 用户反馈：
+             * 「咋有一堆为什么要这样，你直接说明不就得了」）—— 直接说事。
+             * why 与 note 在展示上就是一前一后两段，note 仍用警示色区分。 */
+            row.append(el("div", "h3d-perf-hint", mdBold(e.why)));
+            if (e.note) {
+                row.append(el("div", "h3d-perf-hint h3d-lref-warn", mdBold(e.note)));
+            }
+            det.append(row);
+        }
+    }
 }
 
 /* 提示词优化设置面板（结构对齐参考项目，请求仍走自研 /h3chain 后端）。
@@ -6116,6 +6365,28 @@ function injectStyles() {
     .h3d-perf-top input[type=checkbox]{width:15px;height:15px;accent-color:#7fc79f;flex:none}
     .h3d-perf-hint{margin-top:4px;color:var(--h3d-muted);font-size:11.5px;line-height:1.65}
     .h3d-perf-status{margin:8px 0 0;color:#8fc9a5;font-size:11.5px;line-height:1.6;white-space:pre-wrap}
+
+    /* ---- 📖 启动命令速查弹窗（2026-09-27 加）----
+     * 复用 .h3d-opt-dialog / .h3d-perf-dialog 外壳与 .h3d-perf-body/foot，
+     * 只加命令行自己的样式。配色跟随该面板既有的暗色系（#1d1a15 底 / #cdd9e1 字）。 */
+    .h3d-lref-toc{display:flex;flex-wrap:wrap;gap:5px;align-items:center;padding:8px 10px;margin:0 0 10px;border:1px solid #37332b;border-radius:8px;background:#181712}
+    .h3d-lref-toc-h{color:var(--h3d-muted);font-size:11px;margin-right:2px}
+    .h3d-lref-toc-i{cursor:pointer;border:1px solid #3a352c;border-radius:999px;background:#211f1a;color:#c8c2b4;padding:3px 9px;font-size:11px;font-family:inherit}
+    .h3d-lref-toc-i:hover{border-color:#a8d8bd;color:var(--h3d-bone)}
+    .h3d-lref-sec>.h3d-lref-row{padding:10px 11px;border-bottom:1px dashed #2e2a23}
+    .h3d-lref-sec>.h3d-lref-row:last-child{border-bottom:0}
+    .h3d-lref-title{color:var(--h3d-bone);font-size:12.5px;font-weight:600;line-height:1.5}
+    /* 节头那句「参数都加在 python main.py 后面」（2026-09-27 加：去掉每条重复的基础命令）。
+     * 只印一次，放在正文开头 —— 逐节印会重复 11 遍。 */
+    .h3d-lref-base{padding:9px 11px;margin:0 0 10px;border:1px solid #37332b;border-radius:8px;background:#181712;font-size:11.5px;line-height:1.7;color:#9fd3b4}
+    .h3d-lref-head{display:flex;align-items:center;gap:8px}
+    .h3d-lref-head>.h3d-lref-title{flex:1 1 auto;min-width:0}
+    /* 「参数」/「完整命令」标签：一眼分清这行是贴到 python main.py 后面，还是能直接跑 */
+    .h3d-lref-kind{flex:none;font-size:10.5px;padding:1px 6px;border-radius:3px;background:#2d333b;color:#909dab;font-weight:500;letter-spacing:.2px}
+    .h3d-lref-cmd{margin:7px 0 0;padding:9px 11px;border:1px solid #3a352c;border-radius:7px;background:#141310;color:#9fd3b4;font:12px/1.65 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;overflow-x:auto}
+    .h3d-lref-bar{display:flex;gap:8px;margin-top:7px}
+    .h3d-lref-copy{flex:none;width:auto!important;padding:4px 10px;font-size:11.5px}
+    .h3d-lref-warn{color:#e0b06a!important}
     /* 弹窗内的两级分类树：复用 foldSection（折叠态记忆），视觉覆盖右栏那套 ——
        右栏的齿轮图标（.h3d-adv summary::before）与紧凑内边距在弹窗里不合适。
        特异性必须带上 .h3d-perf-body：.h3d-adv 那几条规则定义在本块之后，
@@ -6575,6 +6846,13 @@ function openDesk() {
     perfBtn.title = "OOM 自救 / FFN 分块 / 成片内存 / 编码器 / 素材库索引等机器级设置"
         + "（全局，跨项目共用）";
     perfBtn.onclick = openPerfSettings;
+    /* 启动命令速查：与性能优化同级放顶栏。为什么也要独立弹窗 —— 17 个分区、
+     * 140+ 条命令，每条都要带「为什么要这样」，右栏那种窄折叠装不下（与性能优化
+     * 同一个理由）。内容全部来自后端 launch_ref.py，前端不硬编码任何命令。 */
+    const cmdRefBtn = el("button", "h3d-btn", "📖 启动命令");
+    cmdRefBtn.title = "ComfyUI 启动参数速查 + Linux 部署（后台运行 / systemd 开机自启 / "
+        + "端口与防火墙 / nginx 反向代理 / Docker / 云平台），每条可单独复制，也能导出 .txt";
+    cmdRefBtn.onclick = openLaunchRef;
     /* 27B 本地模型 + H3 采样轮流抢显存，谁后加载谁 OOM。兜底动作：把 ComfyUI
      * 驻留的模型全卸了再清缓存 —— OOM 之后点一下就能重跑，不用重启 ComfyUI。
      * 本地 LLM 句柄本来就是用完即卸，这里只管 torch 这边的驻留模型。
@@ -6604,7 +6882,8 @@ function openDesk() {
      * 无从判断是没数据还是代码挂了。这里把区名与错误一行摆到顶栏。 */
     const zoneErr = el("span", "h3d-zoneerr", "");
     zoneErr.style.display = "none";
-    right.append(fixFocus, refreshBtn, optBtn, perfBtn, vramBtn, ledWrap, sub, zoneErr, close);
+    right.append(fixFocus, refreshBtn, optBtn, perfBtn, cmdRefBtn, vramBtn, ledWrap,
+                 sub, zoneErr, close);
     topbar.append(left, right);
 
     /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */

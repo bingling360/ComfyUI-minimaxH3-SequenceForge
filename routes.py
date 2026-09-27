@@ -33,6 +33,7 @@ from aiohttp import web
 from folder_paths import get_output_directory
 
 from . import library as h3lib
+from . import launch_ref
 from . import perf
 from . import projects
 
@@ -89,6 +90,8 @@ ROUTES = [
     ("POST", "/h3chain/expand_validate"),
     ("GET", "/h3chain/perf"),
     ("POST", "/h3chain/perf"),
+    ("GET", "/h3chain/launch_ref"),
+    ("GET", "/h3chain/launch_ref.txt"),
     ("GET", "/h3chain/lib_list"),
     ("GET", "/h3chain/lib_item"),
     ("GET", "/h3chain/lib_thumb"),
@@ -1581,6 +1584,52 @@ def add_routes(routes):
                 "Content-Disposition": f'attachment; filename="{fn}"'})
         return web.FileResponse(src)
 
+    def _launch_args_or_none(table, hw):
+        """启动参数体检（只读）；探不到就 None —— 与 `hw` 探测同一纪律：
+        **不让一个诊断项把整个 perf 接口搞成 500**。
+
+        `hw` 是探到的本机硬件（vram_total_gb），让体检**按本机卡片大小**调整建议
+        —— 24GB+ 卡装得下就不该喊 `--vram-headroom`、< 12GB 卡才能建议关编译器。
+        """
+        try:
+            return perf.launch_args_report(table=table, hw=hw or {})
+        except Exception:
+            return None
+
+    # ---- 启动命令速查（📖 启动命令弹窗 + .txt 下载）----
+    #
+    # 数据全在 `launch_ref.py`（**单一真源**）：弹窗与 txt 都由它生成，
+    # 不存在「界面里改了、txt 还是旧的」。
+    #
+    # 为什么还要一个 .txt 路由：用户明确要求「不止在 ComfyUI 内部才能看到」——
+    # 他要能把它拷到云平台的机器上边看边敲。所以除了仓库里那份静态文件，
+    # 这里再给一个**随进程实时生成**的下载口（改了 launch_ref.py 立刻生效，
+    # 不依赖磁盘上那份有没有重新生成）。
+
+    async def launch_ref_get(request):
+        """启动命令速查（JSON，给弹窗用）。"""
+        try:
+            return web.json_response({"ok": True, "data": launch_ref.payload()})
+        except Exception:
+            return _err("启动命令速查数据生成失败", code="INTERNAL", status=500)
+
+    async def launch_ref_txt(request):
+        """启动命令速查（纯文本下载）。
+
+        ⚠ 用 `text/plain; charset=utf-8` 而不是 octet-stream：浏览器会直接
+        在标签页里显示，用户想直接看/复制都行；要存盘再另存。
+        ⚠ 内容用 **LF**（`launch_ref.to_text` 显式指定）—— 这份东西的主要用途
+        是拷到 Linux 上边看边敲，CRLF 会让复制出来的命令带上 `\\r` 直接报错。
+        """
+        try:
+            body = launch_ref.to_text()
+        except Exception:
+            return _err("启动命令速查生成失败", code="INTERNAL", status=500)
+        return web.Response(
+            text=body, content_type="text/plain", charset="utf-8",
+            headers={"Content-Disposition":
+                     'inline; filename="%s"' % launch_ref.TXT_NAME})
+
     async def perf_get(request):
         """性能设置：读全局设置 + 硬件探测 + 当前生效值（面板的唯一数据来源）。"""
         table = perf.load_settings()
@@ -1599,6 +1648,13 @@ def add_routes(routes):
             "hw": hw,
             "report": perf.report_line(hw) if isinstance(hw, dict) else "",
             "upcast": perf.upcast_attention_state(),
+            # 启动参数体检（**只读**）：这几项是启动时定死的，面板改不了，
+            # 所以只能如实摆出「现在是什么 / 缺什么 / 一行可直接粘的命令」。
+            # 为什么不做成开关见 perf.launch_args_report 的 docstring。
+            # 探不到给 None（前端整块不渲染），绝不因此让整个 perf 接口 500。
+            # ⚠ 必须传 hw —— 否则体检退回「卡大小未知」，会错把 24GB 卡也喊
+            # `--vram-headroom`（2026-09-27 加设备档位之前就是这样）。
+            "launch_args": _launch_args_or_none(table, hw),
         })
 
     async def perf_set(request):
@@ -2583,6 +2639,8 @@ def add_routes(routes):
         ("GET", "/h3chain/ping", ping),
         ("GET", "/h3chain/perf", perf_get),
         ("POST", "/h3chain/perf", perf_set),
+        ("GET", "/h3chain/launch_ref", launch_ref_get),
+        ("GET", "/h3chain/launch_ref.txt", launch_ref_txt),
         ("GET", "/h3chain/lib_list", lib_list),
         ("GET", "/h3chain/lib_item", lib_item),
         ("GET", "/h3chain/lib_thumb", lib_thumb),

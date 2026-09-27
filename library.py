@@ -996,9 +996,9 @@ def sheet_path_for(src_abs) -> str:
 # contact sheet 格数：落盘元信息要记这个数，前端按同一口径反查格号。
 SHEET_TILES = 12
 
-# 缩略图的源图解码上限（像素）：超过就跳过解码。40MP ≈ 8000x5000，
-# 这个尺寸以上「只为看一眼」不值得付 ~120MB 的解码尖峰。
-THUMB_MAX_PIXELS = 40_000_000
+# 缩略图的源图解码上限（像素）：超过就跳过解码。4MP ≈ 2400x1700，
+# 这个尺寸以上「只为看一眼」不值得付整个解码尖峰（6000x4000 JPEG 实测 193MB）。
+THUMB_MAX_PIXELS = 4_000_000
 
 
 def make_sheet(frames, dst, tiles=SHEET_TILES, cell=160) -> str:

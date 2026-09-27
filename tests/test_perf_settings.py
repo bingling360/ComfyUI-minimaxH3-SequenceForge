@@ -150,9 +150,9 @@ def test_thumb_on_import_flag(lib):
 
 
 def test_thumb_max_pixels_constant_reasonable():
-    """缩略图源图上限要存在且量级合理（几十 MP 量级，不是 0 也不是无限大）。"""
+    """缩略图源图上限要存在且量级合理（几 MP 量级，不是 0 也不是无限大）。"""
     assert hasattr(L, "THUMB_MAX_PIXELS")
-    assert 5_000_000 <= L.THUMB_MAX_PIXELS <= 200_000_000
+    assert 1_000_000 <= L.THUMB_MAX_PIXELS <= 200_000_000
 
 
 # ------------------------------------------------- 2026-09-23 第二批：显存/内存/编码

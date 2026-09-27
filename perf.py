@@ -236,7 +236,7 @@ DEFAULT_PERF = {
     # 素材库
     "index_mode": "fingerprint",  # fingerprint（目录指纹）/ ttl（3 秒硬过期）
     "thumb_on_import": True,      # 入库即生成缩略图
-    "thumb_max_mp": 40,           # 缩略图源图解码上限（百万像素）
+    "thumb_max_mp": 4,            # 缩略图源图解码上限（百万像素）
 
     # ⛔ `probe` 已连根删除（2026-09-23 本轮）：全仓零读取方，前端也无字段，
     # 属「名字在表里、功能不存在」。诊断走专门的工具（tools/ 下独立 runner）

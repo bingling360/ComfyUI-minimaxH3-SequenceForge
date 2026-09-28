@@ -49,9 +49,13 @@ _TOKEN_FMT = {"image": "<Picture {}>", "video": "<Video {}>", "audio": "<Audio {
 
 
 def safe_name(name) -> str:
-    """与 projects.safe_name 同语义（本地复刻，避免循环导入）。"""
+    """与 projects.safe_name 同语义（本地复刻，避免循环导入）。
+
+    ⚠ 同一条铁律：**不要加 `".." in s`** —— 它会把 `IMG…..jpg` 这类合法文件名
+    当成穿越拒掉，而真正的穿越靠 `/` `\\` `:` 与「整个名字是 `..`」这两条就拦住了。
+    """
     s = str(name or "").strip()
-    if not s or s.startswith(".") or "/" in s or "\\" in s or ":" in s or ".." in s:
+    if not s or s.startswith(".") or "/" in s or "\\" in s or ":" in s:
         return ""
     return s
 
@@ -108,16 +112,20 @@ def clean_ref_name(name) -> str:
     正文里 —— 绿框后面挂个裸后缀（"奇怪的后缀溢出"）。引用名带后缀后，
     `@猫.png` 整体命中池内条目，后缀不再溢出。
 
-    规则：取文件名 -> 空白/括号等非法字符压成 `_`（**保留 `.` `_` `-`**）-> 折叠
-    连续 `_-` 与 `..` -> 去首尾 `._-` -> 超长时**保尾**（尾巴是两条同名素材的
-    唯一区分点，砍头不砍尾）。
+    规则：取文件名 -> 空白/括号等非法字符压成 `_`（**保留 `.` `_` `-`**）-> 折叠连续
+    `_-` -> 去首尾 `._-` -> 超长时**保尾**（尾巴是两条同名素材的唯一区分点，砍头不砍尾）。
+
+    ⚠ **不要折叠连续 `.`**（2026-09-28 移除 `re.sub(r"\\.{2,}", ".", s)`）。引用名的定义
+    就是「用户写进提示词的**真名**」，而 `IMG1788509671869..jpg` 是手机/相机真会产出的
+    名字：折成 `IMG1788509671869.jpg` 之后，用户在素材库里选中/手打真名，在引用池里
+    就**匹配不上**（池子键是折过的）—— 表现是「素材库有、分段提示词框里点不亮」。
+    `library.scan_scope` 给的 ref_name 一直是**原样 basename**，折叠只会让两套来源分家。
     """
     s = str(name or "").strip().replace("\\", "/").split("/")[-1]
     if not s:
         return ""
     s = _REF_NAME_BAD.sub("_", s)
     s = re.sub(r"[_\-]{2,}", "_", s)
-    s = re.sub(r"\.{2,}", ".", s)
     s = s.strip("._-")
     if len(s) > REF_NAME_MAX:
         s = s[:REF_NAME_MAX - 12] + s[-12:]

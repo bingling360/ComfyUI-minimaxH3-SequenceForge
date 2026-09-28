@@ -60,6 +60,10 @@ def test_ref_name_normalizes_spaces_and_brackets(AS):
     assert AS.clean_ref_name("  猫 咪 .png  ") == "猫_咪_.png"
     # 路径只取 basename
     assert AS.clean_ref_name("images/sub/女主.png") == "女主.png"
+    # 连续点**不折叠**：引用名就是真名（`IMG123..jpg` 是手机真会产出的名字），
+    # 折成 `IMG123.jpg` 会让「素材库里选中的真名」在引用池里匹配不上。
+    assert AS.clean_ref_name("IMG1788509671869..jpg") == "IMG1788509671869..jpg"
+    assert AS.clean_ref_name("a..b.png") == "a..b.png"
 
 
 def test_ref_name_truncation_keeps_tail(AS):
@@ -160,7 +164,8 @@ def test_frontend_clean_ref_name_matches_backend(AS):
     assert m, "未找到前端 cleanRefName"
     fn = m.group(0)
     samples = ["女主.png", "my photo (1).png", "  猫 咪 .png  ", "images/sub/阿依.png",
-               "超长素材名" * 30 + "_14_02_12.png", "雨声.wav", "无后缀名"]
+               "超长素材名" * 30 + "_14_02_12.png", "雨声.wav", "无后缀名",
+               "IMG1788509671869..jpg", "a..b.png"]
     code = (
         "const REF_NAME_MAX = 96;\n" + fn + "\n"
         + "console.log(JSON.stringify(" + json.dumps(samples, ensure_ascii=False)

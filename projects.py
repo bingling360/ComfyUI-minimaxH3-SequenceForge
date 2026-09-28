@@ -35,9 +35,20 @@ def _ensure_revision(manifest: dict) -> dict:
 
 
 def safe_name(name) -> str:
-    """项目目录名安全校验：拒空、路径分隔、盘符、与点开头（防目录穿越）。"""
+    """名字安全校验：拒空、路径分隔、盘符、点开头（防目录穿越）。
+
+    ⚠ **不要加回 `".." in s`**（2026-09-28 移除）。它看着更安全，其实是误伤：
+    本函数只收**单个名字**（`/` `\\` `:` 已经在这里被拒），穿越必须靠路径分隔符
+    才成立，而「整个名字就是 `..`」已经被 `startswith(".")` 拦掉 —— 子串检查
+    唯一多拦下来的是 `IMG1788509671869..jpg` 这种**合法文件名**（手机/相机真的
+    会产出这种名字）。
+
+    误伤的后果非常隐蔽，且专坑素材：上传时文件**照常拷进 `<proj>/assets/`**，
+    但登记清单时 `_clean_asset` 拿本函数当文件名校验 → 条目被静默丢弃 → 素材库
+    （扫目录）看得到、分段提示词框（读清单）选不到，全程不报错。
+    """
     s = str(name or "").strip()
-    if not s or s.startswith(".") or "/" in s or "\\" in s or ":" in s or ".." in s:
+    if not s or s.startswith(".") or "/" in s or "\\" in s or ":" in s:
         return ""
     return s
 
@@ -1576,6 +1587,71 @@ def import_asset(name, src_file, label="", kind="image", roles=None, base_revisi
     checkpoint.save_manifest(root, manifest)
     return {"file": dest_rel, "label": lbl, "kind": kk,
             "roles": ent.get("roles", []), "manifest": manifest}
+
+
+def repair_assets(name: str):
+    """扫 `<proj>/assets/`，把**没登记进 manifest["assets"]** 的文件补回池子。
+
+    背景：素材库看**目录**、分段提示词框看**清单**，两套来源。清单是全量覆盖写，
+    被旧池整表覆盖一次就会「文件还在、条目没了」。这个函数是它的自愈出口：
+    按池序补号、按 file 去重，**不删任何条目** —— 所以任何情况下调它都不会丢东西。
+    另外顺手**补正**已登记条目的 `ref_name`（必须等于落盘真名），见下面那段注释。
+
+    返回 {added: [...], fixed: [...], assets: [...], revision}；没有要补/要改的就不写盘。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    _ensure_revision(manifest)
+    try:
+        from . import library as _lib
+    except ImportError:
+        import library as _lib
+    adir = os.path.join(root, "assets")
+    assets = [dict(a) for a in (manifest.get("assets") or []) if isinstance(a, dict)]
+    known = {str(a.get("file") or "").replace("\\", "/") for a in assets}
+    taken = {str(a.get("label") or "") for a in assets if a.get("label")}
+    # 顺带**补正**已登记条目的引用名：它必须等于落盘真名。历史上 clean_ref_name 会把
+    # 连续 `.` 折成一个（`IMG…jpg` → `IMG….jpg`），于是用户在素材库里选中/手打真名，
+    # 在引用池里匹配不上。只改这一项派生字段，不动也没有条目增减。
+    fixed = []
+    for a in assets:
+        f = str(a.get("file") or "").replace("\\", "/")
+        if not f.startswith("assets/") or "/" in f[7:]:
+            continue
+        base = f.split("/")[-1]
+        want = _ref_name_of(base, a.get("label"))
+        if want and str(a.get("ref_name") or "") != want:
+            a["ref_name"] = want
+            fixed.append(f)
+    added = []
+    if os.path.isdir(adir):
+        for fn in sorted(os.listdir(adir)):
+            if fn.startswith(".") or "/" in fn:
+                continue
+            rel = "assets/%s" % fn
+            if rel in known:
+                continue
+            kind = _lib.kind_of(rel)
+            if kind not in _ASSET_KINDS:
+                continue
+            lbl = _unique_label(_alias_of(fn), taken)
+            taken.add(lbl)
+            assets.append({"label": lbl, "kind": kind, "file": rel, "ref_name": fn})
+            known.add(rel)
+            added.append(rel)
+    if added or fixed:
+        manifest["assets"] = _assign_marks(_dedupe_assets(assets))
+        manifest["updated_at"] = time.time()
+        manifest["revision"] = int(manifest.get("revision") or 1) + 1
+        manifest["manifest_schema"] = MANIFEST_SCHEMA
+        checkpoint.save_manifest(root, manifest)
+    return {"added": added, "fixed": fixed, "assets": manifest.get("assets") or [],
+            "revision": int(manifest.get("revision") or 1)}
 
 
 def save_prompts(name: str, prompts, segments=None, base_revision=None):

@@ -167,6 +167,8 @@
       _json("POST", "/h3chain/move_media", Object.assign({ dir, src, dest }, opts || {})),
     importAsset: (dir, src, opts) =>
       _json("POST", "/h3chain/import_asset", Object.assign({ dir, src }, opts || {})),
+    /* 自愈：把 assets/ 里没登记进 manifest["assets"] 的文件补回池子（只加不删） */
+    assetsRepair: (dir) => _json("POST", "/h3chain/assets_repair", { dir }),
     splitAv: (dir, src, opts) =>
       _json("POST", "/h3chain/split_av", Object.assign({ dir, src }, opts || {})),
     busy: () => _call("/h3chain/busy"),

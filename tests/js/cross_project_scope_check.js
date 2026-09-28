@@ -140,6 +140,9 @@ function ok(cond, msg) {
         _promptEditors: { scope: "dir", key: "getDirValue(node)}|" },
         _poolRev: { scope: "derived" },
         _poolDir: { scope: "derived" },
+        /* 显式删过的素材（`<dir>|<file>`）：键带项目目录 —— 同一个 assets/x.png
+         * 在 A/B 两个项目里是两条独立记录，不带目录会让 A 里的删除毒到 B */
+        _poolRemoved: { scope: "dir", key: "${dir}|" },
         fabEl: { scope: "ui" },
     };
 

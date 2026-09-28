@@ -379,7 +379,9 @@ function cleanLabel(text) {
  *  剩下的 `.png` 当普通文本留在正文里 —— 绿框后面挂个裸后缀。
  *
  *  规则：非法字符（空白/括号等）压成 `_`（保留 `.` `_` `-`）→ 折叠连续 `_-`
- *  与 `..` → 去首尾 `._-` → 超长**保尾**（尾巴是两条长名素材的唯一区分点）。 */
+ *  → 去首尾 `._-` → 超长**保尾**（尾巴是两条长名素材的唯一区分点）。
+ *  ⚠ **不折叠连续 `.`**：引用名就是用户写的真名，`IMG123..jpg` 折成 `IMG123.jpg`
+ *  会让「素材库里选中的真名」在引用池里匹配不上。后端同步（2026-09-28）。 */
 const REF_NAME_MAX = 96;
 
 /** 素材的**引用键**：提示词里 `@` 后面写的那个名字。
@@ -392,8 +394,7 @@ function cleanRefName(text) {
     const base = String(text ?? "").trim().replace(/\\/g, "/").split("/").pop() || "";
     if (!base) return "";
     let s = base.replace(/[^\p{L}\p{N}._-]+/gu, "_")
-        .replace(/[_-]{2,}/g, "_")
-        .replace(/\.{2,}/g, ".");
+        .replace(/[_-]{2,}/g, "_");
     s = s.replace(/^[._-]+|[._-]+$/g, "");
     if (s.length > REF_NAME_MAX) s = s.slice(0, REF_NAME_MAX - 12) + s.slice(-12);
     return s.replace(/^[._-]+|[._-]+$/g, "");
@@ -2345,6 +2346,17 @@ function toggleSegmentFrameRef(node, idx, name) {
 
 /* 素材池改动直写项目 manifest["assets"]（读最新 revision 落盘，冲突返回 false 调手动保存）。
  * P3：带 asset_id 的全局链接条目住 asset_links，不进 legacy assets（保存时剥离）。 */
+/* 本次会话里用户**显式删掉**的项目资产，键 = `<项目目录>|<file>`。
+ * 必须带目录：同一个 `assets/x.png` 在 A / B 两个项目里是两条独立记录，
+ * 键不带目录就会跨项目串味（A 里删过，B 里就再也补不回来）。
+ * 写清单是「拿 widget 里的池子整表覆盖」，只有显式删过的才允许真的从清单里消失，
+ * 其余一律以服务端为准补回来。 */
+const _poolRemoved = new Set();
+
+function poolRemovedKey(dir, file) {
+    return `${dir}|${file}`;
+}
+
 async function persistPool(node) {
     try {
         const dir = getDirValue(node);
@@ -2352,6 +2364,24 @@ async function persistPool(node) {
         const ds = getDs(node);
         const mf = await fetchManifest(dir);
         const legacy = (ds.ref_assets || []).filter((a) => a && !a.asset_id);
+        /* 服务端有、widget 没有、又不是本次显式删除的 —— 一律补回来再写。
+         *
+         * 这是「上传完素材，分段提示词框里却选不到」的唯一防线：
+         * `manifest["assets"]` 是**全量覆盖写**，而 widget 里的池子会跟着工作流
+         * 存档走 —— 页面重载 / ComfyUI 重启后它恢复成「上传之前」的旧池，
+         * 此时任何一次写清单（删素材 / 改标签 / 打标…）都会把服务端刚登记的
+         * 素材整条抹掉，文件却还留在磁盘上：素材库照样看得到（它扫的是目录），
+         * 引用池却是空的。只有用户自己点过删除的才真正允许消失。 */
+        if (mf) {
+            const have = new Set(legacy.map((a) => String(a.file || "")));
+            for (const a of (mf.assets || [])) {
+                if (!a || !a.file) continue;
+                const f = String(a.file);
+                if (have.has(f) || _poolRemoved.has(poolRemovedKey(dir, f))) continue;
+                legacy.push({ ...a });
+                have.add(f);
+            }
+        }
         const r = await window.H3Api.saveAssets(dir, legacy, mf?.revision);
         if (r.body?.ok) { scheduleRefresh(400); return true; }
         return false;
@@ -2362,6 +2392,11 @@ function removeRefImage(node, idx) {
     const ds = getDs(node);
     if (idx < 0 || idx >= ds.ref_assets.length) return;
     const gone = ds.ref_assets.splice(idx, 1)[0];
+    /* 记一笔「显式删除」：只有这里删过的，persistPool 才允许它从清单里消失 */
+    if (gone && gone.file) {
+        const _dir = getDirValue(node);
+        if (_dir) _poolRemoved.add(poolRemovedKey(_dir, String(gone.file)));
+    }
     const goneKey = refKeyOf(gone);
     if (goneKey) {
         for (const s of ds.segments || []) {
@@ -8432,7 +8467,34 @@ function buildCards(data) {
                 inp.click();
                 setLed("idle", "已打开文件选择框：选中素材即上传到本项目 assets/");
             };
-            aiBar.append(bExpandOpt, bOptRun, bResolve, bUpload);
+            /* 🧷 补回清单（自愈）：素材库看的是**目录**（assets/ 里有什么就列什么），
+             * 分段提示词框的素材 chip 看的是**清单**（manifest["assets"]）。两套来源 ——
+             * 清单被旧池整表覆盖过一次，就会出现「素材库看得到、引用处选不到」。
+             * 这一下扫目录、把没登记的补进清单，**只加不删**，随时点都安全。 */
+            const bRepair = el("button", "h3d-btn", "🧷 补回清单");
+            bRepair.type = "button";
+            bRepair.disabled = !canEdit;
+            bRepair.title = "扫一遍本项目 assets/ 目录，把「文件在、清单里没有」的素材"
+                + "补回分段提示词框的素材池。只加不删，可以随时点。";
+            bRepair.onclick = async () => {
+                const dir = getDirValue(node);
+                if (!dir) { alert("当前还没有项目：请先新建或读档一个项目。"); return; }
+                bRepair.disabled = true;
+                try {
+                    const r = await window.H3Api.assetsRepair(dir);
+                    if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "补回失败"));
+                    const n = (r.body.added || []).length;
+                    await hydratePool(true).catch(() => {});
+                    setLed(n ? "done" : "idle",
+                        n ? `已补回 ${n} 个素材到引用清单` : "清单已是最新，没有要补的");
+                    scheduleRefresh(60);
+                } catch (e) {
+                    setLed("err", `补回失败：${e?.message || e}`);
+                } finally {
+                    bRepair.disabled = !canEdit;
+                }
+            };
+            aiBar.append(bExpandOpt, bOptRun, bResolve, bUpload, bRepair);
             pResult.body.append(aiBar);
             /* 工具条：原稿切换 / 结构化弹窗（paintOptbar 填）。
              * 挂在 paneMain 上、pResult.body 之外 —— 放进结果框里的话

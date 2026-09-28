@@ -116,6 +116,7 @@ ROUTES = [
     ("GET", "/h3chain/anchor_sources"),
     ("GET", "/h3chain/anchor_sheet"),
     ("POST", "/h3chain/anchor_sheet_build"),
+    ("POST", "/h3chain/assets_repair"),
 ]
 
 _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
@@ -123,6 +124,83 @@ _ROUTES_LOG = ", ".join(f"{m} {p}" for m, p in ROUTES)
 
 def _routes_desc() -> list:
     return [{"method": m, "path": p} for m, p in ROUTES]
+
+
+_compress_mw = None
+
+
+def _compression_middleware():
+    """构造（并缓存）「ComfyUI 官方 `server.compress_body` + 补一条 Vary」的新式中间件。
+
+    为什么必须补 `Vary: Accept-Encoding`：**要不要压缩取决于请求头 `Accept-Encoding`**，
+    那响应就必须声明「同一个 URL 会因该请求头而不同」。官方那个函数没设（`server.py`
+    全文只有一处 Vary，是给 `Sec-Fetch-Dest` 的）→ 中间只要有一层会缓存的反向代理
+    （租卡平台前面必有），它完全可能把 gzip 那一份发给**没有**声明支持 gzip 的客户端，
+    浏览器收到一坨二进制，前端解析 `/object_info` 当场炸。本机直连永远遇不到。
+    压缩范围仍是官方那套（只压 `application/json` / `text/plain` 的 `web.Response`）——
+    静态 JS/CSS 走 `FileResponse`（流式响应），**根本不经过这里**。
+
+    ⚠ 为什么不写成模块级函数（两条都实测摔过）：
+      1. 官方实现只能从 `server` 模块 `getattr` 拿到，**模块级函数里直接调那个裸名是
+         NameError** → 中间件在请求路径上，异常会变成**每一个请求都 500**。
+         （也不该在模块级 `import server`：测试环境没有 server 模块。）
+      2. aiohttp 对带 `__middleware_version__ == 1` 的新式中间件按
+         `partial(m, handler=handler)` 调用（`web_app.py:555`）——`handler` 走**关键字**，
+         所以签名必须老实写 `(request, handler)`，写成 `(*args)` 会直接漏掉 handler。
+    """
+    global _compress_mw
+    if _compress_mw is not None:
+        return _compress_mw
+    try:
+        import server as _server
+    except ImportError:
+        return None
+    fn = getattr(_server, "compress_body", None)
+    if fn is None:
+        return None
+
+    @web.middleware
+    async def _mw(request, handler):
+        resp = await fn(request, handler)
+        if isinstance(resp, web.Response):
+            # Vary 描述的是「响应**取决于**哪个请求头」，不是「这次到底压没压」——
+            # 所以按内容类型一律声明。别去读 `Content-Encoding` 判断：aiohttp 的
+            # `enable_compression()` 把该头延迟到发送时才补，此刻读不到（实测踩过）。
+            resp.headers.setdefault("Vary", "Accept-Encoding")
+        return resp
+
+    _compress_mw = _mw
+    return _compress_mw
+
+
+def enable_response_compression(app) -> bool:
+    """把 ComfyUI **自带的**压缩中间件挂到运行中的 aiohttp app 上。
+
+    为什么：ComfyUI 默认不压缩响应体，官方开关是 `--enable-compress-response-body`
+    （`comfy/cli_args.py`），租卡平台的启动脚本基本都不会带它。后果是 `/object_info`
+    这种「所有节点定义」的大 JSON **明文传输** —— 装满自定义节点的环境里 6–7MB。
+    本机访问是内存速度，感觉不到；走公网就是十几秒的空白等待（实测 6.41MB / 9.0s），
+    表现为「打开界面卡住很久」。压缩后同样的 JSON 只剩十几分之一。
+
+    压缩逻辑一律复用官方函数，不自己写。任何异常都吞掉 —— 这只是加速开关，
+    不允许它影响路由注册。
+    """
+    try:
+        mw = _compression_middleware()
+        if mw is None:
+            return False
+        cur = getattr(app, "middlewares", None) or ()
+        if mw in cur:
+            return True
+        # ⚠ 必须**原地 append**：`app._middlewares` 是 frozenlist.FrozenList，
+        # 整体换成一个普通 tuple 会让 aiohttp 起服务时 `pre_freeze() -> _middlewares.freeze()`
+        # 抛 AttributeError，**ComfyUI 直接起不来**（实测踩过）。官方开关也是 append。
+        app._middlewares.append(mw)
+        print("[ComfyUI_H3_SeamlessChain] 已启用响应体压缩（/object_info 等大 JSON，含 Vary）")
+        return True
+    except Exception as e:
+        print(f"[ComfyUI_H3_SeamlessChain] 响应体压缩未启用：{e}")
+        return False
 
 
 def _err(message, code="BAD_REQUEST", status=400, **extra):
@@ -1495,6 +1573,27 @@ def add_routes(routes):
         return web.json_response({"ok": True, **{k: v for k, v in res.items() if k != "manifest"},
                                   "manifest": res["manifest"]})
 
+    async def assets_repair(request):
+        """把 `<proj>/assets/` 里没登记进 `manifest["assets"]` 的文件补回池子（**只加不删**）。
+
+        为什么需要它：素材库看的是**目录扫描**（`library.scan_scope` 直接 walk assets/），
+        而分段提示词框的素材 chip 看的是**清单**（`manifest["assets"]`）。清单是
+        「全量覆盖写」—— 任何一次拿旧池整表覆盖（页面重载 / ComfyUI 重启后 widget 里
+        恢复成上传之前的旧池）都会把刚传的素材从清单里抹掉、文件却留在磁盘上。
+        症状就是「素材库看得到、分段提示词框里选不到」。
+
+        这个接口按池序补号、按 file 去重，**绝不删任何已有条目** —— 所以拿它做自愈是安全的。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            res = projects.repair_assets(str(data.get("dir") or ""))
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        return web.json_response({"ok": True, **res})
+
     # ---------- 素材库（Library）：一个浏览器 + 四个 scope ----------
     # 蓝本 Majoor Assets Manager 的 API 形状；索引/查询在 library.py，
     # 这里只做「HTTP 进出 + 本插件语义（段引用 / 角色标记）」的接线。
@@ -2692,6 +2791,7 @@ def add_routes(routes):
         ("POST", "/h3chain/move_media", move_media),
         ("POST", "/h3chain/split_av", split_av),
         ("POST", "/h3chain/import_asset", import_asset),
+        ("POST", "/h3chain/assets_repair", assets_repair),
         ("POST", "/h3chain/assets", save_assets),
         ("POST", "/h3chain/asset_check", asset_check),
         ("POST", "/h3chain/compile_refs", compile_refs),
@@ -2797,6 +2897,8 @@ def register(routes=None):
     # app.add_routes(PromptServer.instance.routes)，导入期加进 RouteTableDef
     # 的路由不会被装载，导致代码里"注册成功"但浏览器访问 404。
     app = getattr(inst, "app", None)
+    if app is not None:
+        enable_response_compression(app)
     router = getattr(app, "router", None) if app is not None else None
     target = router if router is not None else getattr(inst, "routes", None)
     if target is not None:

@@ -10395,9 +10395,12 @@ function removeFab() {
  * 同一条路径描一圈 2px 渐变边。机身**底色一律不动** —— 它跟主题走，浅色深色都不打架。
  *
  * 端口免打扰：drawSlots 只对「控件型输入槽」自动隐身，真端口没有开关，只能包一层：
- *   getInputPos / getOutputPos 换下标 → 藏起来的端口不占行（按钮随之上移、节点收矮）
- *   drawSlots                 换 draw → 藏起来的端口不画（连了线也不画）
- *   computeSize               收窄   → 尺寸按**可见**端口算，否则底部会白留几行
+ *   getInputPos / getOutputPos / getInputSlotPos 三个坐标入口：露头的槽换到「紧凑行」，
+ *                                            不露头的槽丢到停机场（点不到、不占行）
+ *   drawSlots                                不画不露头的（连了线也不画那根线的前提是它没连线）
+ *   computeSize                              尺寸按**露头**的端口算，否则底部会白留几行
+ * 「露头」= 不在隐藏名单里，**或者已经接了线**。接了线的必须照常露头 —— 不然那根线要么
+ * 悬在半空、要么被拉到一个看不见的角落，两种都比露出这个端口更难看。
  * 一律**按名字认，不按位次认**：位次会随控件增删漂移（输出位次还是连线的坐标），名字不会。
  * 端口本身留在 inputs/outputs 里没删 —— 删「帧率」会把「报告」从第 3 位挤到第 2 位，
  * 老工作流里连「报告」的线会静默接到「帧率」上，那是真事故。
@@ -10440,45 +10443,66 @@ function paintDeskNode(node) {
         ctx.restore();
     };
 
-    /* 端口紧凑：把藏起来的槽从排布里摘掉，同时保证**标注与连线用的是同一套坐标**。
-     * 前端查槽位坐标全都要过 getInputPos / getOutputPos —— 量标签的 _measureSlot、画连线的
-     * drawConnections、鼠标命中的 getNodeInputOnPos，三处都是它们 —— 所以只在这一个地方把
-     * 「原始下标」换成「它前面还剩几个可见槽」，三处就永远一致。
-     * ⚠ 踩过的坑：最早是去过滤 _measureSlots。那会儿标签量算按紧凑下标、连线仍按原始下标，
-     * 两套坐标并存 →「二采模型」的标签在第 5 行、接线点却画在第 7 行。别再动 _measureSlots。 */
-    const shiftIndex = (arr, i) => {
+    /* 端口坐标：只在这一个地方算，全前端就一套。
+     * 前端查槽位坐标有两条路，都得收敛到同一结果：
+     *   ① 按下标：getInputPos / getOutputPos —— 量标签（_measureSlot）、画连线（drawConnections）、
+     *      鼠标命中（getNodeInputOnPos）、命中判定（getNodeOutputOnPos）走这条
+     *   ② 按槽对象：getInputSlotPos —— 拖线找落点走这条，它内部绕开了 ①，得显式接回来
+     * 露头的槽 → 换成「紧凑行」（＝它前面还剩几个露头的槽）；不露头的槽 → 停机场。
+     * ⚠ 停机场是必须的：命中的判定是「按数组顺序第一个命中的赢」，只要不露头的槽还占着
+     *   某一行，它就会抢走那一行可见端口的点击（二采模型拖不出线、拉出来的是起始视频）。
+     * ⚠ 两处别再动：_measureSlots（会把「量标签」和「画连线」拆成两套坐标）；槽对象的 pos
+     *   （会被写进存档，旧版本插件读到就变成永远点不到的端口）。 */
+    const H3_DESK_PARK_X = -1e5;         // 停机场横坐标（相对节点原点）：远到点不着
+    const parkPos = (node) => [node.pos[0] + H3_DESK_PARK_X, node.pos[1]];
+
+    /* 「露头」判定：不在隐藏名单里，或者已经接了线（输入看 link、输出看 links ——
+     * 与前端自己的 isConnected 同口径）。 */
+    const deskSlotVisible = (slot) => {
+        if (!slot || !H3_DESK_HIDE_SLOTS.has(slot.name)) return true;
+        return slot.link != null || (slot.links != null && slot.links.length > 0);
+    };
+
+    // 下标 → 紧凑行：数一数它前面还剩几个露头的槽
+    const deskRow = (arr, i) => {
         let n = 0;
-        for (let k = 0; k < i; k++) if (!H3_DESK_HIDE_SLOTS.has(arr[k].name)) n += 1;
+        for (let k = 0; k < i && k < arr.length; k += 1) if (deskSlotVisible(arr[k])) n += 1;
         return n;
     };
 
     const origInputPos = node.getInputPos;
     node.getInputPos = function (i) {
-        return origInputPos.call(this, shiftIndex(this.inputs, i));
+        return deskSlotVisible(this.inputs[i]) ? origInputPos.call(this, deskRow(this.inputs, i))
+                                              : parkPos(this);
     };
 
     const origOutputPos = node.getOutputPos;
     node.getOutputPos = function (i) {
-        return origOutputPos.call(this, shiftIndex(this.outputs, i));
+        return deskSlotVisible(this.outputs[i]) ? origOutputPos.call(this, deskRow(this.outputs, i))
+                                               : parkPos(this);
+    };
+
+    const origInputSlotPos = node.getInputSlotPos;
+    node.getInputSlotPos = function (slot) {
+        const i = this.inputs.indexOf(slot);
+        return i < 0 ? origInputSlotPos.call(this, slot) : this.getInputPos(i);
     };
 
     const origDrawSlots = node.drawSlots;
     node.drawSlots = function (ctx, opts) {
-        /* 把命中的 concrete 槽位的 draw 换成空函数，而不是重写整个循环 ——
+        /* 把不露头的 concrete 槽位的 draw 换成空函数，而不是重写整个循环 ——
          * 循环里那套「悬停/是否控件槽/透明度」的判定留给原生，少抄一遍就少一处漂移 */
         for (const s of [...this._concreteInputs, ...this._concreteOutputs]) {
-            if (H3_DESK_HIDE_SLOTS.has(s.name)) s.draw = H3_DESK_NOOP_DRAW;
+            if (!deskSlotVisible(s)) s.draw = H3_DESK_NOOP_DRAW;
         }
         return origDrawSlots.call(this, ctx, opts);
     };
 
-    const filterHidden = (arr) => arr.filter((s) => !H3_DESK_HIDE_SLOTS.has(s.name));
-
     const origComputeSize = node.computeSize;
     node.computeSize = function () {
         const keepIn = this.inputs, keepOut = this.outputs;
-        this.inputs = filterHidden(keepIn);
-        this.outputs = filterHidden(keepOut);
+        this.inputs = keepIn.filter(deskSlotVisible);
+        this.outputs = keepOut.filter(deskSlotVisible);
         const size = origComputeSize.call(this);
         this.inputs = keepIn;
         this.outputs = keepOut;

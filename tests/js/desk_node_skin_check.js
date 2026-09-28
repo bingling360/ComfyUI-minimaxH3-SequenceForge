@@ -50,22 +50,29 @@ if (hide) {
     const want = ["起始视频", "起始视频音轨", "帧率", "分段图像", "分段音频"].sort();
     ok(JSON.stringify(got) === JSON.stringify(want), `免打扰名单应为 5 个端口，实际：${got.join("/")}`);
 }
-for (const h of ["node.getInputPos =", "node.getOutputPos =", "node.drawSlots =", "node.computeSize ="]) {
+for (const h of ["node.getInputPos =", "node.getOutputPos =", "node.getInputSlotPos =",
+                 "node.drawSlots =", "node.computeSize ="]) {
     ok(director.includes(h), `端口免打扰钩子缺失：${h}`);
 }
-/* 反向钉一次踩过的坑：坐标必须只在 getInputPos/getOutputPos 一处换下标。
- * 包 _measureSlots 会让「量标签」与「画连线」各用一套下标 → 端口的接线点画到别的行去。 */
+/* 坐标入口三条都得包上：按下标的两个 + 按槽对象的 getInputSlotPos（拖线找落点走它，
+ * 漏掉它就会出现「落点预览与标签不在同一行」）。 */
+ok(director.includes("H3_DESK_PARK_X"), "隐藏端口必须丢到停机场，不能和可见端口挤同一行");
+ok(director.includes("deskSlotVisible"), "缺少「露头」统一判定");
+ok(director.includes("slot.link != null") && director.includes("slot.links.length > 0"),
+   "「露头」判定要与前端 isConnected 同口径（输入看 link、输出看 links）");
+/* 反向钉两次踩过的坑：① 坐标必须收敛，不许包 _measureSlots；② 不许往槽对象写 pos
+ * （会被存档带走，旧版本插件读到就变成永远点不到的端口）。 */
 ok(!director.includes("node._measureSlots ="),
-   "不许包 _measureSlots —— 标签与连线会各算一套坐标（二采模型错位就是这么来的）");
+   "不许包 _measureSlots —— 标签与连线会各算一套坐标");
+ok(!/\.\s*pos\s*=\s*\[\s*node\.pos/.test(director),
+   "不许给槽对象写 pos 当停车位 —— 那个字段跟着存档走，会毒到旧版本插件");
 ok(director.includes("paintDeskNode(node);"), "mountDeskButton 未调用 paintDeskNode");
 ok(director.includes("if (node.__h3DeskPainted) return;"), "paintDeskNode 必须幂等（重复挂会层层套娃）");
 
 /* ---------- ③ 按名字认，不按位次认 ---------- */
-ok(director.includes("H3_DESK_HIDE_SLOTS.has(s.name)"),
+ok(director.includes("H3_DESK_HIDE_SLOTS.has(slot.name)"),
    "端口必须按 name 命中，不许按下标/位次认");
-ok(director.includes("H3_DESK_HIDE_SLOTS.has(arr[k].name)"),
-   "换下标那处也必须按 name 认");
-ok(!/H3_DESK_HIDE_SLOTS\.has\((?!s\.name|arr\[k\]\.name)/.test(director),
+ok(!/H3_DESK_HIDE_SLOTS\.has\((?!slot\.name)/.test(director),
    "H3_DESK_HIDE_SLOTS 的命中键只能是槽位名");
 
 /* ---------- ④ 反向：后端与工作流的端口一个都不许删 ---------- */

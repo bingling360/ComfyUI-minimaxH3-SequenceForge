@@ -1114,6 +1114,19 @@ def tile_grid(mode):
     return (max(1, int(r)), max(1, int(c)))
 
 
+def refine_tile_effective_mode(tile_on, mode):
+    """精化空间 tile 的**生效档位**：总开关（`refine_tile_on`）是唯一裁决。
+
+    「开关 + 参数」两件套的口径：开关关 = 参数只被记住（前端置灰但不清零）、
+    **不生效**。plan_tiles 只认档位字符串、不知道开关的存在，所以调用方喂给
+    它的档位必须先过这里 —— 否则开关空挂：`refine_tile` 默认 "2x1"，总开关
+    关着也会被 plan_tiles 切成两块。
+    """
+    if not tile_on:
+        return "off"
+    return str(mode or "off")
+
+
 def plan_tiles(h, w, mode, overlap, min_side=16):
     """把 H×W 切成网格 -> [(hs, he, ws, we, chs, che, cws, cwe, eff_ov), ...]。
 

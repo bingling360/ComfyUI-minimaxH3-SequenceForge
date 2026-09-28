@@ -1421,6 +1421,24 @@ def test_plan_tiles_off_returns_single_tile():
     assert perf.plan_tiles(-8, 64, "2x2", 8) == []
 
 
+def test_refine_tile_master_switch_gates_effective_mode():
+    """★ 总开关是唯一裁决：关 = 生效档位 off，哪怕参数档位给的是能切开的值。
+
+    回归钉子：此前 `_rt_on` 在 upscale 里只包着一条日志，原始档位直接喂
+    plan_tiles —— `refine_tile` 默认 "2x1"，总开关关着也照样分块（开关空挂）。
+    任何走 plan_tiles 的调用方都必须先过 `refine_tile_effective_mode`。
+    """
+    # 关：参数被记住（默认 "2x1"）但**不生效**
+    assert perf.refine_tile_effective_mode(False, "2x1") == "off"
+    assert perf.refine_tile_effective_mode(False, "4x4") == "off"
+    assert perf.refine_tile_effective_mode(False, None) == "off"
+    # 开：档位原样透传（含 off 本身 —— 开着但选 off 也不切）
+    assert perf.refine_tile_effective_mode(True, "2x1") == "2x1"
+    assert perf.refine_tile_effective_mode(True, "2x2") == "2x2"
+    assert perf.refine_tile_effective_mode(True, "off") == "off"
+    assert perf.refine_tile_effective_mode(True, None) == "off"
+
+
 def test_plan_tiles_core_union_covers_whole_canvas():
     """★ 核心不变量：各块 core 的**并集**必须铺满整幅 H×W。
 

@@ -2062,7 +2062,9 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 区按二维羽化权重过渡。二维权重 = 行向权重 × 列向权重（可分离，省一次 2D 场
     # 构造，且天然是「角上最轻、中心最重」的合理形状）。
     _rt_on = bool(cfg.get("refine_tile_on", False))
-    _rt_mode = str(cfg.get("refine_tile") or "off")
+    # 生效档位必须过总开关裁决：关 = 参数只被记住、不生效。直接把原始档位喂给
+    # plan_tiles 的话开关是空挂的（refine_tile 默认 "2x1"，开关关着也照样分块）。
+    _rt_mode = perf.refine_tile_effective_mode(_rt_on, cfg.get("refine_tile"))
     _rt_ov = int(cfg.get("refine_tile_overlap") or 0)
     _rt_feather = int(cfg.get("refine_tile_feather") or 0)
 

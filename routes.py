@@ -203,6 +203,106 @@ def enable_response_compression(app) -> bool:
         return False
 
 
+_static_cache_mw = None
+
+
+def _static_cache_middleware():
+    """构造「静态 JS/CSS 缓存策略」中间件：接管 .js/.css 的 FileResponse 缓存头。
+
+    背景（云端实测，2026-09-29）：ComfyUI 的 `middleware/cache_middleware.py` 对一切
+    .js/.css 响应 `Cache-Control: no-store` —— 浏览器**完全不缓存**，每次刷新把前端
+    93MB 的 JS 池 + 插件 ~770KB 全量明文重传。走公网（RTT ~150ms、下行 ~2.5MB/s）
+    一次刷新就是十几秒空白，这是「云端打开/刷新界面卡」的最大单项。
+
+    aiohttp ≥3.9 的 FileResponse 本来就带全套协商机制（`_make_response` 里
+    ETag/If-None-Match→304、Last-Modified/If-Modified-Since），被 no-store 一手摁死。
+    所以这里只做三件事：
+
+      1. **接管 .js/.css 的 Cache-Control**（本中间件在链路内层、先于 cache_control
+         执行，它里面的 setdefault 就不会再补 no-store）——
+         - `/assets/`（前端 vite 内容哈希文件名，内容永不变）：`immutable` 长缓存，
+           有效期内零请求；
+         - 其余（/extensions/ 下的插件文件，URL 固定但会随插件更新变）：`no-cache`
+           每次协商重验，命中就是 304 空响应（158ms RTT 而非整包重传）。
+      2. **兜底 ETag + 304 短路**：格式与 aiohttp 原生完全一致（mtime_ns十六进制-size），
+         老 aiohttp 的 FileResponse 没有协商逻辑时由这里接住 If-None-Match。
+      3. **冷启动 gzip**：客户端接受时对 200 的 .js/.css 开启传输压缩并补
+         `Vary: Accept-Encoding`（FileResponse 会自动退到分块流式压缩路径）。
+
+    ⚠ 与压缩中间件同两条纪律：签名老实写 `(request, handler)`（新式中间件的 handler
+    走关键字传参）；中间件在请求路径上，任何异常都是全局 500 —— stat/ETag 全部
+    try 包住，出错就原样放行，宁可退回「每次全量重传」也不许 5xx。
+    """
+    global _static_cache_mw
+    if _static_cache_mw is not None:
+        return _static_cache_mw
+
+    @web.middleware
+    async def _mw(request, handler):
+        resp = await handler(request)
+        if not isinstance(resp, web.FileResponse):
+            return resp
+        p = request.path
+        if not (p.endswith(".js") or p.endswith(".css")):
+            return resp
+        try:
+            fpath = getattr(resp, "_path", None)
+            if fpath is None:
+                return resp
+            st = os.stat(fpath)
+        except (OSError, TypeError, ValueError):
+            return resp
+        etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+        # /assets/ 是 vite 内容哈希文件（改内容必改名）→ 永不失效；
+        # 其余 .js/.css（插件扩展、模板、文档）URL 固定内容会变 → 每次协商重验。
+        policy = ("public, max-age=31536000, immutable" if "/assets/" in p
+                  else "no-cache")
+        inm = request.headers.get("If-None-Match", "")
+        if inm:
+            tags = [t.strip() for t in inm.split(",")]
+            if "*" in tags or etag in tags or ("W/" + etag) in tags:
+                # 304 必须带上 Cache-Control：浏览器用它刷新已存条目的缓存策略
+                return web.Response(status=304, headers={
+                    "ETag": etag, "Cache-Control": policy})
+        resp.headers["ETag"] = etag
+        # 强设（不是 setdefault）：必须在 cache_control 的 setdefault(no-store) 之前
+        # 占住这个头，否则浏览器根本不存，304 机制形同虚设。
+        resp.headers["Cache-Control"] = policy
+        if "gzip" in request.headers.get("Accept-Encoding", "").lower():
+            try:
+                resp.enable_compression()
+                resp.headers.setdefault("Vary", "Accept-Encoding")
+            except Exception:
+                pass  # 压缩只是加速，失败就明文传
+        return resp
+
+    _static_cache_mw = _mw
+    return _static_cache_mw
+
+
+def enable_static_cache_policy(app) -> bool:
+    """把静态 JS/CSS 缓存策略中间件挂到运行中的 aiohttp app 上。
+
+    动机见 `_static_cache_middleware`。同样只许 append、任何异常都吞掉——
+    这只是加速开关，不允许它影响路由注册。
+    """
+    try:
+        mw = _static_cache_middleware()
+        if mw is None:
+            return False
+        cur = getattr(app, "middlewares", None) or ()
+        if mw in cur:
+            return True
+        # 同 `enable_response_compression`：FrozenList 只能原地 append。
+        app._middlewares.append(mw)
+        print("[ComfyUI_H3_SeamlessChain] 已启用静态缓存策略"
+              "（/assets 长缓存 + /extensions 协商 304 + 静态 JS/CSS gzip）")
+        return True
+    except Exception as e:
+        print(f"[ComfyUI_H3_SeamlessChain] 静态缓存策略未启用：{e}")
+        return False
+
+
 def _err(message, code="BAD_REQUEST", status=400, **extra):
     body = {"ok": False, "code": code, "message": message}
     body.update(extra)
@@ -1663,7 +1763,12 @@ def add_routes(routes):
                              it["id"], it["kind"])
         if not p:
             return _err("无缩略图（非图片或缺 Pillow）", code="NO_THUMB", status=404)
-        return web.FileResponse(p)
+        # 缩略图入库即生成、按 id 内容不变 → 可以放心让浏览器缓存一整天；URL 不带
+        # 图片扩展名，ComfyUI 的 cache_control 中间件对它不设任何头，这里不补的话
+        # 每次翻页都全量重拉（公网上一页 60 张 × RTT 就是纯浪费）。过期后的协商
+        # 304 由 aiohttp ≥3.9 的 FileResponse 自带（ETag= mtime_ns-size）。
+        return web.FileResponse(p, headers={
+            "Cache-Control": "public, max-age=86400"})
 
     async def lib_raw(request):
         """原文件流：默认 inline（预览用）；`download=1` 带 attachment 头触发另存为。"""
@@ -1681,7 +1786,11 @@ def add_routes(routes):
             fn = os.path.basename(src)
             return web.FileResponse(src, headers={
                 "Content-Disposition": f'attachment; filename="{fn}"'})
-        return web.FileResponse(src)
+        # inline 预览（视频/图片）：原文件有被重传覆盖的可能，只给 1 小时强缓存；
+        # 过期后 FileResponse 自带的 ETag（mtime_ns-size）协商——重传过的新文件
+        # mtime/size 变了自然回 200 新内容。不带头则每次预览都重传整个视频。
+        return web.FileResponse(src, headers={
+            "Cache-Control": "public, max-age=3600"})
 
     def _launch_args_or_none(table, hw):
         """启动参数体检（只读）；探不到就 None —— 与 `hw` 探测同一纪律：
@@ -2899,6 +3008,7 @@ def register(routes=None):
     app = getattr(inst, "app", None)
     if app is not None:
         enable_response_compression(app)
+        enable_static_cache_policy(app)
     router = getattr(app, "router", None) if app is not None else None
     target = router if router is not None else getattr(inst, "routes", None)
     if target is not None:

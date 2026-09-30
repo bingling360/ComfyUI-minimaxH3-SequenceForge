@@ -538,9 +538,13 @@ async function t(name, fn) {
         /* 只认类名与摆放：保存按钮的文字会短暂变成「✓ 已应用」（上一条刚点过），
          * 拿瞬时文案做断言会假失败。 */
         const btns = [...overlay.querySelectorAll(".h3d-perf-foot .h3d-btn")].map((b) => b.className);
-        assert.strictEqual(btns.length, 2, "底栏该有两个按钮：" + btns.join("/"));
-        assert.ok(/h3d-opt-save/.test(btns[1]), "底栏第二个该是保存：" + btns[1]);
+        assert.strictEqual(btns.length, 3,
+          "底栏该有三个按钮（关闭 / 恢复默认 / 保存并应用）：" + btns.join("/"));
+        assert.ok(/h3d-opt-save/.test(btns[2]), "底栏第三个该是保存：" + btns[2]);
         assert.strictEqual(overlay.querySelector(".h3d-perf-foot .h3d-btn").textContent, "关闭");
+        const resetBtn = [...overlay.querySelectorAll(".h3d-perf-foot .h3d-btn")]
+            .find((b) => b.textContent === "恢复默认");
+        assert.ok(resetBtn, "缺「恢复默认」按钮（2026-09-30 用户要求：恢复出厂默认并重建面板）");
         const css = SRC.slice(SRC.indexOf(".h3d-perf-dialog{"));
         const oneLine = css.slice(0, css.indexOf("}"));
         assert.ok(oneLine.indexOf("overflow:hidden") >= 0, "弹窗自身还在滚 → 按钮位置又会跟着内容跑");

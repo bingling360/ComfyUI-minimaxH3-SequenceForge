@@ -1765,17 +1765,36 @@ class H3SeamlessChainSampler(io.ComfyNode):
             """latent 库文件 -> (video_cpu, audio_cpu|None)；**取不到直接抛**。
 
             旧实现「加载/形状失败就静默回落上段尾」已删除——设了源却不生效还不说，
-            是最坏的一类 bug（规划 §1.3）。只认 latent/<名>.pt（防穿越）；
+            是最坏的一类 bug（规划 §1.3）。两种寻址：
+            - 项目 latent：`latent/<名>.pt`（防穿越，只认项目 latent/ 目录）；
+            - 全局库 latent：asset_id / 别名 —— 注册表解析到全局库里的 .pt。
+              这是「旧项目的 latent 衔接到新项目」的执行期通路：旧项目把 latent
+              存入全局库，新项目锚定面板从素材库挑它，ref 就是 asset_id。
             形状与「能不能重编」的判断交给 _resolve_anchor_latent 里的
             resolve_anchor_source（它要区分裸 latent 与可重编素材，报错文案不同）。
             """
             f = str(file or "").strip().replace("\\", "/")
             parts = [p for p in f.split("/") if p and p != "."]
-            if len(parts) != 2 or parts[0] != "latent" or not parts[1].endswith(".pt"):
-                raise ValueError(f"latent 源路径非法：{f!r}（须为 latent/<名>.pt）")
-            cand = os.path.join(root, "latent", parts[1]) if root else None
-            if cand is None or not os.path.isfile(cand):
-                raise ValueError(f"latent 源缺失：{f}（项目 latent/ 下没有这个文件）")
+            cand = None
+            if len(parts) == 2 and parts[0] == "latent" and parts[1].endswith(".pt"):
+                cand = os.path.join(root, "latent", parts[1]) if root else None
+                if cand is None or not os.path.isfile(cand):
+                    raise ValueError(f"latent 源缺失：{f}（项目 latent/ 下没有这个文件）")
+            else:
+                _rec = None
+                if _AS is not None:
+                    _reg, _libroot = _asset_registry()
+                    _rec = ((_reg.get("by_id") or {}).get(f)
+                            or (_reg.get("by_alias") or {}).get(f))
+                    if _rec is not None and _libroot:
+                        _rf = str(_rec.get("file") or "").replace("\\", "/")
+                        if _rf:
+                            _c = os.path.join(_libroot, *_rf.split("/"))
+                            if os.path.isfile(_c) and _c.lower().endswith(".pt"):
+                                cand = _c
+                if cand is None:
+                    raise ValueError(f"latent 源非法或缺失：{f!r}（须为 latent/<名>.pt，"
+                                     "或已「存入全局库」的 latent）")
             with open(cand, "rb") as fh:
                 payload = torch.load(fh, map_location="cpu", weights_only=True)
             ev = payload.get("video")
@@ -1789,13 +1808,36 @@ class H3SeamlessChainSampler(io.ComfyNode):
         def _anchor_asset(label, want_kind):
             """锚点素材标签 -> (绝对路径 | None, pool 文件名 | None)。
 
-            标签寻址走 P2 三级寻址（asset_store 注册表 by_alias / by_id -> 绝对路径），
-            注册表未命中才回落 pool 文件名（input 目录 / 项目 assets）。图片与视频共用
-            这一条通路：原先只有图片有，视频被写死走 `_load_input_video`（只认 ComfyUI
-            input 目录），于是项目 assets/ 与素材库里的视频根本接不进来。
+            三级寻址：
+            1. 成片相对路径（`finals/…` / `videos/…` / `merges/…` / `clips/…` 两段以上
+               且文件存在）—— 成片条目没有 asset_id 也不在标签池里，路径直读是它唯一
+               的执行期通路（与 routes._anchor_ref_of 的口径一致）；
+            2. P2 注册表（asset_store by_alias / by_id -> 绝对路径）；
+            3. 回落 pool 文件名（input 目录 / 项目 assets）。
+            图片与视频共用这一条通路：原先只有图片有，视频被写死走 `_load_input_video`
+            （只认 ComfyUI input 目录），于是项目 assets/ 与素材库里的视频根本接不进来。
 
             未知标签、类型不符一律硬抛——手动锚是显式意图，静默换源等于「设了锚不生效」。
             """
+            # ---- 成片相对路径直读（防穿越：前缀白名单 + 每段都过 safe_name）----
+            _rel = str(label or "").strip().replace("\\", "/")
+            _parts = [p for p in _rel.split("/") if p and p != "."]
+            _parts_ok = all(
+                p and not p.startswith(".") and ".." not in p and ":" not in p
+                for p in _parts)
+            if (root and _parts_ok and len(_parts) >= 2
+                    and _parts[0] in ("finals", "videos", "merges", "clips")):
+                _cand = os.path.join(root, *_parts)
+                if os.path.isfile(_cand):
+                    try:
+                        from . import library as _h3lib_k
+                    except ImportError:
+                        import library as _h3lib_k
+                    _k = _h3lib_k.kind_of(_cand)
+                    if _k != want_kind:
+                        raise ValueError(f"锚点「{_rel}」的素材类型是 {_k or '未知'}，"
+                                         f"不是 {want_kind}（源类型与素材类型必须一致）")
+                    return _cand, None
             _rec = None
             if label not in pool_labels and _AS is not None:
                 _reg, _ = _asset_registry()

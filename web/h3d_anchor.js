@@ -6,9 +6,11 @@
  * 后端契约冻结：grid_spec / anchor_sources / anchor_sheet / anchor_sheet_build 接口
  * 与 anchor 数据结构字段名严格按规划写，不在前端硬编码档位数字（一律取自 grid_spec）。
  *
- * 来源只有两类（用户 2026-09-16 拍板）：
- *   「段」  = 本项目已落盘的 seg_NNN.pt（选上一段 = 旧 prev_tail，同一份 latent）
+ * 来源只有两类（用户 2026-09-16 拍板，2026-09-30 更名+改默认）：
+ *   「上段」= 本项目已落盘的 seg_NNN.pt（选上一段 = 旧 prev_tail，同一份 latent）
  *   「素材」= 从**现有素材库**里挑的图片/视频/latent（挑出条目后由后端确认元信息）
+ * 默认：有上一段 → 上段（取用窗贴其结尾）；没有上一段 → 素材（外部源是本面板
+ * 的核心用途，见 newAnchor 注释）。取用窗默认一律贴**源结尾**（衔接语义）。
  * 素材一律从资产库选，不自己枚举输入目录——那等于另造一个素材库，两套数据必然漂移。
  */
 (function () {
@@ -155,20 +157,34 @@
     for (const w of ws) if (w <= frames) best = w;
     return best;
   }
-  /* 新建锚：默认「段」+ 上一段（同一份 latent，就是旧的 prev_tail）。
-   * 上一段没落盘 latent（该段设了「不存 latent」）时 ref 留空，由用户从「段」列表里挑
+  /* 新建锚的默认源（用户 2026-09-30 拍板）：
+   * - 有上一段：默认「上段」（同一份 latent，就是旧的 prev_tail）；
+   * - 没有上一段（第 1 段/序章后的首段）：默认「素材」——本面板最核心的两个用途
+   *   （外部视频/latent 给初始段参考、旧项目 latent 衔接过来）都从素材库进来，
+   *   在没有上段的段上默认钉「上段」只会得到一条必须先改来源的死锚。
+   * 上一段没落盘 latent（该段设了「不存 latent」）时 ref 留空，由用户自己挑
    * ——后端 validate_anchors 会硬拦空 ref，不会静默生成一个没有源的锚。 */
+  /* 取用窗默认贴**源结尾**：衔接要的是"最近发生的那几帧"，不是开头。
+   * 源比窗短（或长度未知）时退到 0，绝不产生反区间。 */
+  function tailStart(frames, win) {
+    return (Number.isFinite(frames) && frames > win) ? Math.round(frames - win) : 0;
+  }
   function newAnchor(prev) {
+    /* 预填上一段时 ref 与渲染期对齐的判定相等（不触发对齐分支），所以「取用窗贴
+     * 源结尾」必须在这里就落；上一段帧数未知（清单没到）时退 0，选素材/对齐路径
+     * 会再按 tailStart 落一次。 */
+    const win = 22;
+    const startF = (prev && Number.isFinite(prev.frames)) ? tailStart(prev.frames, win) : 0;
     return {
       id: genId(),
       src: {
-        kind: "segment", ref: (prev && prev.ref) || "",
-        start_f: 0, end_f: 22,
+        kind: prev ? "segment" : "image", ref: (prev && prev.ref) || "",
+        start_f: startF, end_f: startF + win,
         src_fps: (prev && prev.fps != null) ? prev.fps : null,
         meta_ok: false,
       },
       at: { mode: "head", frame_idx: 0 },
-      window: 22,
+      window: win,
       branches: { av: "both" },
       on: true,
     };
@@ -317,7 +333,8 @@
     const addWrap = el("div", "h3d-anchor-add");
     const add = el("button", "h3d-btn", "＋ 新增锚定");
     add.title = "新增一条 anchor（同源可多条；head/mid/tail 落点各自自由）。"
-      + "默认取上一段作源——与「没有显式锚时自动注入的段首桥」是同一份 latent";
+      + "有上段默认取上段、取用窗贴上段结尾（衔接下段用）；"
+      + "没有上段（第 1 段）默认从素材库选——外部视频/latent、旧项目的 latent 都从这里进来";
     add.onclick = () => {
       const cur = (Array.isArray(seg.anchors) ? seg.anchors : []).slice();
       cur.push(newAnchor(prevSegment()));
@@ -425,7 +442,7 @@
     if (anchor.src.kind === "prev_tail") return "上段尾";
     if (src && src.label) return src.label;
     if (anchor.src.ref) return anchor.src.ref;
-    return anchor.src.kind === "segment" ? "（未选段）" : "（未选素材）";
+    return anchor.src.kind === "segment" ? "（未选上段）" : "（未选素材）";
   }
   /* 本链分辨率：manifest 里记的 params（上一次跑生成时的 C/H/W 基准）。
    * 项目还没跑过任何一段时没有这个键 —— 那就说"项目还没跑过"，不要只说"未知"。 */
@@ -654,8 +671,11 @@
     host.append(info);
 
     // 无 sheet 的 latent 老条目给「生成预览」按钮（按需 VAE 解码一次并缓存）。
-    // 素材库来的条目已经有缩略图/首帧，不需要这一步。
-    if (anchor.src.kind === "library" && (!src || !src.sheet) && anchor.src.ref) {
+    // 素材库来的条目已经有缩略图/首帧，不需要这一步；**只限项目内** latent/<名>.pt
+    // ——全局库 latent（ref 是 asset_id）没有"同段 finals 视频"可抽帧，
+    // anchor_sheet_build 也不认 asset_id，摆个必败按钮不如没有。
+    if (anchor.src.kind === "library" && (!src || !src.sheet) && anchor.src.ref
+        && /^latent\/[^/]+\.pt$/.test(anchor.src.ref)) {
       const gp = el("div", "h3d-genprev");
       const btn = el("button", "h3d-btn", "🖼 生成预览");
       btn.title = "给这个 latent 补一张 contact sheet（用同段已落盘的 finals/seg_NNN.mp4 抽帧，不加载 VAE）";
@@ -836,7 +856,7 @@
       o.value = "prev_tail"; o.textContent = "上段尾（旧格式）"; o.selected = true;
       sel.append(o);
     }
-    for (const [v, t] of [["segment", "段"], ["asset", "素材"]]) {
+    for (const [v, t] of [["segment", "上段"], ["asset", "素材"]]) {
       const o = document.createElement("option");
       o.value = v; o.textContent = t;
       if (!legacyPrev && (v === "segment") === !isAsset) o.selected = true;
@@ -887,8 +907,9 @@
           anchor.src.meta_ok = !!prev.meta_ok;
           anchor.window = (Number.isFinite(prev.frames) && prev.frames >= 22)
             ? 22 : snapDown(spec, prev.frames);
-          anchor.src.start_f = 0;
-          anchor.src.end_f = anchor.window;
+          // 取用窗默认贴**源结尾**：衔接用的是上段"最近发生的那几帧"（用户 2026-09-30 拍板）
+          anchor.src.start_f = tailStart(prev.frames, anchor.window);
+          anchor.src.end_f = anchor.src.start_f + anchor.window;
           needRebuild = true;
         }
       }
@@ -947,8 +968,9 @@
             // 不再"选个长视频窗宽就跟着跳到源长"——那不是默认值，是惊吓。
             anchor.window = (kind === "audio") ? 22
               : (Number.isFinite(hit.frames) && hit.frames >= 22 ? 22 : snapDown(spec, hit.frames));
-            anchor.src.start_f = 0;
-            anchor.src.end_f = anchor.window;
+            // 取用窗默认贴**源结尾**（同上段：衔接要"最近的画面"，不是开头）
+            anchor.src.start_f = tailStart(hit.frames, anchor.window);
+            anchor.src.end_f = anchor.src.start_f + anchor.window;
             ctx.__pickErr = hit.resolvable === false
               ? `「${hit.label}」在素材库里没有别名、也没有 asset_id，生成时节点侧寻址不到：`
                 + "先在素材库给它「改名」（登记别名）或重新上传一次"

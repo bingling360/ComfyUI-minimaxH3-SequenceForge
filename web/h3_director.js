@@ -4539,12 +4539,35 @@ async function openPerfSettings() {
     const status = el("div", "h3d-perf-status", "");
     const actions = el("div", "h3d-opt-actions");
     const cancel = el("button", "h3d-btn", "关闭");
+    const reset = el("button", "h3d-btn", "恢复默认");
+    reset.title = "把全部性能优化项恢复为出厂默认（写回 perf.json 并立即应用），"
+        + "然后按默认值重建本面板";
     const save = el("button", "h3d-btn h3d-opt-save", "保存并应用");
     save.disabled = true;
-    actions.append(cancel, save);
+    actions.append(cancel, reset, save);
     foot.append(status, actions);
     const close = () => overlay.remove();
     cancel.onclick = close;
+    reset.onclick = async () => {
+        /* 恢复默认 = POST 一份空对象：后端 parse_state 以 DEFAULT_PERF 起底，
+         * 空对象解析出来就是一份完整默认副本（perf.parse_state 的既有语义，
+         * 不需要新接口）。成功后关掉重开：面板按 GET 回来的默认值重建。 */
+        if (!window.confirm("把性能优化恢复为默认设置？\n\n"
+            + "手工调过的每一项（块交换 / 分块 / 编码器 / 显存守卫等）都会回到默认值，"
+            + "立即应用并写入 perf.json。")) return;
+        reset.disabled = true;
+        reset.textContent = "恢复中…";
+        try {
+            const b = (await A.perfSet({ perf: {} })).body;
+            if (!b || !b.ok) throw new Error("后端未接受（详见 ComfyUI 控制台）");
+            close();
+            openPerfSettings();
+        } catch (e) {
+            reset.disabled = false;
+            reset.textContent = "恢复默认";
+            alert("恢复默认失败：" + ((e && e.message) || e));
+        }
+    };
     overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) close(); });
     overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
     document.body.append(overlay);
@@ -5438,10 +5461,26 @@ async function openOptSettings(node, onSaved) {
 
     const actions = el("div", "h3d-opt-actions");
     const cancel = el("button", "h3d-btn", "取消");
+    const reset = el("button", "h3d-btn", "恢复默认");
+    reset.title = "全部 AI 优化设置回到默认（服务商 / 模型 / Key / 本地模型 / "
+        + "思考强度 / 提示词规则 / 扩写风格）";
     const save = el("button", "h3d-btn h3d-opt-save", "保存");
-    actions.append(cancel, save); dialog.append(actions);
+    actions.append(cancel, reset, save); dialog.append(actions);
     const close = () => overlay.remove();
     cancel.onclick = close;
+    reset.onclick = () => {
+        /* 恢复默认 = optDefaultSettings() 整份覆盖 ds.optimizer（该函数是本弹窗
+         * 所有字段的唯一默认值来源）。Key 一并清空：服务端内置 Key（optimizer.
+         * local.json）仍然兜底，开箱可用的状态不受影响。 */
+        if (!window.confirm("把 AI 优化设置恢复为默认值？\n\n"
+            + "服务商 / 模型 / API Key / 本地模型 / 思考强度 / 提示词规则 / 扩写风格"
+            + "全部回到默认（Key 会清空；服务端内置 Key 仍然可用）。")) return;
+        const defs = optDefaultSettings();
+        optSaveSettings(node, defs);
+        close();
+        if (onSaved) onSaved(defs);
+        scheduleRefresh(120);
+    };
     overlay.addEventListener("pointerdown", (ev) => { if (ev.target === overlay) close(); });
     save.onclick = () => {
         const preset = OPT_PROVIDERS[provider.value];
@@ -6508,6 +6547,9 @@ function injectStyles() {
     .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#22272eee;backdrop-filter:blur(8px);border-bottom:1px solid #3f4854}
     .h3d-sechead strong{display:block}
     .h3d-sechead small{color:var(--h3d-muted)}
+    /* 右栏各区的「↺ 恢复默认」按钮行：贴区头右缘，小号不抢焦点 */
+    .h3d-resetrow{display:flex;justify-content:flex-end;padding:8px 12px 0}
+    .h3d-resetrow button{font-size:11px;padding:3px 9px}
 
     .h3d-projlist{display:grid;gap:7px;padding:12px}
     .h3d-projrow{display:flex;gap:6px;align-items:stretch}
@@ -9225,11 +9267,67 @@ function renderWidgetField(node, name, labelOverride) {
     return field;
 }
 
+/* ---- 右栏「恢复默认」（2026-09-30 用户要求：性能优化 / 右栏 / AI优化三处各一个） ----
+ * 链参数默认值 = nodes.py INPUT_TYPES 的 default（前端镜像一份；改后端默认值时
+ * 必须同步这里）。语义桥 / 二采的默认值直接用 defaultBridge / defaultUpscale，
+ * 不另抄一份。 */
+const CHAIN_DEFAULTS = {
+    [W_AR]: "16:9", [W_MP]: 0.5, [W_DUR]: 5.0, [W_SEED]: 0,
+    "步数": 25, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple",
+    "审片模式": "关闭", "自动保存": "分段", "自动成片": "开启", "参考图像尺寸": "match",
+    "引导帧数": "22", "锚定加噪": 0, "递减锚定": "关闭", "响度对齐强度": 1.0,
+    "桥帧门控": "标注", "清晰度阈值": 30.0, "回退上限": 34,
+    "接缝重摇": "自动", "重摇阈值": 0.06, "重摇上限": 1,
+};
+
+/** 区头右上角的小按钮行（三个区共用一个样式，不放 sechead 里——那里不是 flex） */
+function resetRow(label, title, fn) {
+    const row = el("div", "h3d-resetrow");
+    const b = el("button", "h3d-btn", label);
+    b.type = "button";
+    b.title = title;
+    b.onclick = fn;
+    row.append(b);
+    return row;
+}
+
+function resetChainParams(node) {
+    if (!node) return;
+    if (!window.confirm("把链参数恢复为默认值？\n\n"
+        + "分辨率 / 时长 / 采样器 / 关键帧 / 检测重摇全部回到节点默认"
+        + "（画布控件值直接改写，种子回到 0）。")) return;
+    for (const [name, def] of Object.entries(CHAIN_DEFAULTS)) {
+        setWidgetValue(node, name, def);
+    }
+    repaintParams();      // 重建本区（换算徽章等跟着画幅默认值走）
+    repaintUpscale();     // 画幅两件影响二采目标画布估算
+}
+
+function resetBridgeDefaults(node) {
+    if (!node) return;
+    if (!window.confirm("把语义桥恢复为默认设置？\n\n"
+        + "关闭开关、强度回到 0.15、范围回到「全量过桥」、权重清空。")) return;
+    setBridge(node, defaultBridge());
+}
+
+function resetUpscaleDefaults(node) {
+    if (!node) return;
+    if (!window.confirm("把二采放大恢复为默认设置？\n\n"
+        + "模式 / 模型 / 尺寸 / 采样 / 抗糊增强全部回到默认（段选择清空）。")) return;
+    const ds = getDs(node);
+    ds.upscale = defaultUpscale();
+    setDs(node, ds);
+    scheduleRefresh(60);
+    repaintUpscale();
+}
+
 function renderParamsZone(sec, data) {
     const { node } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
         "<strong>链参数</strong><small>基础设置 + 视频延续（关键帧/检测重摇）</small>"));
+    sec.append(resetRow("↺ 恢复默认",
+        "链参数（本栏全部设置）恢复为节点默认值", () => resetChainParams(node)));
     if (!node) {
         sec.append(el("div", "h3d-empty", "画布上未找到节点，参数面板不可用"));
         return;
@@ -9361,6 +9459,9 @@ function renderBridgeZone(sec, data) {
     const b = data.ds?.bridge || defaultBridge();
     const models = data.bridgeModels || [];
     sec.replaceChildren();
+    sec.append(resetRow("↺ 恢复默认",
+        "语义桥（本栏）恢复为默认：关闭 / 0.15 / 全量过桥 / 无权重",
+        () => resetBridgeDefaults(node)));
     const det = foldSection("bridge-top", false,
         "<summary>🌉 语义桥（条件增强）"
         + (b.enabled ? ' <span class="h3d-chip cyan">已开启</span>' : "") + "</summary>");
@@ -9531,6 +9632,9 @@ function upNumField(label, value, min, max, step, tip, commit) {
 function renderUpscaleZone(sec, data) {
     const { node, state, mf } = data;
     sec.replaceChildren();
+    sec.append(resetRow("↺ 恢复默认",
+        "二采放大（本栏）恢复为默认：关闭 / 自动架构 / 2 倍 / 0.35 去噪",
+        () => resetUpscaleDefaults(node)));
     const up = data.ds.upscale;
     const on = up.mode !== "关闭";
     const models = data.upscaleModels || [];

@@ -375,13 +375,15 @@
     return Array.isArray(it.blocked) && it.blocked.indexOf(target) >= 0;
   }
 
-  /** 瓦片上的常驻动作：**只留「改名」**。
+  /** 瓦片上的常驻动作：「下载」+「改名」。
    *
    *  「调入项目 / 存入全局库 / 删除」原本都在这里，结果每张瓦片被按钮糊满、
    *  缩略图只剩一条缝，而它们真正的使用场景是"对一批素材做同一件事"——
    *  一件一件点反而更慢。这三个已迁到工具条的批量操作区（常显，见 open 里的
    *  batchBox），选中谁就作用于谁；右键菜单里也还留着同样的入口。
-   *  改名是唯一"只跟这一张有关"的动作，留在瓦片上。 */
+   *  改名是唯一"只跟这一张有关"的动作，留在瓦片上。
+   *  下载（2026-09-30 用户要求）：原来只藏在右键菜单/预览器里，瓦片上给常驻
+   *  按钮——导出单个素材是高频动作，不该让人先想起"右键"。 */
   function tileButtons(it) {
     const box = el("div", "h3l-tbtns");
     const mk = (label, on, fn, danger) => {
@@ -397,6 +399,7 @@
       mk(`✓ ${roles.join("·")}`, true,
         () => say(`「${it.name}」带有旧的首尾帧标注：现在请在导演台每段的「资产引用」栏指定首/尾帧图`));
     }
+    mk("⬇ 下载", false, () => actDownload(it, [it.id]));
     if (it.scope === "project" || it.scope === "global") {
       mk("改名", false, () => actAlias(it));
     }
@@ -743,10 +746,11 @@
           () => actBringMany(gl)));
         m.append(el("div", "h3l-sep"));
       }
-      // latent 不能入库（全局库只收 image/video/audio），过滤掉免得后端逐个报错
+      // latent 现在能入全局库（asset_store 收 latent，进 latents/），与项目/成片同列；
+      // 已链接的全局条目本来就来自全局库，不重复入库。
       const up = S.items.filter((x) => S.sel.has(x.id)
-        && (x.scope === "project" || x.scope === "finals") && !x.linked
-        && !isBlocked(x, "global"));
+        && (x.scope === "project" || x.scope === "finals" || x.scope === "latent")
+        && !x.linked && !isBlocked(x, "global"));
       if (up.length) {
         m.append(menuItem(`⬆ 把选中的 ${up.length} 个存入全局库`, () => actArchiveMany(up)));
         m.append(el("div", "h3l-sep"));
@@ -763,6 +767,12 @@
       }
       if (!isBlocked(it, "global")) {
         m.append(menuItem("⬆ 存入全局库（跨项目可复用）", () => actArchive(it)));
+      }
+    } else if (it.scope === "latent" && !many) {
+      /* latent 存入全局库 = 跨项目复用的正路：旧项目存库，新项目锚定面板挑选，
+       * 执行期按 asset_id 解析回全局库里的 .pt（nodes._load_library_latent）。 */
+      if (!isBlocked(it, "global")) {
+        m.append(menuItem("⬆ 存入全局库（别的项目也能挑它作锚源）", () => actArchive(it)));
       }
     } else if (it.scope === "project" && !many && !it.linked && !isBlocked(it, "global")) {
       m.append(menuItem("⬆ 存入全局库（跨项目可复用）", () => actArchive(it)));
@@ -1249,13 +1259,13 @@
         for (const x of fi) actToAssets(x);
       });
     mkBatch("⬆ 存入全局库",
-      "把选中的项目/成片素材存进全局库（跨项目可复用）。"
-      + "latent 不能入库，会自动跳过",
+      "把选中的项目/成片/latent 素材存进全局库（跨项目可复用）。"
+      + "目标库已有同名的会被自动跳过",
       () => {
         const up = S.items.filter((x) => S.sel.has(x.id)
-          && (x.scope === "project" || x.scope === "finals") && !x.linked
-          && !isBlocked(x, "global"));
-        if (!up.length) { say("选中的素材没有可存入全局库的（已是全局素材 / latent / 目标库已有同名）"); return; }
+          && (x.scope === "project" || x.scope === "finals" || x.scope === "latent")
+          && !x.linked && !isBlocked(x, "global"));
+        if (!up.length) { say("选中的素材没有可存入全局库的（已是全局素材 / 目标库已有同名）"); return; }
         actArchiveMany(up);
       });
     mkBatch("🗑 删除", "删除选中的素材（不可撤销）",
@@ -1322,11 +1332,11 @@
     }
 
     /* 上传落点 = 当前所在库，**上传到哪里就是哪里，不顺手复制**：
-     *   全局库 → 只进全局库（跨项目复用）
+     *   全局库 → 只进全局库（跨项目复用；latent 进库内 latents/）
      *   项目资产 → 只落本项目 assets/（登记清单，可直接 @别名 引用）
      *   成片     → 只落本项目 finals/（目录扫描即见）
-     *   latent   → 按项目资产处理
-     * 想要"全局库也存一份"用项目瓦片上的「存入全局库」（显式动作）。 */
+     *   latent   → 只落本项目 latent/ 库（登记 manifest["latents"]，锚定可直接挑）
+     * 想要"全局库也存一份"用瓦片上的「存入全局库」（显式动作）。 */
     const upBtn = el("button", "h3l-btn h3l-btn-cta", "＋ 上传");
     upBtn.type = "button";
     const DEST_CN = { global: "全局库", project: "项目资产", finals: "成片库" };
@@ -1334,14 +1344,18 @@
       : (scope === "finals" ? "finals" : "project"));
     const paintUpBtn = () => {
       const dest = destOf(S.scope);
-      upBtn.textContent = `＋ 上传到${DEST_CN[dest] || "项目资产"}`;
-      upBtn.title = dest === "global"
-        ? "当前在「全局库」：只进全局库（跨项目复用，不碰任何项目）；"
-          + "要落进项目请切到「项目资产」再传。"
-        : dest === "finals"
-          ? "当前在「成片」：只落本项目 finals/（成片库，目录扫描即见）。"
-          : "当前在「项目资产」：只落本项目 assets/ 并登记进清单，"
-            + "提示词里写 @别名 即可引用（不会往全局库复制一份）。";
+      upBtn.textContent = S.scope === "latent"
+        ? "＋ 上传到 latent 库" : `＋ 上传到${DEST_CN[dest] || "项目资产"}`;
+      upBtn.title = S.scope === "latent"
+        ? "当前在「latent」库：.pt / .latent / .safetensors 只落本项目 latent/ 库"
+          + "（登记进清单，锚定面板可直接挑它作源）；要跨项目复用，传完后「存入全局库」。"
+        : dest === "global"
+          ? "当前在「全局库」：只进全局库（跨项目复用，不碰任何项目）；"
+            + "要落进项目请切到「项目资产」再传。"
+          : dest === "finals"
+            ? "当前在「成片」：只落本项目 finals/（成片库，目录扫描即见）。"
+            : "当前在「项目资产」：只落本项目 assets/ 并登记进清单，"
+              + "提示词里写 @别名 即可引用（不会往全局库复制一份）。";
     };
     paintUpBtn();
     upBtn.onclick = () => {
@@ -1378,8 +1392,10 @@
         if (onlyGlobal) {
           say(`已上传 ${ok} 个到全局库（跨项目可复用）\n要落进当前项目，点瓦片上的「调入项目」`);
         } else {
-          after(`已上传 ${ok} 个到${DEST_CN[dest]}（只这一份，不往别处复制）`
-            + (dest === "project" ? "\n提示词里写 @别名 即可引用" : ""));
+          const destTxt = S.scope === "latent" ? "latent 库" : (DEST_CN[dest] || "项目资产");
+          after(`已上传 ${ok} 个到${destTxt}（只这一份，不往别处复制）`
+            + (dest === "project" && S.scope !== "latent"
+              ? "\n提示词里写 @别名 即可引用" : ""));
         }
         fetchPage(false);
       };

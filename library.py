@@ -908,7 +908,9 @@ MOVE_TARGETS = {
     "global": ("project",),                 # 全局库 → 调入项目（复制一份进 assets/）
     "project": ("global",),                 # 项目资产 → 存入全局库
     "finals": ("project", "global"),        # 成片 → 调入项目（搬家）+ 存入全局库
-    "latent": (),                           # 全局库不收 latent，没有库间动作
+    # latent → 全局库（asset_store 收 latent，进库内 latents/）：跨项目衔接的
+    # 正路——旧项目把 latent 存进全局库，新项目从素材库挑它作锚源。
+    "latent": ("global",),
 }
 
 

@@ -692,7 +692,14 @@ def add_routes(routes):
 
     _UPLOAD_EXT = {"image": ("png", "jpg", "jpeg", "webp", "bmp"),
                    "video": ("mp4", "mov", "mkv", "webm"),
-                   "audio": ("wav", "mp3", "flac", "ogg", "m4a")}
+                   "audio": ("wav", "mp3", "flac", "ogg", "m4a"),
+                   # 只收 .pt：执行期 _load_library_latent 用 torch.load 读
+                   # {"video":...} 容器——.safetensors / ComfyUI .latent 不是这个
+                   # 形状，放行会造出「能列出、当锚源必炸」的死条目。
+                   "latent": ("pt",)}
+    # latent 容器的扩展名集合：前端按 MIME 猜类别时 .pt 会落到默认的 image，
+    # _upload_kind 里按扩展名兜底改判（老前端 / headless 调用都受益）。
+    _LATENT_EXTS = {"pt"}
 
     _LIB_CT = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
                "webp": "image/webp", "bmp": "image/bmp",
@@ -939,11 +946,13 @@ def add_routes(routes):
 
     def _upload_kind(kind, filename):
         k = str(kind or "").strip() or "image"
-        if k not in ("image", "video", "audio"):
+        if k not in _UPLOAD_EXT:
             k = "image"
         ext = os.path.splitext(str(filename or ""))[1].lower().lstrip(".")
         if not ext:
             raise ValueError(f"上传文件缺扩展名：{filename!r}")
+        if k in ("image", "video", "audio") and ext in _LATENT_EXTS:
+            k = "latent"        # .pt 传成 image 类（前端 MIME 猜不出）：按扩展名改判
         if ext not in _UPLOAD_EXT[k]:
             raise ValueError(f"扩展名 .{ext} 与类别 {k} 不符（允许 {list(_UPLOAD_EXT[k])}）")
         return k
@@ -1065,9 +1074,10 @@ def add_routes(routes):
             alias = str(data.get("alias") or "")
             dest = str(data.get("dest") or "")
         # 落点 dest（前端按当前 scope 传）——**上传到哪里就是哪里，不顺手复制**：
-        #   global  —— 只进全局库（跨项目复用）
-        #   project —— 只落项目 assets/ 并登记清单（可用 @别名 引用）
-        #   finals  —— 只落项目 finals/（成片库，目录扫描即见）
+        #   global  —— 只进全局库（跨项目复用；latent 也收，进库内 latents/）
+        #   project —— 落项目：媒体进 assets/ 并登记清单（可用 @别名 引用），
+        #              latent 进 latent/ 库并登记 manifest["latents"]
+        #   finals  —— 只落项目 finals/（成片库，目录扫描即见；不收 latent）
         # 缺省（空）= 给了 link_dir 就按 project（兼容旧调用）。
         # 注：早期实现是"项目落点也往全局库复制一份"，用户明确反馈那样不对 ——
         # 跨项目复用改成显式动作（项目瓦片上的「存入全局库」→ /h3chain/lib_archive）。
@@ -1109,8 +1119,16 @@ def add_routes(routes):
                     return _err("项目不存在（没有 manifest，先新建或跑一段）",
                                 code="NOT_FOUND", status=404)
                 if dest == "finals":
+                    if kind == "latent":
+                        return _err("latent 请传到「latent」库（成片库只收音视频）",
+                                    code="BAD_REQUEST", status=400)
                     # 成片库是目录扫描型：拷进 finals/ 即可见，不登记进资产清单
                     out["stored"] = h3lib.store_to_finals(
+                        link_dir, staged, tmp_name or None)
+                elif kind == "latent":
+                    # latent 落项目 latent/ 库（目录扫描即见）+ 登记 manifest["latents"]
+                    # ——与 slice_latent 的产物同构，锚定面板/时间线直接可用。
+                    out["stored"] = projects.register_latent_file(
                         link_dir, staged, tmp_name or None)
                 else:
                     out["stored"] = h3lib.store_to_project(
@@ -2639,13 +2657,25 @@ def add_routes(routes):
     def _anchor_ref_of(item):
         """库条目 -> anchor.src.ref（执行期 nodes.py 能寻址的标识）。
 
-        latent 用 `latent/<名>.pt`（_load_library_latent 认这个形式）；其余优先 asset_id
-        —— 全局库与项目链接在**执行期只按 asset_id 注册**（注册表 by_alias 里只有旧
-        label / 链接别名），拿 orig_name 当标签会查不到。项目目录直接扫到的文件没有
-        asset_id 时才回落别名（name 就是清单里的 label）。
+        - latent：全局库条目带 asset_id（执行期注册表按 id 解析到库内 .pt）；
+          项目 latent 用 `latent/<名>.pt`（_load_library_latent 认这个形式）。
+        - 成片（finals 扫描条目）：用项目相对路径 `finals/…`（同样认 videos/merges/
+          clips/）。成片条目**没有** asset_id、也不在 manifest.assets 的别名表里，
+          旧实现回落到裸文件名，执行期既不在注册表也不在标签池——必报
+          「未知素材标签」。改用相对路径后，_anchor_asset 按「两段式白名单前缀 +
+          文件存在」直接寻址，生成的视频/分段片不用登记别名就能接进锚定。
+        - 其余（全局库/项目资产）优先 asset_id——全局库与项目链接在执行期只按
+          asset_id 注册（注册表 by_alias 里只有旧 label / 链接别名），拿 orig_name
+          当标签会查不到。项目目录直接扫到的文件没有 asset_id 时才回落别名
+          （name 就是清单里的 label）。
         """
         if item.get("kind") == "latent":
+            aid = str(item.get("asset_id") or "").strip()
+            if aid:
+                return aid
             return "latent/" + os.path.basename(str(item.get("file") or ""))
+        if item.get("scope") == "finals":
+            return str(item.get("file") or "").replace("\\", "/").strip()
         return str(item.get("asset_id") or "").strip() or str(item.get("name") or "").strip()
 
     async def _anchor_sources_impl(request):
@@ -2740,6 +2770,18 @@ def add_routes(routes):
             ref = _anchor_ref_of(item)
             labels = {str(a.get("label") or "")
                       for a in (man.get("assets") or []) if isinstance(a, dict)}
+            # 可寻址口径必须与执行期（nodes._anchor_asset / _load_library_latent）逐字一致：
+            #   asset_id —— 注册表按 id 解析（全局库 / 项目链接）
+            #   项目资产别名 —— manifest.assets[].label（标签池）
+            #   成片相对路径 —— finals/videos/merges/clips 前缀 + 项目内文件存在
+            #     （成片条目没有 asset_id，此前被误判「没有别名」——生成的视频
+            #     明明就在项目里，执行期却按标签去找，必报未知标签）
+            #   项目 latent —— latent/<名>.pt 且文件在（_load_library_latent 同一判定）
+            _ref_parts = [p for p in ref.split("/") if p and p != "."] if ref else []
+            _direct = (len(_ref_parts) >= 2
+                       and _ref_parts[0] in ("finals", "videos", "merges", "clips"))
+            _proj_latent = (item_kind == "latent" and len(_ref_parts) == 2
+                            and _ref_parts[0] == "latent")
             srcs = [s for s in srcs if not (s["kind"] == kind and s.get("ref") == ref)]
             srcs.append({
                 "slot": None, "kind": kind, "ref": ref,
@@ -2748,7 +2790,11 @@ def add_routes(routes):
                 # 执行期注册表只认 asset_id 与清单里的别名：两者都没有时节点侧寻址不到，
                 # 面板据此提前提示（比等到跑生成才报「未知素材标签」好得多）。
                 "resolvable": bool(str(item.get("asset_id") or "").strip())
-                              or (item.get("scope") == "project" and ref in labels),
+                              or (item.get("scope") == "project" and ref in labels)
+                              or (_direct and os.path.isfile(
+                                  os.path.join(root, *_ref_parts)))
+                              or (_proj_latent and os.path.isfile(
+                                  os.path.join(root, "latent", _ref_parts[1]))),
             })
 
         params = man.get("params") or {}

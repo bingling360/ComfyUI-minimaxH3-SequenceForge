@@ -27,8 +27,8 @@ import time
 import uuid
 
 SCHEMA = "h3/asset-library-v1"
-KINDS = ("image", "video", "audio")
-KIND_CN = {"image": "图片", "video": "视频", "audio": "音频"}
+KINDS = ("image", "video", "audio", "latent")
+KIND_CN = {"image": "图片", "video": "视频", "audio": "音频", "latent": "latent"}
 REF_CAPS = {"image": 9, "video": 3, "audio": 3}
 ALIAS_MAX = 24
 # 引用名（@全名）上限：比别名宽松得多 —— 引用名要**含格式后缀**且不能砍掉尾巴
@@ -40,10 +40,13 @@ _ALIAS_BAD = re.compile(r"[^\w\-]+")
 # 解析靠池内最长前缀精确匹配，点号不会像别名那样造成断句歧义。
 _REF_NAME_BAD = re.compile(r"[^\w.\-]+")
 # 只剥这些真媒体扩展名；`v1.0` / `2.5` 之类不在名单里的尾巴保持原样（再被 `_ALIAS_BAD` 压成 `_`）。
+# latent 容器（.pt/.latent/.safetensors）也在名单里：全局库收 latent 后，别名的语义
+# 与图片一致（`seg_003_auto.pt` 的别名是 `seg_003_auto`，不带后缀）。
 _MEDIA_EXT = (
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "avif",
     "mp4", "mov", "webm", "mkv", "avi", "wmv", "flv", "m4v",
     "wav", "mp3", "ogg", "flac", "m4a", "aac", "opus",
+    "pt", "latent", "safetensors",
 )
 _TOKEN_FMT = {"image": "<Picture {}>", "video": "<Video {}>", "audio": "<Audio {}>"}
 
@@ -405,14 +408,15 @@ def register_content(root: str, src_path: str, kind, tags=None, desc="",
     """文件入库全局库：sha256 内容寻址拷贝 + manifest 登记（秒传：同 sha 直接返回）。
 
     返回 entry {asset_id, sha256, kind, file, orig_name, bytes, ...}。
-    kind 目录：images/videos/audios。只做拷贝与登记，不做探针（探针是 P1 后台任务的事）。
+    kind 目录：images/videos/audios/latents。只做拷贝与登记，不做探针（探针是 P1 后台任务的事）。
     orig_name：入库显示名（缺省取源文件名；multipart 中转的是随机临时名，
     必须显式传真实文件名，否则库内/调入/转码全链路都被 h3lib_ 前缀污染）。
     """
     kind = normalize_kind(kind)
     if not src_path or not os.path.isfile(src_path):
         raise ValueError(f"源文件不存在：{src_path!r}")
-    sub = {"image": "images", "video": "videos", "audio": "audios"}[kind]
+    sub = {"image": "images", "video": "videos", "audio": "audios",
+           "latent": "latents"}[kind]
     h = hashlib.sha256()
     with open(src_path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):

@@ -1251,6 +1251,45 @@ def slice_latent(name, src, start_f, end_f, save_name, base_revision=None, kind=
     return manifest
 
 
+def register_latent_file(name, src_abs, save_name=None):
+    """把外部 .pt latent 收进项目 latent/ 库并登记 manifest["latents"]。
+
+    上传落点（routes.library_upload，dest=project 且 kind=latent）与「调入项目」共用：
+    latent 库是目录扫描型（library.scan_scope("latent") 走 latents/ 与 latent/），
+    拷进去即可见；登记进 manifest 是为了与 slice_latent 的产物同构（引用/删除路径
+    都按 `latent/<名>` 走）。同名加 _2 不覆盖。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    if not src_abs or not os.path.isfile(src_abs):
+        raise ValueError("源文件不存在")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（先新建项目或跑一段）")
+    want = str(save_name or os.path.basename(src_abs)).replace("\\", "/").split("/")[-1]
+    if not want.lower().endswith(".pt") or not safe_name(os.path.splitext(want)[0]) \
+            or safe_name(os.path.splitext(want)[0]) != os.path.splitext(want)[0]:
+        raise ValueError(f"非法 latent 文件名：{want!r}（须为 <名>.pt）")
+    ldir = _latent_dir(root)
+    os.makedirs(ldir, exist_ok=True)
+    clean = _unique_filename(ldir, want)
+    import shutil as _sh
+    _sh.copy2(src_abs, os.path.join(ldir, clean))
+    manifest.setdefault("latents", [])
+    manifest["latents"] = [x for x in manifest["latents"]
+                           if not (isinstance(x, dict) and x.get("file") == f"latent/{clean}")]
+    manifest["latents"].append({"file": f"latent/{clean}", "src": "上传",
+                                "updated_at": time.time()})
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    return {"file": f"latent/{clean}", "name": clean,
+            "revision": int(manifest.get("revision") or 1)}
+
+
 def delete_latent(name, file, base_revision=None):
     """删除 latent 登记文件（幂等）。"""
     name = safe_name(name)

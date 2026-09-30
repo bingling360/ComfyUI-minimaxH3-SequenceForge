@@ -137,11 +137,13 @@ function ok(cond, label, extra) {
   ok(doc.querySelectorAll(".h3d-anchor-card").length === 5, "当场多一张卡（不用退出重进）",
     doc.querySelectorAll(".h3d-anchor-card").length);
   ok(card(doc, 4).textContent.includes("段 1"), "新卡预填上一段（段 1）");
+  ok(card(doc, 4).textContent.includes("帧[102,124)"), "取用窗默认贴源结尾（124-22=102 起）",
+    (card(doc, 4).textContent.match(/帧\[\d+,\d+\)/) || [""])[0]);
 
-  console.log("\n== 6 切来源 段 -> 素材 ==");
+  console.log("\n== 6 切来源 上段 -> 素材 ==");
   const sel = card(doc, 0).querySelectorAll("select")[0];
   const opts = [...sel.querySelectorAll("option")].map((o) => o.textContent).join("/");
-  ok(opts === "段/素材", "来源只有两类", opts);
+  ok(opts === "上段/素材", "来源只有两类（段源叫「上段」）", opts);
   sel.value = "asset";
   sel.dispatchEvent(new window.Event("change", { bubbles: true }));
   await tick(80);

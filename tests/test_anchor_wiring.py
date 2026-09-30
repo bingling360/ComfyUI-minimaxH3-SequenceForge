@@ -245,27 +245,39 @@ def test_anchor_panel_owns_its_own_rendering():
     assert "ctx.__rebuildCard" in code, "本地重建能力未挂到 ctx，commit 无法自行刷新"
 
 
-# ---- 来源只有两类：段 / 素材（prev_tail 退出 UI） ----
+# ---- 来源只有两类：上段 / 素材（prev_tail 退出 UI） ----
 
 def test_anchor_source_kinds_are_only_segment_and_asset():
-    """来源下拉只许两类：「段」= 本项目落盘的 seg_NNN；「素材」= 素材库里挑。
+    """来源下拉只许两类：「上段」= 本项目落盘的 seg_NNN；「素材」= 素材库里挑。
 
     用户 2026-09-16 明确：prev_tail 冗余——「有上段的选择就行了」。后端保留
     prev_tail 作隐式默认段首桥（没有显式 head anchor 时才走），只是 UI 不再暴露。
     旧存档里已有的 prev_tail 锚作为只读项回显，不得再变回一个可选项。
+    2026-09-30 更名：「段」改成「上段」（用户明确：段源说的就是上一段，
+    单叫「段」让人以为是任选段落）。
     """
     src = _js_code(_src("web/h3d_anchor.js"))
-    assert '[["segment", "段"], ["asset", "素材"]]' in src, "来源下拉的两类选项被改动"
+    assert '[["segment", "上段"], ["asset", "素材"]]' in src, "来源下拉的两类选项被改动"
     assert '"prev_tail（旧格式）"' in src or "上段尾（旧格式）" in src, \
         "旧存档的 prev_tail 锚需要只读回显（否则用户看不懂那一行是什么）"
-    assert 'kind: "prev_tail"' not in src, "新建锚又默认成 prev_tail 了（应默认「段」+ 上一段）"
+    assert 'kind: "prev_tail"' not in src, "新建锚又默认成 prev_tail 了（应默认「上段」+ 上一段）"
 
 
 def test_anchor_default_prefers_previous_segment():
-    """新建锚预填「上一段」：拿到的就是 prev_tail 那份 latent，不填则用户自己挑。"""
+    """新建锚默认源：有上一段 → 「上段」并预填；没有 → 「素材」。
+
+    2026-09-30 用户拍板两条默认：① 没上段的段（第 1 段）默认「素材」——
+    本面板最核心的用途（外部视频/latent 给初始段参考、旧项目 latent 衔接）
+    都从素材库进来，默认「上段」只会得到一条必改的死锚；② 取用窗默认贴
+    **源结尾**（衔接用的是"最近发生的那几帧"），newAnchor / 上段对齐 / 挑素材
+    三条路径都必须落 tailStart，漏任何一条默认就退回开头。
+    """
     src = _js_code(_src("web/h3d_anchor.js"))
-    assert 'kind: "segment", ref: (prev && prev.ref) || ""' in src
+    assert 'kind: prev ? "segment" : "image", ref: (prev && prev.ref) || ""' in src
     assert "prevSegment" in src
+    assert "function tailStart(" in src, "缺 tailStart（取用窗默认贴源结尾的统一算法）"
+    assert src.count("tailStart(") >= 4, \
+        "tailStart 定义 + 三条默认路径（newAnchor/上段对齐/挑素材）都要用到"
 
 
 # ---- 素材一律从素材库选，不自己枚举 ----

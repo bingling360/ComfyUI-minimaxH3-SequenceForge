@@ -168,6 +168,11 @@
   }
 
   function guessKind(file) {
+    /* latent 容器没有 MIME 类型（浏览器给空串），按扩展名先判；
+     * 落到后端还有一层扩展名兜底改判（_upload_kind），这里先判是为了
+     * 「上传到 latent 库」的落点提示与后端落点分支拿到正确 kind。 */
+    const n = String(file?.name || "").toLowerCase();
+    if (/\.(pt|latent|safetensors)$/.test(n)) return "latent";
     const t = String(file?.type || "");
     if (t.startsWith("video/")) return "video";
     if (t.startsWith("audio/")) return "audio";

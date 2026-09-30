@@ -98,6 +98,12 @@ def list_projects() -> list:
                 updated = os.path.getmtime(os.path.join(pdir, "manifest.json"))
             except OSError:
                 updated = 0
+        finals_raw = list(manifest.get("finals") or [])
+        finals = [_viewable_media(f, pdir) or f
+                  if isinstance(f, str) else f for f in finals_raw]
+        merges = [_viewable_media(m.get("file"), pdir) or m.get("file")
+                  for m in (manifest.get("merges") or [])
+                  if isinstance(m, dict) and m.get("file")]
         out.append({
             "dir": name,
             "title": manifest.get("title") or name,
@@ -105,9 +111,8 @@ def list_projects() -> list:
             "total": int(manifest.get("total") or 0),
             "updated_at": updated,
             "cover": _cover(pdir, manifest),
-            "finals": list(manifest.get("finals") or []),
-            "merges": [m.get("file") for m in (manifest.get("merges") or [])
-                       if isinstance(m, dict) and m.get("file")],
+            "finals": finals,
+            "merges": merges,
             "params": manifest.get("params") or {},
             "revision": int(manifest.get("revision") or 1),
             "manifest_schema": manifest.get("manifest_schema") or MANIFEST_SCHEMA,
@@ -150,6 +155,71 @@ def read_project(name: str):
     if not isinstance(manifest, dict):
         return None
     return _ensure_revision(manifest)
+
+
+# ── UI 出口的媒体路径归一化 ─────────────────────────────────────────────
+# 旧格式 manifest 把媒体记成裸名（seg_000.mp4），四库迁移后文件实际落在
+# finals/ 下。后端读写全走 resolve_project_file 的双路径兜底，manifest 本体
+# 因此「不改写」（模块头口径）；唯独前端拼的 /api/view URL 没有兜底 ——
+# 裸名命中不了 finals/ 里的文件，表现为预览黑屏、下载/删除「文件不存在」
+# （/api/view 与 delete_file 都按字面路径找，2026-09-30 实锤：9:16 项目
+# videos 记裸名、文件在 finals/，16:9 新项目无此问题）。在 API 出口把
+# 「裸名且根目录没有、finals//assets/ 有」的条目换成真实位置即可，查不到
+# 原样保留；manifest 本体零改动，旧项目与新代码互不污染。
+_MEDIA_EXTS = (".mp4", ".png", ".jpg", ".jpeg", ".webp", ".wav")
+_MEDIA_LIST_KEYS = ("videos", "thumbs", "seams", "finals", "merges")
+
+
+def _viewable_media(name: str, root: str):
+    """裸媒体名 -> UI 可直连的相对路径；根目录已有 / 非裸名 / 找不到时返回 None。
+
+    与 resolve_project_file 的查找序对齐：裸名本身能命中根目录就别动它
+    （/api/view 直接打得开），只有根目录没有、finals//assets/ 有才换。
+    """
+    s = str(name or "").strip().replace("\\", "/")
+    if not s or "/" in s or os.path.splitext(s)[1].lower() not in _MEDIA_EXTS:
+        return None
+    if os.path.isfile(os.path.join(root, s)):
+        return None
+    for d in ("finals", "assets"):
+        if os.path.isfile(os.path.join(root, d, s)):
+            return f"{d}/{s}"
+    return None
+
+
+def with_viewable_paths(name: str, manifest):
+    """返回给 UI 的 manifest 副本：白名单媒体字段里的裸名换成真实位置。
+
+    只认 {_MEDIA_LIST_KEYS} 五个字段的两种形态（纯字符串列表 / {file:...}
+    字典列表）；其余字段原样共享，manifest 本体零改动。
+    """
+    if not isinstance(manifest, dict) or not safe_name(name):
+        return manifest
+    root = os.path.join(checkpoint.projects_root(), safe_name(name))
+    out = dict(manifest)
+    for key in _MEDIA_LIST_KEYS:
+        val = manifest.get(key)
+        if not isinstance(val, list):
+            continue
+        fixed = []
+        changed = False
+        for it in val:
+            if isinstance(it, str):
+                rep = _viewable_media(it, root)
+                fixed.append(rep or it)
+                changed = changed or rep is not None
+            elif isinstance(it, dict) and it.get("file"):
+                rep = _viewable_media(it.get("file"), root)
+                if rep:
+                    fixed.append({**it, "file": rep})
+                    changed = True
+                else:
+                    fixed.append(it)
+            else:
+                fixed.append(it)
+        if changed:
+            out[key] = fixed
+    return out
 
 
 _ASSET_KINDS = ("image", "video", "audio")

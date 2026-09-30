@@ -340,10 +340,14 @@ def add_routes(routes):
                                   "projects": projects.list_projects()})
 
     async def project_detail(request):
-        manifest = projects.read_project(request.query.get("dir") or "")
+        d = request.query.get("dir") or ""
+        manifest = projects.read_project(d)
         if manifest is None:
             return _err("项目不存在", code="NOT_FOUND", status=404)
-        return web.json_response({"ok": True, "manifest": manifest})
+        # 出口归一化：旧格式裸名媒体路径换成文件真实位置（finals/），前端
+        # /api/view 才打得开；manifest 本体不动（projects.with_viewable_paths）。
+        return web.json_response({"ok": True,
+                                  "manifest": projects.with_viewable_paths(d, manifest)})
 
     async def create_project(request):
         try:
@@ -380,7 +384,9 @@ def add_routes(routes):
         if manifest is None:
             return _err("项目不存在（未新建也未跑过，无 manifest 可写）",
                         code="NOT_FOUND", status=404)
-        return web.json_response({"ok": True, "manifest": manifest})
+        d = str(data.get("dir") or "")
+        return web.json_response({"ok": True,
+                                  "manifest": projects.with_viewable_paths(d, manifest)})
 
     async def delete_project(request):
         try:

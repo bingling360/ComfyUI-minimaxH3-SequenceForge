@@ -46,7 +46,7 @@ const W_DS = "导演台状态";
 const W_AR = "宽高比";
 const W_MP = "百万像素";
 /* 版本标记：浏览器控制台过滤 [h3-director] 可确认加载的是新 JS 还是缓存旧版 */
-const H3D_VER = "20260914+lib-dup-gate";
+const H3D_VER = "20260914+lib-dup-gate+link-repair";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
@@ -1784,6 +1784,263 @@ function migrateGraphWidgets(graphData) {
     }
     if (migrated) console.log(`[h3-director] 已迁移 ${migrated} 个旧版 H3 节点的参数（旧布局 → 当前 ${CUR_WIDGET_COUNT} 值）`);
     return graphData;
+}
+
+/* ---- 端口错位修复：连线是**按位次**存的，存档布局与本机不同时整体移位 ----
+ *
+ * workflow JSON 里一条连线是 [id, 源节点, 源槽, 目标节点, **目标槽下标**, 类型]，
+ * 「目标槽下标」= node.inputs 的**下标**。所以只要端口的**顺序**变了 —— 插件 schema
+ * 增删/改 optional、ComfyUI 把 V3 schema 拆成 required/optional 的口径换了、前端组装
+ * node.inputs 的版本换了 —— 存档里的下标就落到别的端口上：MODEL 的线跑到「宽高比」
+ * (COMBO) / 「宽度」(INT) 上，前端弹「宽度 输入需要 INT，但连接的输出为 MODEL」，
+ * 后端 validate_prompt 报 received_type(MODEL) mismatch input_type(COMBO)。
+ * 画布上那根线看着还连在节点上，肉眼查不出来：同一份工作流在另一台机器/另一个版本上
+ * 就是"连接错位"，而存它的那台机器一切正常。
+ *
+ * 存档里同时带着 inputs 的**名字**，而且「存档时的下标 ↔ 存档里的名字」同源：
+ *   名字 = 用户当初连的是哪个端口（意图）；活节点上的下标 = 本机现在把它摆在哪（现状）
+ * → 按名字把线搬回去。为什么在**载入后**按活节点修、而不是在 JSON 上重算下标：
+ * 活节点的端口顺序由前端现场组装，插件去复刻它的排序规则必然随版本漂移
+ * （paintDeskNode 那句「位次会随控件增删漂移，名字不会」是同一个道理）。
+ *
+ * 三条铁律（宁可明确报错，也不许静默把线留在错端口上）：
+ *   ① 目标端口还在 → 搬回去。**同名就搬，不看类型**：视频VAE/音频VAE 互换时类型
+ *      一模一样，靠类型判据发现不了；
+ *   ② 目标端口已下线（名字在本机不存在）→ **断开**并告警 —— 留着就是接到别的端口上；
+ *   ③ 目标端口已被别的线占用 → 一条都不动，报冲突（不许拆别人的线）。
+ * 守卫：tests/js/link_repair_check.js。 */
+const LINK_REPAIR_TYPES = new Set([NODE_TYPE, "H3SeamDoctor", "H3EAVFetaPatch", "H3EAVFetaReport"]);
+let pendingLinkIntents = [];
+const _linkRepairNoted = new Set();   // 报过的 link id：多次兜底扫描不重复刷屏
+
+/** 存档 → 本插件节点的「连线意图」：[{id, targetId, name, type}]。
+ *  name 取存档自己的 inputs[target_slot]（下标与名字同源，文件自洽）；
+ *  links 的数组形态（[id, 源, 源槽, 目标, 目标槽, 类型]）与对象形态都认。 */
+function savedLinkIntents(graphData) {
+    const out = [];
+    if (!graphData || !Array.isArray(graphData.nodes)) return out;
+    const inputsOf = new Map();
+    for (const n of graphData.nodes) {
+        if (!n || !LINK_REPAIR_TYPES.has(n.type) || !Array.isArray(n.inputs)) continue;
+        inputsOf.set(String(n.id), n.inputs);
+    }
+    if (!inputsOf.size) return out;
+    const src = graphData.links;
+    const links = Array.isArray(src) ? src
+        : (src && typeof src === "object" ? Object.values(src) : []);
+    for (const L of links) {
+        let id, targetId, slot, type;
+        if (Array.isArray(L)) { [id, , , targetId, slot, type] = L; }
+        else if (L && typeof L === "object") { id = L.id; targetId = L.target_id; slot = L.target_slot; type = L.type; }
+        else continue;
+        const inputs = inputsOf.get(String(targetId));
+        if (!inputs) continue;
+        /* 认领这条线的那个槽才是真意图：存档里 inputs[i].link === link id（前端就是这么画的）。
+         * 万一文件里 inputs 与 links 的位次对不上（手工改过），再退回按 target_slot 取。 */
+        const port = inputs.find((s) => s && s.link != null && String(s.link) === String(id))
+            || inputs[slot];
+        if (!port) continue;
+        out.push({ id: String(id), targetId: String(targetId),
+                   name: port.name ? String(port.name) : "",
+                   type: String(type || port.type || "") });
+    }
+    return out;
+}
+
+/** 活图上的连线：新版前端是 Map / id→link 的对象，老版是数组 —— 都兜住。 */
+function liveLinksOf(graph) {
+    const box = graph && graph.links;
+    if (!box) return [];
+    if (Array.isArray(box)) return box.filter(Boolean);
+    if (typeof Map !== "undefined" && box instanceof Map) return Array.from(box.values()).filter(Boolean);
+    if (typeof box.values === "function" && typeof box.get === "function") return Array.from(box.values()).filter(Boolean);
+    return Object.values(box).filter(Boolean);
+}
+
+function liveNodeById(graph, id) {
+    if (typeof graph.getNodeById === "function") {
+        const n = graph.getNodeById(id);
+        if (n) return n;
+    }
+    return (graph._nodes || []).find((n) => n && String(n.id) === String(id)) || null;
+}
+
+/** 类型是否相容（`*` 通配；缺类型不判）。 */
+function linkTypeOk(slotType, linkType) {
+    const a = String(slotType || ""), b = String(linkType || "");
+    return !a || !b || a === "*" || b === "*" || a === b;
+}
+
+/** 目标端口下标；找不到返回 -1。from = 这条线现在落在哪个槽（活节点上查到的）。
+ *  首选按名字（意图）；存档没留名字（极老文件）时才退到「类型唯一候选」，且只在
+ *  当前落点类型就不对时才猜 —— 猜不出就交给调用方报冲突，绝不乱搬。 */
+function findRepairSlot(node, it, link, from) {
+    if (it.name) return node.inputs.findIndex((s) => s && s.name === it.name);
+    const cur = node.inputs[from];
+    if (cur && linkTypeOk(cur.type, link.type)) return -1;   // 类型对得上，没有错位证据 → 不动
+    const cands = [];
+    node.inputs.forEach((s, i) => { if (s && linkTypeOk(s.type, link.type)) cands.push(i); });
+    return cands.length === 1 ? cands[0] : -1;
+}
+
+function noteLinkRepair(it, msg, level) {
+    if (_linkRepairNoted.has(it.id)) return;
+    _linkRepairNoted.add(it.id);
+    const line = `[h3-director] 端口错位修复：节点 ${it.targetId} ${msg}`;
+    if (level === "error") {
+        console.error(line);
+        setApiError(msg);   // 导演台打开时顶部横幅也留一句；没打开就只剩控制台
+    } else {
+        console.warn(line);
+    }
+}
+
+function dropLink(node, from, it, why) {
+    if (typeof node.disconnectInput !== "function") {
+        noteLinkRepair(it, `${why}，且前端未提供断开接口，请手工删掉这条线`, "error");
+        return false;
+    }
+    node.disconnectInput(from);
+    noteLinkRepair(it, `${why}，已断开这条线`, "warn");
+    return true;
+}
+
+/** 跑一批意图 → {rest, moved, dropped, conflicts}；rest = 图/节点还没建好的那些。
+ *  graph 可显式传入（单测用），缺省取活图 app.graph。
+ *
+ *  为什么要「先规划、再全摘、再全挂」三段而不是一条条搬：错位是**整体移位**，
+ *  目标端口十有八九正被另一条同样错位的线占着（甚至互成环）。一条条搬会一路
+ *  撞"目标已占用"而全军不动 —— 所以先把整批的落点算出来，把**本次要搬的线**
+ *  从端口上全摘下来（互相让位、环也自解），再按算好的落点全挂回去。
+ *  只有"被本次不搬的线占着"才算真冲突（别人的线一条都不许拆）。 */
+function repairMisplacedLinks(intents, graph) {
+    const g = graph || app.graph;
+    const out = { rest: [], moved: 0, dropped: 0, conflicts: 0 };
+    if (!Array.isArray(intents) || !intents.length) return out;
+    if (!g || !Array.isArray(g._nodes) || !g._nodes.length) { out.rest = intents.slice(); return out; }
+    const linkById = new Map();
+    for (const l of liveLinksOf(g)) linkById.set(String(l.id), l);
+    const conflict = (it, why) => { noteLinkRepair(it, why, "error"); out.conflicts += 1; };
+
+    /* ---- ① 规划：现在在哪 / 该去哪；拿不准的当场分流（断开 / 冲突 / 留待下一轮） ---- */
+    const plan = [];
+    for (const it of intents) {
+        const node = liveNodeById(g, it.targetId);
+        if (!node || !Array.isArray(node.inputs)) { out.rest.push(it); continue; }   // 节点还没建好
+        const link = linkById.get(it.id);
+        if (!link) {
+            // 不在图上：多半是连线还没挂上。给几次机会；再没有就是前端把它丢了
+            it.tries = (it.tries || 0) + 1;
+            if (it.tries < 3) out.rest.push(it);
+            continue;
+        }
+        /* 现在落在哪个槽：以**活节点上记的 link** 为准（与前端 isConnected 同口径），
+         * link.target_slot 只当兜底 —— 两者不一致时宁可不动，也不许断开别人的线 */
+        let from = -1;
+        for (let i = 0; i < node.inputs.length; i += 1) {
+            if (node.inputs[i] && String(node.inputs[i].link) === it.id) { from = i; break; }
+        }
+        if (from < 0) {
+            it.tries = (it.tries || 0) + 1;
+            if (it.tries < 3) out.rest.push(it);   // 活节点还没认领这条线 → 下一轮再看
+            continue;
+        }
+        const cur = node.inputs[from];
+        if (it.name && cur && cur.name === it.name) continue;              // 已在正确端口
+        if (!it.name && cur && linkTypeOk(cur.type, link.type)) continue;  // 没名字且类型对得上
+        const origin = liveNodeById(g, link.origin_id);
+        if (!origin) { out.rest.push(it); continue; }   // 源节点还没建好：先别摘线，下一轮再说
+        const to = findRepairSlot(node, it, link, from);
+        if (to < 0) {
+            if (it.name) {
+                if (dropLink(node, from, it, `存档端口「${it.name}」在本机已不存在`
+                        + `（原落在「${cur ? cur.name : "?"}」）`)) out.dropped += 1;
+                else out.conflicts += 1;
+            } else {
+                conflict(it, `落点「${cur ? cur.name : "?"}」与线类型 ${link.type} 不匹配，`
+                    + "且无法唯一判定该搬去哪，未改动");
+            }
+            continue;
+        }
+        plan.push({ it, node, from, to, cur, origin, originSlot: link.origin_slot });
+    }
+
+    /* ---- ② 筛冲突：目标端口被"本次不搬的线"占着 → 别动它；被挡的线自己也让位，
+     *      所以这轮筛查要迭代到稳定（计划里一条线被剔除，可能连带挡掉另一条） ---- */
+    let live = plan.slice();
+    for (let guard = 0; guard <= plan.length; guard += 1) {
+        const movable = new Set(live.map((m) => m.it.id));
+        const byTo = new Map();
+        for (const m of live) {
+            const k = `${m.node.id}#${m.to}`;
+            if (!byTo.has(k)) byTo.set(k, []);
+            byTo.get(k).push(m);
+        }
+        let clash = null;
+        for (const [, items] of byTo) { if (items.length > 1) { clash = items; break; } }
+        if (clash) {   // 两条线都要落同一个端口：无法判定，两条都别动
+            for (const m of clash) {
+                conflict(m.it, `两条存档连线都要落到「${m.node.inputs[m.to].name}」，`
+                    + "无法自动判定，两条都未改动");
+                live = live.filter((x) => x !== m);
+            }
+            continue;
+        }
+        const blocked = live.find((m) => {
+            const occ = m.node.inputs[m.to].link;
+            return occ != null && String(occ) !== m.it.id && !movable.has(String(occ));
+        });
+        if (!blocked) break;
+        conflict(blocked.it, `「${blocked.node.inputs[blocked.to].name}」已被另一条线占用`
+            + "（那条线不在本次修复范围内），未改动");
+        live = live.filter((x) => x !== blocked);
+    }
+
+    /* ---- ③ 先全摘、再全挂（互相让位；环状错位也一次修好） ---- */
+    const detached = [];
+    for (const m of live) {
+        if (typeof m.node.disconnectInput !== "function") {
+            conflict(m.it, "前端未提供搬线接口（disconnectInput），未改动，请手工确认端口");
+            continue;
+        }
+        try { m.node.disconnectInput(m.from); } catch (e) {
+            conflict(m.it, "断开原端口失败，未改动（请手工确认端口）");
+            continue;
+        }
+        detached.push(m);
+    }
+    for (const m of detached) {
+        let made = null;
+        try { made = m.origin.connect(m.originSlot, m.node, m.to); } catch (e) { made = null; }
+        const slot = m.node.inputs[m.to];
+        if (made || (slot && slot.link != null)) {
+            noteLinkRepair(m.it, `线按存档端口名搬回「${slot.name}」`
+                + `（原先落在「${m.cur ? m.cur.name : "?"}」）`, "warn");
+            out.moved += 1;
+        } else {
+            conflict(m.it, `搬线未成功（该线已断开），请手工重连「${slot.name}」`);
+        }
+    }
+    return out;
+}
+
+/** 队列入口：载入钩子（Promise 结算 / 兜底定时器）与 loadedGraphNode 三处都调它。 */
+function runPendingLinkRepair() {
+    if (!pendingLinkIntents.length) return 0;
+    const res = repairMisplacedLinks(pendingLinkIntents);
+    pendingLinkIntents = res.rest;
+    if (res.moved) {
+        console.log(`[h3-director] 端口错位修复：${res.moved} 条连线按存档里的端口名搬回了正确位置`
+            + "（本机端口顺序与存档不同 —— 多半是两台机器/两个版本不一致；"
+            + "改完就在本机另存一份，别把这个文件拷回原来那台）");
+    }
+    if (res.dropped || res.conflicts) {
+        console.warn(`[h3-director] 端口错位修复：断开 ${res.dropped} 条（端口已下线）、`
+            + `${res.conflicts} 条需人工确认（详见上面的 error）`);
+    }
+    const g = app.graph;
+    if (res.moved && g && typeof g.setDirtyCanvas === "function") g.setDirtyCanvas(true, true);
+    return res.moved;
 }
 
 /** 兜底：宽高比控件值非法（错位载入/手工改坏/旧「自定义」档）时修正，避免后端换算报错。
@@ -4241,6 +4498,10 @@ const H3_PERF_FIELDS = [
           + "权重那半 ComfyUI 自己算得到，激活那半只有实测才看得见" },
     { key: "upcast_attention", label: "Upcast Attention", kind: "tri", group: "通用与机器 · 运行时",
       hint: "attention 强制走 fp32：更稳但更吃显存、更慢。**小显存卡通常关**；auto = 跟随启动参数。改动立即生效" },
+    { key: "te_drop_after_cond", label: "cond 后释放文本编码器", kind: "tri", group: "通用与机器 · 运行时",
+      hint: "★ 64GB 无 swap 云端实测：1MP 单段一采峰值 59.5/64G，段间残留 +2G/段，第 3-4 段必撞顶被**整个容器**杀掉（断连+记录消失）。"
+          + "开启后每次 cond 编码完就把 25.9GB 的 TE 驻留丢掉，采样/解码全程不背它 —— 单段峰值降到 ~35G，代价是每段首次编码多 ~45s（TE 回载）。"
+          + "auto = Linux 开 / Windows 关（Windows 有 pagefile 不会 OOM）。改动立即生效" },
     { key: "index_mode", label: "素材库索引失效口径", kind: "sel", group: "通用与机器 · 素材库",
       opts: [["fingerprint", "目录指纹（推荐）"], ["ttl", "固定 3 秒过期"]],
       hint: "指纹：没增删文件就一直复用，翻页不再重建索引（1200 条目实测省掉 1895ms）；ttl：老行为，遇到「新素材不显示」可退回" },
@@ -10625,6 +10886,10 @@ app.registerExtension({
             mountDeskButton(node);   // 载入路径兜底：某些前端版本建控件晚于 nodeCreated
             scheduleRefresh(250);
         }
+        /* 端口错位修复的第三个触发点：老前端 loadGraphData 不返回 Promise，
+         * 节点建好时链接才刚挂上 → 每次节点载入顺手把待修队列排到下一拍再跑
+         * （同步改线会撞上正在进行的 configure；空队列时 runPendingLinkRepair 直接返回） */
+        if (pendingLinkIntents.length) setTimeout(runPendingLinkRepair, 0);
     },
     nodeCreated(node) {
         if (node && node.type === NODE_TYPE) {
@@ -10637,11 +10902,24 @@ app.registerExtension({
         injectStyles();
         installDesktopFocusFix();   // 桌面端输入框打不进字的兜底
 
-        /* 旧工作流迁移：widget 参数官方化后按位错位，载入画布前重排 widgets_values */
+        /* 旧工作流迁移：widget 参数官方化后按位错位，载入画布前重排 widgets_values；
+         * 连线错位（端口按位次存）只能在**图建好之后**按活节点端口名修，所以这里先
+         * 把存档里的连线意图收下来，载入完成后再跑 —— 三处触发点见 runPendingLinkRepair
+         * 的注释（Promise 结算 / 兜底定时器 / loadedGraphNode）。 */
         if (typeof app.loadGraphData === "function") {
             const origLoadGraphData = app.loadGraphData.bind(app);
             app.loadGraphData = function (data, ...args) {
-                return origLoadGraphData(migrateGraphWidgets(data), ...args);
+                const migrated = migrateGraphWidgets(data);
+                pendingLinkIntents = savedLinkIntents(migrated);
+                _linkRepairNoted.clear();
+                const res = origLoadGraphData(migrated, ...args);
+                if (pendingLinkIntents.length) {
+                    const run = () => runPendingLinkRepair();
+                    if (res && typeof res.then === "function") res.then(run, run);
+                    else setTimeout(run, 0);
+                    setTimeout(run, 600);   // 兜底：某些前端版本建节点晚于 loadGraphData 返回
+                }
+                return res;
             };
         }
 

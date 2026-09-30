@@ -144,6 +144,11 @@ function ok(cond, msg) {
          * 在 A/B 两个项目里是两条独立记录，不带目录会让 A 里的删除毒到 B */
         _poolRemoved: { scope: "dir", key: "${dir}|" },
         fabEl: { scope: "ui" },
+        /* 端口错位修复（2026-09-30）：类型表是写死的名字常量；意图队列与去重集
+         * 都是单次载入的瞬态 —— 每次 loadGraphData 重建/清空，不跨项目攒状态 */
+        LINK_REPAIR_TYPES: { scope: "const" },
+        pendingLinkIntents: { scope: "derived" },
+        _linkRepairNoted: { scope: "derived" },   // 载入钩子里随 pendingLinkIntents 一并 clear
     };
 
     const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");

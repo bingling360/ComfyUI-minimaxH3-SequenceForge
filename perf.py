@@ -208,6 +208,12 @@ DEFAULT_PERF = {
     # 收 ratio 入参，以前 nodes 没传 → 键改了不生效；现在按它传。
     "offload_guard_ratio": DEFAULT_GUARD_RATIO,
     "guard_action": "warn",        # warn=只报 / block=critical 时禁止全卸
+    # cond 出口释放 TE 驻留（2026-09-30）：64GB 无 swap 云端实测，1MP 单段一采
+    # 峰值 59.5G/64G，段间残留 +2G/段 → 第 3-4 段必撞顶被 cgroup 整容器杀掉
+    # （断连 + 运行记录消失）。编码完就把 TE 的权重副本丢掉，采样/解码全程
+    # 不背 25.9GB —— 单段峰值降到 ~35G。auto = Linux 开 / Windows 关（见
+    # te_drop_after_cond_enabled 的 docstring）。消费端：cond_cache.CachedClipProxy。
+    "te_drop_after_cond": "auto",
 
     # 编码。**一个「质量数值」跟着编码器换含义**（面板上按 encoder 值显隐）：
     #   encoder=libx264     -> 读 `x264_crf`（恒定质量，越小越清晰）
@@ -326,6 +332,7 @@ PERF_TYPES = {
     # 磁盘 / swap 守卫
     "offload_guard_ratio": (int, float),
     "guard_action": (str,),
+    "te_drop_after_cond": (bool, "auto"),
     # 编码（两个维度：实现 / 质量档；质量档随 encoder 换含义，crf 与 cq 分开存）
     "encoder": (str,),
     "x264_crf": (int,),
@@ -892,6 +899,27 @@ def guard_allows_unload(hw, action="warn", ratio=DEFAULT_GUARD_RATIO):
     if str(action or "warn").lower() == "block" and g.get("level") == "critical":
         return False, g
     return True, g
+
+
+def te_drop_after_cond_enabled(value, profile=None):
+    """解析 `te_drop_after_cond`：显式 bool 直用；"auto" = Linux 开 / Windows 关。
+
+    为什么 auto 按 OS 判而不按 profile：这个开关救的是「无 swap 的 Linux 被
+    cgroup OOM killer 整容器杀掉」（2026-09-30 实测：1MP 单段一采 cgroup 峰值
+    59.5G/64G，段间残留 +2G/段，第 3-4 段必死）。Windows 有 pagefile，内存压力
+    的表现是变慢不是被杀，丢了 TE 反而每段多付一次重载，故 auto 下不开。
+    profile 在设置里可能是 "auto"（还没跑过渲染就没解析），不可靠；
+    运行时 OS 是当下事实。
+    """
+    if isinstance(value, bool):
+        return value
+    s = str(value if value is not None else "auto").strip().lower()
+    if s in ("true", "1", "on"):
+        return True
+    if s in ("false", "0", "off"):
+        return False
+    import platform
+    return not platform.system().lower().startswith("win")
 
 
 # ---- 编码档位 ----

@@ -1995,11 +1995,22 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 官方 H3 节点固定给 tokenize 传一个 list 参数，而缓存的键要求参数可哈希，
         # 于是全部旁路、命中恒为 0，容量 1/8/32 结果逐字相同（见 perf.py 同名注释）。
         from .cond_cache import CachedClipProxy
-        clip = CachedClipProxy(clip)
+        # cond 出口释放 TE 驻留（perf.te_drop_after_cond，auto=Linux 开 / Windows 关）。
+        # 为什么挂在这层：全链的 TE encode 唯一入口就是这个代理，正/负向、一采/二采
+        # 的重建全走它；挂在别处（各 cond 构建点）就是多处重复还容易漏。
+        try:
+            _te_drop = perf.te_drop_after_cond_enabled(
+                perf.current_settings().get("te_drop_after_cond"))
+        except Exception:
+            _te_drop = perf.te_drop_after_cond_enabled("auto")
+        clip = CachedClipProxy(clip, drop_after_encode=_te_drop)
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         _mode = str(生成模式)   # 旧控件占位：后端不再读取，仅报告回显
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}（按实际引用自动推导），上下文 {ctx} 帧"]
+        if _te_drop:
+            report.append("内存瘦身：cond 编码后即释放文本编码器驻留"
+                          "（te_drop_after_cond，代价=每段首次编码多一次回载）")
 
         # ---- 手动锚定（Anchor Studio）：唯一入口 ----
         # 所有「把某段 latent / 素材钉到本段某位置」的诉求统一走 seg.anchors[]（规划 §2/§3）。

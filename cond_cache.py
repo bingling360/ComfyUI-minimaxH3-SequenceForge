@@ -127,17 +127,38 @@ class CachedClipProxy:
     hits/misses/last_encode_hit 供计时报告标注「TE命中/未命中」。
     """
 
-    def __init__(self, clip, capacity=32):
+    def __init__(self, clip, capacity=32, drop_after_encode=False):
         self._clip = clip
         self._cap = max(1, int(capacity))
         self._cond_cache = {}   # (方法, 提示词键, 调用参数键) -> cond，dict 保序做 LRU
         self._tok_alive = {}    # id(tokens) -> (tokens, 键)   强引用保活防 id 复用
         self.hits = 0
         self.misses = 0
+        self.drops = 0
+        self.drop_after_encode = bool(drop_after_encode)
         self.last_encode_hit = None
 
     def __getattr__(self, name):
         return getattr(self._clip, name)
+
+    def _drop_te(self):
+        """cond 出口释放 TE 的权重驻留（显存 staged + 内存副本，非 CLIP 对象本身）。
+
+        为什么存在：64GB 无 swap 的云端跑 1MP，TE 的 25.9GB 驻留从编码起一直背到
+        解码结束，段间残留 +2G/段，3-4 段必撞 cgroup 上限被整容器杀掉（2026-09-30
+        实测）。编码完它就闲了（下一段的 cond 才用，权重躺在 577MB/s 共享盘，
+        回载 ~45s）——编码一结束就丢，采样/解码全程不背它。
+        用 unload_model_and_clips 而不是 unload_all_models：只动 TE 自己，
+        不碰主模型的暖驻留（那是「Staged 11956MB」半热加载的来源）。
+        """
+        try:
+            import gc as _gc
+            import comfy.model_management as _mm
+            _mm.unload_model_and_clips(self._clip.patcher)
+            _gc.collect()
+            self.drops += 1
+        except Exception:
+            pass
 
     def tokenize(self, text, *args, **kwargs):
         tokens = self._clip.tokenize(text, *args, **kwargs)
@@ -178,7 +199,12 @@ class CachedClipProxy:
             self._cond_cache[cache_key] = cond
             while len(self._cond_cache) > self._cap:
                 self._cond_cache.pop(next(iter(self._cond_cache)))
+            if self.drop_after_encode:
+                # 只在 miss 时丢：hit 没碰 TE 权重，丢等于白付一次回载
+                self._drop_te()
             return _copy_cond(cond)   # 存原件返回副本：调用方永不持有缓存内部引用
+        if self.drop_after_encode:
+            self._drop_te()
         return cond
 
 

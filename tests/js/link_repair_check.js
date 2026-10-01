@@ -47,6 +47,8 @@ function mkWin() {
         w, logs,
         intents: w.eval("savedLinkIntents"),
         repair: w.eval("repairMisplacedLinks"),
+        outIntents: w.eval("savedOutputIntents"),
+        repairOut: w.eval("repairMisplacedOutputLinks"),
         said: (lv) => logs.filter((x) => !lv || x[0] === lv).map((x) => x[1]).join("\n"),
     };
 }
@@ -287,15 +289,20 @@ const MODERN_LIVE = [{ id: 10, ports: [
         assert.ok(body.indexOf("migrateGraphWidgets(data)") >= 0, "widget 迁移层不该被挤掉");
         assert.ok(body.indexOf("pendingLinkIntents = savedLinkIntents(migrated)") >= 0,
             "载入钩子必须先把连线意图收下来");
+        assert.ok(body.indexOf("pendingOutputIntents = savedOutputIntents(migrated)") >= 0,
+            "载入钩子必须同时收输出侧意图（1.53.x 输出槽位漂移没有前端兜底）");
         assert.ok(body.indexOf("res.then(run, run)") >= 0, "该在 Promise 结算后跑一次");
         assert.ok(body.indexOf("setTimeout(run, 600)") >= 0, "该留定时器兜底（建节点晚于返回的前端）");
-        assert.ok(DIR_SRC.indexOf("if (pendingLinkIntents.length) setTimeout(runPendingLinkRepair, 0);") >= 0,
+        assert.ok(DIR_SRC.indexOf("if (pendingLinkIntents.length || pendingOutputIntents.length) setTimeout(runPendingLinkRepair, 0);") >= 0,
             "loadedGraphNode 那条触发路径不见了（还得是下一拍，不能同步改线）");
         assert.ok(DIR_SRC.indexOf("s.name === it.name") >= 0, "必须按端口**名字**判定");
         assert.ok(DIR_SRC.indexOf("已被另一条线占用") >= 0 && DIR_SRC.indexOf("本机已不存在") >= 0,
             "三条铁律的代码锚点（冲突 / 下线）不见了");
         assert.ok(DIR_SRC.indexOf('const LINK_REPAIR_TYPES = new Set([NODE_TYPE, "H3SeamDoctor", '
             + '"H3EAVFetaPatch", "H3EAVFetaReport"]);') >= 0, "修复范围必须只限本插件节点");
+        assert.ok(DIR_SRC.indexOf("function savedOutputIntents(") >= 0
+            && DIR_SRC.indexOf("function repairMisplacedOutputLinks(") >= 0,
+            "输出侧按名搬线（savedOutputIntents / repairMisplacedOutputLinks）不见了");
         /* 反向：不许去复刻前端的端口排序规则（那正是随版本漂移的东西），也不许重排活节点端口表 */
         assert.ok(DIR_SRC.indexOf("defaultVerticalInputs") < 0, "不许复刻前端排序规则");
         assert.ok(!/node\.inputs\.(sort|reverse|splice)\(/.test(DIR_SRC), "不许重排活节点的端口表");
@@ -305,10 +312,11 @@ const MODERN_LIVE = [{ id: 10, ports: [
         const m = TPL_SRC.match(/window\.H3_DEFAULT_WORKFLOW\s*=\s*(\{[\s\S]*\})\s*;?\s*$/);
         assert.ok(m, "读不出 web/h3_default_workflow.js 的 JSON");
         const tpl = JSON.parse(m[1]);
-        const { intents, repair } = mkWin();
+        const { intents, repair, outIntents, repairOut } = mkWin();
         const list = intents(tpl);
         const names = Array.from(list, (x) => x.name).sort();   // Array.from 收进主 realm
-        assert.deepStrictEqual(names, ["文本编码器", "模型", "视频VAE", "音频VAE"],
+        /* rev3（2026-10-01）起出厂模板默认接独立二采链 → 意图含「二采模型」 */
+        assert.deepStrictEqual(names, ["二采模型", "文本编码器", "模型", "视频VAE", "音频VAE"],
             "默认工作流的接线端口漂了：" + JSON.stringify(names));
         const sampler = tpl.nodes.find((n) => n.type === "H3SeamlessChainSampler");
         for (const it of list) {
@@ -323,6 +331,157 @@ const MODERN_LIVE = [{ id: 10, ports: [
         const res = repair(list, env.graph);
         assert.strictEqual(res.moved, 0, "同布局机器上出厂工作流不该被改动");
         assert.strictEqual(res.conflicts + res.dropped + res.rest.length, 0, "也不该有冲突/断开/待修");
+        /* 输出侧：模板「报告」带线（schema 4 槽制、末位），同布局零改动 */
+        const oList = outIntents(tpl);
+        assert.deepStrictEqual(Array.from(oList, (x) => x.name).sort(), ["报告"],
+            "模板输出意图应只有「报告」：" + JSON.stringify(Array.from(oList, (x) => x.name)));
+        const outEnv = mkOutGraph(
+            [{ id: sampler.id, outputs: sampler.outputs.map((o) => ({ name: o.name, links: o.links || [] })) },
+             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 58 }] }],
+            { 58: { origin_id: sampler.id, origin_slot: 3, target_id: 54, target_slot: 0, type: "STRING" } });
+        const oRes = repairOut(oList, outEnv.graph);
+        assert.strictEqual(oRes.moved, 0, "同布局机器上输出线不该被改动");
+        assert.strictEqual(oRes.conflicts + oRes.dropped + oRes.rest.length, 0, "输出侧也不该有冲突/断开/待修");
+    });
+
+    /* ---------- 输出侧（1.53.x 输出槽位漂移，前端没有 realignment 兜底） ---------- */
+
+    /** 输出侧夹具：outputs[].links 数组 + linkBox + disconnectOutput/-Input 桩。 */
+    function mkOutGraph(liveNodes, links) {
+        const linkBox = {};
+        for (const [id, l] of Object.entries(links)) {
+            linkBox[id] = Object.assign({ id: Number.isFinite(Number(id)) ? Number(id) : id }, l);
+        }
+        const nodes = new Map();
+        for (const n of liveNodes) {
+            nodes.set(String(n.id), {
+                id: n.id,
+                type: n.type || "H3SeamlessChainSampler",
+                outputs: (n.outputs || []).map((o) => ({ name: o.name, links: o.links == null ? null : o.links.slice() })),
+                inputs: (n.inputs || []).map((i) => ({ name: i.name, link: i.link == null ? null : i.link })),
+                disconnectInput(i) {
+                    const s = this.inputs[i];
+                    if (!s || s.link == null) return;
+                    delete linkBox[String(s.link)];
+                    s.link = null;
+                },
+                disconnectOutput(i) {
+                    const s = this.outputs[i];
+                    if (!s || !s.links || !s.links.length) return;
+                    for (const id of s.links.slice()) {
+                        const l = linkBox[String(id)];
+                        if (l) {
+                            const tn = nodes.get(String(l.target_id));
+                            if (tn) {
+                                const tp = (tn.inputs || []).find((x) => x && String(x.link) === String(id));
+                                if (tp) tp.link = null;
+                            }
+                            delete linkBox[String(id)];
+                        }
+                    }
+                    s.links = [];
+                },
+            });
+        }
+        return {
+            graph: { _nodes: [...nodes.values()], links: linkBox, setDirtyCanvas() {},
+                     getNodeById: (id) => nodes.get(String(id)) || null },
+            nodes, linkBox,
+        };
+    }
+
+    await t("★ 输出线落在「帧率」上 → 按名接回「报告」（3 槽存档 + 4 槽运行时）", () => {
+        const { outIntents, repairOut } = mkWin();
+        /* 老会话存档：outputs 是 3 槽制（报告=2），连线表 origin_slot=2；
+         * 1.53.6 运行时是 schema 4 槽，前端把线挂到了 2 号位「帧率」上。 */
+        const saved = {
+            nodes: [
+                { id: 10, type: "H3SeamlessChainSampler", outputs: [
+                    { name: "图像", links: [] },
+                    { name: "音频", links: null },
+                    { name: "报告", links: [58] },
+                ] },
+                { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 58 }] },
+            ],
+            links: [[58, 10, 2, 54, 0, "STRING"]],
+        };
+        const env = mkOutGraph(
+            [{ id: 10, outputs: [
+                { name: "图像", links: [] },
+                { name: "音频", links: null },
+                { name: "帧率", links: [58] },       // ← 前端按位次挂错的地方
+                { name: "报告", links: null },
+            ] },
+             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 58 }] }],
+            { 58: { origin_id: 10, origin_slot: 2, target_id: 54, target_slot: 0, type: "STRING" } });
+        const list = outIntents(saved);
+        assert.strictEqual(list.length, 1);
+        assert.strictEqual(list[0].name, "报告");
+        const res = repairOut(list, env.graph);
+        assert.strictEqual(res.moved, 1, "输出线该按名接回「报告」");
+        assert.strictEqual(res.conflicts + res.dropped + res.rest.length, 0);
+        const sampler = env.nodes.get("10");
+        /* Array.from 收进主 realm：repairOut 在 jsdom realm 里 new 的数组原型不同 */
+        assert.deepStrictEqual(Array.from(sampler.outputs[3].links, String), ["58"], "「报告」该领着这条线");
+        assert.strictEqual(sampler.outputs[2].links.length, 0, "「帧率」必须被腾空");
+        assert.strictEqual(Number(env.linkBox["58"].origin_slot), 3, "连线表 origin_slot 该改成 3");
+        /* 幂等：同一份意图再跑一遍，不该再动 */
+        const again = repairOut(outIntents(saved), env.graph);
+        assert.strictEqual(again.moved, 0, "修完再跑必须空转");
+    });
+
+    await t("★ link id 被 remint（61→62）也能按目标端口领线定位", () => {
+        const { outIntents, repairOut } = mkWin();
+        const saved = {
+            nodes: [
+                { id: 10, type: "H3SeamlessChainSampler", outputs: [
+                    { name: "图像", links: [] }, { name: "音频", links: null },
+                    { name: "帧率", links: null }, { name: "报告", links: [61] },
+                ] },
+                { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 61 }] },
+            ],
+            links: [[61, 10, 3, 54, 0, "STRING"]],
+        };
+        /* 运行时连线被前端 remint 成 62；目标输入端口领的就是 62 */
+        const env = mkOutGraph(
+            [{ id: 10, outputs: [
+                { name: "图像", links: [] }, { name: "音频", links: null },
+                { name: "帧率", links: [62] }, { name: "报告", links: null },
+            ] },
+             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 62 }] }],
+            { 62: { origin_id: 10, origin_slot: 2, target_id: 54, target_slot: 0, type: "STRING" } });
+        const res = repairOut(outIntents(saved), env.graph);
+        assert.strictEqual(res.moved, 1, "remint 后仍该按目标端口找到线并接回「报告」");
+        const sampler = env.nodes.get("10");
+        assert.deepStrictEqual(Array.from(sampler.outputs[3].links, String), ["62"]);
+        assert.strictEqual(sampler.outputs[2].links.length, 0);
+        assert.strictEqual(Number(env.linkBox["62"].origin_slot), 3);
+    });
+
+    await t("输出端口已下线 → 断开（绝不留在错误端口上）", () => {
+        const { outIntents, repairOut } = mkWin();
+        const saved = {
+            nodes: [
+                { id: 10, type: "H3SeamlessChainSampler", outputs: [
+                    { name: "图像", links: [] }, { name: "音频", links: null },
+                    { name: "分段图像", links: [59] },
+                ] },
+                { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 59 }] },
+            ],
+            links: [[59, 10, 2, 54, 0, "IMAGE"]],
+        };
+        const env = mkOutGraph(
+            [{ id: 10, outputs: [
+                { name: "图像", links: [] }, { name: "音频", links: null },
+                { name: "帧率", links: [59] }, { name: "报告", links: null },
+            ] },
+             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 59 }] }],
+            { 59: { origin_id: 10, origin_slot: 2, target_id: 54, target_slot: 0, type: "IMAGE" } });
+        const res = repairOut(outIntents(saved), env.graph);
+        assert.strictEqual(res.dropped, 1, "下线端口的输出线该被断开");
+        assert.strictEqual(env.nodes.get("10").outputs[2].links.length, 0, "不许留在「帧率」上");
+        assert.strictEqual(env.linkBox["59"], undefined, "连线该从图上移除");
+        assert.strictEqual(env.nodes.get("54").inputs[0].link, null, "目标输入该同步断开");
     });
 
     results.forEach((r) => console.log(r));

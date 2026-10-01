@@ -94,13 +94,13 @@ withDur(10);
 ok(segmentSeconds(node, { seconds: null }) === 10, "节点默认改成 10s 也要跟着变",
     segmentSeconds(node, { seconds: null }), 10);
 
-/* ---------- 3) 节点默认也没了 → 才回落到 5 ---------- */
+/* ---------- 3) 节点默认也没了 → 才回落到出厂默认 8s（2026-10-01 起，原为 5s） ---------- */
 withDur(0);
-ok(segmentSeconds(node, { seconds: null }) === 5.0, "节点默认无效 → 回落 5s",
-    segmentSeconds(node, { seconds: null }), 5.0);
+ok(segmentSeconds(node, { seconds: null }) === 8.0, "节点默认无效 → 回落 8s（出厂默认）",
+    segmentSeconds(node, { seconds: null }), 8.0);
 withDur(undefined);
-ok(segmentSeconds(node, { seconds: null }) === 5.0, "节点默认缺失 → 回落 5s",
-    segmentSeconds(node, { seconds: null }), 5.0);
+ok(segmentSeconds(node, { seconds: null }) === 8.0, "节点默认缺失 → 回落 8s（出厂默认）",
+    segmentSeconds(node, { seconds: null }), 8.0);
 
 /* ---------- 4) 帧数显示必须跟着同一个值走 ---------- */
 withDur(6);

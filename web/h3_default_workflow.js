@@ -1,42 +1,48 @@
-/* H3 长片导演台 · 配套默认工作流模板
+/* H3 长片导演台 · 配套默认工作流模板（rev 3.2 · 2026-10-01）
  *
- * 由「长视频接续二采导演台工作流.json」导出生成（D:/Downloads）：
- * - 模型加载器（UNET / Qwen3-VL CLIP / 视频+音频 VAE）
- * - 注意力后端 + 块稀疏注意力（ModelAttentionBackend → BlockSparseAttention，
- *   长序列下省算力）+ 主节点（导演台模式）
- * - 提示词与素材全走导演台状态，画布无任何外联
- *   （提示词 1–64 段不限，全在导演台管理）
- * - 每段视频由主节点「自动保存=分段」存进项目文件夹 output/h3_projects/<项目名>/，
- *   主节点「自动成片=开启」时另编码完整成片（final_*.mp4）落同一文件夹；
- *   不再依赖 H3ChainSaver 节点（成片保存由主节点一体化完成）
- * - P4g：资产只走导演台状态 ds.ref_assets（导演台 poolFromManifest 自拉 manifest）。
- *   画布上的 H3AssetBundle（资产包）、H3LatentExtract（现抽存档）、
- *   H3LatentUpscale（库内放大）与现抽输入链（LoadVideo/GetVideoComponents）已整体下线——
- *   它们均无执行入口（非 OUTPUT_NODE）且全部前端代码零引用，属资产库时代残留。
- * - 注意：本文件由导出 JSON 直接转换，widget 顺序须与 nodes.py define_schema 严格一致
- *   （已校验 31 项）。如需改默认参数，改导出 JSON 后重新生成，勿手工编辑此数组。
- * - 2026-09-24：导演台参数按用户导出（默认工作流3.json）更新——百万像素 0.4→1、
- *   审片模式 关闭→逐段确认、导演台状态换成新 schema（二采 scale 1.4 / size_mode 倍率 /
- *   target 1280×704 / denoise 0.2 / steps 4 / device auto，语义桥开启 alpha 0.15 scope all）。
- *   「存档目录」保持空（空 = 按画布参数指纹自动命名项目）。本次只动这一处控件数组，
- *   节点输入/输出槽与连线一律未动（与 nodes.py schema、冻结测试保持一致）。
+ * 由用户导出「新版默认工作流.json」（frontend 1.53.6）重制；按用户截图反馈修三轮：
+ * - rev3.2 报告线连到「帧率」（真机 1.53.6 两轮实证）：运行时输出槽按 schema 建 4 槽，
+ *   但前端会把「未接线的停机场槽」从数组里裁掉 → 3/4 槽随载入时序漂移，输出连线
+ *   按位次写本质不可靠。最终口径：模板 outputs 写 schema 4 槽、报告线 origin_slot=3；
+ *   导演台新增输出侧按名搬线（savedOutputIntents / repairMisplacedOutputLinks），
+ *   无论本机 3 槽还是 4 槽都把报告线接回「报告」（老 3 槽制导出同样被救）。
+ *   输入侧由序列化数组重建：模板 6 实槽顺序被采纳，控件槽由前端追加在尾部。
+ *   输入侧相反：**输入槽由序列化数组重建**（本模板 6 实槽顺序被采纳，控件槽
+ *   由前端追加在尾部，起始视频/起始视频音轨不出现在画布）→ 输入连线写
+ *   序列化位次（视频VAE=0/音频VAE=1/模型=2/文本编码器=3/二采模型=4）。
+ * - rev3.1 报告线断开：3 输出制口径在真机上同样错位——两轮实证合并为上面的结论。
+ * - rev3.1 布局：皮肤把主节点缩成「标题+端口+打开导演台按钮」（mountDeskButton 里
+ *   setSize(computeSize())，尺寸运行时重算），分组 ③ 按紧凑形态收紧；
+ *   分组 ④（二采链）节点距组顶/组底 ≥50，不再溢出；说明卡挪进初始视野（左列下方）。
+ *
+ * 链路与参数（同 rev3）：
+ * - 一采：UNET int8 混合 → turbo LoRA（步数 8 配套）→ Motion Repair 0.6 →
+ *   comfy kitchen 注意力 → Sol-Attn 块稀疏 → 主节点
+ * - 二采：UNET w6a8 → 同款注意力 → 主节点「二采模型」槽（高清精化专用）
+ * - 链参数出厂值三处同源（nodes.py INPUT_TYPES default / h3_director.js
+ *   CHAIN_DEFAULTS / 本模板）：1.0MP、每段时长 8s、步数 8、桥帧门控 关、
+ *   接缝重摇 关、审片 关、参考图像尺寸 max；导演台状态 = 锚定双轨 schema
+ *   （二采 跟随生成 1.4× / denoise 0.35 / steps 4 / shift 6 / euler+simple，
+ *   语义桥开 alpha 0.15，AI 优化 GLM api 预设）。
+ * - widget 顺序须与 nodes.py define_schema 严格一致（30 项）。改默认参数：
+ *   nodes.py、CHAIN_DEFAULTS、本文件三处同改（见 docs/改动总结_新版默认工作流_2026-10-01.md）。
  */
 window.H3_DEFAULT_WORKFLOW = {
   "id": "h3-chain-director-default",
   "revision": 2,
-  "last_node_id": 60,
-  "last_link_id": 46,
+  "last_node_id": 71,
+  "last_link_id": 61,
   "nodes": [
     {
-      "id": 3,
-      "type": "VAELoader",
+      "id": 1,
+      "type": "UNETLoader",
       "pos": [
-        -720,
-        370
+        -980,
+        40
       ],
       "size": [
         640,
-        70
+        90
       ],
       "flags": {},
       "order": 0,
@@ -44,293 +50,42 @@ window.H3_DEFAULT_WORKFLOW = {
       "inputs": [],
       "outputs": [
         {
-          "name": "VAE",
-          "type": "VAE",
-          "links": [
-            3
-          ]
-        }
-      ],
-      "title": "视频 VAE",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "VAELoader"
-      },
-      "widgets_values": [
-        "minimax_h3_video_vae_int8_convrot.safetensors"
-      ]
-    },
-    {
-      "id": 4,
-      "type": "VAELoader",
-      "pos": [
-        -720,
-        480
-      ],
-      "size": [
-        640,
-        70
-      ],
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "VAE",
-          "type": "VAE",
-          "links": [
-            4
-          ]
-        }
-      ],
-      "title": "音频 VAE",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "VAELoader"
-      },
-      "widgets_values": [
-        "minimax_h3_audio_vae_fp32.safetensors"
-      ]
-    },
-    {
-      "id": 40,
-      "type": "MarkdownNote",
-      "pos": [
-        40,
-        2820
-      ],
-      "size": [
-        620,
-        380
-      ],
-      "flags": {},
-      "order": 23,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "导演台使用说明",
-      "properties": {},
-      "widgets_values": [
-        "# H3 长片导演台 · 配套工作流\n\n- 生成控制在左侧「长片导演台」侧栏：提示词/素材/参数一体化，无需手动连点节点\n- 提示词走导演台状态（JSON 优先），**1–64 段不限**：「＋ 添加一段」加段，提示词只走导演台状态（画布无任何提示词/素材外联）\n- 资产全在导演台三库面板管理（项目资产 / 全局库 / 成片）：瓦片拖放与正文 @素材名 引用，画布上没有任何资产节点与拉线\n- 每段结果自动存进项目文件夹 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图 + 成片），导演台段卡片直接预览播放\n- 链路自动推导（无模式选择）：有段引用素材即走 ref conditioning；UNET 请按引用情况接 ref2va（或混用权重），纯文生链用 fl2va 也可\n- 每段时长/宽高比/百万像素（0.1–2.0MP 步进0.1）/种子/步数在导演台右栏「链参数」；其余参数收在「⚙ 高级设置」"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 53,
-      "type": "ModelAttentionBackend",
-      "pos": [
-        -539.5497629506184,
-        -201.4399075229341
-      ],
-      "size": [
-        270,
-        58
-      ],
-      "flags": {},
-      "order": 29,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 34
-        }
-      ],
-      "outputs": [
-        {
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            45
+            47
           ]
         }
       ],
+      "title": "① 一采 UNET · int8 混合（fl2va+ref2va）",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.33.1",
-        "Node name for S&R": "ModelAttentionBackend"
+        "Node name for S&R": "UNETLoader"
       },
       "widgets_values": [
-        "comfy kitchen attention"
-      ]
-    },
-    {
-      "id": 54,
-      "type": "PreviewAny",
-      "pos": [
-        922.7541434875644,
-        -132.0233707446445
+        "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
+        "default"
       ],
-      "size": [
-        210,
-        122
-      ],
-      "flags": {},
-      "order": 31,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "source",
-          "type": "*",
-          "link": 36
-        }
-      ],
-      "outputs": [
-        {
-          "name": "STRING",
-          "type": "STRING",
-          "links": null
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.33.1",
-        "Node name for S&R": "PreviewAny"
+      "widgets_values_named": {
+        "unet_name": "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
+        "weight_dtype": "default"
       },
-      "widgets_values": []
-    },
-    {
-      "id": 10,
-      "type": "H3SeamlessChainSampler",
-      "pos": [
-        40,
-        40
-      ],
-      "size": [
-        720,
-        1380
-      ],
-      "flags": {},
-      "order": 30,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "模型",
-          "type": "MODEL",
-          "link": 46
-        },
-        {
-          "name": "文本编码器",
-          "type": "CLIP",
-          "link": 2
-        },
-        {
-          "name": "视频VAE",
-          "type": "VAE",
-          "link": 3
-        },
-        {
-          "name": "音频VAE",
-          "type": "VAE",
-          "link": 4
-        },
-        {
-          "name": "起始视频",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "起始视频音轨",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": null
-        },
-        {
-          "name": "二采模型",
-          "type": "MODEL",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "图像",
-          "type": "IMAGE",
-          "links": []
-        },
-        {
-          "name": "音频",
-          "type": "AUDIO",
-          "links": []
-        },
-        {
-          "name": "帧率",
-          "type": "INT"
-        },
-        {
-          "name": "报告",
-          "type": "STRING",
-          "links": [
-            36
-          ]
-        },
-        {
-          "name": "分段图像",
-          "shape": 6,
-          "type": "IMAGE"
-        },
-        {
-          "name": "分段音频",
-          "shape": 6,
-          "type": "AUDIO"
-        }
-      ],
-      "title": "H3 Seamless Chain · 导演台主节点",
-      "properties": {
-        "aux_id": "bingling360/ComfyUI_H3_SeamlessChain",
-        "ver": "731bde31a74ff438381a07c8d647795aed63952c",
-        "Node name for S&R": "H3SeamlessChainSampler"
-      },
-      "widgets_values": [
-        "16:9",
-        1,
-        864,
-        480,
-        5,
-        "22",
-        89596547198180,
-        "fixed",
-        20,
-        1,
-        "res_multistep",
-        "simple",
-        "关闭",
-        "",
-        "关闭",
-        30,
-        34,
-        0,
-        "逐段确认",
-        "分段",
-        0,
-        "关闭",
-        0.06,
-        1,
-        "关闭",
-        "文生视频",
-        "开启",
-        "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"unlink\":false,\"disabled\":false,\"frame_refs\":null}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"3D\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.2,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0.05,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"\",\"scheduler\":\"\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":null,\"opt_hist\":null}",
-        "match",
-        1.0
-      ]
+      "color": "#3f789e"
     },
     {
       "id": 2,
       "type": "CLIPLoader",
       "pos": [
-        -712.2928048458093,
-        197.97505939231482
+        -980,
+        170
       ],
       "size": [
         640,
         120
       ],
       "flags": {},
-      "order": 24,
+      "order": 1,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -342,6 +97,7 @@ window.H3_DEFAULT_WORKFLOW = {
           ]
         }
       ],
+      "title": "② 文本编码器 · Qwen3-VL 32B（nvfp4-awq）",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.33.1",
@@ -351,55 +107,235 @@ window.H3_DEFAULT_WORKFLOW = {
         "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
         "minimax",
         "default"
-      ]
+      ],
+      "widgets_values_named": {
+        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "type": "minimax",
+        "device": "default"
+      },
+      "color": "#3f789e"
     },
     {
-      "id": 1,
-      "type": "UNETLoader",
+      "id": 3,
+      "type": "VAELoader",
       "pos": [
-        -713.4749642985317,
-        58.29051812722833
+        -980,
+        330
       ],
       "size": [
         640,
-        90
+        70
       ],
       "flags": {},
-      "order": 25,
+      "order": 2,
       "mode": 0,
       "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "title": "③ 视频 VAE · int8",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_video_vae_int8_convrot.safetensors"
+      ],
+      "widgets_values_named": {
+        "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
+      },
+      "color": "#3f789e"
+    },
+    {
+      "id": 4,
+      "type": "VAELoader",
+      "pos": [
+        -980,
+        440
+      ],
+      "size": [
+        640,
+        70
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "title": "④ 音频 VAE · fp32",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "minimax_h3_audio_vae_fp32.safetensors"
+      ],
+      "widgets_values_named": {
+        "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+      },
+      "color": "#3f789e"
+    },
+    {
+      "id": 63,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        -240,
+        40
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 47
+        }
+      ],
       "outputs": [
         {
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            34
+            48
           ]
         }
       ],
+      "title": "⑤ turbo 加速 LoRA（配套少步采样 · 1.0）",
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+        1
+      ],
+      "widgets_values_named": {
+        "lora_name": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+        "strength_model": 1
+      },
+      "color": "#2a8f6d"
+    },
+    {
+      "id": 64,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        100,
+        40
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 48
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            49
+          ]
+        }
+      ],
+      "title": "⑥ Motion Repair 运动修复（0.6）",
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "Motion_Repair_V2.safetensors",
+        0.6
+      ],
+      "widgets_values_named": {
+        "lora_name": "Motion_Repair_V2.safetensors",
+        "strength_model": 0.6
+      },
+      "color": "#2a8f6d"
+    },
+    {
+      "id": 53,
+      "type": "ModelAttentionBackend",
+      "pos": [
+        440,
+        40
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 49
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            45
+          ]
+        }
+      ],
+      "title": "⑦ 注意力后端 · comfy kitchen",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.33.1",
-        "Node name for S&R": "UNETLoader"
+        "Node name for S&R": "ModelAttentionBackend"
       },
       "widgets_values": [
-        "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
-        "default"
-      ]
+        "comfy kitchen attention"
+      ],
+      "widgets_values_named": {
+        "attention": "comfy kitchen attention"
+      },
+      "color": "#7c5cbf"
     },
     {
       "id": 60,
       "type": "BlockSparseAttention",
       "pos": [
-        -193.19832687618307,
-        -275.32737438866627
+        440,
+        140
       ],
       "size": [
-        270,
+        300,
         250
       ],
       "flags": {},
-      "order": 6,
+      "order": 7,
       "mode": 0,
       "inputs": [
         {
@@ -417,6 +353,7 @@ window.H3_DEFAULT_WORKFLOW = {
           ]
         }
       ],
+      "title": "⑧ 块稀疏注意力 · Sol-Attn（一采）",
       "properties": {
         "Node name for S&R": "BlockSparseAttention"
       },
@@ -441,7 +378,359 @@ window.H3_DEFAULT_WORKFLOW = {
         "extra_tokens": 256,
         "sink_conditioning": "exact_kv_and_rows",
         "verbose": false
+      },
+      "color": "#7c5cbf"
+    },
+    {
+      "id": 69,
+      "type": "UNETLoader",
+      "pos": [
+        -980,
+        610
+      ],
+      "size": [
+        640,
+        90
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            59
+          ]
+        }
+      ],
+      "title": "⑨ 二采 UNET · w6a8（高清精化）",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "minimax_h3_hybrid_fl2va_ref2va_b25-49_w6a8.safetensors",
+        "default"
+      ],
+      "widgets_values_named": {
+        "unet_name": "minimax_h3_hybrid_fl2va_ref2va_b25-49_w6a8.safetensors",
+        "weight_dtype": "default"
+      },
+      "color": "#b58b2a"
+    },
+    {
+      "id": 70,
+      "type": "ModelAttentionBackend",
+      "pos": [
+        -240,
+        610
+      ],
+      "size": [
+        300,
+        58
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 59
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            60
+          ]
+        }
+      ],
+      "title": "⑩ 注意力后端（二采）",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "ModelAttentionBackend"
+      },
+      "widgets_values": [
+        "comfy kitchen attention"
+      ],
+      "widgets_values_named": {
+        "attention": "comfy kitchen attention"
+      },
+      "color": "#7c5cbf"
+    },
+    {
+      "id": 71,
+      "type": "BlockSparseAttention",
+      "pos": [
+        100,
+        610
+      ],
+      "size": [
+        300,
+        250
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 60
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            61
+          ]
+        }
+      ],
+      "title": "⑪ 块稀疏注意力 · Sol-Attn（二采）",
+      "properties": {
+        "Node name for S&R": "BlockSparseAttention"
+      },
+      "widgets_values": [
+        "sol-attn",
+        1.3,
+        0.2,
+        1,
+        "",
+        12288,
+        256,
+        "exact_kv_and_rows",
+        false
+      ],
+      "widgets_values_named": {
+        "selection": "sol-attn",
+        "selection.tau": 1.3,
+        "start_percent": 0.2,
+        "end_percent": 1,
+        "dense_blocks": "",
+        "min_tokens": 12288,
+        "extra_tokens": 256,
+        "sink_conditioning": "exact_kv_and_rows",
+        "verbose": false
+      },
+      "color": "#7c5cbf"
+    },
+    {
+      "id": 10,
+      "type": "H3SeamlessChainSampler",
+      "pos": [
+        840,
+        40
+      ],
+      "size": [
+        300,
+        240
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "视频VAE",
+          "type": "VAE",
+          "link": 3
+        },
+        {
+          "name": "音频VAE",
+          "type": "VAE",
+          "link": 4
+        },
+        {
+          "name": "模型",
+          "shape": 7,
+          "type": "MODEL",
+          "link": 46
+        },
+        {
+          "name": "文本编码器",
+          "shape": 7,
+          "type": "CLIP",
+          "link": 2
+        },
+        {
+          "name": "二采模型",
+          "shape": 7,
+          "type": "MODEL",
+          "link": 61
+        },
+        {
+          "name": "自定义Sigmas",
+          "shape": 7,
+          "type": "SIGMAS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "图像",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "音频",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "帧率",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "报告",
+          "type": "STRING",
+          "links": [
+            58
+          ]
+        }
+      ],
+      "title": "H3 Seamless Chain · 导演台主节点",
+      "properties": {
+        "aux_id": "bingling360/ComfyUI_H3_SeamlessChain",
+        "ver": "731bde31a74ff438381a07c8d647795aed63952c",
+        "Node name for S&R": "H3SeamlessChainSampler"
+      },
+      "widgets_values": [
+        "16:9",
+        1,
+        1376,
+        768,
+        8,
+        "22",
+        19389496656561,
+        "fixed",
+        8,
+        1,
+        "res_multistep",
+        "simple",
+        "关闭",
+        "1",
+        "关闭",
+        30,
+        34,
+        0,
+        "关闭",
+        "分段",
+        0,
+        "关闭",
+        0.06,
+        1,
+        "关闭",
+        "文生视频",
+        "开启",
+        "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"frame_img\":null,\"unlink\":false,\"disabled\":false,\"auto_ref\":null,\"auto_seq\":null,\"frame_refs\":null,\"latent_save\":null,\"latent_ref\":null,\"tail_src\":null,\"anchors\":[]}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"auto\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.35,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"euler\",\"scheduler\":\"simple\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":{\"mode\":\"api\",\"provider\":\"glm\",\"api_url\":\"https://open.bigmodel.cn/api/paas/v4\",\"api_key\":\"\",\"api_keys\":{},\"model\":\"glm-5.3-flashx\",\"provider_models\":{},\"protocol\":\"openai\",\"read_media\":true,\"local_model\":\"\",\"local_mmproj\":\"\",\"local_device\":\"cuda\",\"max_tokens\":8192,\"timeout\":300,\"thinking\":\"disabled\",\"reasoning_effort\":\"\",\"rule_file\":\"auto\",\"cfg_ver\":3,\"expand\":{\"style\":\"balanced\"}},\"opt_hist\":null}",
+        "max",
+        1
+      ],
+      "widgets_values_named": {
+        "宽高比": "16:9",
+        "百万像素": 1,
+        "宽度": 1376,
+        "高度": 768,
+        "每段时长": 8,
+        "引导帧数": "22",
+        "种子": 19389496656561,
+        "control_after_generate": "fixed",
+        "步数": 8,
+        "CFG": 1,
+        "采样器": "res_multistep",
+        "调度器": "simple",
+        "自动存档": "关闭",
+        "存档目录": "1",
+        "桥帧门控": "关闭",
+        "清晰度阈值": 30,
+        "回退上限": 34,
+        "锚定加噪": 0,
+        "审片模式": "关闭",
+        "自动保存": "分段",
+        "重跑起始段": 0,
+        "接缝重摇": "关闭",
+        "重摇阈值": 0.06,
+        "重摇上限": 1,
+        "递减锚定": "关闭",
+        "生成模式": "文生视频",
+        "自动成片": "开启",
+        "导演台状态": "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"frame_img\":null,\"unlink\":false,\"disabled\":false,\"auto_ref\":null,\"auto_seq\":null,\"frame_refs\":null,\"latent_save\":null,\"latent_ref\":null,\"tail_src\":null,\"anchors\":[]}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"auto\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.35,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"euler\",\"scheduler\":\"simple\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":{\"mode\":\"api\",\"provider\":\"glm\",\"api_url\":\"https://open.bigmodel.cn/api/paas/v4\",\"api_key\":\"\",\"api_keys\":{},\"model\":\"glm-5.3-flashx\",\"provider_models\":{},\"protocol\":\"openai\",\"read_media\":true,\"local_model\":\"\",\"local_mmproj\":\"\",\"local_device\":\"cuda\",\"max_tokens\":8192,\"timeout\":300,\"thinking\":\"disabled\",\"reasoning_effort\":\"\",\"rule_file\":\"auto\",\"cfg_ver\":3,\"expand\":{\"style\":\"balanced\"}},\"opt_hist\":null}",
+        "参考图像尺寸": "max",
+        "响度对齐强度": 1
       }
+    },
+    {
+      "id": 54,
+      "type": "PreviewAny",
+      "pos": [
+        1180,
+        40
+      ],
+      "size": [
+        260,
+        200
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 58
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "运行报告",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.33.1",
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "widgets_values_named": {}
+    },
+    {
+      "id": 40,
+      "type": "MarkdownNote",
+      "pos": [
+        -1010,
+        960
+      ],
+      "size": [
+        780,
+        680
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "导演台使用说明",
+      "properties": {},
+      "widgets_values": [
+        "# H3 长片导演台 · 配套默认工作流（2026-10-01 版）\n\n生成全在左侧「长片导演台」侧栏：提示词 / 素材 / 链参数一体化，画布零连线操作。\n- 提示词走导演台状态，1–64 段不限：顶部选段条「＋」加段；素材在三库面板（项目资产 / 全局库 / 成片）拖放，或正文 @素材名 引用\n- 每段自动存 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图）；「自动成片=开启」另编码完整成片，段卡片直接预览播放\n- 链路自动推导（无模式选择）：段里引用素材即走 ref conditioning；纯文生链走 fl2va\n\n**一采链（上排，左→右）**：UNET int8 混合权重（fl2va+ref2va）→ turbo 加速 LoRA（配套少步采样，本模板步数 8）→ Motion Repair 运动修复 0.6 → comfy kitchen 注意力 → Sol-Attn 块稀疏注意力（≥12288 token 生效、0.2 起生效）→ 主节点\n\n**二采链（下排）**：UNET w6a8 → 同款注意力 → 主节点「二采模型」槽，专做高清精化二采（换权重不影响一采与接缝重摇）\n\n**出厂链参数**（= 右栏「↺ 恢复默认」基准，与 nodes.py 默认值同源）：\n- 16:9 · 1.0MP（1376×768）｜每段时长 8s｜步数 8｜CFG 1｜res_multistep / simple\n- 审片模式 关｜自动保存 分段｜自动成片 开｜参考图像尺寸 max（身份保真优先，参考管线 2048 短边，较慢）\n- 检测重摇默认全关（桥帧门控 / 接缝重摇）——要自动排坏段，到「视频延续 · 检测重摇」里打开\n- 右栏「二采放大」预置：跟随生成 · 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n- 语义桥预置：开 · BUNNY V2 · alpha 0.15 · 全量过桥；AI 优化：GLM 预设（open.bigmodel.cn · glm-5.3-flashx，Key 在「AI 优化设置」自填）\n\n小字：「宽度/高度」是旧版兼容位（画布由 宽高比×百万像素 换算，改它们不生效）；自定义Sigmas 槽默认空置（接少步 sigma 表覆盖「步数/调度器」）；序章（上传视频当第 1 段）走「起始视频」端口，导演台默认把它收起，需要时载入含序章连线的旧工作流即可恢复；顶栏「↺ 全局重置」一键回出厂（链参数 + 语义桥 + 二采；性能优化与 AI 优化设置各有自己的恢复默认）。"
+      ],
+      "widgets_values_named": {
+        "text": "# H3 长片导演台 · 配套默认工作流（2026-10-01 版）\n\n生成全在左侧「长片导演台」侧栏：提示词 / 素材 / 链参数一体化，画布零连线操作。\n- 提示词走导演台状态，1–64 段不限：顶部选段条「＋」加段；素材在三库面板（项目资产 / 全局库 / 成片）拖放，或正文 @素材名 引用\n- 每段自动存 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图）；「自动成片=开启」另编码完整成片，段卡片直接预览播放\n- 链路自动推导（无模式选择）：段里引用素材即走 ref conditioning；纯文生链走 fl2va\n\n**一采链（上排，左→右）**：UNET int8 混合权重（fl2va+ref2va）→ turbo 加速 LoRA（配套少步采样，本模板步数 8）→ Motion Repair 运动修复 0.6 → comfy kitchen 注意力 → Sol-Attn 块稀疏注意力（≥12288 token 生效、0.2 起生效）→ 主节点\n\n**二采链（下排）**：UNET w6a8 → 同款注意力 → 主节点「二采模型」槽，专做高清精化二采（换权重不影响一采与接缝重摇）\n\n**出厂链参数**（= 右栏「↺ 恢复默认」基准，与 nodes.py 默认值同源）：\n- 16:9 · 1.0MP（1376×768）｜每段时长 8s｜步数 8｜CFG 1｜res_multistep / simple\n- 审片模式 关｜自动保存 分段｜自动成片 开｜参考图像尺寸 max（身份保真优先，参考管线 2048 短边，较慢）\n- 检测重摇默认全关（桥帧门控 / 接缝重摇）——要自动排坏段，到「视频延续 · 检测重摇」里打开\n- 右栏「二采放大」预置：跟随生成 · 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n- 语义桥预置：开 · BUNNY V2 · alpha 0.15 · 全量过桥；AI 优化：GLM 预设（open.bigmodel.cn · glm-5.3-flashx，Key 在「AI 优化设置」自填）\n\n小字：「宽度/高度」是旧版兼容位（画布由 宽高比×百万像素 换算，改它们不生效）；自定义Sigmas 槽默认空置（接少步 sigma 表覆盖「步数/调度器」）；序章（上传视频当第 1 段）走「起始视频」端口，导演台默认把它收起，需要时载入含序章连线的旧工作流即可恢复；顶栏「↺ 全局重置」一键回出厂（链参数 + 语义桥 + 二采；性能优化与 AI 优化设置各有自己的恢复默认）。"
+      },
+      "color": "#432",
+      "bgcolor": "#653"
     }
   ],
   "links": [
@@ -450,7 +739,7 @@ window.H3_DEFAULT_WORKFLOW = {
       2,
       0,
       10,
-      1,
+      3,
       "CLIP"
     ],
     [
@@ -458,7 +747,7 @@ window.H3_DEFAULT_WORKFLOW = {
       3,
       0,
       10,
-      2,
+      0,
       "VAE"
     ],
     [
@@ -466,24 +755,40 @@ window.H3_DEFAULT_WORKFLOW = {
       4,
       0,
       10,
-      3,
+      1,
       "VAE"
     ],
     [
-      34,
+      46,
+      60,
+      0,
+      10,
+      2,
+      "MODEL"
+    ],
+    [
+      47,
       1,
       0,
-      53,
+      63,
       0,
       "MODEL"
     ],
     [
-      36,
-      10,
-      3,
-      54,
+      48,
+      63,
       0,
-      "STRING"
+      64,
+      0,
+      "MODEL"
+    ],
+    [
+      49,
+      64,
+      0,
+      53,
+      0,
+      "MODEL"
     ],
     [
       45,
@@ -494,50 +799,98 @@ window.H3_DEFAULT_WORKFLOW = {
       "MODEL"
     ],
     [
-      46,
+      58,
+      10,
+      3,
+      54,
+      0,
+      "STRING"
+    ],
+    [
+      59,
+      69,
+      0,
+      70,
+      0,
+      "MODEL"
+    ],
+    [
       60,
+      70,
+      0,
+      71,
+      0,
+      "MODEL"
+    ],
+    [
+      61,
+      71,
       0,
       10,
-      0,
+      4,
       "MODEL"
     ]
   ],
   "groups": [
     {
       "id": 1,
-      "title": "模型加载",
+      "title": "① 模型加载",
       "bounding": [
-        -760,
-        0,
-        720,
-        620
+        -1010,
+        -10,
+        700,
+        540
       ],
       "color": "#3f789e",
       "flags": {}
     },
     {
       "id": 2,
-      "title": "导演台主链",
+      "title": "② 一采加速链（LoRA × 注意力）",
       "bounding": [
-        0,
-        0,
-        1260,
-        1100
+        -270,
+        -10,
+        1060,
+        420
       ],
-      "color": "#88A",
+      "color": "#2a8f6d",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "③ 导演台主节点",
+      "bounding": [
+        810,
+        0,
+        690,
+        300
+      ],
+      "color": "#a1309b",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "④ 二采模型链（高清精化）",
+      "bounding": [
+        -1010,
+        560,
+        1450,
+        350
+      ],
+      "color": "#b58b2a",
       "flags": {}
     }
   ],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.6512906823746598,
+      "scale": 0.5,
       "offset": [
-        1868.9135086855777,
-        765.6611648228783
+        570,
+        10
       ]
     },
-    "frontendVersion": "1.48.7"
+    "frontendVersion": "1.53.6"
   },
   "version": 0.4
 };

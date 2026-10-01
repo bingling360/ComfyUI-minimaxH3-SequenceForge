@@ -148,6 +148,7 @@ function ok(cond, msg) {
          * 都是单次载入的瞬态 —— 每次 loadGraphData 重建/清空，不跨项目攒状态 */
         LINK_REPAIR_TYPES: { scope: "const" },
         pendingLinkIntents: { scope: "derived" },
+        pendingOutputIntents: { scope: "derived" },   // 输出侧意图：同一次载入重建/清空，不跨项目攒状态
         _linkRepairNoted: { scope: "derived" },   // 载入钩子里随 pendingLinkIntents 一并 clear
     };
 

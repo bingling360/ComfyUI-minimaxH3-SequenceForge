@@ -68,20 +68,32 @@ def _assert_frozen(wf):
     #    节点上再留一份 = 一张表两处入口，两处会打架。新控件仍恒加在末尾。）
     _wv = sampler.get("widgets_values", [])
     assert len(_wv) == 30
-    assert _wv[-2:] == ["match", 1.0], _wv[-2:]
+    assert _wv[-2:] == ["max", 1], _wv[-2:]   # rev3（2026-10-01）：出厂口径 参考图像尺寸=max
     assert any(L[5] == "MODEL" for L in wf["links"])
     # P4b 全冻结：无任何画布外联（提示词/素材全走导演台状态）
     assert not any(n["type"] == "PrimitiveStringMultiline" for n in wf["nodes"])
-    # P4g：画布只剩模型链 + 序章（「资产包」输入已删）
+    # P4g：画布只剩模型链（「资产包」输入已删）；rev3.1 起模板按 1.53.6 序列化口径：
+    # 停机场槽（起始视频/起始视频音轨）不落盘，含「自定义Sigmas」纯连线槽
     assert sorted(i.get("name") for i in sampler.get("inputs", [])) == sorted([
-        "模型", "文本编码器", "视频VAE", "音频VAE",
-        "起始视频", "起始视频音轨", "二采模型",
+        "模型", "文本编码器", "视频VAE", "音频VAE", "二采模型", "自定义Sigmas",
     ])
-    # 「二采模型」：可选 MODEL 槽，默认不接线（不接=沿用一采「模型」）
+    # 模板输出 = schema 4 槽制（1.53.6 实测：运行时输出槽永远按 schema 建，序列化
+    # 的 outputs 数组对布局无效）；「报告」必须带连线且在末位（连线表 origin_slot
+    # 按 schema 位次解析，位次错了报告线会落到「帧率」上）
+    _outs = [o.get("name") for o in sampler.get("outputs", [])]
+    assert _outs == ["图像", "音频", "帧率", "报告"], _outs
+    _rep = [o for o in sampler.get("outputs", []) if o.get("name") == "报告"]
+    assert _rep and _rep[0].get("links"), "模板报告输出必须带连线"
+    # 「二采模型」：可选 MODEL 槽。rev3（2026-10-01）起默认接独立二采链
+    # （UNET w6a8 → 注意力 → 本槽，高清精化专用；不接=沿用一采「模型」）
     _up = [i for i in sampler.get("inputs", []) if i.get("name") == "二采模型"]
     assert len(_up) == 1
     assert _up[0].get("type") == "MODEL"
-    assert _up[0].get("link") is None
+    assert _up[0].get("link") is not None
+    # 「自定义Sigmas」：纯连线槽（无 widget，不占 widgets_values），默认空置
+    _sig = [i for i in sampler.get("inputs", []) if i.get("name") == "自定义Sigmas"]
+    assert len(_sig) == 1 and _sig[0].get("type") == "SIGMAS"
+    assert _sig[0].get("link") is None
     for i in sampler.get("inputs", []):
         name = i.get("name") or ""
         if name in ("起始视频", "起始视频音轨"):

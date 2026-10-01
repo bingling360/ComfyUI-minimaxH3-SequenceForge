@@ -101,8 +101,8 @@ ok(api.snapSecondsToFrames(8) === 192, "8s -> 192 帧", api.snapSecondsToFrames(
 ok(api.framesToSeconds(124) === 5.17, "124 帧 -> 5.17s", api.framesToSeconds(124), 5.17);
 ok(api.segAlignSeconds({ seconds: 5 }) === 5.17, "段 5s 的对齐 S.SS = 5.17",
     api.segAlignSeconds({ seconds: 5 }), 5.17);
-ok(api.segAlignSeconds({}) === 5.17, "没写时长时默认 5s 也要走同一换算",
-    api.segAlignSeconds({}), 5.17);
+ok(api.segAlignSeconds({}) === 8.0, "没写时长时默认 8s（出厂默认）也要走同一换算",
+    api.segAlignSeconds({}), 8.0);
 
 /* ---------- 2) 句式：逐字照抄 h3-dialect.md §1.2 ---------- */
 const fl = api.v2InstrLines("FL2VA", 8, true, true, 3);

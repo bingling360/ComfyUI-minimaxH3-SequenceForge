@@ -46,7 +46,7 @@ const W_DS = "导演台状态";
 const W_AR = "宽高比";
 const W_MP = "百万像素";
 /* 版本标记：浏览器控制台过滤 [h3-director] 可确认加载的是新 JS 还是缓存旧版 */
-const H3D_VER = "20260914+lib-dup-gate+link-repair";
+const H3D_VER = "20261001+link-repair-io";
 const W_DUR = "每段时长";
 const W_WIDTH = "宽度";
 const W_HEIGHT = "高度";
@@ -274,7 +274,7 @@ function snapFrames(seconds) {
      * （round(6.5)=6 而 Math.round(6.5)=7）。段长一旦差 1 帧，对齐指令的
      * S.SS 就跟着差 0.04s，前端显示和实跑注入又对不上。 */
     const s = Number(seconds);
-    if (!isFinite(s) || s <= 0) return 124;      // 与后端默认 5s 一致
+    if (!isFinite(s) || s <= 0) return 192;      // 与后端默认 8s 一致（192=17×11+5）
     const f = Math.max(5, pyRound(s * 24));
     const k = Math.max(0, pyRound((f - 5) / 17));
     return 17 * k + 5;
@@ -296,7 +296,7 @@ function segmentSeconds(node, seg) {
     const s = Number(seg && seg.seconds);
     if (Number.isFinite(s) && s > 0) return s;
     const defRaw = Number(getWidgetValue(node, W_DUR));
-    return Number.isFinite(defRaw) && defRaw > 0 ? defRaw : 5.0;
+    return Number.isFinite(defRaw) && defRaw > 0 ? defRaw : 8.0;   // 兜底=出厂默认 8s
 }
 
 function segmentFrames(node, seg) {
@@ -1811,6 +1811,7 @@ function migrateGraphWidgets(graphData) {
  * 守卫：tests/js/link_repair_check.js。 */
 const LINK_REPAIR_TYPES = new Set([NODE_TYPE, "H3SeamDoctor", "H3EAVFetaPatch", "H3EAVFetaReport"]);
 let pendingLinkIntents = [];
+let pendingOutputIntents = [];      // 输出侧连线意图（见 savedOutputIntents）
 const _linkRepairNoted = new Set();   // 报过的 link id：多次兜底扫描不重复刷屏
 
 /** 存档 → 本插件节点的「连线意图」：[{id, targetId, name, type}]。
@@ -1843,6 +1844,62 @@ function savedLinkIntents(graphData) {
         out.push({ id: String(id), targetId: String(targetId),
                    name: port.name ? String(port.name) : "",
                    type: String(type || port.type || "") });
+    }
+    return out;
+}
+
+/** 存档 → 本插件节点的「输出连线意图」：[{id, originId, name, targetId, targetName, type}]。
+ *
+ *  为什么输出侧也要修（1.53.6 真机两轮实证）：运行时**输出槽 = schema 固定 4 槽**，
+ *  但存档里的 outputs 数组可能是 3 槽制（旧前端会话／载入窗口被前端 prune 过），
+ *  「报告」在 2 号位——连线表按位次解析，落点随本机槽数在「报告/帧率」之间漂；
+ *  输入侧前端有 realignment 兜底，输出侧没有。意图从存档 outputs[].links 收
+ *  （名字 ↔ link id 同源，与 inputs 一致）；运行时定位这条线优先走「目标输入端口
+ *  的领线」（input realignment 之后 input.link 是可信的运行时 id），找不到再退回
+ *  存档 link id（老文件未经 remint 的场合）。 */
+function savedOutputIntents(graphData) {
+    const out = [];
+    if (!graphData || !Array.isArray(graphData.nodes)) return out;
+    const nodesOf = new Map();
+    const allNodesOf = new Map();
+    for (const n of graphData.nodes) {
+        if (!n) continue;
+        allNodesOf.set(String(n.id), n);
+        if (LINK_REPAIR_TYPES.has(n.type)) nodesOf.set(String(n.id), n);
+    }
+    if (!nodesOf.size) return out;
+    const src = graphData.links;
+    const links = Array.isArray(src) ? src
+        : (src && typeof src === "object" ? Object.values(src) : []);
+    const linkById = new Map();
+    for (const L of links) {
+        if (Array.isArray(L)) linkById.set(String(L[0]), L);
+        else if (L && typeof L === "object" && L.id != null) linkById.set(String(L.id), L);
+    }
+    for (const n of nodesOf.values()) {
+        if (!Array.isArray(n.outputs)) continue;
+        for (const o of n.outputs) {
+            if (!o || !o.name) continue;
+            const ids = Array.isArray(o.links) ? o.links
+                : (o.links && typeof o.links === "object" ? Object.values(o.links) : []);
+            for (const rawId of ids) {
+                const L = linkById.get(String(rawId));
+                let targetId, tslot, type;
+                if (Array.isArray(L)) { targetId = L[3]; tslot = L[4]; type = L[5]; }
+                else if (L) { targetId = L.target_id; tslot = L.target_slot; type = L.type; }
+                else continue;
+                const tNode = allNodesOf.get(String(targetId));
+                const tPort = (tNode && Array.isArray(tNode.inputs))
+                    ? (tNode.inputs.find((s) => s && s.link != null && String(s.link) === String(rawId))
+                       || tNode.inputs[tslot])
+                    : null;
+                out.push({ id: String(rawId), originId: String(n.id),
+                           name: String(o.name),
+                           targetId: String(targetId),
+                           targetName: tPort && tPort.name ? String(tPort.name) : "",
+                           type: String(type || o.type || "") });
+            }
+        }
     }
     return out;
 }
@@ -2026,21 +2083,126 @@ function repairMisplacedLinks(intents, graph) {
 
 /** 队列入口：载入钩子（Promise 结算 / 兜底定时器）与 loadedGraphNode 三处都调它。 */
 function runPendingLinkRepair() {
-    if (!pendingLinkIntents.length) return 0;
-    const res = repairMisplacedLinks(pendingLinkIntents);
-    pendingLinkIntents = res.rest;
-    if (res.moved) {
-        console.log(`[h3-director] 端口错位修复：${res.moved} 条连线按存档里的端口名搬回了正确位置`
-            + "（本机端口顺序与存档不同 —— 多半是两台机器/两个版本不一致；"
-            + "改完就在本机另存一份，别把这个文件拷回原来那台）");
+    let movedAll = 0, droppedAll = 0, conflictAll = 0;
+    if (pendingLinkIntents.length) {
+        const res = repairMisplacedLinks(pendingLinkIntents);
+        pendingLinkIntents = res.rest;
+        movedAll += res.moved; droppedAll += res.dropped; conflictAll += res.conflicts;
+        if (res.moved) {
+            console.log(`[h3-director] 端口错位修复：${res.moved} 条输入连线按存档里的端口名搬回了正确位置`
+                + "（本机端口顺序与存档不同 —— 多半是两台机器/两个版本不一致；"
+                + "改完就在本机另存一份，别把这个文件拷回原来那台）");
+        }
+        if (res.dropped || res.conflicts) {
+            console.warn(`[h3-director] 端口错位修复：断开 ${res.dropped} 条（端口已下线）、`
+                + `${res.conflicts} 条需人工确认（详见上面的 error）`);
+        }
     }
-    if (res.dropped || res.conflicts) {
-        console.warn(`[h3-director] 端口错位修复：断开 ${res.dropped} 条（端口已下线）、`
-            + `${res.conflicts} 条需人工确认（详见上面的 error）`);
+    if (pendingOutputIntents.length) {
+        const res2 = repairMisplacedOutputLinks(pendingOutputIntents);
+        pendingOutputIntents = res2.rest;
+        movedAll += res2.moved; droppedAll += res2.dropped; conflictAll += res2.conflicts;
+        if (res2.moved) {
+            console.log(`[h3-director] 端口错位修复：${res2.moved} 条输出连线按存档里的端口名接回了正确端口`
+                + "（本机输出槽位与存档不同 —— 1.53.x 的槽位裁剪/4 槽 schema 差异，输出侧没有前端兜底）");
+        }
+        if (res2.dropped || res2.conflicts) {
+            console.warn(`[h3-director] 端口错位修复（输出侧）：断开 ${res2.dropped} 条（端口已下线）、`
+                + `${res2.conflicts} 条需人工确认（详见上面的 error）`);
+        }
     }
     const g = app.graph;
-    if (res.moved && g && typeof g.setDirtyCanvas === "function") g.setDirtyCanvas(true, true);
-    return res.moved;
+    if (movedAll && g && typeof g.setDirtyCanvas === "function") g.setDirtyCanvas(true, true);
+    return movedAll;
+}
+
+/** 槽对象上记的连线 id 集合（数组形态 / 对象形态都兜住）。 */
+function slotLinkIds(slot) {
+    if (!slot || slot.links == null) return [];
+    return Array.isArray(slot.links) ? slot.links.map(String)
+        : (typeof slot.links === "object" ? Object.values(slot.links).map(String) : []);
+}
+
+/** 输出侧修复：把本插件节点「按名认领」的输出连线对准本机运行时端口。
+ *
+ *  与输入侧的两个不同：① 输出端口可以一拖多（outputs[].links 是数组），
+ *  不存在「占用冲突」，直接逐条对准；② 运行时这条线**优先按目标输入端口的领线
+ *  定位**（载入时前端 input realignment 已把目标侧修对），按存档 link id 只是兜底
+ *  —— 前端载入可能 remint link id（61→62 那种），存档 id 不总可信。
+ *  同名输出端口在本机不存在 → 断开（铁律②同款，绝不留在错误端口上）。 */
+function repairMisplacedOutputLinks(intents, graph) {
+    const g = graph || app.graph;
+    const out = { rest: [], moved: 0, dropped: 0, conflicts: 0 };
+    if (!Array.isArray(intents) || !intents.length) return out;
+    if (!g || !Array.isArray(g._nodes) || !g._nodes.length) { out.rest = intents.slice(); return out; }
+    const linkById = new Map();
+    for (const l of liveLinksOf(g)) linkById.set(String(l.id), l);
+    for (const it of intents) {
+        const node = liveNodeById(g, it.originId);
+        if (!node || !Array.isArray(node.outputs)) { out.rest.push(it); continue; }
+        /* 运行时这条线在哪：目标输入端口领的线为准，存档 link id 兜底 */
+        let link = null;
+        const tNode = liveNodeById(g, it.targetId);
+        if (tNode && Array.isArray(tNode.inputs)) {
+            const tPort = it.targetName
+                ? tNode.inputs.find((s) => s && s.name === it.targetName) : null;
+            const claim = tPort && tPort.link != null ? String(tPort.link) : null;
+            if (claim && linkById.has(claim)) link = linkById.get(claim);
+        }
+        if (!link && linkById.has(it.id)) link = linkById.get(it.id);
+        if (!link || String(link.origin_id) !== String(node.id)) {
+            /* 还没挂上（等下一轮）／不是这个节点的线（异常文件，不动） */
+            if (!link) {
+                it.tries = (it.tries || 0) + 1;
+                if (it.tries < 3) out.rest.push(it);
+            }
+            continue;
+        }
+        const to = node.outputs.findIndex((s) => s && s.name === it.name);
+        if (to < 0) {
+            /* 铁律②：同名输出端口在本机已不存在 → 断开，绝不留在错误端口上 */
+            const runtimeId0 = link.id != null ? String(link.id) : it.id;
+            const from = node.outputs.findIndex((s) => slotLinkIds(s).includes(runtimeId0));
+            let done = false;
+            if (from >= 0 && typeof node.disconnectOutput === "function") {
+                try { node.disconnectOutput(from); done = true; } catch (e) { /* 走目标侧兜底 */ }
+            }
+            if (!done) {
+                const tn = liveNodeById(g, link.target_id);
+                if (tn && Array.isArray(tn.inputs)) {
+                    const tp = tn.inputs.find((s) => s && String(s.link) === String(link.id));
+                    if (tp && typeof tn.disconnectInput === "function") {
+                        try { tn.disconnectInput(tn.inputs.indexOf(tp)); done = true; } catch (e) { /* 放弃 */ }
+                    }
+                }
+            }
+            noteLinkRepair({ id: it.id, targetId: it.originId },
+                `存档输出端口「${it.name}」在本机已不存在` + (done ? "，这条输出线已断开" : "，请手工删掉这条线"),
+                done ? "warn" : "error");
+            if (done) out.dropped += 1; else out.conflicts += 1;
+            continue;
+        }
+        const slot = node.outputs[to];
+        /* 运行时 id 优先：前端载入可能 remint link id（61→62），旧槽上挂的是新 id */
+        const runtimeId = link.id != null ? String(link.id) : it.id;
+        if (slotLinkIds(slot).includes(runtimeId) && Number(link.origin_slot) === to) continue;   // 已在正确端口
+        const from = node.outputs.findIndex((s) => s !== slot && slotLinkIds(s).includes(runtimeId));
+        const fromName = from >= 0 ? (node.outputs[from] ? node.outputs[from].name : "?") : null;
+        if (from >= 0 && Array.isArray(node.outputs[from].links)) {
+            node.outputs[from].links = node.outputs[from].links.filter((x) => String(x) !== runtimeId);
+        }
+        try { link.origin_slot = to; } catch (e) { /* 只读对象：放弃改写，靠下一步尽量挂上 */ }
+        if (!Array.isArray(slot.links)) slot.links = [];
+        if (!slotLinkIds(slot).includes(runtimeId)) {
+            slot.links.push(link.id != null ? link.id
+                : (Number.isFinite(Number(it.id)) ? Number(it.id) : it.id));
+        }
+        noteLinkRepair({ id: it.id, targetId: it.originId },
+            `输出线按存档端口名接回「${slot.name}」` + (fromName ? `（原先落在「${fromName}」）` : ""),
+            "warn");
+        out.moved += 1;
+    }
+    return out;
 }
 
 /** 兜底：宽高比控件值非法（错位载入/手工改坏/旧「自定义」档）时修正，避免后端换算报错。
@@ -2071,29 +2233,36 @@ function defaultDs() {
  * 逐项目（跟二采设置同款，不像性能设置那样跟机器）：它改的是画出来的东西，该跟着作品走。
  * 关闭时后端一个张量都不碰 —— 不加载权重、不建张量，也不进任何指纹。
  * 开启时进 ckpt_params 指纹（`scope`/`alpha`/权重任一变化 → 整链重做）：cond 变了，
- * 只重做一半会做出「前几段带桥、后几段不带」的半条链，比整链重做糟得多。 */
+ * 只重做一半会做出「前几段带桥、后几段不带」的半条链，比整链重做糟得多。
+ *
+ * 2026-10-01：默认值与新版默认工作流同源（开启 · BUNNY V2 · alpha 0.15 · 全量过桥）。
+ * getDs 对**缺键的老存档**另有保守填充（关，见那段内联 default），不经过这里 ——
+ * 既有项目不会被静默改写；「恢复默认 / 全局重置 / 新建项目」走本函数。 */
 function defaultBridge() {
-    return { enabled: false, adapter: "", alpha: 0.15, scope: "all" };
+    return { enabled: true, adapter: "BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors", alpha: 0.15, scope: "all" };
 }
 
 function defaultUpscale() {
     /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹。
        schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移。
-       time_bias / mix / shift / stg / sharpen / pixel_sharpen 默认 0=关、adaptive / retry
-       默认 false=关、passes=1=单轮、encode=标准、采样器空=沿用主链——仅启用时进后端
-       指纹（不使既有记录失效）。抗糊武器库详见《更新说明_二采抗糊抗条纹》 */
-    return { schema: 2, on: true, mode: "关闭", model: "", arch: "auto", scale: 2.0,
+       time_bias / mix / stg / sharpen / pixel_sharpen 默认 0=关、adaptive / retry
+       默认 false=关、passes=1=单轮——仅启用时进后端指纹（不使既有记录失效）。
+       抗糊武器库详见《更新说明_二采抗糊抗条纹》。
+       2026-10-01：默认值与新版默认工作流同源（跟随生成 · 1.4× · 去噪 0.35 ·
+       精化 4 步 · shift 6 · euler/simple）。getDs 对**缺键的老存档**另有保守填充，
+       不经过这里；「恢复默认 / 全局重置 / 新建项目」走本函数。 */
+    return { schema: 2, on: true, mode: "跟随生成", model: "minimax_h3_latent_upscaler_3d_fp16.safetensors", arch: "auto", scale: 1.4,
              /* 目标尺寸模式：倍率（现状默认）/ 目标尺寸 / 百万像素 */
              size_mode: "倍率", target_w: 1280, target_h: 704, megapixels: 1.0,
-             denoise: 0.35, steps: 6, cfg: 1.0, precision: "fp16",
-             time_bias: 0.0, mix: 0.0, adaptive: false, shift: 0.0,
+             denoise: 0.35, steps: 4, cfg: 1.0, precision: "fp16",
+             time_bias: 0.0, mix: 0.0, adaptive: false, shift: 6.0,
              stg: 0.0, stg_block: 25, passes: 1, decay: 0.5,
              sharpen: 0.0, pixel_sharpen: 0.0,
              /* 3D 时序分块（`chunk`）与放大网络强制卸载（`force_unload`）**已迁到
               * 性能优化设置**（机器级、全局），项目存档里不再有这两个键 —— 见该字段表
               * 「放大网络 · 分块 / 常驻」两组。别再往这里加回来。 */
              device: "auto",
-             sampler: "", scheduler: "", retry: false, retry_target: 0.15,
+             sampler: "euler", scheduler: "simple", retry: false, retry_target: 0.15,
              include: [] };
 }
 
@@ -4430,7 +4599,7 @@ const H3_PERF_FIELDS = [
           + "那个是纯前馈（一次 forward，切开算再融合即可）；这个是**扩散采样循环**，段与段之间没有注意力交互 → "
           + "接缝两侧各自收敛到不同局部解 → **接缝逐帧闪烁**（不是一条静止的缝）。必须配合接缝医生" },
     { key: "refine_temporal_chunk", label: "　　每段帧数", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
-      hint: "0=关。每段多少帧。越小越省显存，接缝也越多。默认 124 ≈ 5.17 秒（与主链「每段时长」默认同宽，等于整段不切）；想切细再给 16–24（一段 5 秒 ≈ 120 帧 → 5–8 段）" },
+      hint: "0=关。每段多少帧。越小越省显存，接缝也越多。默认 192 = 8 秒（与主链「每段时长」默认同宽，等于整段不切）；想切细再给 16–24（一段 5 秒 ≈ 120 帧 → 5–8 段）" },
     { key: "refine_temporal_overlap", label: "　　段间重叠（latent token）", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
       hint: "**单位是 latent token，不是像素**（与下面空间那个 overlap 不是一个量纲）。至少 8，不够会明显闪烁。"
           + "视频模型的 latent 时间压缩比通常为 4 或 8，所以 8 个 latent token 约等于 32–64 帧" },
@@ -9277,15 +9446,17 @@ function renderWidgetField(node, name, labelOverride) {
 
 /* ---- 右栏「恢复默认」（2026-09-30 用户要求：性能优化 / 右栏 / AI优化三处各一个） ----
  * 链参数默认值 = nodes.py INPUT_TYPES 的 default（前端镜像一份；改后端默认值时
- * 必须同步这里）。语义桥 / 二采的默认值直接用 defaultBridge / defaultUpscale，
- * 不另抄一份。 */
+ * 必须同步这里）。2026-10-01 起与新版默认工作流同源：1.0MP / 8s / 8 步 /
+ * 参考图像尺寸 max / 桥帧门控 关 / 接缝重摇 关（用户导出口径）。
+ * 语义桥 / 二采的默认值直接用 defaultBridge / defaultUpscale（2026-10-01 起同样
+ * 与默认工作流同源：桥开 · BUNNY V2；二采 跟随生成 1.4×），不另抄一份。 */
 const CHAIN_DEFAULTS = {
-    [W_AR]: "16:9", [W_MP]: 0.5, [W_DUR]: 5.0, [W_SEED]: 0,
-    "步数": 25, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple",
-    "审片模式": "关闭", "自动保存": "分段", "自动成片": "开启", "参考图像尺寸": "match",
+    [W_AR]: "16:9", [W_MP]: 1.0, [W_DUR]: 8.0, [W_SEED]: 0,
+    "步数": 8, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple",
+    "审片模式": "关闭", "自动保存": "分段", "自动成片": "开启", "参考图像尺寸": "max",
     "引导帧数": "22", "锚定加噪": 0, "递减锚定": "关闭", "响度对齐强度": 1.0,
-    "桥帧门控": "标注", "清晰度阈值": 30.0, "回退上限": 34,
-    "接缝重摇": "自动", "重摇阈值": 0.06, "重摇上限": 1,
+    "桥帧门控": "关闭", "清晰度阈值": 30.0, "回退上限": 34,
+    "接缝重摇": "关闭", "重摇阈值": 0.06, "重摇上限": 1,
 };
 
 /** 区头右上角的小按钮行（三个区共用一个样式，不放 sechead 里——那里不是 flex） */
@@ -9330,7 +9501,7 @@ function resetContinuityParams(node) {
     if (!node) return;
     if (!window.confirm("把「视频延续」恢复为默认值？\n\n"
         + "引导帧数 22 / 锚定加噪 0 / 递减锚定 关 / 响度对齐 1.0；"
-        + "桥帧门控 标注 / 清晰度阈值 30 / 回退上限 34 / 接缝重摇 自动 / "
+        + "桥帧门控 关 / 清晰度阈值 30 / 回退上限 34 / 接缝重摇 关 / "
         + "重摇阈值 0.06 / 重摇上限 1。\n基础设置不受影响。")) return;
     applyChainDefaults(node, [...KEYFRAME_DEFS, ...SEAM_DEFS]);
     repaintParams();
@@ -9339,14 +9510,15 @@ function resetContinuityParams(node) {
 function resetBridgeDefaults(node) {
     if (!node) return;
     if (!window.confirm("把语义桥恢复为默认设置？\n\n"
-        + "关闭开关、强度回到 0.15、范围回到「全量过桥」、权重清空。")) return;
+        + "开启开关 · BUNNY V2 权重 · 强度 0.15 · 全量过桥。")) return;
     applyBridgeDefaults(node);
 }
 
 function resetUpscaleDefaults(node) {
     if (!node) return;
     if (!window.confirm("把二采放大恢复为默认设置？\n\n"
-        + "模式 / 模型 / 尺寸 / 采样 / 抗糊增强全部回到默认（段选择清空）。")) return;
+        + "跟随生成 · 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n"
+        + "（模式 / 模型 / 尺寸 / 采样 / 抗糊增强全部回默认，段选择清空）。")) return;
     applyUpscaleDefaults(node);
 }
 
@@ -9361,8 +9533,9 @@ function resetAllParams(node) {
     }
     if (!window.confirm("把全部生成参数恢复为默认值？\n\n"
         + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 检测重摇）\n"
-        + "· 语义桥（关闭 / 0.15 / 全量过桥 / 无权重）\n"
-        + "· 二采放大（关闭 / 2 倍 / 0.35 去噪）\n\n"
+        + "· 语义桥（开启 / BUNNY V2 / 0.15 / 全量过桥）\n"
+        + "· 二采放大（跟随生成 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n\n"
+        + "以上默认值与新版默认工作流同源。\n"
         + "不含：性能优化（机器级）、AI 优化设置、每段提示词与锚定。\n"
         + "版本更新导致参数错位时，重置即回到节点当前定义的默认值。")) return;
     applyChainDefaults(node, Object.keys(CHAIN_DEFAULTS));
@@ -9406,7 +9579,7 @@ function renderParamsZone(sec, data) {
     /* 组内恢复默认：只动本组（关键帧 + 检测重摇），基础设置不动——
      * 与基础设置上那个区级按钮各管各的（区级仍重置全部）。 */
     cont.append(resetRow("↺ 恢复默认",
-        "「视频延续」恢复为默认（引导帧数 22 / 门控 标注 / 接缝重摇 自动 …）；基础设置不受影响",
+        "「视频延续」恢复为默认（引导帧数 22 / 门控 关 / 接缝重摇 关 …）；基础设置不受影响",
         () => resetContinuityParams(node)));
     const cwrap = el("div", "h3d-adv-grid");
     const kf = foldSection("param-kf", false,
@@ -9516,7 +9689,7 @@ function renderBridgeZone(sec, data) {
     const models = data.bridgeModels || [];
     sec.replaceChildren();
     sec.append(resetRow("↺ 恢复默认",
-        "语义桥（本栏）恢复为默认：关闭 / 0.15 / 全量过桥 / 无权重",
+        "语义桥（本栏）恢复为默认：开启 / BUNNY V2 / 0.15 / 全量过桥",
         () => resetBridgeDefaults(node)));
     const det = foldSection("bridge-top", false,
         "<summary>🌉 语义桥（条件增强）"
@@ -9689,7 +9862,7 @@ function renderUpscaleZone(sec, data) {
     const { node, state, mf } = data;
     sec.replaceChildren();
     sec.append(resetRow("↺ 恢复默认",
-        "二采放大（本栏）恢复为默认：关闭 / 自动架构 / 2 倍 / 0.35 去噪",
+        "二采放大（本栏）恢复为默认：跟随生成 / 自动架构 / 1.4 倍 / 0.35 去噪 / 精化 4 步",
         () => resetUpscaleDefaults(node)));
     const up = data.ds.upscale;
     const on = up.mode !== "关闭";
@@ -10986,10 +11159,15 @@ function paintDeskNode(node) {
         const keepIn = this.inputs, keepOut = this.outputs;
         this.inputs = keepIn.filter(deskSlotVisible);
         this.outputs = keepOut.filter(deskSlotVisible);
-        const size = origComputeSize.call(this);
-        this.inputs = keepIn;
-        this.outputs = keepOut;
-        return size;
+        try {
+            return origComputeSize.call(this);
+        } finally {
+            /* 必须 finally 归还：origComputeSize 在载入窗口可能抛异常（widget 未就绪），
+             * 一旦漏还，过滤后的 outputs 数组就永久丢失端口（「帧率」整个消失，
+             * 老存档的报告连线随之落空）—— 1.53.6 真机出过这事。 */
+            this.inputs = keepIn;
+            this.outputs = keepOut;
+        }
     };
 }
 
@@ -11049,7 +11227,7 @@ app.registerExtension({
         /* 端口错位修复的第三个触发点：老前端 loadGraphData 不返回 Promise，
          * 节点建好时链接才刚挂上 → 每次节点载入顺手把待修队列排到下一拍再跑
          * （同步改线会撞上正在进行的 configure；空队列时 runPendingLinkRepair 直接返回） */
-        if (pendingLinkIntents.length) setTimeout(runPendingLinkRepair, 0);
+        if (pendingLinkIntents.length || pendingOutputIntents.length) setTimeout(runPendingLinkRepair, 0);
     },
     nodeCreated(node) {
         if (node && node.type === NODE_TYPE) {
@@ -11071,9 +11249,10 @@ app.registerExtension({
             app.loadGraphData = function (data, ...args) {
                 const migrated = migrateGraphWidgets(data);
                 pendingLinkIntents = savedLinkIntents(migrated);
+                pendingOutputIntents = savedOutputIntents(migrated);
                 _linkRepairNoted.clear();
                 const res = origLoadGraphData(migrated, ...args);
-                if (pendingLinkIntents.length) {
+                if (pendingLinkIntents.length || pendingOutputIntents.length) {
                     const run = () => runPendingLinkRepair();
                     if (res && typeof res.then === "function") res.then(run, run);
                     else setTimeout(run, 0);

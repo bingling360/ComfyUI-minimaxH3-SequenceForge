@@ -23,6 +23,11 @@
  *   「关键位语义仍对齐」逐位写的就是**自带默认工作流自己的值**——它是串位探测器，
  *   所以以后**每次改默认工作流参数，这里对应的那几行必须同步改**，不许删。
  *
+ * 2026-10-01（rev 3）：默认工作流按用户「新版默认工作流.json」重制，链参数出厂值
+ *   同步为 1.0MP / 每段时长 8s / 步数 8（turbo 少步配套）/ 审片 关 / 参考图像尺寸
+ *   max / 桥帧门控 关 / 接缝重摇 关；旧版兼容位「宽度/高度」对齐真实画布 1376×768。
+ *   同批：nodes.py INPUT_TYPES 与 h3_director.js CHAIN_DEFAULTS 同步（三处同源）。
+ *
  * 用法：node tests/js/widget_layout_migrate_check.js
  *      （pytest 侧由 tests/test_js_checks.py 统一收集）
  */
@@ -77,21 +82,22 @@ t("迁移后关键位语义仍对齐（任何一位串位都会红）", () => {
     w.migrateGraphWidgets(graph);
     const wv = samplerOf(graph).widgets_values;
     assert.strictEqual(wv[1], 1, "百万像素");
-    assert.strictEqual(wv[2], 864, "宽度");
-    assert.strictEqual(wv[8], 20, "步数");
+    assert.strictEqual(wv[2], 1376, "宽度（旧版兼容位，对齐 1MP 16:9 画布）");
+    assert.strictEqual(wv[4], 8, "每段时长");
+    assert.strictEqual(wv[8], 8, "步数");
     assert.strictEqual(wv[9], 1, "CFG");
     assert.strictEqual(wv[10], "res_multistep", "采样器");
     assert.strictEqual(wv[16], 34, "回退上限");
     assert.strictEqual(wv[17], 0, "锚定加噪");
-    assert.strictEqual(wv[18], "逐段确认", "审片模式");
+    assert.strictEqual(wv[18], "关闭", "审片模式");
     assert.strictEqual(wv[21], "关闭", "接缝重摇");
     assert.strictEqual(wv[22], 0.06, "重摇阈值");
     assert.strictEqual(wv[23], 1, "重摇上限");
     assert.strictEqual(wv[24], "关闭", "递减锚定");
     assert.strictEqual(wv[25], "文生视频", "生成模式");
     assert.strictEqual(wv[26], "开启", "自动成片");
-    assert.strictEqual(wv[28], "match", "参考图像尺寸");
-    assert.strictEqual(wv[29], 1.0, "响度对齐强度");
+    assert.strictEqual(wv[28], "max", "参考图像尺寸");
+    assert.strictEqual(wv[29], 1, "响度对齐强度");
 });
 
 t("判据：当前 30 值 / 上一版 29 值 → 视为当前，不重排", () => {
@@ -162,13 +168,13 @@ t("★ 当前布局但宽高比=「自定义」（已删档位）→ 只换画�
     const before = samplerOf(clone(w.H3_DEFAULT_WORKFLOW)).widgets_values;
     const legacy = before.slice();
     legacy[0] = "自定义";
-    // 864×480 面积 ≈0.3955MP → 就近 0.4MP；比例 1.8 → 16:9
+    // 1376×768 面积 ≈1.008MP → 就近 1.0MP；比例 1.79 → 16:9
     const graph = { nodes: [{ type: "H3SeamlessChainSampler", widgets_values: legacy }] };
     w.migrateGraphWidgets(graph);
     const out = graph.nodes[0].widgets_values;
     assert.strictEqual(out.length, CUR, "迁移不应改变值数");
     assert.strictEqual(out[0], "16:9", "宽高比应反推到最近比例");
-    assert.strictEqual(out[1], 0.4, "百万像素应按面积就近（0.1 步进）");
+    assert.strictEqual(out[1], 1.0, "百万像素应按面积就近（0.1 步进）");
     for (let i = 2; i < CUR; i++) {
         assert.strictEqual(out[i], before[i], `第 ${i} 位不应被迁移改动`);
     }

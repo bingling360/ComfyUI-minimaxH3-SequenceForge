@@ -963,7 +963,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Combo.Input("宽高比", options=["21:9", "16:9", "9:16", "4:3", "3:4", "1:1"], default="16:9",
                                tooltip="官方 Resolution Selector 同款：与「百万像素」共同换算画布"
                                        "（1MP=1024×1024，32 倍数对齐）"),
-                io.Float.Input("百万像素", default=0.5, min=0.1, max=2.0, step=0.1,
+                io.Float.Input("百万像素", default=1.0, min=0.1, max=2.0, step=0.1,
                                tooltip="目标总像素（MP），0.1–2.0 步进 0.1，箭头微调（官方 Resolution Selector 同款口径）："
                                        "0.2 草稿（608×352）/ 0.5 快速预览（960×544）/ 0.98 H3 官方原生（1344×768）/ "
                                        "1.0（1376×768）/ 2.0 超采样（1920×1088）"),
@@ -973,14 +973,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Int.Input("高度", default=480, min=32, max=16384, step=32, advanced=True,
                              tooltip="旧版兼容位（原「自定义」画幅入口，该档位已删）："
                                      "画布始终由 宽高比+百万像素 换算覆盖，改这两个控件不生效"),
-                io.Float.Input("每段时长", default=5.0, min=0.5, max=15.0, step=0.1,
+                io.Float.Input("每段时长", default=8.0, min=0.5, max=15.0, step=0.1,
                                tooltip="每段可见时长（秒）@24fps，内部自动吸附 H3 的 17k+5 帧网格："
-                                       "5.0s→124帧、6.0s→141帧。全链默认值，导演台每段可单独覆盖"),
+                                       "8.0s→192帧、5.0s→124帧。全链默认值，导演台每段可单独覆盖"),
                 io.Combo.Input("引导帧数", options=["5", "22", "39", "56"], default="22",
                                tooltip="段间引导重叠桥：钉入下段头部的上段尾帧数。越大衔接越顺、越慢越吃显存"),
                 io.Int.Input("种子", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
                              tooltip="第 i 段实际使用 种子+i"),
-                io.Int.Input("步数", default=25, min=1, max=100),
+                io.Int.Input("步数", default=8, min=1, max=100),
                 io.Float.Input("CFG", default=1.0, min=0.0, max=100.0, step=0.1),
                 io.Combo.Input("采样器", options=comfy.samplers.KSampler.SAMPLERS, default="res_multistep"),
                 io.Combo.Input("调度器", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
@@ -991,7 +991,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.String.Input("存档目录", default="",
                                 tooltip="项目名：output/h3_projects/<项目名>/ 一个项目一个文件夹（视频/提示词/成片/latent 全在内）。"
                                         "空=按参数指纹自动命名；填了名字即固定项目：中断重跑、改词重跑都续在这个文件夹"),
-                io.Combo.Input("桥帧门控", options=["关闭", "标注", "自动回退"], default="标注",
+                io.Combo.Input("桥帧门控", options=["关闭", "标注", "自动回退"], default="关闭",
                                tooltip="对将成为重叠桥的尾帧打分（Laplacian清晰度+曝光）：标注=只写报告；自动回退=尾帧低于阈值时向前回退17/34帧取好帧续拍（该段可见帧数随之减少）"),
                 io.Float.Input("清晰度阈值", default=30.0, min=0.0, max=100.0, step=0.5,
                                tooltip="桥帧总分阈值，低于判定为坏尾。建议先跑「标注」档看报告里的分数分布再定"),
@@ -1016,7 +1016,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Int.Input("重跑起始段", default=0, min=0, max=63,
                              tooltip="0=自动（沿用存档进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成"
                                      "（有序章时序章为第 1 段），配合改「种子」即可重摇该段及之后。用完记得改回 0"),
-                io.Combo.Input("接缝重摇", options=["关闭", "自动"], default="自动",
+                io.Combo.Input("接缝重摇", options=["关闭", "自动"], default="关闭",
                                tooltip="自动：本段生成后若接缝帧差 > 重摇阈值，换种子重采本段（最多「重摇上限」次），"
                                        "排除抽卡坏段（同参数下缝差 0.02-0.17 波动大，重摇取达标结果）；"
                                        "回放段（存档载入）不参与重摇。坏段触发时每次重摇=一次完整段采样时长"),
@@ -1074,7 +1074,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 旧工作流残留连线加载时自动忽略。
                 # —— 新控件一律加在**本列表末尾**（= widgets_values 末尾）：旧工作流值不足时
                 #    按默认值补齐；插进中间会顶掉它之后所有控件的既有取值。
-                io.Combo.Input("参考图像尺寸", options=["match", "max"], default="match",
+                io.Combo.Input("参考图像尺寸", options=["match", "max"], default="max",
                                tooltip="参考图缩放口径（官方 Reference to Video 同款）："
                                        "match=每张参考图按本次生成画幅的像素面积等比缩小（只缩不放，省显存与时间）；"
                                        "max=走参考管线的 2048 短边，身份保真最好，"

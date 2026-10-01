@@ -24,9 +24,12 @@ function t(name, fn) {
 const { w, errors } = load({});
 
 const mkSec = () => w.document.createElement("div");
+/* 面板夹具基线 = **关闭态**（显式给，不跟 defaultBridge 走）：2026-10-01 起
+ * defaultBridge 与默认工作流同源（开启），关闭态的置灰/未勾渲染逻辑仍要有用例守着 */
+const BRIDGE_OFF = { enabled: false, adapter: "", alpha: 0.15, scope: "all" };
 const mkData = (node, bridge, models) => ({
     node,
-    ds: { bridge: Object.assign(w.defaultBridge(), bridge || {}) },
+    ds: { bridge: Object.assign({}, BRIDGE_OFF, bridge || {}) },
     bridgeModels: models || [],
 });
 /** 渲染一栏，返回 { det, cbs, nums, sels, params, text } */
@@ -49,15 +52,15 @@ const MODEL = "BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors";
 
 console.log("\n== 语义桥面板 ==");
 
-t("defaultBridge 契约：默认关闭 / alpha 0.15 / 全量过桥", () => {
+t("defaultBridge 契约：默认开启 / BUNNY V2 / alpha 0.15 / 全量过桥（与默认工作流同源）", () => {
     const b = w.defaultBridge();
-    assert.strictEqual(b.enabled, false, "默认必须关闭（否则既有项目会被静默改写）");
-    assert.strictEqual(b.adapter, "");
+    assert.strictEqual(b.enabled, true, "2026-10-01 起默认开启（与新版默认工作流同源）");
+    assert.strictEqual(b.adapter, MODEL);
     assert.strictEqual(b.alpha, 0.15);
     assert.strictEqual(b.scope, "all");
 });
 
-t("getDs 缺键：补出完整 bridge 默认值（不让 undefined 进后端）", () => {
+t("getDs 缺键（老存档）：保守补关闭态，不跟 defaultBridge 一起翻转", () => {
     const n = mkNode({ prompts: ["x"] });
     const b = w.getDs(n).bridge;
     assert.strictEqual(b.enabled, false);

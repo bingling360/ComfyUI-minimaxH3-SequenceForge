@@ -6,9 +6,10 @@
  *   ② 免打扰名单就是那 5 个，一个不多一个不少；三个内部方法（_measureSlots / drawSlots /
  *      computeSize）都得包上，少包一个就会出现「端口看不见但还占着行高」；
  *   ③ 必须按**名字**认端口 —— 按位次认的话，控件一增删就错位；
- *   ④ 反向：后端 schema 与两个工作流 JSON 里的端口**一个都不许删**。删「帧率」会把
- *      「报告」从第 3 位挤到第 2 位（输出位次就是连线的坐标），老工作流的报告连线会
- *      静默接到帧率上。这条只有靠守卫钉着才不会被后人「顺手清理」掉。
+ *   ④ 反向：后端 schema 的端口**一个都不许删**（帧率/起始视频等停机场槽是 schema 真身，
+ *      模板上藏而不删）。默认工作流模板自 rev 3.1 起按 1.53.6 序列化口径走（停机场槽
+ *      不落盘、3 输出制），「报告」必须是最后一个输出条目且带连线——位次就是连线坐标，
+ *      位次错了载入即断线。
  *
  * 纯读文件断言，不需要 jsdom。跑法：NODE_PATH=<root>/node_modules node tests/js/desk_node_skin_check.js
  */
@@ -75,7 +76,7 @@ ok(director.includes("H3_DESK_HIDE_SLOTS.has(slot.name)"),
 ok(!/H3_DESK_HIDE_SLOTS\.has\((?!slot\.name)/.test(director),
    "H3_DESK_HIDE_SLOTS 的命中键只能是槽位名");
 
-/* ---------- ④ 反向：后端与工作流的端口一个都不许删 ---------- */
+/* ---------- ④ 反向：后端端口一个都不许删；模板按 1.53.6 序列化口径 ---------- */
 for (const out of ['io.Int.Output("帧率")', 'io.String.Output("报告")']) {
     ok(nodesPy.includes(out), `nodes.py 误删输出：${out}`);
 }
@@ -83,9 +84,32 @@ for (const inp of ['io.Image.Input("起始视频"', 'io.Audio.Input("起始视�
                    'io.Model.Input("二采模型"', 'io.Sigmas.Input("自定义Sigmas"']) {
     ok(nodesPy.includes(inp), `nodes.py 误删输入：${inp}`);
 }
-for (const nm of ["起始视频", "起始视频音轨", "帧率"]) {
-    ok(templateWf.includes('"name": "' + nm + '"'),
-       `默认工作流误删端口条目：${nm}（藏而不删，删了会串位）`);
+/* 模板输出 = schema 4 槽制（1.53.6 实测：运行时输出槽永远按 schema 建，序列化里的
+ * outputs 数组对布局无效）；「报告」必须是最后一个输出条目且带着连线，连线表
+ * origin_slot 按 schema 位次（3）解析——位次错了报告线会落到「帧率」上（rev3.1 真断过）。
+ * 输入侧相反：运行时输入由序列化数组重建，停机场槽（起始视频/起始视频音轨）不进模板。 */
+let tplWf = null;
+try {
+    const m = templateWf.match(/window\.H3_DEFAULT_WORKFLOW\s*=\s*(\{[\s\S]*\})\s*;?\s*$/);
+    if (m) tplWf = JSON.parse(m[1]);
+} catch (e) { /* 解析失败由下面的 ok 兜底报红 */ }
+ok(!!tplWf, "默认工作流 JSON 解析失败");
+if (tplWf) {
+    const s = (tplWf.nodes || []).find((n) => n.type === "H3SeamlessChainSampler");
+    ok(!!s, "默认工作流缺主节点");
+    if (s) {
+        const outs = (s.outputs || []).map((o) => o.name);
+        ok(JSON.stringify(outs) === JSON.stringify(["图像", "音频", "帧率", "报告"]),
+           `模板输出应为 schema 4 槽制，实际：${outs.join("/")}`);
+        const rep = (s.outputs || []).find((o) => o.name === "报告");
+        ok(!!rep && Array.isArray(rep.links) && rep.links.length > 0,
+           "模板「报告」输出必须带连线（否则载入即断报告线）");
+        ok(outs.indexOf("报告") === outs.length - 1, "「报告」必须是最后一个输出条目（位次=连线坐标）");
+        const ins = (s.inputs || []).map((i) => i.name);
+        for (const gone of ["起始视频", "起始视频音轨"]) {
+            ok(!ins.includes(gone), `模板不该带停机场槽「${gone}」（输入侧由序列化数组重建）`);
+        }
+    }
 }
 
 console.log(fails.length ? `\n${fails.length} 个断言失败：\n  ` + fails.join("\n  ")

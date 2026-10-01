@@ -156,8 +156,8 @@ DEFAULT_PERF = {
     # `frames = min(frames, chunk_frames + 2)` 只按单块算）。外面再套一层是与官方 tile
     # 叠加 → 更慢更糊、显存一点不多省。留着只会让人以为勾了有用。
     "refine_temporal_on": False,      # 精化时序分块总开关
-    # 124 帧 ≈ 5.17 秒 = 与主链「每段时长」默认同宽（即整段不切）。0 也是「不分块」。
-    "refine_temporal_chunk": 124,
+    # 192 帧 = 8 秒 = 与主链「每段时长」默认同宽（即整段不切）。0 也是「不分块」。
+    "refine_temporal_chunk": 192,
     "refine_temporal_overlap": 8,     # 段间重叠 latent token（单位：latent token，非像素）
     "refine_tile_on": False,          # 精化空间分块总开关
     "refine_tile": "2x1",             # off / 2x2 / 3x3 / 4x4 / 2x1（横向 2 条）/ 1x2

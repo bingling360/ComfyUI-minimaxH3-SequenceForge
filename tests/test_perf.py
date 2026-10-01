@@ -1169,7 +1169,7 @@ def test_chunk_param_defaults_are_sane():
     assert d["attn_head_chunks"] == 8            # 建议起点（实测平台期起点；1 = 不分块）
     assert d["upscale_chunk_frames"] == 32       # 上游同款默认
     assert d["upscale_overlap"] == 0             # 0 = 自动取卷积核宽（只增不减）
-    assert d["refine_temporal_chunk"] == 124     # ≈ 5.17 秒，与主链「每段时长」同宽
+    assert d["refine_temporal_chunk"] == 192    # = 8 秒，与主链「每段时长」默认（8s）同宽
     assert d["refine_temporal_overlap"] == 8     # 至少 8 latent token
     assert d["refine_tile"] == "2x1"             # 横向 2 条（总开关仍默认关）
     assert d["refine_tile_overlap"] == 32 and d["refine_tile_feather"] == 16

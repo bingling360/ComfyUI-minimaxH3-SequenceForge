@@ -2093,6 +2093,16 @@ def add_routes(routes):
         if it["scope"] != "global":
             return _err("只有全局库条目需要「调入项目」（项目资产已经在项目里了）",
                         code="NOT_GLOBAL", status=400)
+        if str(it.get("kind") or "") == "latent":
+            # latent 不进项目资产库：H3 的素材引用（@别名 / 绿框 / REF_CAPS）只收
+            # 图/视/音，项目里没有 latent 的引用入口——复制/链接进去都只会得到一个
+            # 引用不到的死条目（此前 copy 模式会把 kind 压成 image 落清单，正是
+            # 用户撞到的 bug）。latent 的跨项目复用：存入全局库 → 锚定面板挑选
+            # （执行期按 asset_id 解析回全局库的 .pt）。
+            return _err("latent 不进项目资产库：H3 的素材引用只收图/视/音，"
+                        "项目里引用不了 latent。跨项目复用请在锚定面板「选素材」时"
+                        "直接从全局库挑它（执行期按 asset_id 解析）。",
+                        code="LATENT_NO_MIRROR", status=400)
         mode = str(data.get("mode") or "link").strip().lower()
         if mode == "copy":
             # 同名闸门：项目资产里已经有同名条目 -> 拒绝（前端连按钮都不画，

@@ -375,15 +375,15 @@
     return Array.isArray(it.blocked) && it.blocked.indexOf(target) >= 0;
   }
 
-  /** 瓦片上的常驻动作：「下载」+「改名」。
+  /** 瓦片上的常驻动作：**只留「改名」**。
    *
    *  「调入项目 / 存入全局库 / 删除」原本都在这里，结果每张瓦片被按钮糊满、
    *  缩略图只剩一条缝，而它们真正的使用场景是"对一批素材做同一件事"——
    *  一件一件点反而更慢。这三个已迁到工具条的批量操作区（常显，见 open 里的
    *  batchBox），选中谁就作用于谁；右键菜单里也还留着同样的入口。
    *  改名是唯一"只跟这一张有关"的动作，留在瓦片上。
-   *  下载（2026-09-30 用户要求）：原来只藏在右键菜单/预览器里，瓦片上给常驻
-   *  按钮——导出单个素材是高频动作，不该让人先想起"右键"。 */
+   *  （下载在工具条批量区「⬇ 下载」：单选直接另存、多选打包 ZIP——
+   *  2026-09-30 用户拍板不再放瓦片上，批量才顺手。） */
   function tileButtons(it) {
     const box = el("div", "h3l-tbtns");
     const mk = (label, on, fn, danger) => {
@@ -399,7 +399,6 @@
       mk(`✓ ${roles.join("·")}`, true,
         () => say(`「${it.name}」带有旧的首尾帧标注：现在请在导演台每段的「资产引用」栏指定首/尾帧图`));
     }
-    mk("⬇ 下载", false, () => actDownload(it, [it.id]));
     if (it.scope === "project" || it.scope === "global") {
       mk("改名", false, () => actAlias(it));
     }
@@ -740,7 +739,7 @@
     if (many) {
       // 目标库已有同名的直接排除在批量动作之外（与瓦片按钮同一套判定）
       const gl = S.items.filter((x) => S.sel.has(x.id) && x.scope === "global"
-        && !isBlocked(x, "project"));
+        && x.kind !== "latent" && !isBlocked(x, "project"));
       if (gl.length) {
         m.append(menuItem(`⇩ 把选中的 ${gl.length} 个全局素材调入项目（复制）`,
           () => actBringMany(gl)));
@@ -757,7 +756,10 @@
       }
     }
     if (it.scope === "global" && !many) {
-      if (!isBlocked(it, "project")) {
+      /* latent 不给「调入项目」：H3 的素材引用只收图/视/音，项目里没有
+       * latent 的引用入口——把它复制进 assets/ 只会得到一个用不上的死条目。
+       * latent 的跨项目复用走「存入全局库」+ 锚定面板挑选。 */
+      if (it.kind !== "latent" && !isBlocked(it, "project")) {
         m.append(menuItem("⇩ 调入项目（复制一份到项目 assets/）", () => actBring(it)));
       }
     } else if (it.scope === "finals" && !many) {
@@ -1247,14 +1249,19 @@
     };
     mkBatch("⇩ 调入项目",
       "把选中的全局库/成片素材复制进本项目 assets/（源库那份还在）。"
-      + "目标库已有同名的会被自动跳过",
+      + "目标库已有同名的会被自动跳过；latent 不进项目资产库（H3 引用只收图/视/音）",
       () => {
         const gl = S.items.filter((x) => S.sel.has(x.id) && x.scope === "global"
-          && !isBlocked(x, "project"));
+          && x.kind !== "latent" && !isBlocked(x, "project"));
         const fi = S.items.filter((x) => S.sel.has(x.id) && x.scope === "finals"
           && !isBlocked(x, "project"));
         const all = [...gl, ...fi];
-        if (!all.length) { say("选中的素材都不在全局库/成片里（项目资产本来就已在项目里）"); return; }
+        if (!all.length) {
+          say("选中的素材没有可调入项目的（项目资产本来就已在项目里；"
+            + "latent 不进项目资产库——H3 的素材引用只收图/视/音，"
+            + "跨项目请在锚定面板「选素材」时直接从全局库挑）");
+          return;
+        }
         for (const x of gl) actBring(x);
         for (const x of fi) actToAssets(x);
       });
@@ -1267,6 +1274,13 @@
           && !x.linked && !isBlocked(x, "global"));
         if (!up.length) { say("选中的素材没有可存入全局库的（已是全局素材 / 目标库已有同名）"); return; }
         actArchiveMany(up);
+      });
+    mkBatch("⬇ 下载",
+      "下载选中的素材：1 个直接另存为原文件；多个打包成一个 ZIP（跨 scope 混选也行）",
+      () => {
+        const rows = S.items.filter((x) => S.sel.has(x.id));
+        if (rows.length === 1) actDownload(rows[0], [rows[0].id]);
+        else actZip(rows.map((x) => x.id));
       });
     mkBatch("🗑 删除", "删除选中的素材（不可撤销）",
       () => actDelete([...S.sel]), true);

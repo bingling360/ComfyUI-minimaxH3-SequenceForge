@@ -7199,6 +7199,14 @@ function openDesk() {
         + "（报错或被中断后不再一直挂着「已提交队列」）。\n"
         + "不会取消正在跑的生成 —— 要取消请用页脚「✕ 终止」。";
     refreshBtn.onclick = () => { refreshAll(); };
+    /* 全局重置：紧挨「刷新」——两个都是"界面/参数不对劲了先点它"的兜底动作。
+     * 链参数（画布控件）+ 语义桥 + 二采一次拉回默认；版本更新导致控件值
+     * 错位/出现怪值时用它兜底（按控件名落值，不依赖位置，天然修错位）。 */
+    const resetAllBtn = el("button", "h3d-btn", "↺ 全局重置");
+    resetAllBtn.title = "全部生成参数一键恢复默认：链参数（画布控件）+ 语义桥 + 二采放大。"
+        + "版本更新导致参数错位 / 改乱了想回头时用。\n"
+        + "不含性能优化（机器级，在 ⚡ 性能优化弹窗里）、AI 优化设置、每段提示词与锚定。";
+    resetAllBtn.onclick = () => resetAllParams(findNode());
     /* AI 优化设置也是**全链共用**的一套（服务商 / 模型 / 提示词规则），
      * 跟性能优化同级。以前它挂在每段卡里 —— 每段都长一个按钮，看着像"本段设置"，
      * 而且必须翻到某一段才点得到。放顶栏后位置固定，不用先找段。
@@ -7257,8 +7265,8 @@ function openDesk() {
      * 无从判断是没数据还是代码挂了。这里把区名与错误一行摆到顶栏。 */
     const zoneErr = el("span", "h3d-zoneerr", "");
     zoneErr.style.display = "none";
-    right.append(fixFocus, refreshBtn, optBtn, perfBtn, cmdRefBtn, vramBtn, ledWrap,
-                 sub, zoneErr, close);
+    right.append(fixFocus, refreshBtn, resetAllBtn, optBtn, perfBtn, cmdRefBtn,
+                 vramBtn, ledWrap, sub, zoneErr, close);
     topbar.append(left, right);
 
     /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */
@@ -9291,34 +9299,77 @@ function resetRow(label, title, fn) {
     return row;
 }
 
+/* ---- 无确认的 apply 层：各区自己的恢复默认（带各自 confirm）与顶栏
+ * 「全局重置」（只 confirm 一次）共用同一份落值逻辑，不各写一份。 ---- */
+function applyChainDefaults(node, names) {
+    for (const name of names) setWidgetValue(node, name, CHAIN_DEFAULTS[name]);
+}
+function applyBridgeDefaults(node) {
+    setBridge(node, defaultBridge());   // setBridge 内部已 setDs + repaintBridge
+}
+function applyUpscaleDefaults(node) {
+    const ds = getDs(node);
+    ds.upscale = defaultUpscale();
+    setDs(node, ds);
+    repaintUpscale();
+}
+
 function resetChainParams(node) {
     if (!node) return;
     if (!window.confirm("把链参数恢复为默认值？\n\n"
-        + "分辨率 / 时长 / 采样器 / 关键帧 / 检测重摇全部回到节点默认"
+        + "基础设置 + 视频延续全部回到节点默认"
         + "（画布控件值直接改写，种子回到 0）。")) return;
-    for (const [name, def] of Object.entries(CHAIN_DEFAULTS)) {
-        setWidgetValue(node, name, def);
-    }
+    applyChainDefaults(node, Object.keys(CHAIN_DEFAULTS));
     repaintParams();      // 重建本区（换算徽章等跟着画幅默认值走）
     repaintUpscale();     // 画幅两件影响二采目标画布估算
+}
+
+function resetContinuityParams(node) {
+    /* 「视频延续」组内的恢复默认：只动关键帧 + 检测重摇两组，
+     * 基础设置（分辨率/时长/采样器/存档…）不动 —— 两个组各管各的。 */
+    if (!node) return;
+    if (!window.confirm("把「视频延续」恢复为默认值？\n\n"
+        + "引导帧数 22 / 锚定加噪 0 / 递减锚定 关 / 响度对齐 1.0；"
+        + "桥帧门控 标注 / 清晰度阈值 30 / 回退上限 34 / 接缝重摇 自动 / "
+        + "重摇阈值 0.06 / 重摇上限 1。\n基础设置不受影响。")) return;
+    applyChainDefaults(node, [...KEYFRAME_DEFS, ...SEAM_DEFS]);
+    repaintParams();
 }
 
 function resetBridgeDefaults(node) {
     if (!node) return;
     if (!window.confirm("把语义桥恢复为默认设置？\n\n"
         + "关闭开关、强度回到 0.15、范围回到「全量过桥」、权重清空。")) return;
-    setBridge(node, defaultBridge());
+    applyBridgeDefaults(node);
 }
 
 function resetUpscaleDefaults(node) {
     if (!node) return;
     if (!window.confirm("把二采放大恢复为默认设置？\n\n"
         + "模式 / 模型 / 尺寸 / 采样 / 抗糊增强全部回到默认（段选择清空）。")) return;
-    const ds = getDs(node);
-    ds.upscale = defaultUpscale();
-    setDs(node, ds);
-    scheduleRefresh(60);
-    repaintUpscale();
+    applyUpscaleDefaults(node);
+}
+
+function resetAllParams(node) {
+    /* 顶栏「全局重置」：链参数（画布控件）+ 语义桥 + 二采一次拉回默认。
+     * 版本更新后控件值错位/出现怪值时，用它兜底回到已知状态。
+     * 不含：性能优化（机器级，在 ⚡ 性能优化弹窗里有自己的恢复默认）、
+     * AI 优化设置（里面有 API Key，误重置会丢配置）、每段提示词/锚定。 */
+    if (!node) {
+        alert("画布上没找到 H3 链节点，全局重置不可用。");
+        return;
+    }
+    if (!window.confirm("把全部生成参数恢复为默认值？\n\n"
+        + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 检测重摇）\n"
+        + "· 语义桥（关闭 / 0.15 / 全量过桥 / 无权重）\n"
+        + "· 二采放大（关闭 / 2 倍 / 0.35 去噪）\n\n"
+        + "不含：性能优化（机器级）、AI 优化设置、每段提示词与锚定。\n"
+        + "版本更新导致参数错位时，重置即回到节点当前定义的默认值。")) return;
+    applyChainDefaults(node, Object.keys(CHAIN_DEFAULTS));
+    applyBridgeDefaults(node);
+    applyUpscaleDefaults(node);
+    repaintParams();
+    scheduleRefresh(120);
 }
 
 function renderParamsZone(sec, data) {
@@ -9352,6 +9403,11 @@ function renderParamsZone(sec, data) {
     /* —— 视频延续（大折叠套两子折叠） —— */
     const cont = foldSection("param-cont", false,
         "<summary>🔗 视频延续（段间引导 / 关键帧 / 接缝）</summary>");
+    /* 组内恢复默认：只动本组（关键帧 + 检测重摇），基础设置不动——
+     * 与基础设置上那个区级按钮各管各的（区级仍重置全部）。 */
+    cont.append(resetRow("↺ 恢复默认",
+        "「视频延续」恢复为默认（引导帧数 22 / 门控 标注 / 接缝重摇 自动 …）；基础设置不受影响",
+        () => resetContinuityParams(node)));
     const cwrap = el("div", "h3d-adv-grid");
     const kf = foldSection("param-kf", false,
         "<summary>📌 关键帧设置（尾部保存 / 注入帧数 / 加噪 / 响度对齐）</summary>");

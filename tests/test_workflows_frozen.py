@@ -69,6 +69,12 @@ def _assert_frozen(wf):
     _wv = sampler.get("widgets_values", [])
     assert len(_wv) == 30
     assert _wv[-2:] == ["max", 1], _wv[-2:]   # rev3（2026-10-01）：出厂口径 参考图像尺寸=max
+    # rev3.3（2026-10-02）：出厂「存档目录」必须为空 —— 新电脑开箱即完全空项目。
+    # 旧值 "1" 把默认工作流绑死在同名项目上：一跑就落进 output/h3_projects/1/，
+    # 换参数还会跟项目指纹对不上（用户拍板：默认不绑任何项目）。
+    _slots = _widget_slots()
+    _dir_idx = next(i for i, (n, _) in enumerate(_slots) if n == "存档目录")
+    assert _wv[_dir_idx] == "", _wv[_dir_idx]
     assert any(L[5] == "MODEL" for L in wf["links"])
     # P4b 全冻结：无任何画布外联（提示词/素材全走导演台状态）
     assert not any(n["type"] == "PrimitiveStringMultiline" for n in wf["nodes"])
@@ -84,8 +90,9 @@ def _assert_frozen(wf):
     assert _outs == ["图像", "音频", "帧率", "报告"], _outs
     _rep = [o for o in sampler.get("outputs", []) if o.get("name") == "报告"]
     assert _rep and _rep[0].get("links"), "模板报告输出必须带连线"
-    # 「二采模型」：可选 MODEL 槽。rev3（2026-10-01）起默认接独立二采链
-    # （UNET w6a8 → 注意力 → 本槽，高清精化专用；不接=沿用一采「模型」）
+    # 「二采模型」：可选 MODEL 槽。rev3（2026-10-01）起默认接独立二采链，
+    # rev3.3（2026-10-02）起权重与一采同款 int8 混合（替代 w6a8）
+    # （UNET int8 混合 → 注意力 → 本槽，高清精化专用；不接=沿用一采「模型」）
     _up = [i for i in sampler.get("inputs", []) if i.get("name") == "二采模型"]
     assert len(_up) == 1
     assert _up[0].get("type") == "MODEL"
@@ -113,6 +120,45 @@ def test_template_frozen():
 
 def test_example_frozen():
     _assert_frozen(_load_wf(EXAMPLE))
+
+
+def _upscale_chain(wf):
+    """从主节点「二采模型」输入向上游遍历 MODEL 链（下游→上游），反转成执行顺序。"""
+    nodes = {n["id"]: n for n in wf["nodes"]}
+    links = {L[0]: L for L in wf["links"]}
+    sampler = next(n for n in wf["nodes"] if n["type"] == "H3SeamlessChainSampler")
+    cur = links[next(i for i in sampler["inputs"] if i["name"] == "二采模型")["link"]]
+    chain = []
+    while True:
+        n = nodes[cur[1]]
+        chain.append(n)
+        ins = n.get("inputs") or []
+        if not ins or ins[0].get("link") is None:
+            return list(reversed(chain))
+        cur = links[ins[0]["link"]]
+
+
+def test_upscale_chain_ignored_by_default():
+    """rev3.3（2026-10-02）：二采链出厂**整条忽略**（mode=4）。
+
+    忽略态不进执行图：二采不用时内存零占用（同款 int8 权重不会被第二个
+    UNETLoader 再读一份 ~13GB 进 RAM）。链上含二采专用 Motion Repair 0.25；
+    一采 Motion Repair 保持 0.6。要二采：框选 ④ 组「取消忽略」
+    + 右栏把二采拨回「跟随生成」。
+    """
+    for path in (TEMPLATE, EXAMPLE):
+        wf = _load_wf(path)
+        chain = _upscale_chain(wf)
+        assert [n["type"] for n in chain] == ["UNETLoader", "LoraLoaderModelOnly",
+                                              "ModelAttentionBackend",
+                                              "BlockSparseAttention"], (path, chain)
+        assert all(n["mode"] == 4 for n in chain), f"{path}: 二采链必须整条 mode=4 忽略"
+        assert chain[0]["widgets_values"][0].endswith("int8.safetensors"), path
+        assert chain[1]["widgets_values"] == ["Motion_Repair_V2.safetensors", 0.25], path
+        first = next(n for n in wf["nodes"] if n["type"] == "LoraLoaderModelOnly"
+                     and n["widgets_values"][0] == "Motion_Repair_V2.safetensors"
+                     and n["id"] != chain[1]["id"])
+        assert first["widgets_values"][1] == 0.6, f"{path}: 一采 Motion Repair 必须保持 0.6"
 
 
 def test_no_mirror_text():

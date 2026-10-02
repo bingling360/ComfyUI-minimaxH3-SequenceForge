@@ -976,8 +976,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Float.Input("每段时长", default=8.0, min=0.5, max=15.0, step=0.1,
                                tooltip="每段可见时长（秒）@24fps，内部自动吸附 H3 的 17k+5 帧网格："
                                        "8.0s→192帧、5.0s→124帧。全链默认值，导演台每段可单独覆盖"),
-                io.Combo.Input("引导帧数", options=["5", "22", "39", "56"], default="22",
-                               tooltip="段间引导重叠桥：钉入下段头部的上段尾帧数。越大衔接越顺、越慢越吃显存"),
+                io.Combo.Input("引导帧数", options=["关闭", "1", "5", "22", "39", "56"], default="22",
+                               tooltip="段间引导重叠桥：钉入下段头部的上段尾帧数。越大衔接越顺、越慢越吃显存。"
+                                       "1=单帧锚（官方同款，只钉上段末尾稳住身份，衔接弱但几乎不烧显存）；"
+                                       "关闭=段间不自动引用上段（硬切，各段独立采样），"
+                                       "响度对齐仍生效；各段锚定里的显式段首锚不受影响"),
                 io.Int.Input("种子", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
                              tooltip="第 i 段实际使用 种子+i"),
                 io.Int.Input("步数", default=8, min=1, max=100),
@@ -1532,7 +1535,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 编码画质开关（preset + 暗部 aq + 抖动）与 crf 数值**分开**：
             # 开关管「哪套 preset/抖动」，crf 单独给（面板上按编码器显隐）。
             # 两者正交 —— 开关不会带着改 crf，改 crf 也不会动开关。
-            up_cfg["encode_hq"] = bool(_pf.get("encode_hq", False))
+            up_cfg["encode_hq"] = bool(_pf.get("encode_hq", True))
             up_cfg["x264_crf"] = _pf.get("x264_crf")
             # 精化二采分块（机器级，不进指纹）：时序切段 / 空间 tile。
             # 值从 perf 直下 —— upscale.parse_state 不再解析它们（见那里的注释）。
@@ -1568,7 +1571,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 原先节点上有个「一采编码」下拉，与性能设置里的「画质档位」是同一张表 ——
         # 两个入口改同一个旋钮，已删除（2026-09-23）。二采开启时其高清产物同名覆盖，
         # 本档只作用于二采未覆盖的段与基础成片。
-        _bhq = bool(_pf.get("encode_hq", False))
+        _bhq = bool(_pf.get("encode_hq", True))
         _bcrf, _bpreset, _baq, _bdith = upscale.resolve_encode_quad(
             _bhq, _pf.get("x264_crf"))
 
@@ -1702,7 +1705,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _last_shot = len(re.findall(r"\[Shot\s+\d+\]", seg_prompts[-1])) or 1
             seg_prompts[-1] = (L2VA_HEAD.format(shot=_last_shot, t=_end_s) + "\n"
                                + seg_prompts[-1])
-        ctx = int(引导帧数)
+        # 「关闭」=0：只关**自动**段首桥（显式头锚优先，见 _eff_inject），响度对齐不受影响
+        ctx = 0 if str(引导帧数).strip() == "关闭" else int(引导帧数)
         gate_limit = max(0, int(回退上限) // 17 * 17)
         full_bridge0 = full_bridge_supported()
         # 段级注入解析（分段优先，null/0=跟随全局 ctx）：返回 (帧数, 含视频, 含音频)。
@@ -1725,6 +1729,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if _a is None:
                 if 0 <= pi < len(seg_unlink) and seg_unlink[pi]:
                     return 0, False, False
+                if ctx <= 0:   # 引导帧数=关闭：不自动引用上段（显式头锚已在上方优先）
+                    return 0, False, False
                 return grid.snap_window_down(ctx), True, True
             _av = _a["branches"]["av"]
             return _a["window"], _av in ("both", "video"), _av in ("both", "audio")
@@ -1741,6 +1747,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             """
             fr, want_v, want_a = _eff_inject(pi)
             return bool(fr > 0 and (want_v or want_a))
+        def _visual_bridge(pi):
+            """段 pi 会不会钉入**上段尾视频帧**——接缝诊断口径（只看视频分支）。
+
+            引导帧数=关闭时无显式头锚的段是纯硬切：帧差/接缝重摇没有意义，
+            一律跳过；响度对齐是独立干预，不走这个口径（见段循环响度对齐处）。
+            """
+            fr, want_v, _wa = _eff_inject(pi)
+            return bool(fr > 0 and want_v)
         def _inject_guide(video_t, audio_t, for_pi, end_tokens=None):
             """段首桥 keyframe；src 非 prev_tail 时改取该外源（库/段/视频/图片）。
 
@@ -2049,7 +2063,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         _mode = str(生成模式)   # 旧控件占位：后端不再读取，仅报告回显
-        report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}（按实际引用自动推导），上下文 {ctx} 帧"]
+        _ctx_txt = f"上下文 {ctx} 帧" if ctx > 0 else "引导桥 关闭（段间硬切，响度对齐仍生效）"
+        report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}（按实际引用自动推导），{_ctx_txt}"]
         if _te_drop:
             report.append("内存瘦身：cond 编码后即释放文本编码器驻留"
                           "（te_drop_after_cond，代价=每段首次编码多一次回载）")
@@ -3274,8 +3289,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             nxt = exec_items[item_i + 1] if item_i + 1 < len(exec_items) else None
             if not (nxt and nxt[0] == "prompt" and not seg_unlink[nxt[1]]):
                 return False
-            fr, want_v, _w = _eff_inject(nxt[1])
-            return bool(fr > 0 and want_v)
+            return _visual_bridge(nxt[1])
 
         for item_i, item in enumerate(exec_items):
             i = item[1]   # 提示词段索引（seg_lengths/seg_unlink/seg_disabled/seg_label_orders 均按此索引）
@@ -3594,7 +3608,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
                         _decode_crop(i, video_t, audio_t, skip_f, gi=g, next_bridge=next_wants_bridge)
                     d_raw = None
-                    if prev_tail_frame is not None and not seg_unlink[i]:
+                    if prev_tail_frame is not None and not seg_unlink[i] and _visual_bridge(i):
                         d_raw = qc.seam_metrics(prev_tail_frame, frames[0])[0]
                     if best is None or (d_raw is not None and (best[0] is None or d_raw < best[0])):
                         best = (d_raw, (frames.cpu(), wav.cpu(), sample_rate,
@@ -3640,17 +3654,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if gain_db is not None:
                     report.append(f"段{g + 1} 响度对齐：段首 {gain_db:+.1f} dB（1s 渐出）")
 
-            # 接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧
+            # 接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧。
+            # 只对真接了视觉桥的段有意义：断链段（unlink）与引导关闭的硬切段
+            # 帧差必然巨大，测出来只会每段误报「建议人工检查」。
             seam_n = int(sample_rate * 0.25)
             seam_d, seam_db = None, None
-            if (item_i > 0 or off) and prev_tail_frame is not None and not seg_unlink[i]:
+            if (item_i > 0 or off) and prev_tail_frame is not None \
+                    and not seg_unlink[i] and _visual_bridge(i):
                 seam_d, seam_db = qc.seam_metrics(prev_tail_frame, frames[0],
                                                   prev_tail_wav, wav[..., :seam_n], rate=sample_rate)
                 db_txt = f"{seam_db:+.1f} dB" if seam_db is not None else "—"
                 flag = " ↑ 建议人工检查" if seam_d > 0.08 or (seam_db is not None and abs(seam_db) > 6.0) else ""
                 report.append(f"段{g + 1} 接缝：帧差 {seam_d:.3f} · 响度跳变 {db_txt}{flag}")
 
-            if (item_i > 0 or off) and prev_tail_frame is not None and not seg_unlink[i]:
+            if (item_i > 0 or off) and prev_tail_frame is not None \
+                    and not seg_unlink[i] and _visual_bridge(i):
                 seams.append([round(seam_d, 4), None if seam_db is None else round(seam_db, 2)])
             else:
                 seams.append(None)
@@ -3658,7 +3676,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 本段头 48 帧的局部基线评测，在最终成帧上测。
             # 写入 manifest seam_metrics（tools/ab_report.py 的 A/B 对比数据源）
             z_row = None
-            if (item_i > 0 or off) and prev_tail_clip is not None and not seg_unlink[i]:
+            if (item_i > 0 or off) and prev_tail_clip is not None \
+                    and not seg_unlink[i] and _visual_bridge(i):
                 try:
                     z_row = metrics.evaluate_local(prev_tail_clip, frames[:48].cpu())
                     z_txt = metrics.fmt_seam_z(z_row)
@@ -3666,7 +3685,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         report.append(f"段{g + 1} 接缝基准：{z_txt}（|z|<2 合格）")
                 except Exception:
                     z_row = None
-            seam_metrics_rows.append(z_row if ((item_i > 0 or off) and not seg_unlink[i]) else None)
+            seam_metrics_rows.append(z_row if ((item_i > 0 or off) and not seg_unlink[i]
+                                               and _visual_bridge(i)) else None)
 
             _cf = frames.cpu()
             # 帧存 uint8（内存 ×¼）：全链帧 tensor 是内存峰值的大头（D3：
@@ -3726,8 +3746,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # "guide=无"（其实钉了）、「仅音频」锚被说成"上段尾N帧+音频"（其实没钉画面）。
             # 回放段不注入接片，这里仍读交棒位（与旧报告口径一致）。
             if guide is None or not _takes_bridge(i):
-                note = ("guide=无（关闭自动引用上段·断链）" if seg_unlink[i]
-                        else "guide=无（本段不挂段首桥）")
+                if seg_unlink[i]:
+                    note = "guide=无（关闭自动引用上段·断链）"
+                elif ctx <= 0 and _head_anchor(i) is None:
+                    note = "guide=无（引导帧数=关闭·段间硬切，响度对齐仍生效）"
+                else:
+                    note = "guide=无（本段不挂段首桥）"
             elif "latent" not in guide:
                 note = f"guide=仅音频{_eff_fr}帧" if full_bridge else "guide=仅音频（单帧桥降级）"
             else:

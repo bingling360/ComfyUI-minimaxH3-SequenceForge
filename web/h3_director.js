@@ -1897,11 +1897,62 @@ function savedOutputIntents(graphData) {
                            name: String(o.name),
                            targetId: String(targetId),
                            targetName: tPort && tPort.name ? String(tPort.name) : "",
+                           targetSlot: Number(tslot) || 0,
                            type: String(type || o.type || "") });
             }
         }
     }
     return out;
+}
+
+/** 活节点 → 本节点有连线的输出意图（onSerialize 落 properties 用）。
+ *  形状与 savedOutputIntents 的条目对齐（缺 id：恢复路径不按 id 找线）。 */
+function captureLiveOutputIntents(node) {
+    const out = [];
+    if (!node || !Array.isArray(node.outputs)) return out;
+    const links = liveLinksOf(node.graph);
+    for (const o of node.outputs) {
+        for (const rawId of slotLinkIds(o)) {
+            const link = links.find((l) => String(l.id) === String(rawId));
+            if (!link) continue;
+            const tNode = liveNodeById(node.graph, link.target_id);
+            const tInputs = tNode && Array.isArray(tNode.inputs) ? tNode.inputs : [];
+            let tIdx = tInputs.findIndex((s) => s && String(s.link) === String(rawId));
+            if (tIdx < 0 && Number.isInteger(link.target_slot)) tIdx = link.target_slot;
+            const tPort = tInputs[tIdx];
+            out.push({ name: String(o.name || ""),
+                       targetId: String(link.target_id),
+                       targetName: tPort && tPort.name ? String(tPort.name) : "",
+                       targetSlot: tIdx >= 0 ? tIdx : 0,
+                       type: String(link.type || o.type || "") });
+        }
+    }
+    return out;
+}
+
+/** 存档节点 properties.__h3_out_intents → 补充输出意图（断连棘轮的兜底）。
+ *  线在上次会话被裁掉**之后**才存档的话，links 表里永远没有它，
+ *  savedOutputIntents 收不到 —— 只有节点属性里这份「上次序列化时的连线快照」
+ *  能救（快照与线是否存在解耦；用户手工拔线后保存会同步清空对应意图）。 */
+function mergePropOutputIntents(graphData, intents) {
+    if (!graphData || !Array.isArray(graphData.nodes) || !Array.isArray(intents)) return;
+    for (const n of graphData.nodes) {
+        if (!n || !LINK_REPAIR_TYPES.has(n.type)) continue;
+        const saved = n.properties && Array.isArray(n.properties.__h3_out_intents)
+            ? n.properties.__h3_out_intents : [];
+        for (const it of saved) {
+            if (!it || !it.name || it.targetId == null) continue;
+            const dup = intents.some((x) => String(x.originId) === String(n.id)
+                && String(x.name) === String(it.name));
+            if (dup) continue;
+            intents.push({ id: "prop-" + String(n.id) + "-" + String(it.name),
+                           originId: String(n.id), name: String(it.name),
+                           targetId: String(it.targetId),
+                           targetName: it.targetName ? String(it.targetName) : "",
+                           targetSlot: Number(it.targetSlot) || 0,
+                           type: String(it.type || "") });
+        }
+    }
 }
 
 /** 活图上的连线：新版前端是 Map / id→link 的对象，老版是数组 —— 都兜住。 */
@@ -2150,12 +2201,41 @@ function repairMisplacedOutputLinks(intents, graph) {
             if (claim && linkById.has(claim)) link = linkById.get(claim);
         }
         if (!link && linkById.has(it.id)) link = linkById.get(it.id);
-        if (!link || String(link.origin_id) !== String(node.id)) {
-            /* 还没挂上（等下一轮）／不是这个节点的线（异常文件，不动） */
-            if (!link) {
-                it.tries = (it.tries || 0) + 1;
-                if (it.tries < 3) out.rest.push(it);
+        if (!link) {
+            /* 这条线在活图上不存在。等 3 轮（载入时序）仍没有 = 前端在 configure
+             * 时把它丢了 —— 最常见于「只有报告一条输出线」：前端会裁剪未接线的
+             * 输出槽，槽数一变 origin_slot 就越界，载入即断线；被裁掉的线不再进
+             * 存档 links 表，下次连意图都收不到（断连固化成棘轮 ——「运行报告
+             * 经常和导演台断连」的根源）。此时按名自愈重建：输出端口与目标输入
+             * 端口**都空着**才接，绝不覆盖 / 拆别人的线；接不上才报人工。 */
+            it.tries = (it.tries || 0) + 1;
+            if (it.tries < 3) { out.rest.push(it); continue; }
+            const to0 = node.outputs.findIndex((s) => s && s.name === it.name);
+            const tInputs = (tNode && Array.isArray(tNode.inputs)) ? tNode.inputs : null;
+            const tPort0 = !tInputs ? null
+                : ((it.targetName ? tInputs.find((s) => s && s.name === it.targetName) : null)
+                   || (Number.isInteger(it.targetSlot) ? tInputs[it.targetSlot] : null) || null);
+            const emptyOut = to0 >= 0 && slotLinkIds(node.outputs[to0]).length === 0;
+            if (to0 < 0 || !tNode || !tPort0 || tPort0.link != null || !emptyOut
+                    || typeof node.connect !== "function") {
+                continue;   // 建不了就放弃（端口已消失 / 被占用时绝不强接）
             }
+            let made = null;
+            try { made = node.connect(to0, tNode, tInputs.indexOf(tPort0)); } catch (e) { made = null; }
+            if (made || tPort0.link != null) {
+                noteLinkRepair({ id: it.id, targetId: it.originId },
+                    "输出线在载入时被前端丢弃（输出槽裁剪 → origin_slot 越界），已按名自愈重建"
+                    + `「${it.name}」→「${tNode.title || it.targetId}」`, "warn");
+                out.moved += 1;
+            } else {
+                noteLinkRepair({ id: it.id, targetId: it.originId },
+                    `「${it.name}」的输出线已断且自愈重建未成功，请从导演台输出手工接回`, "error");
+                out.conflicts += 1;
+            }
+            continue;
+        }
+        if (String(link.origin_id) !== String(node.id)) {
+            /* 不是这个节点的线（异常文件，不动） */
             continue;
         }
         const to = node.outputs.findIndex((s) => s && s.name === it.name);
@@ -2248,10 +2328,12 @@ function defaultUpscale() {
        time_bias / mix / stg / sharpen / pixel_sharpen 默认 0=关、adaptive / retry
        默认 false=关、passes=1=单轮——仅启用时进后端指纹（不使既有记录失效）。
        抗糊武器库详见《更新说明_二采抗糊抗条纹》。
-       2026-10-01：默认值与新版默认工作流同源（跟随生成 · 1.4× · 去噪 0.35 ·
-       精化 4 步 · shift 6 · euler/simple）。getDs 对**缺键的老存档**另有保守填充，
-       不经过这里；「恢复默认 / 全局重置 / 新建项目」走本函数。 */
-    return { schema: 2, on: true, mode: "跟随生成", model: "minimax_h3_latent_upscaler_3d_fp16.safetensors", arch: "auto", scale: 1.4,
+       2026-10-01：默认值与新版默认工作流同源（1.4× · 去噪 0.35 ·
+       精化 4 步 · shift 6 · euler/simple）；2026-10-02 起模式出厂改**关闭**
+       （用户拍板：不二采的链更省一次模型加载，要二采在右栏拨回「跟随生成」）。
+       getDs 对**缺键的老存档**另有保守填充，不经过这里；
+       「恢复默认 / 全局重置 / 新建项目」走本函数。 */
+    return { schema: 2, on: true, mode: "关闭", model: "minimax_h3_latent_upscaler_3d_fp16.safetensors", arch: "auto", scale: 1.4,
              /* 目标尺寸模式：倍率（现状默认）/ 目标尺寸 / 百万像素 */
              size_mode: "倍率", target_w: 1280, target_h: 704, megapixels: 1.0,
              denoise: 0.35, steps: 4, cfg: 1.0, precision: "fp16",
@@ -4599,7 +4681,7 @@ const H3_PERF_FIELDS = [
           + "那个是纯前馈（一次 forward，切开算再融合即可）；这个是**扩散采样循环**，段与段之间没有注意力交互 → "
           + "接缝两侧各自收敛到不同局部解 → **接缝逐帧闪烁**（不是一条静止的缝）。必须配合接缝医生" },
     { key: "refine_temporal_chunk", label: "　　每段帧数", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
-      hint: "0=关。每段多少帧。越小越省显存，接缝也越多。默认 192 = 8 秒（与主链「每段时长」默认同宽，等于整段不切）；想切细再给 16–24（一段 5 秒 ≈ 120 帧 → 5–8 段）" },
+      hint: "0=关。每段多少帧。越小越省显存，接缝也越多。默认 120 ≈ 5 秒（主链 8 秒段会被切成两块）；给 192 可与主链「每段时长」默认同宽、等于整段不切（显存够想少接缝就调回去）" },
     { key: "refine_temporal_overlap", label: "　　段间重叠（latent token）", kind: "num", enable: "refine_temporal_on", group: "精化二采 · 分块",
       hint: "**单位是 latent token，不是像素**（与下面空间那个 overlap 不是一个量纲）。至少 8，不够会明显闪烁。"
           + "视频模型的 latent 时间压缩比通常为 4 或 8，所以 8 个 latent token 约等于 32–64 帧" },
@@ -4652,9 +4734,10 @@ const H3_PERF_FIELDS = [
           + "**NVENC 不认 crf**，两者必须分开传，否则 NVENC 会静默丢掉质量档。"
           + "因 NVENC 压缩效率略低，同画质可比 crf 再调低 2–4。" },
     { key: "encode_hq", label: "高清编码档（preset + 抗条纹）", kind: "bool", group: "成片与编码 · 编码",
-      hint: "**开**：medium preset（veryfast 的率失真差约 5–15%，是编码层的二次模糊）"
+      hint: "**开**（默认）：medium preset（veryfast 的率失真差约 5–15%，是编码层的二次模糊）"
           + "+ aq-mode 3（暗部自适应量化，保暗场细节）+ Bayer 抖动（打散 8bit 量化台阶，"
-          + "消解渐变色带 / 天空横向条纹）。**关**（默认）= 现状 veryfast 无抖动。"
+          + "消解渐变色带 / 天空横向条纹）。**关** = veryfast 无抖动（编码更快；"
+          + "NVENC 下 preset / aq 本就不生效，只有抖动有效）。"
           + "⚠ 与 crf / cq **正交** —— 本开关只管 preset + 抖动，质量数值在上面单独调，"
           + "两边互不覆盖。开了会进二采指纹（换了档 → 既有高清段判失效重做）" },
 
@@ -6376,7 +6459,8 @@ function applyChainParams(node, params) {
         put(W_DUR, sec, `每段时长 ${sec}s`);
     }
     if (params.ctx != null) {
-        const v = String(params.ctx);
+        /* 引导帧数=「关闭」在后端 manifest 里存 ctx=0（数字），映射回控件档位 */
+        const v = Number(params.ctx) === 0 ? "关闭" : String(params.ctx);
         const wd = (node.widgets || []).find((x) => x.name === "引导帧数");
         if (!wd || (wd.options?.options || []).includes(v)) {
             put("引导帧数", v, `引导帧数 ${v}`);
@@ -6451,11 +6535,13 @@ function paramsSummary(node, mf) {
     const durRaw = Number(p.length ? p.length / 24 : gw(W_DUR));
     const len = isFinite(durRaw) && durRaw > 0
         ? `${(p.length ? p.length / 24 : durRaw).toFixed(1)}s/段${p.length ? `(${p.length}f)` : ""}` : "";
-    const ctx = p.ctx || gw("引导帧数");
+    /* 引导帧数：manifest ctx=0（数字）与控件值「关闭」都表示段间不挂桥 */
+    const ctxRaw = p.ctx != null ? String(p.ctx) : gw("引导帧数");
+    const ctx = ctxRaw === "0" || ctxRaw === "关闭" ? "关" : ctxRaw;
     return {
         geo,
         len,
-        ctx: ctx ? `引导${ctx}帧` : "",
+        ctx: ctx ? `引导${ctx}${ctx === "关" ? "" : "帧"}` : "",
     };
 }
 
@@ -9449,7 +9535,7 @@ function renderWidgetField(node, name, labelOverride) {
  * 必须同步这里）。2026-10-01 起与新版默认工作流同源：1.0MP / 8s / 8 步 /
  * 参考图像尺寸 max / 桥帧门控 关 / 接缝重摇 关（用户导出口径）。
  * 语义桥 / 二采的默认值直接用 defaultBridge / defaultUpscale（2026-10-01 起同样
- * 与默认工作流同源：桥开 · BUNNY V2；二采 跟随生成 1.4×），不另抄一份。 */
+ * 与默认工作流同源：桥开 · BUNNY V2；二采 关闭 · 1.4×，rev 3.3），不另抄一份。 */
 const CHAIN_DEFAULTS = {
     [W_AR]: "16:9", [W_MP]: 1.0, [W_DUR]: 8.0, [W_SEED]: 0,
     "步数": 8, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple",
@@ -9517,7 +9603,7 @@ function resetBridgeDefaults(node) {
 function resetUpscaleDefaults(node) {
     if (!node) return;
     if (!window.confirm("把二采放大恢复为默认设置？\n\n"
-        + "跟随生成 · 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n"
+        + "关闭 · 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n"
         + "（模式 / 模型 / 尺寸 / 采样 / 抗糊增强全部回默认，段选择清空）。")) return;
     applyUpscaleDefaults(node);
 }
@@ -9534,7 +9620,7 @@ function resetAllParams(node) {
     if (!window.confirm("把全部生成参数恢复为默认值？\n\n"
         + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 检测重摇）\n"
         + "· 语义桥（开启 / BUNNY V2 / 0.15 / 全量过桥）\n"
-        + "· 二采放大（跟随生成 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n\n"
+        + "· 二采放大（关闭 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n\n"
         + "以上默认值与新版默认工作流同源。\n"
         + "不含：性能优化（机器级）、AI 优化设置、每段提示词与锚定。\n"
         + "版本更新导致参数错位时，重置即回到节点当前定义的默认值。")) return;
@@ -9862,7 +9948,7 @@ function renderUpscaleZone(sec, data) {
     const { node, state, mf } = data;
     sec.replaceChildren();
     sec.append(resetRow("↺ 恢复默认",
-        "二采放大（本栏）恢复为默认：跟随生成 / 自动架构 / 1.4 倍 / 0.35 去噪 / 精化 4 步",
+        "二采放大（本栏）恢复为默认：关闭 / 自动架构 / 1.4 倍 / 0.35 去噪 / 精化 4 步",
         () => resetUpscaleDefaults(node)));
     const up = data.ds.upscale;
     const on = up.mode !== "关闭";
@@ -11214,7 +11300,25 @@ app.registerExtension({
      * title_text_color 是节点类的属性（drawTitleText 读 this.constructor.title_text_color），
      * 所以只能在注册期挂在 nodeType 上，挂不到单个实例。 */
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData && nodeData.name === NODE_TYPE) nodeType.title_text_color = "#fff";
+        if (nodeData && nodeData.name === NODE_TYPE) {
+            nodeType.title_text_color = "#fff";
+            /* 存档时把「有连线的输出」快照进 properties.__h3_out_intents：
+             * 输出线一旦在载入时被前端裁掉（输出槽裁剪 → origin_slot 越界），
+             * 存档 links 表从此没有这条线，savedOutputIntents 再也收不到 ——
+             * 断连就此固化。快照与线是否存在解耦，载入侧据此按名接回
+             * （repairMisplacedOutputLinks 的自愈分支）；用户手工拔线并保存后
+             * 快照同步清空，不会违背人工操作。 */
+            const origOnSerialize = nodeType.prototype.onSerialize;
+            nodeType.prototype.onSerialize = function (o) {
+                const r = origOnSerialize ? origOnSerialize.call(this, o) : undefined;
+                try {
+                    const d = o || (o = {});
+                    d.properties = d.properties || {};
+                    d.properties.__h3_out_intents = captureLiveOutputIntents(this);
+                } catch (e) { /* 快照失败不影响正常存档 */ }
+                return r;
+            };
+        }
     },
     /* 画布节点就绪即刷新：面板首刷可能早于工作流载入（节点未就绪 → 各区渲染
      * 「画布上未找到节点」），之后没有任何事件再触发刷新——这里在节点载入/
@@ -11250,6 +11354,7 @@ app.registerExtension({
                 const migrated = migrateGraphWidgets(data);
                 pendingLinkIntents = savedLinkIntents(migrated);
                 pendingOutputIntents = savedOutputIntents(migrated);
+                mergePropOutputIntents(migrated, pendingOutputIntents);
                 _linkRepairNoted.clear();
                 const res = origLoadGraphData(migrated, ...args);
                 if (pendingLinkIntents.length || pendingOutputIntents.length) {

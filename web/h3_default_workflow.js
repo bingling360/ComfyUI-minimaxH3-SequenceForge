@@ -1,6 +1,10 @@
-/* H3 长片导演台 · 配套默认工作流模板（rev 3.2 · 2026-10-01）
+/* H3 长片导演台 · 配套默认工作流模板（rev 3.3 · 2026-10-02）
  *
  * 由用户导出「新版默认工作流.json」（frontend 1.53.6）重制；按用户截图反馈修三轮：
+ * - rev3.3（2026-10-02，用户拍板）：二采 UNET 由 w6a8 换成 int8 混合（与一采同权重）；
+ *   二采链新增 Motion Repair 0.25（一采保持 0.6）；二采链**整条出厂忽略**
+ *   （mode=4，不进执行图、内存零占用 —— 要二采时框选 ④ 组「取消忽略」再跑）；
+ *   导演台「二采放大」出厂模式改为关闭（要二采在右栏开）。
  * - rev3.2 报告线连到「帧率」（真机 1.53.6 两轮实证）：运行时输出槽按 schema 建 4 槽，
  *   但前端会把「未接线的停机场槽」从数组里裁掉 → 3/4 槽随载入时序漂移，输出连线
  *   按位次写本质不可靠。最终口径：模板 outputs 写 schema 4 槽、报告线 origin_slot=3；
@@ -18,11 +22,13 @@
  * 链路与参数（同 rev3）：
  * - 一采：UNET int8 混合 → turbo LoRA（步数 8 配套）→ Motion Repair 0.6 →
  *   comfy kitchen 注意力 → Sol-Attn 块稀疏 → 主节点
- * - 二采：UNET w6a8 → 同款注意力 → 主节点「二采模型」槽（高清精化专用）
+ * - 二采：UNET int8 混合（rev3.3 起与一采同权重，替代 w6a8）→ Motion Repair 0.25 →
+ *   同款注意力 → 主节点「二采模型」槽（高清精化专用）。整条链出厂 mode=4 忽略：
+ *   不进执行图、内存零占用；要二采时框选 ④ 组「取消忽略」，再在右栏开「跟随生成」
  * - 链参数出厂值三处同源（nodes.py INPUT_TYPES default / h3_director.js
  *   CHAIN_DEFAULTS / 本模板）：1.0MP、每段时长 8s、步数 8、桥帧门控 关、
  *   接缝重摇 关、审片 关、参考图像尺寸 max；导演台状态 = 锚定双轨 schema
- *   （二采 跟随生成 1.4× / denoise 0.35 / steps 4 / shift 6 / euler+simple，
+ *   （二采 关闭 · 1.4× / denoise 0.35 / steps 4 / shift 6 / euler+simple，
  *   语义桥开 alpha 0.15，AI 优化 GLM api 预设）。
  * - widget 顺序须与 nodes.py define_schema 严格一致（30 项）。改默认参数：
  *   nodes.py、CHAIN_DEFAULTS、本文件三处同改（见 docs/改动总结_新版默认工作流_2026-10-01.md）。
@@ -30,8 +36,8 @@
 window.H3_DEFAULT_WORKFLOW = {
   "id": "h3-chain-director-default",
   "revision": 2,
-  "last_node_id": 71,
-  "last_link_id": 61,
+  "last_node_id": 72,
+  "last_link_id": 62,
   "nodes": [
     {
       "id": 1,
@@ -394,7 +400,7 @@ window.H3_DEFAULT_WORKFLOW = {
       ],
       "flags": {},
       "order": 8,
-      "mode": 0,
+      "mode": 4,
       "inputs": [],
       "outputs": [
         {
@@ -405,18 +411,18 @@ window.H3_DEFAULT_WORKFLOW = {
           ]
         }
       ],
-      "title": "⑨ 二采 UNET · w6a8（高清精化）",
+      "title": "⑨ 二采 UNET · int8 混合（高清精化）",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.33.1",
         "Node name for S&R": "UNETLoader"
       },
       "widgets_values": [
-        "minimax_h3_hybrid_fl2va_ref2va_b25-49_w6a8.safetensors",
+        "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
         "default"
       ],
       "widgets_values_named": {
-        "unet_name": "minimax_h3_hybrid_fl2va_ref2va_b25-49_w6a8.safetensors",
+        "unet_name": "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
         "weight_dtype": "default"
       },
       "color": "#b58b2a"
@@ -425,7 +431,7 @@ window.H3_DEFAULT_WORKFLOW = {
       "id": 70,
       "type": "ModelAttentionBackend",
       "pos": [
-        -240,
+        100,
         610
       ],
       "size": [
@@ -434,12 +440,12 @@ window.H3_DEFAULT_WORKFLOW = {
       ],
       "flags": {},
       "order": 9,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 59
+          "link": 62
         }
       ],
       "outputs": [
@@ -451,7 +457,7 @@ window.H3_DEFAULT_WORKFLOW = {
           ]
         }
       ],
-      "title": "⑩ 注意力后端（二采）",
+      "title": "⑪ 注意力后端（二采）",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.33.1",
@@ -469,7 +475,7 @@ window.H3_DEFAULT_WORKFLOW = {
       "id": 71,
       "type": "BlockSparseAttention",
       "pos": [
-        100,
+        440,
         610
       ],
       "size": [
@@ -478,7 +484,7 @@ window.H3_DEFAULT_WORKFLOW = {
       ],
       "flags": {},
       "order": 10,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
           "name": "model",
@@ -495,7 +501,7 @@ window.H3_DEFAULT_WORKFLOW = {
           ]
         }
       ],
-      "title": "⑪ 块稀疏注意力 · Sol-Attn（二采）",
+      "title": "⑫ 块稀疏注意力 · Sol-Attn（二采）",
       "properties": {
         "Node name for S&R": "BlockSparseAttention"
       },
@@ -601,7 +607,16 @@ window.H3_DEFAULT_WORKFLOW = {
       "properties": {
         "aux_id": "bingling360/ComfyUI_H3_SeamlessChain",
         "ver": "731bde31a74ff438381a07c8d647795aed63952c",
-        "Node name for S&R": "H3SeamlessChainSampler"
+        "Node name for S&R": "H3SeamlessChainSampler",
+        "__h3_out_intents": [
+          {
+            "name": "报告",
+            "targetId": "54",
+            "targetName": "source",
+            "targetSlot": 0,
+            "type": "STRING"
+          }
+        ]
       },
       "widgets_values": [
         "16:9",
@@ -617,7 +632,7 @@ window.H3_DEFAULT_WORKFLOW = {
         "res_multistep",
         "simple",
         "关闭",
-        "1",
+        "",
         "关闭",
         30,
         34,
@@ -631,7 +646,7 @@ window.H3_DEFAULT_WORKFLOW = {
         "关闭",
         "文生视频",
         "开启",
-        "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"frame_img\":null,\"unlink\":false,\"disabled\":false,\"auto_ref\":null,\"auto_seq\":null,\"frame_refs\":null,\"latent_save\":null,\"latent_ref\":null,\"tail_src\":null,\"anchors\":[]}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"auto\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.35,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"euler\",\"scheduler\":\"simple\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":{\"mode\":\"api\",\"provider\":\"glm\",\"api_url\":\"https://open.bigmodel.cn/api/paas/v4\",\"api_key\":\"\",\"api_keys\":{},\"model\":\"glm-5.3-flashx\",\"provider_models\":{},\"protocol\":\"openai\",\"read_media\":true,\"local_model\":\"\",\"local_mmproj\":\"\",\"local_device\":\"cuda\",\"max_tokens\":8192,\"timeout\":300,\"thinking\":\"disabled\",\"reasoning_effort\":\"\",\"rule_file\":\"auto\",\"cfg_ver\":3,\"expand\":{\"style\":\"balanced\"}},\"opt_hist\":null}",
+        "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"frame_img\":null,\"unlink\":false,\"disabled\":false,\"auto_ref\":null,\"auto_seq\":null,\"frame_refs\":null,\"latent_save\":null,\"latent_ref\":null,\"tail_src\":null,\"anchors\":[]}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"关闭\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"auto\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.35,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"euler\",\"scheduler\":\"simple\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":{\"mode\":\"api\",\"provider\":\"glm\",\"api_url\":\"https://open.bigmodel.cn/api/paas/v4\",\"api_key\":\"\",\"api_keys\":{},\"model\":\"glm-5.3-flashx\",\"provider_models\":{},\"protocol\":\"openai\",\"read_media\":true,\"local_model\":\"\",\"local_mmproj\":\"\",\"local_device\":\"cuda\",\"max_tokens\":8192,\"timeout\":300,\"thinking\":\"disabled\",\"reasoning_effort\":\"\",\"rule_file\":\"auto\",\"cfg_ver\":3,\"expand\":{\"style\":\"balanced\"}},\"opt_hist\":null}",
         "max",
         1
       ],
@@ -663,7 +678,7 @@ window.H3_DEFAULT_WORKFLOW = {
         "递减锚定": "关闭",
         "生成模式": "文生视频",
         "自动成片": "开启",
-        "导演台状态": "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"frame_img\":null,\"unlink\":false,\"disabled\":false,\"auto_ref\":null,\"auto_seq\":null,\"frame_refs\":null,\"latent_save\":null,\"latent_ref\":null,\"tail_src\":null,\"anchors\":[]}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"跟随生成\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"auto\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.35,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"euler\",\"scheduler\":\"simple\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":{\"mode\":\"api\",\"provider\":\"glm\",\"api_url\":\"https://open.bigmodel.cn/api/paas/v4\",\"api_key\":\"\",\"api_keys\":{},\"model\":\"glm-5.3-flashx\",\"provider_models\":{},\"protocol\":\"openai\",\"read_media\":true,\"local_model\":\"\",\"local_mmproj\":\"\",\"local_device\":\"cuda\",\"max_tokens\":8192,\"timeout\":300,\"thinking\":\"disabled\",\"reasoning_effort\":\"\",\"rule_file\":\"auto\",\"cfg_ver\":3,\"expand\":{\"style\":\"balanced\"}},\"opt_hist\":null}",
+        "导演台状态": "{\"mode\":\"文生视频\",\"prompts\":[\"\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"frame_img\":null,\"unlink\":false,\"disabled\":false,\"auto_ref\":null,\"auto_seq\":null,\"frame_refs\":null,\"latent_save\":null,\"latent_ref\":null,\"tail_src\":null,\"anchors\":[]}],\"inserts\":[],\"redo_segs\":[],\"upscale\":{\"schema\":2,\"on\":true,\"enlarge\":true,\"mode\":\"关闭\",\"model\":\"minimax_h3_latent_upscaler_3d_fp16.safetensors\",\"arch\":\"auto\",\"scale\":1.4,\"size_mode\":\"倍率\",\"target_w\":1280,\"target_h\":704,\"megapixels\":1,\"denoise\":0.35,\"steps\":4,\"cfg\":1,\"precision\":\"fp16\",\"time_bias\":0,\"mix\":0,\"adaptive\":false,\"shift\":6,\"stg\":0,\"stg_block\":25,\"passes\":1,\"decay\":0.5,\"sharpen\":0,\"pixel_sharpen\":0,\"device\":\"auto\",\"sampler\":\"euler\",\"scheduler\":\"simple\",\"retry\":false,\"retry_target\":0.15,\"include\":[]},\"bridge\":{\"enabled\":true,\"adapter\":\"BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors\",\"alpha\":0.15,\"scope\":\"all\"},\"optimizer\":{\"mode\":\"api\",\"provider\":\"glm\",\"api_url\":\"https://open.bigmodel.cn/api/paas/v4\",\"api_key\":\"\",\"api_keys\":{},\"model\":\"glm-5.3-flashx\",\"provider_models\":{},\"protocol\":\"openai\",\"read_media\":true,\"local_model\":\"\",\"local_mmproj\":\"\",\"local_device\":\"cuda\",\"max_tokens\":8192,\"timeout\":300,\"thinking\":\"disabled\",\"reasoning_effort\":\"\",\"rule_file\":\"auto\",\"cfg_ver\":3,\"expand\":{\"style\":\"balanced\"}},\"opt_hist\":null}",
         "参考图像尺寸": "max",
         "响度对齐强度": 1
       }
@@ -724,13 +739,57 @@ window.H3_DEFAULT_WORKFLOW = {
       "title": "导演台使用说明",
       "properties": {},
       "widgets_values": [
-        "# H3 长片导演台 · 配套默认工作流（2026-10-01 版）\n\n生成全在左侧「长片导演台」侧栏：提示词 / 素材 / 链参数一体化，画布零连线操作。\n- 提示词走导演台状态，1–64 段不限：顶部选段条「＋」加段；素材在三库面板（项目资产 / 全局库 / 成片）拖放，或正文 @素材名 引用\n- 每段自动存 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图）；「自动成片=开启」另编码完整成片，段卡片直接预览播放\n- 链路自动推导（无模式选择）：段里引用素材即走 ref conditioning；纯文生链走 fl2va\n\n**一采链（上排，左→右）**：UNET int8 混合权重（fl2va+ref2va）→ turbo 加速 LoRA（配套少步采样，本模板步数 8）→ Motion Repair 运动修复 0.6 → comfy kitchen 注意力 → Sol-Attn 块稀疏注意力（≥12288 token 生效、0.2 起生效）→ 主节点\n\n**二采链（下排）**：UNET w6a8 → 同款注意力 → 主节点「二采模型」槽，专做高清精化二采（换权重不影响一采与接缝重摇）\n\n**出厂链参数**（= 右栏「↺ 恢复默认」基准，与 nodes.py 默认值同源）：\n- 16:9 · 1.0MP（1376×768）｜每段时长 8s｜步数 8｜CFG 1｜res_multistep / simple\n- 审片模式 关｜自动保存 分段｜自动成片 开｜参考图像尺寸 max（身份保真优先，参考管线 2048 短边，较慢）\n- 检测重摇默认全关（桥帧门控 / 接缝重摇）——要自动排坏段，到「视频延续 · 检测重摇」里打开\n- 右栏「二采放大」预置：跟随生成 · 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n- 语义桥预置：开 · BUNNY V2 · alpha 0.15 · 全量过桥；AI 优化：GLM 预设（open.bigmodel.cn · glm-5.3-flashx，Key 在「AI 优化设置」自填）\n\n小字：「宽度/高度」是旧版兼容位（画布由 宽高比×百万像素 换算，改它们不生效）；自定义Sigmas 槽默认空置（接少步 sigma 表覆盖「步数/调度器」）；序章（上传视频当第 1 段）走「起始视频」端口，导演台默认把它收起，需要时载入含序章连线的旧工作流即可恢复；顶栏「↺ 全局重置」一键回出厂（链参数 + 语义桥 + 二采；性能优化与 AI 优化设置各有自己的恢复默认）。"
+        "# H3 长片导演台 · 配套默认工作流（2026-10-02 版）\n\n生成全在左侧「长片导演台」侧栏：提示词 / 素材 / 链参数一体化，画布零连线操作。\n- 提示词走导演台状态，1–64 段不限：顶部选段条「＋」加段；素材在三库面板（项目资产 / 全局库 / 成片）拖放，或正文 @素材名 引用\n- 每段自动存 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图）；「自动成片=开启」另编码完整成片，段卡片直接预览播放\n- 链路自动推导（无模式选择）：段里引用素材即走 ref conditioning；纯文生链走 fl2va\n\n**一采链（上排，左→右）**：UNET int8 混合权重（fl2va+ref2va）→ turbo 加速 LoRA（配套少步采样，本模板步数 8）→ Motion Repair 运动修复 0.6 → comfy kitchen 注意力 → Sol-Attn 块稀疏注意力（≥12288 token 生效、0.2 起生效）→ 主节点\n\n**二采链（下排）**：UNET int8 混合（与一采同权重）→ Motion Repair 0.25 → 同款注意力 → 主节点「二采模型」槽，专做高清精化二采（换权重不影响一采与接缝重摇）。**出厂整条为「忽略」态（mode=4）**：不进执行图、内存零占用；要二采时框选 ④ 组「取消忽略」，并在右栏把二采拨回「跟随生成」\n\n**出厂链参数**（= 右栏「↺ 恢复默认」基准，与 nodes.py 默认值同源）：\n- 16:9 · 1.0MP（1376×768）｜每段时长 8s｜步数 8｜CFG 1｜res_multistep / simple\n- 审片模式 关｜自动保存 分段｜自动成片 开｜参考图像尺寸 max（身份保真优先，参考管线 2048 短边，较慢）\n- 检测重摇默认全关（桥帧门控 / 接缝重摇）——要自动排坏段，到「视频延续 · 检测重摇」里打开\n- 右栏「二采放大」预置：关闭（要用时在右栏开「跟随生成」）· 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n- 语义桥预置：开 · BUNNY V2 · alpha 0.15 · 全量过桥；AI 优化：GLM 预设（open.bigmodel.cn · glm-5.3-flashx，Key 在「AI 优化设置」自填）\n\n小字：「宽度/高度」是旧版兼容位（画布由 宽高比×百万像素 换算，改它们不生效）；自定义Sigmas 槽默认空置（接少步 sigma 表覆盖「步数/调度器」）；序章（上传视频当第 1 段）走「起始视频」端口，导演台默认把它收起，需要时载入含序章连线的旧工作流即可恢复；顶栏「↺ 全局重置」一键回出厂（链参数 + 语义桥 + 二采；性能优化与 AI 优化设置各有自己的恢复默认）。"
       ],
       "widgets_values_named": {
-        "text": "# H3 长片导演台 · 配套默认工作流（2026-10-01 版）\n\n生成全在左侧「长片导演台」侧栏：提示词 / 素材 / 链参数一体化，画布零连线操作。\n- 提示词走导演台状态，1–64 段不限：顶部选段条「＋」加段；素材在三库面板（项目资产 / 全局库 / 成片）拖放，或正文 @素材名 引用\n- 每段自动存 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图）；「自动成片=开启」另编码完整成片，段卡片直接预览播放\n- 链路自动推导（无模式选择）：段里引用素材即走 ref conditioning；纯文生链走 fl2va\n\n**一采链（上排，左→右）**：UNET int8 混合权重（fl2va+ref2va）→ turbo 加速 LoRA（配套少步采样，本模板步数 8）→ Motion Repair 运动修复 0.6 → comfy kitchen 注意力 → Sol-Attn 块稀疏注意力（≥12288 token 生效、0.2 起生效）→ 主节点\n\n**二采链（下排）**：UNET w6a8 → 同款注意力 → 主节点「二采模型」槽，专做高清精化二采（换权重不影响一采与接缝重摇）\n\n**出厂链参数**（= 右栏「↺ 恢复默认」基准，与 nodes.py 默认值同源）：\n- 16:9 · 1.0MP（1376×768）｜每段时长 8s｜步数 8｜CFG 1｜res_multistep / simple\n- 审片模式 关｜自动保存 分段｜自动成片 开｜参考图像尺寸 max（身份保真优先，参考管线 2048 短边，较慢）\n- 检测重摇默认全关（桥帧门控 / 接缝重摇）——要自动排坏段，到「视频延续 · 检测重摇」里打开\n- 右栏「二采放大」预置：跟随生成 · 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n- 语义桥预置：开 · BUNNY V2 · alpha 0.15 · 全量过桥；AI 优化：GLM 预设（open.bigmodel.cn · glm-5.3-flashx，Key 在「AI 优化设置」自填）\n\n小字：「宽度/高度」是旧版兼容位（画布由 宽高比×百万像素 换算，改它们不生效）；自定义Sigmas 槽默认空置（接少步 sigma 表覆盖「步数/调度器」）；序章（上传视频当第 1 段）走「起始视频」端口，导演台默认把它收起，需要时载入含序章连线的旧工作流即可恢复；顶栏「↺ 全局重置」一键回出厂（链参数 + 语义桥 + 二采；性能优化与 AI 优化设置各有自己的恢复默认）。"
+        "text": "# H3 长片导演台 · 配套默认工作流（2026-10-02 版）\n\n生成全在左侧「长片导演台」侧栏：提示词 / 素材 / 链参数一体化，画布零连线操作。\n- 提示词走导演台状态，1–64 段不限：顶部选段条「＋」加段；素材在三库面板（项目资产 / 全局库 / 成片）拖放，或正文 @素材名 引用\n- 每段自动存 output/h3_projects/<项目名>/（seg_NNN.mp4 + 缩略图）；「自动成片=开启」另编码完整成片，段卡片直接预览播放\n- 链路自动推导（无模式选择）：段里引用素材即走 ref conditioning；纯文生链走 fl2va\n\n**一采链（上排，左→右）**：UNET int8 混合权重（fl2va+ref2va）→ turbo 加速 LoRA（配套少步采样，本模板步数 8）→ Motion Repair 运动修复 0.6 → comfy kitchen 注意力 → Sol-Attn 块稀疏注意力（≥12288 token 生效、0.2 起生效）→ 主节点\n\n**二采链（下排）**：UNET int8 混合（与一采同权重）→ Motion Repair 0.25 → 同款注意力 → 主节点「二采模型」槽，专做高清精化二采（换权重不影响一采与接缝重摇）。**出厂整条为「忽略」态（mode=4）**：不进执行图、内存零占用；要二采时框选 ④ 组「取消忽略」，并在右栏把二采拨回「跟随生成」\n\n**出厂链参数**（= 右栏「↺ 恢复默认」基准，与 nodes.py 默认值同源）：\n- 16:9 · 1.0MP（1376×768）｜每段时长 8s｜步数 8｜CFG 1｜res_multistep / simple\n- 审片模式 关｜自动保存 分段｜自动成片 开｜参考图像尺寸 max（身份保真优先，参考管线 2048 短边，较慢）\n- 检测重摇默认全关（桥帧门控 / 接缝重摇）——要自动排坏段，到「视频延续 · 检测重摇」里打开\n- 右栏「二采放大」预置：关闭（要用时在右栏开「跟随生成」）· 1.4× · 去噪 0.35 · 精化 4 步 · shift 6 · euler/simple\n- 语义桥预置：开 · BUNNY V2 · alpha 0.15 · 全量过桥；AI 优化：GLM 预设（open.bigmodel.cn · glm-5.3-flashx，Key 在「AI 优化设置」自填）\n\n小字：「宽度/高度」是旧版兼容位（画布由 宽高比×百万像素 换算，改它们不生效）；自定义Sigmas 槽默认空置（接少步 sigma 表覆盖「步数/调度器」）；序章（上传视频当第 1 段）走「起始视频」端口，导演台默认把它收起，需要时载入含序章连线的旧工作流即可恢复；顶栏「↺ 全局重置」一键回出厂（链参数 + 语义桥 + 二采；性能优化与 AI 优化设置各有自己的恢复默认）。"
       },
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 72,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        -300,
+        610
+      ],
+      "size": [
+        300,
+        82
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 59
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            62
+          ]
+        }
+      ],
+      "title": "⑩ Motion Repair · 运动修复（二采 0.25）",
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "Motion_Repair_V2.safetensors",
+        0.25
+      ],
+      "widgets_values_named": {
+        "lora_name": "Motion_Repair_V2.safetensors",
+        "strength_model": 0.25
+      },
+      "color": "#2a8f6d"
     }
   ],
   "links": [
@@ -810,7 +869,7 @@ window.H3_DEFAULT_WORKFLOW = {
       59,
       69,
       0,
-      70,
+      72,
       0,
       "MODEL"
     ],
@@ -828,6 +887,14 @@ window.H3_DEFAULT_WORKFLOW = {
       0,
       10,
       4,
+      "MODEL"
+    ],
+    [
+      62,
+      72,
+      0,
+      70,
+      0,
       "MODEL"
     ]
   ],
@@ -874,7 +941,7 @@ window.H3_DEFAULT_WORKFLOW = {
       "bounding": [
         -1010,
         560,
-        1450,
+        1780,
         350
       ],
       "color": "#b58b2a",

@@ -454,7 +454,7 @@ def test_encode_hq_is_a_two_state_switch():
     抗条纹」，crf 由 `x264_crf` 单独调。所以真值表必须**恰好两态**。
     """
     import ast
-    assert perf.DEFAULT_PERF["encode_hq"] is False
+    assert perf.DEFAULT_PERF["encode_hq"] is True
     assert perf.PERF_TYPES["encode_hq"] == (bool,)
     with open(os.path.join(ROOT, "upscale.py"), encoding="utf-8") as f:
         tree = ast.parse(f.read())

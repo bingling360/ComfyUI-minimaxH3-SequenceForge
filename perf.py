@@ -156,8 +156,10 @@ DEFAULT_PERF = {
     # `frames = min(frames, chunk_frames + 2)` 只按单块算）。外面再套一层是与官方 tile
     # 叠加 → 更慢更糊、显存一点不多省。留着只会让人以为勾了有用。
     "refine_temporal_on": False,      # 精化时序分块总开关
-    # 192 帧 = 8 秒 = 与主链「每段时长」默认同宽（即整段不切）。0 也是「不分块」。
-    "refine_temporal_chunk": 192,
+    # 120 帧 ≈ 5 秒（2026-10-02 由 192 下调，用户拍板）：主链 8 秒段会切成两块，
+    # 省显存、代价是每段多一条接缝（必须配接缝医生）。0 也是「不分块」；
+    # 192 = 与主链「每段时长」默认同宽（整段不切），显存够可以调回去。
+    "refine_temporal_chunk": 120,
     "refine_temporal_overlap": 8,     # 段间重叠 latent token（单位：latent token，非像素）
     "refine_tile_on": False,          # 精化空间分块总开关
     "refine_tile": "2x1",             # off / 2x2 / 3x3 / 4x4 / 2x1（横向 2 条）/ 1x2
@@ -222,9 +224,10 @@ DEFAULT_PERF = {
     # （质量档整个失效），所以后端按 encoder 显式分流（见 media._video_stream_options）。
     #
     # ★ `encode_hq`（2026-09-23 本轮，用户拍板）把原三档「标准 / 高清 / 极致」压成
-    #   **一个开关**：
-    #     关（默认）= 旧「标准」：veryfast · 无 aq · 无抖动
-    #     开         = 旧「高清」：medium · aq-mode 3（暗部自适应）· Bayer 抖动
+    #   **一个开关**；2026-10-02 起默认改**开**（用户拍板）：
+    #     关 = 旧「标准」：veryfast · 无 aq · 无抖动（编码更快；NVENC 下 preset/aq
+    #          本就不生效，只有抖动有效）
+    #     开（默认）= 旧「高清」：medium · aq-mode 3（暗部自适应）· Bayer 抖动
     #   「极致」（slow）删除 —— crf 被 `x264_crf` 独立接管后，它与「高清」**只差
     #   preset 速度档**，不值得单列。crf / cq 与 preset / 抖动是**两个正交旋钮**：
     #   档位只定后者，前者在上面的质量数值里单独调（面板也不再声称「切档位会带着
@@ -233,7 +236,7 @@ DEFAULT_PERF = {
     "encoder": "libx264",          # libx264 / h264_nvenc / hevc_nvenc（不再有假 auto）
     "x264_crf": 20,                # x264 恒定质量（越小越清晰，常用 13–23）
     "nvenc_cq": 20,                # NVENC 恒定质量（对应 x264 的 crf）
-    "encode_hq": False,            # 高清编码档：medium preset + 暗部 aq + 抖动
+    "encode_hq": True,             # 高清编码档：medium preset + 暗部 aq + 抖动（2026-10-02 起默认开）
 
     # ComfyUI 运行时开关（**节点端适配，不动启动参数**）
     "upcast_attention": "auto",   # auto=跟随启动参数；True/False=强制开/关

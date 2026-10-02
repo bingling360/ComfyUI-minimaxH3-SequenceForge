@@ -49,6 +49,8 @@ function mkWin() {
         repair: w.eval("repairMisplacedLinks"),
         outIntents: w.eval("savedOutputIntents"),
         repairOut: w.eval("repairMisplacedOutputLinks"),
+        captureLive: w.eval("captureLiveOutputIntents"),
+        mergeProps: w.eval("mergePropOutputIntents"),
         said: (lv) => logs.filter((x) => !lv || x[0] === lv).map((x) => x[1]).join("\n"),
     };
 }
@@ -285,7 +287,8 @@ const MODERN_LIVE = [{ id: 10, ports: [
     await t("源码守卫：载入钩子收意图 + 三处触发 + 按名字判定", () => {
         const i = DIR_SRC.indexOf("app.loadGraphData = function (data, ...args) {");
         assert.ok(i > 0, "loadGraphData 包装不见了（widget 迁移与连线修复都挂在它上面）");
-        const body = DIR_SRC.slice(i, i + 700);
+        /* 900 字符窗口（rev3.3 起钩子里多了 mergePropOutputIntents 一行，700 不够装） */
+        const body = DIR_SRC.slice(i, i + 900);
         assert.ok(body.indexOf("migrateGraphWidgets(data)") >= 0, "widget 迁移层不该被挤掉");
         assert.ok(body.indexOf("pendingLinkIntents = savedLinkIntents(migrated)") >= 0,
             "载入钩子必须先把连线意图收下来");
@@ -482,6 +485,124 @@ const MODERN_LIVE = [{ id: 10, ports: [
         assert.strictEqual(env.nodes.get("10").outputs[2].links.length, 0, "不许留在「帧率」上");
         assert.strictEqual(env.linkBox["59"], undefined, "连线该从图上移除");
         assert.strictEqual(env.nodes.get("54").inputs[0].link, null, "目标输入该同步断开");
+    });
+
+    await t("★ 载入时线被前端丢弃（输出槽裁剪 → origin_slot 越界）→ 3 轮后按名自愈重建", () => {
+        const { outIntents, repairOut, said } = mkWin();
+        /* 存档里线还在（报告 → PreviewAny「源」），但本机 configure 时输出槽被
+         * 裁剪、origin_slot=3 越界 → 线被静默丢弃：活图上报告端口空、目标输入空、
+         * linkBox 里根本没有这条线（真机「运行报告经常断连」的形态）。 */
+        const saved = {
+            nodes: [
+                { id: 10, type: "H3SeamlessChainSampler", outputs: [
+                    { name: "图像", links: [] }, { name: "音频", links: null },
+                    { name: "帧率", links: null }, { name: "报告", links: [58] },
+                ] },
+                { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: null }] },
+            ],
+            links: [[58, 10, 3, 54, 0, "STRING"]],
+        };
+        const env = mkOutGraph(
+            [{ id: 10, outputs: [
+                { name: "图像", links: [] }, { name: "音频", links: null },
+                { name: "帧率", links: null }, { name: "报告", links: null },
+            ] },
+             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: null }] }],
+            {});   // ← linkBox 空：线已被 configure 丢弃
+        const sampler = env.nodes.get("10");
+        sampler.connect = function (slot, target, targetSlot) {
+            const id = 77;
+            env.linkBox[id] = { id, origin_id: this.id, origin_slot: slot,
+                                target_id: target.id, target_slot: targetSlot, type: "STRING" };
+            target.inputs[targetSlot].link = id;
+            this.outputs[slot].links = [id];
+            return env.linkBox[id];
+        };
+        const list = outIntents(saved);
+        assert.strictEqual(list.length, 1, "存档里该收得到报告线意图");
+        const r1 = repairOut(list, env.graph);
+        assert.strictEqual(r1.rest.length, 1, "第 1 轮：线还没出现，该留待重试");
+        const r2 = repairOut(r1.rest, env.graph);
+        assert.strictEqual(r2.rest.length, 1, "第 2 轮：仍留待重试");
+        const r3 = repairOut(r2.rest, env.graph);
+        assert.strictEqual(r3.moved, 1, "第 3 轮：该按名自愈重建");
+        assert.strictEqual(r3.rest.length + r3.conflicts, 0, "重建完不留尾巴");
+        assert.strictEqual(sampler.outputs[3].links[0], 77, "「报告」该领着新建的线");
+        assert.strictEqual(env.nodes.get("54").inputs[0].link, 77, "目标「源」该被接上");
+        assert.ok(said("warn").indexOf("自愈重建") >= 0, "自愈必须留告警，不许静默改线");
+        /* 幂等：同一份意图再跑一遍，不该再动 */
+        const again = repairOut(list, env.graph);
+        assert.strictEqual(again.moved, 0, "修完再跑必须空转");
+    });
+
+    await t("自愈有守卫：目标输入被占用 → 绝不强接", () => {
+        const { outIntents, repairOut } = mkWin();
+        const saved = {
+            nodes: [
+                { id: 10, type: "H3SeamlessChainSampler", outputs: [
+                    { name: "报告", links: [58] },
+                ] },
+                { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 99 }] },
+            ],
+            links: [[58, 10, 3, 54, 0, "STRING"]],
+        };
+        const env = mkOutGraph(
+            [{ id: 10, outputs: [{ name: "报告", links: null }] },
+             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 99 }] }],
+            {});   // ← 99 是悬空旧 id（linkBox 里没有）：目标声明解析不了 → 走自愈分支
+        const sampler = env.nodes.get("10");
+        sampler.connect = function () { throw new Error("自愈不许在占用时调 connect"); };
+        let list = outIntents(saved);
+        for (let i = 0; i < 4; i++) list = repairOut(list, env.graph).rest;
+        assert.strictEqual(list.length, 0, "重试耗尽后该放弃（不无限滞留）");
+        assert.strictEqual(env.nodes.get("54").inputs[0].link, 99, "被占用的输入不许被强接");
+        assert.strictEqual(sampler.outputs[0].links, null, "输出端口不该被强行接上");
+    });
+
+    await t("properties 快照合并：存档 links 表没线时也能恢复意图（断连棘轮兜底）", () => {
+        const { mergeProps } = mkWin();
+        const saved = {
+            nodes: [{ id: 10, type: "H3SeamlessChainSampler",
+                      properties: { __h3_out_intents: [
+                          { name: "报告", targetId: "54", targetName: "source",
+                            targetSlot: 0, type: "STRING" },
+                      ] }, inputs: [], outputs: [] }],
+            links: [],
+        };
+        const got = [];
+        mergeProps(saved, got);
+        assert.strictEqual(got.length, 1, "快照意图该被收进来");
+        assert.strictEqual(got[0].name, "报告");
+        assert.strictEqual(got[0].targetName, "source");
+        assert.strictEqual(got[0].targetSlot, 0);
+        /* 去重：存档已按名收到的输出不重复收 */
+        const got2 = [{ originId: "10", name: "报告" }];
+        mergeProps(saved, got2);
+        assert.strictEqual(got2.length, 1, "同一输出不该收两份意图");
+        /* 没有快照的存档 → 零改动 */
+        const got3 = [];
+        mergeProps({ nodes: [{ id: 10, type: "H3SeamlessChainSampler", properties: {} }] }, got3);
+        assert.strictEqual(got3.length, 0);
+    });
+
+    await t("onSerialize 快照：活节点连线 → 意图形状与 savedOutputIntents 对齐", () => {
+        const { captureLive } = mkWin();
+        const env = mkOutGraph(
+            [{ id: 10, outputs: [
+                { name: "图像", links: [] }, { name: "音频", links: null },
+                { name: "帧率", links: null }, { name: "报告", links: [58] },
+            ] },
+             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 58 }] }],
+            { 58: { origin_id: 10, origin_slot: 3, target_id: 54, target_slot: 0, type: "STRING" } });
+        const node = env.nodes.get("10");
+        node.graph = env.graph;
+        const snap = captureLive(node);
+        assert.strictEqual(snap.length, 1, "只该快照有连线的输出");
+        assert.strictEqual(snap[0].name, "报告");
+        assert.strictEqual(snap[0].targetId, "54");
+        assert.strictEqual(snap[0].targetName, "源");
+        assert.strictEqual(snap[0].targetSlot, 0);
+        assert.strictEqual(snap[0].type, "STRING");
     });
 
     results.forEach((r) => console.log(r));

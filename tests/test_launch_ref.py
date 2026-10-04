@@ -5,7 +5,8 @@
 1. **不许编造 ComfyUI 参数** —— 文档里每个 `--flag` 都必须真实存在于
    `comfy/cli_args.py`。这是这份文档最容易出的错（凭印象写参数），
    而错了的后果是用户复制去执行直接报错、还以为是环境问题。
-2. **txt 不许过期** —— 磁盘上 `docs/<name>.txt` 必须与 `to_text()` 逐字一致。
+2. **txt 不许过期** —— 磁盘上 `docs/<name>.txt` 必须与 `to_text()` 归一化
+   换行后逐字一致（Windows autocrlf 检出洗出来的 CRLF 不算过期）。
    改了数据忘了重跑 `tools/make_launch_ref_txt.py` 就红。
 3. **LF 换行** —— 这份 txt 是拿到 Linux 上边看边敲的，CRLF 会让复制出来的
    命令带上 `\\r` 直接报错。
@@ -33,6 +34,21 @@ def _real_flags():
     with open(CLI_ARGS, encoding="utf-8") as f:
         src = f.read()
     return set(re.findall(r'add_argument\(\s*"(--[A-Za-z0-9_-]+)"', src))
+
+
+def _git_blob_text(rel):
+    """`HEAD:<rel>` 的 blob 原文；拿不到（未提交 / 非 git 仓库 / 无 git）给 None。"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "-C", ROOT, "cat-file", "blob",
+             "HEAD:" + rel.replace(os.sep, "/")],
+            capture_output=True, timeout=15)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8")
 
 
 # ---------------------------------------------------------------- 结构
@@ -275,16 +291,25 @@ def test_committed_txt_is_up_to_date():
 
     改了 launch_ref.py 却忘了跑 `tools/make_launch_ref_txt.py` → 这里红。
     这正是「单一真源」在 CI 上的落点：允许生成物存在，但不许它过期。
+
+    ⚠ 比对按归一化换行后的内容：Windows 上 core.autocrlf=true 的检出会把
+    仓库里的 LF 洗成工作区的 CRLF —— 那是 git 的检出行为，不是「生成物过期」，
+    拿原始字节比会在 Windows 上天天假红。
+    ⚠ 「必须是 LF」守卫查的是**仓库 blob**（真正会被提交/分发的内容）：
+    工作区副本被 autocrlf 洗过不冤枉它；blob 拿不到（未提交/无 git）就跳过。
     """
-    out = os.path.join(ROOT, "docs", L.TXT_NAME)
+    rel = os.path.join("docs", L.TXT_NAME)
+    out = os.path.join(ROOT, rel)
     assert os.path.isfile(out), (
         f"缺 {out} —— 跑一下 tools/make_launch_ref_txt.py")
     with open(out, encoding="utf-8", newline="") as f:
         on_disk = f.read()
-    assert on_disk == L.to_text(), (
+    assert on_disk.replace("\r\n", "\n") == L.to_text(), (
         "docs 下的 txt 与 launch_ref.py 不一致 —— 跑 "
         "`python tools/make_launch_ref_txt.py` 重新生成")
-    assert "\r" not in on_disk, "磁盘上那份带 CRLF"
+    blob = _git_blob_text(rel)
+    if blob is not None:
+        assert "\r" not in blob, "仓库里那份带 CRLF"
 
 
 def test_txt_name_is_plain_and_portable():

@@ -148,7 +148,79 @@ HF_ENDPOINT=https://hf-mirror.com hf download LBH-123-AI/Minimax_h3_latent_Upsca
 - The **network architecture** dropdown must match the weights (2D residual backbone / pure 3D convolution). All three files above are **3D backbones** — pick "3D".
 - Without the weights the main chain still works; only the *latent upscale second pass* panel is unavailable (empty dropdown).
 
-### 5.3 Verify
+### 5.3 Models and LoRAs for the bundled workflow
+
+The plugin itself needs no weights, but the bundled `example_workflows/备用初始化导演台工作流.json` is wired for a specific, known-good stack. Download the three files below (plus the official CLIP and VAEs) or the loaders will report a missing file.
+
+| Role | File | Source | Size | Destination |
+|---|---|---|---|---|
+| Base-pass UNET **and** second-pass UNET | `minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors` | [`smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models`](https://huggingface.co/smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models) | ~21 GB | `ComfyUI/models/diffusion_models/` |
+| Turbo (few-step) LoRA | `minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors` | [`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI) | 620 MB | `ComfyUI/models/loras/` |
+| Motion Repair LoRA (V2) | `Motion_Repair_V2.safetensors` | [`JOKER141/MiniMax-H3-General-Motion-Continuity-Repair`](https://huggingface.co/JOKER141/MiniMax-H3-General-Motion-Continuity-Repair) | 155 MB | `ComfyUI/models/loras/` |
+
+```bash
+pip install -U "huggingface_hub[cli]"
+
+hf download smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models \
+  minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors \
+  --local-dir ComfyUI/models/diffusion_models
+
+hf download drbaph/MiniMax-H3-Turbo-Lora-ComfyUI \
+  minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors \
+  --local-dir ComfyUI/models/loras
+
+hf download JOKER141/MiniMax-H3-General-Motion-Continuity-Repair \
+  Motion_Repair_V2.safetensors \
+  --local-dir ComfyUI/models/loras
+
+# mainland China: prepend HF_ENDPOINT=https://hf-mirror.com to any command above
+```
+
+#### Main model — MiniMax H3 hybrid (`fl2va` + `ref2va`)
+
+MiniMax shipped two H3 checkpoints with identical architecture and weight layout but different training regimes:
+
+- **`fl2va`** — trained on first/last-keyframe conditioning only; clearly higher visual and audio quality.
+- **`ref2va`** — additionally trained on multimodal reference conditioning (image / video / audio), but a known training-quality issue makes its raw output noticeably weaker even on tasks that use no references at all.
+
+That creates an awkward trade-off: `ref2va` is the only checkpoint that supports reference conditioning, but it costs real output quality. A tensor-by-tensor comparison shows the two are bit-identical or near-identical (cosine ≥ 0.9997) almost everywhere — attention QKV/output projections, MLPs, RMSNorms, patch projections, RoPE, the token refiner — with the meaningful differences concentrated in the per-block **`adaln_proj`** weights, the AdaLN modulation projections that route text / audio / video / **reference** signals into the residual stream. The hybrid therefore keeps `fl2va` as the base and swaps in `ref2va`'s `adaln_proj` for a chosen tail of blocks.
+
+Four variants are published, differing only in how many of the last blocks come from `ref2va`:
+
+| Variant | Blocks from `ref2va` | Character |
+|---|---|---|
+| `b30-49` | last 20 of 50 | closest to `fl2va` — highest visual/audio quality, least reference capability |
+| **`b25-49`** | last 25 of 50 | **used by the bundled workflow** — close to `fl2va`, slightly reduced reference capability |
+| `b20-49` | last 30 of 50 | closer to `ref2va` |
+| `b15-49` | last 35 of 50 | closest to `ref2va` — best reference fidelity, lowest visual/audio quality |
+
+All variants are built from the pruned **int8-convrot** base models. If your work leans heavily on reference assets (r2v chains), try `b20-49` or `b15-49`; if you mostly do t2v / i2v, stay on `b25-49` or `b30-49`. See the model card for the license.
+
+#### Turbo LoRA — few-step acceleration
+
+[`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI) (**Apache-2.0**) hosts MiniMax-H3 Turbo and few-step LoRAs converted and optimized for ComfyUI. They accelerate the joint video + synchronized-audio generation by cutting the number of sampling steps — the bundled workflow pairs the Turbo LoRA at strength **1.0** with **8 steps**, which is why the factory `steps` default is 8 rather than 25. The same repo also ships HyperFlow 8-step conversions; see [§26 Custom sigmas](#26-custom-sigmas-distilled-loras) for the matching sigma table.
+
+> The repo carries 4-step and 8-step, FL2V and Ref2V, full and pruned variants. The file the bundled workflow expects is `minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors`; if you pick a different variant, update the LoRA node's file name and check its recommended step count.
+
+#### Motion Repair LoRA — motion continuity repair (V2)
+
+[`JOKER141/MiniMax-H3-General-Motion-Continuity-Repair`](https://huggingface.co/JOKER141/MiniMax-H3-General-Motion-Continuity-Repair) is a **general-purpose** motion-continuity LoRA, not a combat-only one: running, sports, dance, acrobatics, character interaction, combat, weapon motion. V2 concentrates on H3's hardest failure zones — flips, spins, rolls, inversions, and orientation recovery — and on the full sequence from takeoff through inversion and reorientation to landing, so limbs stop reconnecting wrong and bodies stop twisting into unreadable masses. It learns structure, orientation sense and momentum recovery rather than named tricks, so it generalizes. It is still a *repair* tool — extreme transition frames can occasionally show small artifacts — but it turns many discarded clips into usable shots.
+
+The author's recommended weights:
+
+- **standalone, ~0.9** — a relatively high weight is needed to visibly affect motion continuity, the slow-motion tendency, broken transitions and prompt following;
+- **alongside a Combat LoRA, stage-1 ~0.5–0.7** — Combat already supplies motion speed and impact, so this LoRA only needs a medium weight to correct continuity / coordination / action logic;
+- very high weights can begin to reshape the whole motion logic, or affect visual style and audio characteristics.
+
+The bundled workflow uses `Motion_Repair_V2.safetensors` at **0.6** on the base pass and **0.25** on the second pass. The V1 file (`Motion_Repair.safetensors`) is in the same repo.
+
+#### Also required — official MiniMax H3 files
+
+The bundled workflow's CLIP and VAE loaders point at the official [`Comfy-Org/MiniMax-H3`](https://huggingface.co/Comfy-Org/MiniMax-H3) weights: `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` (CLIP, type `minimax`), `minimax_h3_video_vae_int8_convrot.safetensors` and `minimax_h3_audio_vae_fp32.safetensors` (VAEs). Download them into `ComfyUI/models/text_encoders/` and `ComfyUI/models/vae/` (ModelScope carries the same files if HuggingFace is slow).
+
+> The second-pass chain (second UNET + Motion Repair 0.25) ships in the **ignored** state (`mode = 4`) — it does not enter the execution graph and uses no memory until you un-bypass that group and switch the console's second-pass panel back to *follow generation*.
+
+### 5.4 Verify
 
 1. After restart, the node menu should find `H3SeamlessChainSampler`, `H3SeamDoctor`, `H3RunReport`, and the two EAV/FETA nodes.
 2. Visit `http://127.0.0.1:8188/h3chain/ping` (adjust the port). A JSON response means the project-archive routes are mounted (the Director Console depends on them; if they are missing, the console shows a diagnostic banner).
@@ -158,16 +230,18 @@ HF_ENDPOINT=https://hf-mirror.com hf download LBH-123-AI/Minimax_h3_latent_Upsca
 
 ## 6. Quick start
 
-1. Load the bundled example workflow and point the loaders at your MiniMax H3 models.
+1. Load the bundled example workflow and download the weights it expects ([§5.3](#53-models-and-loras-for-the-bundled-workflow)).
 2. Open the **Director Console** (full-screen, from the node or the sidebar mini-entry).
 3. Write a prompt per segment (1–64 segments), or paste a multi-segment master prompt and let the console split it.
 4. Queue. The first segment is generated; with auto-save on, `finals/seg_001.mp4` appears in the project folder, and when the chain finishes, `finals/final_<timestamp>.mp4` as well.
 
-Model wiring inside the example workflow (all official nodes):
+How the bundled workflow is wired (all official ComfyUI nodes; weights in [§5.3](#53-models-and-loras-for-the-bundled-workflow)):
 
-- **UNET** — t2v / i2v use `minimax_h3_fl2va_*`; r2v uses `minimax_h3_ref2va_*`. Feed it through the official **ModelSamplingMiniMaxH3** (shift video 12 / audio 3) into the node's *model* input.
-- **CLIP** — type must be `minimax` (Qwen3-VL).
-- **Video VAE** (`minimax_h3_video_vae`) and **audio VAE** (`minimax_h3_audio_vae`).
+- **Base pass (top row):** `UNETLoader` (hybrid int8) → `LoraLoaderModelOnly` (Turbo, 1.0) → `LoraLoaderModelOnly` (Motion Repair, 0.6) → `ModelAttentionBackend` → `BlockSparseAttention` → the node's *model* input.
+- **Second pass (bottom row, shipped bypassed):** `UNETLoader` (same hybrid) → `LoraLoaderModelOnly` (Motion Repair, 0.25) → `ModelAttentionBackend` → `BlockSparseAttention` → the node's *second-pass model* input.
+- **CLIP** — `CLIPLoader` with `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`, type **`minimax`** (Qwen3-VL).
+- **VAEs** — video `minimax_h3_video_vae_int8_convrot.safetensors`, audio `minimax_h3_audio_vae_fp32.safetensors`.
+- The bundled template uses one **hybrid** UNET for both t2v/i2v and r2v conditioning instead of separate `fl2va` / `ref2va` checkpoints. If you follow the official MiniMax H3 workflow instead, insert the official **ModelSamplingMiniMaxH3** (shift video 12 / audio 3) between the UNET and the node, and use `minimax_h3_fl2va_*` for t2v / i2v and `minimax_h3_ref2va_*` for r2v.
 
 ---
 
@@ -671,3 +745,4 @@ It builds on and adapts several third-party projects. Their licenses are noted h
 - **Enhance-A-Video / FETA** — three layers: the paper ([arXiv:2502.07508v3](https://arxiv.org/abs/2502.07508)); the official implementation [NUS-HPC-AI-Lab/Enhance-A-Video](https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video) (**Apache-2.0**); and the H3 adaptation [T8mars/comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8) (**GPL-3.0-or-later**). "FETA" is **not** a paper term — it comes from the T8 source header. Details in [`docs/EAV_FETA.md`](docs/EAV_FETA.md).
 - **Semantic bridge** — FourBunny / JOKER141's BUNNY H3 Conditioning Bridge.
 - **Asset library** — interaction model modelled on Majoor Assets Manager (see `docs/三库重构方案_基于Majoor资产管理器.md`).
+- **Default-workflow weights** — the bundled template's UNET and LoRAs are third-party, not part of this plugin: [`smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models`](https://huggingface.co/smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models), [`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI) (**Apache-2.0**), [`JOKER141/MiniMax-H3-General-Motion-Continuity-Repair`](https://huggingface.co/JOKER141/MiniMax-H3-General-Motion-Continuity-Repair). Download links and notes in [§5.3](#53-models-and-loras-for-the-bundled-workflow).

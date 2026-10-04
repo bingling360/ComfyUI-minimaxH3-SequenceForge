@@ -177,7 +177,8 @@ def test_llm_roundtrip_uses_mark_codec():
     """两条 LLM 链路（单步优化 / 扩写+优化）都必须换码，否则引用会丢。"""
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     assert "function toLLMText(text, pool)" in src
-    assert "function fromLLMText(text, pool)" in src
+    assert "function fromLLMText(text, pool, media)" in src, \
+        "fromLLMText 要带 media：官方 <Picture N> 靠它译回素材名（2026-10-04）"
     for fn in ("async function runOptForSegment(",
                "async function runExpandOptimizeForSegment("):
         assert fn in src, f"找不到 {fn}（改名了就同步这里）"
@@ -185,10 +186,14 @@ def test_llm_roundtrip_uses_mark_codec():
         block = src[i:i + 4200]
         assert "toLLMText(" in block, f"{fn} 出参未换码"
         assert "fromLLMText(" in block, f"{fn} 回参未换码"
+        assert "mm.media" in block, \
+            f"{fn} 回填没把 media 传给 fromLLMText —— 官方 <Picture N> 译不回来"
     # 编解码规则只在 h3_prompts.js 一份（前端不许再写一套）
     hp = open(os.path.join(ROOT, "web", "h3_prompts.js"), encoding="utf-8").read()
     assert "function marksToText(text, pool)" in hp
     assert "function textToMarks(text, pool)" in hp
+    assert "function officialToMarks(text, media, pool)" in hp, \
+        "回填兜底（官方标签 → 素材名）必须存在，且规则只有这一份"
 
 
 # ------------------------------------------------ AI 扩写链 prompt

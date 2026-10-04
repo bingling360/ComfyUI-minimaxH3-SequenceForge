@@ -1,78 +1,77 @@
-# H3 长视频提示词撰写
+# H3 long-video prompt writing
 
-一个 skill，把用户的一段话变成**一份可直接粘进 SequenceForge 总提示词框的多段提示词**。
+A skill that turns a single sentence from the user into **a multi-segment prompt you can paste straight into SequenceForge's master-prompt box**.
 
 ```
-用户一句话
+one sentence from the user
    │
-   ├─ 提问（时长/段数 · 参考图 · 内容 · 衔接 · 风格 · 对白 · 声音）
+   ├─ interview (duration / segment count · reference images · content · continuity · style · dialogue · sound)
    │
-   ├─ 参考图分支
-   │    ├─ 已有图 → 默认每段都用，往下走
-   │    └─ 没有图 → 提问 → 给出「参考图提示词附录 + 初版提示词」→ 等用户生成
-   │                → 读实际生成的图 → 校正 → 最终版
+   ├─ reference-image branch
+   │    ├─ images available → use them for every segment by default, continue
+   │    └─ none → ask → deliver "reference-image prompt appendix + first draft" → wait for the user to generate
+   │                → read the actual images → correct → final version
    │
-   ├─ 逐段扩写剧本（只管内容，**不设创作上限**）
-   ├─ 逐段压成 H3 官方格式（英文；Ref2VA 六段式 / 常规三字段）
-   ├─ 拼成多段文本（英文段头 + Duration / Standalone / Prompt）
-   └─ 附一份中文对照版（逐段逐字段对应，骨架仍英文逐字）
+   ├─ expand the screenplay segment by segment (content only, **no creative cap**)
+   ├─ compress each segment into the official H3 format (English; Ref2VA six-section / standard three-field)
+   ├─ assemble the multi-segment text (English segment headers + Duration / Standalone / Prompt)
+   └─ attach a Chinese reference version (field-by-field, skeleton still verbatim English)
 ```
 
-最终产物每段都符合：**官方格式** + **长度匹配该段时长** + **段间剧情连续**（`Standalone: no` 时下段强接上段）。
+Every delivered segment satisfies: **official format** + **length matched to its duration** + **continuous plot across segments** (`Standalone: no` makes the next segment pick up from the previous one).
 
-交付**两份**：先英文多段文本（唯一要粘进框的），后中文对照版（只供阅读）。
+Delivered as **two parts**: the English multi-segment text first (the only thing to paste), then the Chinese reference version (for reading only).
 
-## 形态
+## Form
 
-**纯提示词，零依赖、零 API Key。** 读完 `SKILL.md` 和它引用的模块就能产出结果——不需要脚本、网络或任何运行时。
+**Pure prompt, zero dependencies, zero API keys.** Reading `SKILL.md` and the modules it references is enough to produce the result — no scripts, network, or runtime required.
 
-## 文件结构（主文件短，工作模块各管一摊）
+## File structure (short main file, one job per module)
 
-| 路径                                  | 作用                          |
+| Path                                  | Purpose                          |
 | ----------------------------------- | --------------------------- |
-| `SKILL.md`                          | 流程编排 + 三条铁律 + 分步交付（**保持短**） |
-| `references/01-interview.md`        | 问什么、怎么问、问几轮                 |
-| `references/02-expand.md`           | 剧本扩写：节拍/字数表、段间接续、两套环境起手式    |
-| `references/03-optimize.md`         | 官方格式压写：字段集、规则分流、禁令、成品字数     |
-| `references/04-master-format.md`    | 总提示词框语法：段头、三标签、`@素材名`、陷阱    |
-| `references/05-reference-images.md` | 参考图全流程（有无图两条分支 + 引用位置）      |
-| `references/06-rules/*.txt`         | **两份**官方英文规则原文（按模式选用，逐字不改）  |
-| `references/07-checklist.md`        | 交付前自检清单                     |
-| `references/08-example.md`          | 完整两段范例（动手前先看）               |
+| `SKILL.md`                          | Flow orchestration + three hard rules + step-by-step delivery (**kept short**) |
+| `references/01-interview.md`        | What to ask, how to ask it, how many rounds                 |
+| `references/02-expand.md`           | Screenplay expansion: beat/word-count tables, inter-segment continuity, starting moves for both environments    |
+| `references/03-optimize.md`         | Official-format compression: field sets, rule routing, prohibitions, finished word counts     |
+| `references/04-master-format.md`    | Master-prompt-box syntax: segment headers, three tags, `@asset name`, pitfalls    |
+| `references/05-reference-images.md` | Full reference-image flow (both branches + where to reference)      |
+| `references/06-rules/*.txt`         | **Two** official English rule texts (chosen per mode, verbatim)  |
+| `references/07-checklist.md`        | Pre-delivery self-check list                     |
+| `references/08-example.md`          | A complete two-segment example (read before starting)               |
 
-主文件只做编排，细节全部下沉到模块——**单文件不长，避免生成时注意力涣散**。
+The main file only orchestrates; details are all pushed down into modules — **no single file is long, so generation does not lose focus**.
 
-## 来源
+## Provenance
 
-规则不是新写的，是从 `ComfyUI-minimaxH3-SequenceForge` 的现行实现里提取的：
+The rules are not newly written; they are extracted from the live implementation in `ComfyUI-minimaxH3-SequenceForge`:
 
-| 部分     | 对应实现                                                                                               |
+| Part     | Corresponding implementation                                                                                               |
 | ------ | -------------------------------------------------------------------------------------------------- |
-| 扩写     | `tools/h3_prompt_expander/screenplay.py` + `prompts/system_screenplay.md` / `system_outline.md`    |
-| 优化     | `optimizer.optimize_once` / `build_system_prompt` + `prompt/*.txt`（**两份官方英文原文**已逐字复制进 `06-rules/`） |
-| 总提示词格式 | `web/h3_director.js` 的 `parseMasterPrompt` / `mpRenderState` / `refsFromText`                      |
-| 参考图流程  | 新增（原项目无此环节）                                                                                        |
+| Expansion     | `tools/h3_prompt_expander/screenplay.py` + `prompts/system_screenplay.md` / `system_outline.md`    |
+| Optimization     | `optimizer.optimize_once` / `build_system_prompt` + `prompt/*.txt` (the **two official English texts** are copied verbatim into `06-rules/`) |
+| Master-prompt format | `web/h3_director.js`'s `parseMasterPrompt` / `mpRenderState` / `refsFromText`                      |
+| Reference-image flow  | New (the original project had no such step)                                                                                        |
 
-## 验证
+## Verification
 
-- 两份规则文件与源文件 **md5 全等**（逐字搬官方原文，无手抄走样）。
-- 用**真实解析器**（从 `h3_director.js` 抽出 `parseMasterPrompt` / `refsFromText` 在 jsdom 里跑）验证过完整示例：  
-  段数 / `Duration` / `Standalone` / 六字段齐全与顺序 / 空行保留 / 镜号连续 / `[Shot 1]` 无时间戳 / 时间戳递增不超时长 /  
-  主描述字数落在 20–40 字/秒区间 / 段间承接 —— 全过。
-- 首次模拟跑出的**主描述只有 180 汉字（低于 10 秒段下限 200）**，被 `07-checklist.md` 拦下回炉补细节后达标——  
-  这正是自检清单存在的意义。
+- The two rule files are **md5-identical** to their sources (verbatim official text, no transcription drift).
+- Validated against a **real parser** (the `parseMasterPrompt` / `refsFromText` functions extracted from `h3_director.js` and run in jsdom) on a complete example:
+  segment count / `Duration` / `Standalone` / six fields present and ordered / blank lines preserved / shot numbers continuous / `[Shot 1]` has no timestamp / timestamps increasing and within duration /
+  main description word count within 20–40 chars per second / inter-segment continuity — all pass.
+- A first simulated run produced a **main description of only 180 Chinese characters (below the 200 lower bound for a 10-second segment)**; `07-checklist.md` caught it and it was sent back for more detail — which is exactly the point of the self-check list.
 
-## 口径统一（2026-09 收敛）
+## Unified conventions (settled 2026-09)
 
-- **正文默认英文，中文是可选项**：语言**只由「提示词规则」一个字段决定**（`auto` = 官方英文规则 · 默认 / `zh` = 中文规则 / `none` = 不注入），
-  独立的 `output_language` 配置字段已删 —— 两个控件各说一套只会互相打架（历史 bug：规则要中文、系统提示词要英文，产出中英混排正文）。
-- **中文规则按官方原文重写后回归**：`prompt/*_zh.txt` 与英文版**逐条对应**，只把"正文用中文写"这一项改掉；
-  骨架（字段名 / `[Shot N]` / `<d>` / 官方标签 / 保留标记 / 运镜词表）两种语言下**都是英文逐字**。
-- **段型自动分流，不按语言分流**：有参考素材 → 全参考六段式；首尾帧 → FL2VA/I2VA/L2VA；都没有 → 常规三字段。
-- **本 skill 只产出英文正文**（外加一份**中文对照版**供阅读），所以 `06-rules/` 只放两份官方英文原文，不引用插件那套中文规则。
-- **四字段自研口径已彻底删除**：`<@名字>` / `<#名字:对话>` 是自造语法，官方 tokenizer 根本不认；
-  中译英规则文件 `prompt_translate_to_en.txt` 同样已删。
-- **Ref2VA 只有一个口径**：六段式 + `@素材名` 只在 `subject_definitions` 定义行、正文用 `<Subject N>` 指代。
-  （历史 bug：正文里出现 `@`，就是因为告诉模型"参考素材直接用 @素材名"。）
-- **AI 扩写不设上限**：`02-expand.md` 只保留「不许改用户点名要保的东西」这一条红线；
-  线上 agent 先问清需求再自由发挥，本地直接自由发挥。
+- **Body is English by default; Chinese is optional**: the language is decided by **the single "prompt rules" field** (`auto` = official English rules · default / `zh` = Chinese rules / `none` = no injection).
+  The separate `output_language` config field has been removed — two controls each saying something different only fight (historical bug: rules asked for Chinese, the system prompt asked for English, and the output was mixed-language body text).
+- **The Chinese rules returned after being rewritten from the official text**: `prompt/*_zh.txt` corresponds **clause by clause** to the English version, changing only the "write the body in Chinese" item;
+  the skeleton (field names / `[Shot N]` / `<d>` / official tags / retention markers / camera vocabulary) is **verbatim English in both languages**.
+- **Segments are routed by type, not by language**: reference assets → full six-section reference format; first/last frames → FL2VA/I2VA/L2VA; neither → the standard three fields.
+- **This skill produces English bodies only** (plus a **Chinese reference version** for reading), so `06-rules/` holds only the two official English texts and does not reference the plugin's Chinese rules.
+- **The home-grown four-field convention is fully removed**: `<@name>` / `<#name:dialogue>` were invented syntax the official tokenizer never understood;
+  the Chinese-to-English rule file `prompt_translate_to_en.txt` is likewise deleted.
+- **Ref2VA has exactly one convention**: six sections + `@asset name` only in the `subject_definitions` definition lines; the body refers to them with `<Subject N>`.
+  (Historical bug: the body contained `@`, because the model was told "reference assets are written directly as @asset name".)
+- **AI expansion has no cap**: `02-expand.md` keeps only the one red line "do not change what the user explicitly asked to keep";
+  the online agent asks for requirements first, the local one just improvises.

@@ -84,10 +84,15 @@ def _assert_frozen(wf):
         "模型", "文本编码器", "视频VAE", "音频VAE", "二采模型", "自定义Sigmas",
     ])
     # 模板输出 = schema 4 槽制（1.53.6 实测：运行时输出槽永远按 schema 建，序列化
-    # 的 outputs 数组对布局无效）；「报告」必须带连线且在末位（连线表 origin_slot
-    # 按 schema 位次解析，位次错了报告线会落到「帧率」上）
+    # 的 outputs 数组对布局无效）；「报告」必须带连线，且**钉在第 2 位**（连线表
+    # origin_slot 按 schema 位次解析）。rev3.4（2026-10-04）起停机场槽「帧率」排在
+    # 「报告」之后：夹在中间会把「报告」挤到第 3 位，而 rev3 之前的存档写的是 2 ——
+    # 载入后报告线静默落到隐藏的「帧率」上，就是「重启即断连」的根因。
     _outs = [o.get("name") for o in sampler.get("outputs", [])]
-    assert _outs == ["图像", "音频", "帧率", "报告"], _outs
+    assert _outs == ["图像", "音频", "报告", "帧率"], _outs
+    assert _outs.index("报告") == 2, _outs
+    _link58 = [L for L in wf["links"] if L[3] == 54]
+    assert _link58 and _link58[0][2] == 2, ("报告线 origin_slot 必须 = 报告 的位次 2", _link58)
     _rep = [o for o in sampler.get("outputs", []) if o.get("name") == "报告"]
     assert _rep and _rep[0].get("links"), "模板报告输出必须带连线"
     # 「二采模型」：可选 MODEL 槽。rev3（2026-10-01）起默认接独立二采链，

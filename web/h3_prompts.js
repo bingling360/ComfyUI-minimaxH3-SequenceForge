@@ -164,6 +164,56 @@
     return out;
   }
 
+  /** 回（LLM 产出）：**官方标签** → `@素材名`（回填兜底，2026-10-04）。
+   *
+   * 为什么需要它：发给 LLM 的素材名是**标注**（`@图片1`），但官方 ref-en.txt
+   * 要求镜头正文用 `<Subject N>` / `<Picture N>` / `<Video N>` / `<Audio N>` 指代
+   * 参考内容 —— 模型两边都听，**有时就把官方标签直接写进产出**。而 `textToMarks`
+   * 只认标注（官方 token 属于"另一层编号"，故意不动）。于是官方标签原样落盘：
+   * ① 提示词框里出现 `<Picture 1>`（用户看到的"picture1"）；
+   * ② `refsFromText` 只扫 `@素材名`，扫不到 → 本段引用为空 → 素材不进模型
+   *   （用户报的"有些时候无法正确识别素材"）。
+   * 所以回填必须再补这一跳：官方标签 → `@素材名`，把引用关系还原回来。
+   *
+   * 编号口径 = **送进 LLM 的 media 顺序**（`collectSegMedia` 与执行期
+   * `nodes._kind_tokens` 同口径：帧锚前置 + 参考素材顺延，各类别独立从 1 编号），
+   * 所以 `<Picture 1>` 就是 media 里第 1 张图，与执行期实跑的 `<Picture k>` 一致。
+   * media 项没有标注时 label 本身就是素材名，直接用它。
+   *
+   * **译不出的（编号越界 / media 里没有）原样保留** —— 不猜、不吞，宁可留个
+   * 明显的红框/告警让用户看见，也不静默指向错图。
+   *
+   * `<Subject N>` **不在此列**：它是"可复用可见内容"的抽象标签（角色/场景/风格），
+   * 不是素材引用，编号也由模型自行定义（与 media 顺序无对应关系）—— 保留给 H3
+   * 模型读，执行期直通。
+   */
+  function officialToMarks(text, media, pool) {
+    const s = String(text == null ? "" : text);
+    if (!s || !Array.isArray(media) || !media.length) return s;
+    if (!/<(?:Picture|Video|Audio)\s+\d+>/.test(s)) return s;
+    /* 标注 -> 素材名（全名优先；同一标注只认第一个，与 markPairs 同口径） */
+    const nameOf = {};
+    for (const a of (pool || [])) {
+      const mk = cleanMark(a && a.mark);
+      const nm = String((a && (a.ref_name || a.label || a.alias)) || "").trim();
+      if (mk && nm && !nameOf[mk]) nameOf[mk] = nm;
+    }
+    const seq = { Picture: [], Video: [], Audio: [] };
+    for (const m of media) {
+      const k = String((m && m.kind) || "image").toLowerCase();
+      const tag = k === "video" ? "Video" : (k === "audio" ? "Audio" : "Picture");
+      const lbl = String((m && m.label) || "").trim();
+      /* label 是**标注**（图片1）时必须有映射才敢用 —— 池里查不到就说明这张图
+       * 已经不在池里，硬译成 `@图片1` 只会留个假引用；label 本身是素材名
+       * （帧锚无标注的情形）才直接采用。 */
+      seq[tag].push(nameOf[lbl] || (cleanMark(lbl) ? "" : lbl));
+    }
+    return s.replace(/<(Picture|Video|Audio)\s+(\d+)>/g, (full, tag, num) => {
+      const nm = seq[tag][Number(num) - 1];
+      return nm ? "@" + nm : full;
+    });
+  }
+
   /* ---- latent 策略（二采/续接用，随 seg_fields 透存） ---- */
 
   function defaultLatentSave() {
@@ -180,7 +230,7 @@
   if (typeof window !== "undefined") {
     window.H3Prompts = {
       /* 素材标注编解码（B03）：只用于「提示词 ⇄ LLM」这一跳，绝不落盘 */
-      markPairs, markOf, marksToText, textToMarks,
+      markPairs, markOf, marksToText, textToMarks, officialToMarks,
       cleanMark, markShaped, nextMarkSeq,
       /* latent 策略 */
       defaultLatentSave, cleanLatentSave,

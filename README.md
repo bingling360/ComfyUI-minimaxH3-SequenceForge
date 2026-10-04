@@ -1,551 +1,673 @@
 # ComfyUI-minimaxH3-SequenceForge
 
-MiniMax H3 长视频插件：**续拍 / 自动保存 / 成片保存（主节点一体化）** 全套长片生产线。
+**Seamless long-form video production for MiniMax H3 inside ComfyUI.**
 
-- `H3SeamlessChainSampler`（无缝续拍）：多段提示词 → 逐段采样 → 段间无缝续接（视频 + 音频双流）→ 裁剪拼接。适合**一镜到底**。「自动保存=分段」每段落盘 `seg_NNN.mp4`，「自动成片=开启」自动拼 `final_*.mp4`，成片保存已并入主节点，不再需要独立保存节点。
-- `H3SeamDoctor`（接缝体检）：只测不治的跳变诊断仪——逐缝量化**时间断层 / 位移瞬移 / 颜色漂移 / 内容切换 / 清晰度骤降 / 音频爆音**，输出详尽报告 + 残差伪彩对比图。
+SequenceForge turns a stack of per-shot prompts into one continuous, arbitrarily long video — chaining each new segment onto the tail of the previous one through the model's own conditioning protocol, archiving every segment to disk so you can resume, re-shoot, or re-render at any point. Everything is driven from a full-screen **Director Console** that ships with the plugin.
 
-> 注：`H3StoryboardChain`（分镜长片）与 `H3ChainSaver`（成片保存）两个节点已移除——分镜模式暂未纳入导演台主线，成片保存由主节点「自动成片」一体化完成。相关历史说明见 `更新说明_分镜模式与锚定加噪.md`、`更新说明_长片导演台.md`。
+No monkey-patching. No extra Python dependencies. Official MiniMax H3 nodes only.
 
-## 原理（一句话）
+---
 
-生成第 N+1 段时，把第 N 段结尾 `context_frames` 帧从**采样输出的 latent 里直接切片**（不解码、不重编码 → 零颜色漂移），按官方 conditioning 协议（`minimax_keyframes`，锚 `resolved_frame_index=0`）钉在第 N+1 段头部，采样每步重注入，顺着上段尾部的运动轨迹继续画；解码后裁掉头部重叠桥再拼接 → 接缝处自然连贯。
+## Table of contents
 
-## 特点
+1. [What's in the box](#1-whats-in-the-box)
+2. [How the seam works](#2-how-the-seam-works)
+3. [Highlights](#3-highlights)
+4. [Requirements](#4-requirements)
+5. [Installation](#5-installation)
+6. [Quick start](#6-quick-start)
+7. [The Director Console](#7-the-director-console)
+8. [Prompt authoring](#8-prompt-authoring)
+9. [Key parameters](#9-key-parameters)
+10. [Project archiving](#10-project-archiving)
+11. [Per-segment review](#11-per-segment-review)
+12. [Re-running and rerolling segments](#12-re-running-and-rerolling-segments)
+13. [Selective redo](#13-selective-redo)
+14. [Segment ordering and disabling](#14-segment-ordering-and-disabling)
+15. [Prologue: continue from an uploaded video](#15-prologue-continue-from-an-uploaded-video)
+16. [Standalone shots (hard cut)](#16-standalone-shots-hard-cut)
+17. [Manual anchors](#17-manual-anchors)
+18. [Merge export](#18-merge-export)
+19. [Latent-upscale second pass](#19-latent-upscale-second-pass)
+20. [Bridge-frame gating](#20-bridge-frame-gating)
+21. [Seam Doctor](#21-seam-doctor)
+22. [Run report (wire-free)](#22-run-report-wire-free)
+23. [Semantic bridge](#23-semantic-bridge)
+24. [Enhance-A-Video / FETA](#24-enhance-a-video--feta)
+25. [Prompt optimizer and expander](#25-prompt-optimizer-and-expander)
+26. [Custom sigmas (distilled LoRAs)](#26-custom-sigmas-distilled-loras)
+27. [Asset library](#27-asset-library)
+28. [Performance settings](#28-performance-settings)
+29. [Seam metrics](#29-seam-metrics)
+30. [Repository layout](#30-repository-layout)
+31. [HTTP API](#31-http-api)
+32. [Upstream tracking](#32-upstream-tracking)
+33. [Removed in 1.0](#33-removed-in-10)
+34. [Credits and licensing](#34-credits-and-licensing)
 
-- **官方原生协议，零 monkey-patch**：conditioning / latent 构造直接调用官方 `MiniMaxH3ImageToVideo` / `MiniMaxH3ReferenceToVideo`，采样走官方 `common_ksampler`，抗 ComfyUI 升级。
-- **零额外依赖**：requirements.txt 为空。只用 ComfyUI 自带的 torch 与 comfy 核心，不装 opencv / scenedetect / ffmpeg。
-- **无缓存架构**：循环在单次执行内完成，段间 handoff 全是局部变量——旧方案「stale-cache 回放」类 bug 在此架构下不存在。
-- **音频双流续接**：guide 同时钉入上段尾部的音频窗（需新版 ComfyUI，见下）。
-- **自定义 Sigmas（少步蒸馏 LoRA 通道）**：「自定义Sigmas」槽可接外部 sigma 表（HyperFlow 8 步、H3 Turbo 等），接了即覆盖「步数」与「调度器」（只作用于一采，二采仍用自己的参数）；不接则与旧行为逐字节一致。详见 [HyperFlow 适配与自定义 Sigmas](docs/HyperFlow适配与自定义Sigmas.md)。
-- **逐段审片**：「审片模式=逐段确认」时每次运行只生成一段新内容即返回，预览满意再重新运行继续下一段——长片不必整链跑完才发现坏段。
-- **任意段重跑**：改了第 N 段提示词 → 只重建**第 N 段**本身（双锚对齐段 N-1 存档尾帧与段 N+1 存档头帧，下游不动、不级联），前段沿用存档；**选择性重做**——已完成段「🎲 重摇」按锚定模式（双锚/仅上/仅下/无锚）标记任意多段，一次提交互不级联，其余段 replay 秒级沿用；审片模式下逐段推进（队列驻留 manifest，剩余段下次继续）。
-- **段落编排**：段卡片拖拽调序（段类型只剩 `prompt` 生成段与 `prologue` 序章两种）——内容变更只重建**变更的那些段**（用双锚对齐上下邻居，下游不动），不级联；「⏸ 不上链」禁用任意提示词段——跳过执行不进成片、槽位稳定零重做成本，随时恢复；已完成段「🔄 重新二采此段」单段重做高清不动其他段，详见[选择性重做说明](更新说明_选择性重做与段落编排.md)。
-- **自动保存（默认开）**：「自动保存=分段」时无需任何下游接线——每段生成完自动存 `output/h3_projects/<项目名>/seg_NNN.mp4`；完整成片由「自动成片」开关独立控制（默认开）：开启则链（或逐段审片已确认部分）自动拼成 `final_时间戳.mp4` 同目录，报告注明路径，跑完直接去 output 看。
-- **成片保存（主节点一体化）**：最终成片与分段视频均由「自动保存 / 自动成片」开关在主节点内落盘（`output/h3_projects/<项目名>/`），原 `H3ChainSaver` 画廊节点已移除，成片统一在导演台「成片」区按 `manifest.finals` 展示与下载。
-- **序章续拍**：`LoadVideo` 接「起始视频」（+「起始视频音轨」），上传视频编码为第 0 段进存档：成片以它开头，生成段从它的结尾无缝续拍。
-- **段级独立镜头**：与上段毫无关联的镜头（新场景/闪回/平行叙事）在导演台勾「🔗 独立镜头」一键全断——不注入引导桥、不裁头、不精修不混合，纯硬切；开关进段哈希，改动自动从该段重做。
-- **手动锚定**：把外部片段 / 图片 / 上段尾 / 已完成段 / latent 库钉到某段的段首 / 中段 / 段尾作为引导锚（五种源、17k+5 窗宽、图像+音频 / 仅图像 / 仅音频三态），让模型从该位置继续画；唯一硬约束是分辨率，无源可用时硬报错。手动锚定**不进成片**（要混外部视频进成片请用「合并导出」），详见下文「手动锚定」章节。
-- **合并导出**：不重跑链，在**素材库**里点「⧉ 合并导出」进选材模式，点视频素材排顺序（点击顺序即拼接顺序），按序流式拼接成 `finals/merged_*.mp4`（H.264+AAC 统一参数），记录入 manifest 可追溯。
-- **潜空间放大二采（高清重制）**：每段采样定稿后、解码之前立即「神经放大 latent → 低强度重采样补回高频细节」（整合 LBH 潜空间放大网络 + JZL 二采范式），**分段视频与成片直接保存二采后的高清结果**（同名覆盖，单份产物，无额外解码）；音轨沿用原声零回归；参数不进基础链指纹——改参数只重做二采，不动已生成段；支持跟随生成 / 手动勾选两种模式，并提供多轮精化、STG、双域锐化、HQ 编码与增益重试，详见[抗糊抗条纹说明](更新说明_二采抗糊抗条纹.md)。
-- **自动存档（游戏式项目存档）**：「自动存档=自动存档」时每段采样后立即落盘 latent 存档（约 5MB/段），中断重跑自动跳过已完成段，结果与一次跑完**逐帧一致**（同参数下）；**一个项目 = `output/h3_projects/` 下一个文件夹**（分段视频 / 成片 / 提示词清单 / 续拍 latent 全在里面），导演台打开即列出全部项目，可读档续拍、一键删除。
-- **桥帧质量门控**：对将成为重叠桥的尾帧打分（Laplacian 清晰度 + 曝光），尾帧低质时可自动回退 17/34 帧取好帧续拍（等价于剪掉坏尾，时间线仍然连续）。
-- **接缝根治三件套（测量 → 重摇 → 精修）**：每段报告帧差与音频响度跳变（诊断模型起始漂移）；「接缝重摇=自动」（默认）在缝差超阈值时换种子重采该段（各次尝试取缝差最小的一组）；「接缝处理=潜空间精修」（默认）把上段尾+本段头各「精修窗口」帧的干净 latent 拼成跨缝窗口，按「精修强度」联合重去噪——缝两侧出自同一次去噪，缝差≈段内正常帧差，从根上替代像素叠影混合；`smoothstep像素混合` 保留为降级选项，`关闭` = 只测量不干预。
-- **接缝体检（H3SeamDoctor）**：跳变根因诊断仪——三角判别**时间断层**（缝差≈N 帧演化量 + 平移补不掉 + 同场景延续 = 时间轴缺帧）、**位移瞬移**（整体平移搜索后残差骤降 = 运动矢量断裂）、**内容重复**（缝后回放）、**颜色漂移 / 内容切换**（ΔE + 直方图 + NCC）、清晰度骤降与音频爆音；接「分段图像」还能校验拼装一致性（smoothstep 是否生效）与帧数守恒。
-- **尾切对齐 + 响度对齐（接缝跳变根治）**：每段输出末端自动对齐到 token 网格，guide 锚定末端与输出末端严格重合——否则续拍点会落在本段从未输出的网格填充帧上（ctx=56 时每个接缝跳过 15 帧内容，观感即"迷之跳变"）；音频归一化只统计保留区（锚定区音频不计入），段首再做 ±6dB 钳制的响度对齐（1s 渐出，不沿链累积），报告单行注明增益。
+---
 
-## 安装
+## 1. What's in the box
 
-### 1. 安装插件本体
+| Node | Purpose |
+|---|---|
+| **`H3SeamlessChainSampler`** | The workhorse. Per-segment prompts → segment-by-segment sampling → seamless audio+video chaining → tail-trim → optional latent-upscale second pass → per-segment save + final encode. Also hosts the Director Console state. |
+| **`H3SeamDoctor`** | Seam diagnostics — measures but never modifies. Quantifies **time gaps / motion teleports / color drift / content switches / sharpness drops / audio pops** per seam, with a residual false-color comparison image. |
+| **`H3RunReport`** | Wire-free run report. **Zero input sockets**, so the "the report wire broke again after restart" failure mode cannot exist. The text is fetched by the front-end straight from the plugin API. |
+| **`H3EAVFetaPatch`** | Optional Enhance-A-Video / FETA temporal-attention enhancement, adapted to H3. Report-only by default. |
+| **`H3EAVFetaReport`** | Reads the CFI / g statistics from the last EAV/FETA run. |
 
-**方式一：git clone（推荐，便于后续更新）**
+> **Note.** `H3StoryboardChain` (storyboard chaining) and `H3ChainSaver` (final-save gallery) have been **removed**. Storyboard mode is not part of the Director Console mainline, and final-save is now folded into the main node's *Auto finalize* switch. See [§33 Removed in 1.0](#33-removed-in-10).
+
+---
+
+## 2. How the seam works
+
+When generating segment *N+1*, SequenceForge slices the last `guide frames` frames **directly out of segment *N*'s sampled latent** (no decode, no re-encode → zero color drift) and pins them to the head of segment *N+1* through the official conditioning protocol (`minimax_keyframes`, anchored at `resolved_frame_index=0`). The anchor is re-injected on every sampling step, so the model keeps drawing along the motion trajectory of the previous tail. After decoding, the overlapping bridge at the head is trimmed and the segments are concatenated — the seam becomes visually continuous.
+
+The tail is also snapped to the H3 token grid before chaining, so the guide anchor and the actual output tail coincide exactly (otherwise the continuation point lands on padding frames the segment never emitted — the classic "mystery jump").
+
+---
+
+## 3. Highlights
+
+- **Official protocol, zero monkey-patching.** Conditioning / latent construction calls the official `MiniMaxH3ImageToVideo` / `MiniMaxH3ReferenceToVideo`; sampling goes through the official `common_ksampler`. Upgrades survive.
+- **Zero extra dependencies.** `requirements.txt` is empty — only ComfyUI's bundled torch and `comfy` core. No opencv / scenedetect / ffmpeg installs.
+- **No cache architecture.** The loop runs inside a single execution; inter-segment handoff is all local variables — the "stale cache replay" class of bugs simply cannot occur.
+- **Dual-stream continuation.** The guide pins the previous tail's **audio window** as well as its video frames.
+- **Custom sigmas.** The `custom sigmas` socket accepts an external sigma table (HyperFlow 8-step, H3 Turbo, …). Connected, it overrides `steps` and `scheduler` for the base pass only; disconnected, behavior is byte-identical to before.
+- **Per-segment review.** With *review mode = confirm each segment*, one run produces exactly one new segment and returns — no need to run a whole chain to discover a bad segment.
+- **Re-shoot any segment.** Edit segment *N*'s prompt → only segment *N* is rebuilt (double-anchored against its archived neighbors; downstream untouched). *Selective redo* lets you flag any number of finished segments and re-shoot them in one batch without cascading.
+- **Segment reordering.** Drag segment cards to reorder; reorder only rebuilds from the change point. **Pause** any prompt segment (`⏸`) to skip it without renumbering slots — zero redo cost, instantly reversible.
+- **Auto-save (on by default).** With *auto-save = segments*, each finished segment lands in the project folder with no downstream wiring. *Auto finalize* (on by default) then concatenates the finished chain into `final_<timestamp>.mp4`.
+- **Game-style project archiving.** One project = one folder under `output/h3_projects/`. Per-segment latent archives (~5 MB each) let an interrupted run resume with **frame-identical** results, skipping already-completed segments.
+- **Prologue continuation.** Feed a `LoadVideo` into *start video* and it becomes segment 0: the final cut starts with it and generation continues seamlessly from its tail.
+- **Standalone shots.** Mark a segment `🔗 standalone` to hard-cut it from the previous one — no bridge injection, no head trim, no post-processing.
+- **Manual anchors.** Pin an external clip / image / previous tail / finished segment / latent-library entry to any segment's head / mid / tail as a guide anchor. Five sources, 17k+5 window widths, image+audio / image-only / audio-only modes. The only hard constraint is resolution.
+- **Merge export.** Re-concatenate existing segments, finals, and external videos in click order into `finals/merged_*.mp4` — no re-run.
+- **Latent-upscale second pass.** After each segment is finalized (and before decode) the latent is **neurally upscaled → lightly re-sampled** to recover high-frequency detail. The saved segment video and final cut are the high-res result directly. Audio is carried over untouched.
+- **Bridge-frame gating.** Score the tail frames that will become the bridge (Laplacian sharpness + exposure); on a bad tail, roll back 17/34 frames to a good one.
+- **Seam reroll.** When the seam frame-difference exceeds a threshold, re-sample that segment with a new seed and keep the smallest-difference attempt.
+- **Tail-trim alignment + loudness alignment.** Segment output tails are snapped to the token grid; per-segment head loudness is matched to the previous tail (±6 dB clamp, 1 s fade-out, never accumulates along the chain).
+
+---
+
+## 4. Requirements
+
+- **ComfyUI ≥ v0.34.0 recommended.** Hard floor is v0.30.0 (must include the official MiniMax H3 nodes and `comfy_api.latest`); below that the plugin does not load and says so in the console.
+- **A GPU that can hold the H3 UNET.** The reference cloud setup is a 24 GB RTX 3090. The plugin is developed on a 6 GB GTX 1660 SUPER (sm75) but that is a dev box, not a target configuration.
+- **sm75 (Turing) note.** Do **not** enable `sol_attn` on sm75 — it bypasses the sm80 guard, does not error, and returns garbage. The node's eligibility check is the only protection.
+
+---
+
+## 5. Installation
+
+### 5.1 The plugin
+
+**Option A — git clone (recommended):**
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/bingling360/ComfyUI-minimaxH3-SequenceForge.git
 ```
 
-**方式二：手动拷贝**
+**Option B — manual copy:**
 
-把整个 `ComfyUI-minimaxH3-SequenceForge` 文件夹（**必须含 `web/` 与 `example_workflows/`**）拷入 `ComfyUI/custom_nodes/`。`web/` 是导演台前端，缺了它节点能跑但导演台不出现。
+Copy the whole `ComfyUI-minimaxH3-SequenceForge` folder (it **must** include `web/` and `example_workflows/`) into `ComfyUI/custom_nodes/`. `web/` is the Director Console front-end; without it the nodes still run but the console will not appear.
 
-**依赖**：本插件零第三方依赖——`requirements.txt` 为空，只用 ComfyUI 自带的 torch / comfy 核心与官方 MiniMax H3 节点，`pip install -r requirements.txt` 一步可跳过。
+**Dependencies:** none. `requirements.txt` is empty — only ComfyUI's bundled torch / `comfy` core and the official MiniMax H3 nodes are used. `pip install -r requirements.txt` can be skipped.
 
-重启 ComfyUI。控制台出现 `[ComfyUI-minimaxH3-SequenceForge] 路由已注册…` 即加载成功；若提示需要更高版本 ComfyUI，先按下方「版本要求」升级（建议 v0.34.0+）。AutoDL 环境（`/root/miniconda3`）同样步骤，无需额外装包。
+Restart ComfyUI. When the console prints `[ComfyUI_H3_SeamlessChain] 路由已注册…` the plugin loaded. AutoDL environments (`/root/miniconda3`) follow the same steps.
 
-### 2. 安装潜空间放大二采权重（可选，仅用二采高清时需要）
+### 5.2 Latent-upscale weights (optional)
 
-从 HuggingFace [`LBH-123-AI/Minimax_h3_latent_Upscaler`](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载权重，放入 `ComfyUI/models/latent_upscale_models/`（目录不存在就新建）。**权重不入 git**（单个 691MB 超 GitHub 单文件 100MB 限制），必须单独下载：
+Only needed if you want the second-pass high-res render. Download from HuggingFace [`LBH-123-AI/Minimax_h3_latent_Upscaler`](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) into `ComfyUI/models/latent_upscale_models/` (create the folder if needed). **The weights are not committed to git** (a single 691 MB file exceeds GitHub's 100 MB limit).
 
-**可下载的权重文件**（三选一，均为 3D 骨干，精度不同）：
-
-| 文件 | 大小 | 说明 |
+| File | Size | Notes |
 |---|---|---|
-| `minimax_h3_latent_upscaler_3d_fp16.safetensors` | 691 MB | **推荐**，半精度，显存占用小 |
-| `minimax_h3_latent_upscaler_3d_bf16.safetensors` | 691 MB | 半精度（bf16），与 fp16 二选一 |
-| `minimax_h3_latent_upscaler_3d_fp32.pth` | 1.38 GB | 全精度，效果最好但显存翻倍 |
-
-**下载方式（三选一）**：
+| `minimax_h3_latent_upscaler_3d_fp16.safetensors` | 691 MB | **Recommended** — half precision, low VRAM |
+| `minimax_h3_latent_upscaler_3d_bf16.safetensors` | 691 MB | bf16 variant (pick one of the two) |
+| `minimax_h3_latent_upscaler_3d_fp32.pth` | 1.38 GB | Full precision, best quality, double VRAM |
 
 ```bash
-# 方式一：浏览器直接下载单文件（最简单）
-# 打开仓库页面，点击对应文件右侧的下载箭头：
-https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/tree/main
+# Option 1 — download the file from the browser:
+#   https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/tree/main
 
-# 方式二：huggingface-cli 命令行下载
+# Option 2 — huggingface-cli
 pip install -U "huggingface_hub[cli]"
 hf download LBH-123-AI/Minimax_h3_latent_Upscaler \
    minimax_h3_latent_upscaler_3d_fp16.safetensors \
    --local-dir ComfyUI/models/latent_upscale_models
 
-# 方式三：国内网络走 hf-mirror.com 镜像（无需代理，用法同上）
+# Option 3 — hf-mirror.com (no proxy needed in mainland China)
 HF_ENDPOINT=https://hf-mirror.com hf download LBH-123-AI/Minimax_h3_latent_Upscaler \
    minimax_h3_latent_upscaler_3d_fp16.safetensors \
    --local-dir ComfyUI/models/latent_upscale_models
-# 或直接用镜像页面下载：https://hf-mirror.com/LBH-123-AI/Minimax_h3_latent_Upscaler
 ```
 
-- **本地已有权重**：若本机 `放大模型放到latent_upscale_models/` 文件夹里已有 `minimax_h3_latent_upscaler_3d_fp16.safetensors`（仅本地暂存，未入 git），直接拷入模型目录即可，无需再下载：
+- The **network architecture** dropdown must match the weights (2D residual backbone / pure 3D convolution). All three files above are **3D backbones** — pick "3D".
+- Without the weights the main chain still works; only the *latent upscale second pass* panel is unavailable (empty dropdown).
 
-```bash
-mkdir -p ComfyUI/models/latent_upscale_models
-cp ComfyUI-minimaxH3-SequenceForge/放大模型放到latent_upscale_models/*.safetensors \
-   ComfyUI/models/latent_upscale_models/
-```
+### 5.3 Verify
 
-- 放大模型的「网络架构」下拉须与权重匹配（2D 残差骨干 / 纯 3D 卷积），不匹配时插件会明确报错；上述三份均为 **3D 骨干**（架构下拉选 3D）；
-- 不装权重不影响主链生成，仅导演台「✦ 潜空间放大二采」面板不可用（下拉为空）。
+1. After restart, the node menu should find `H3SeamlessChainSampler`, `H3SeamDoctor`, `H3RunReport`, and the two EAV/FETA nodes.
+2. Visit `http://127.0.0.1:8188/h3chain/ping` (adjust the port). A JSON response means the project-archive routes are mounted (the Director Console depends on them; if they are missing, the console shows a diagnostic banner).
+3. Load `example_workflows/备用初始化导演台工作流.json`, adjust the model paths to your environment, and run.
 
-### 3. 验证安装
+---
 
-1. 重启后节点菜单能搜到 `H3SeamlessChainSampler`（无缝续拍）与 `H3SeamDoctor`（接缝体检）；
-2. 浏览器访问 `http://127.0.0.1:8188/h3chain/ping`（端口按实际改），返回 JSON 说明项目存档路由已挂载（导演台依赖它，未挂载时导演台顶部会有诊断横幅）；
-3. 加载 `example_workflows/备用初始化导演台工作流.json`，模型路径按自己环境调整后直接开跑。
+## 6. Quick start
 
-## 项目结构（各文件 / 文件夹的用处）
+1. Load the bundled example workflow and point the loaders at your MiniMax H3 models.
+2. Open the **Director Console** (full-screen, from the node or the sidebar mini-entry).
+3. Write a prompt per segment (1–64 segments), or paste a multi-segment master prompt and let the console split it.
+4. Queue. The first segment is generated; with auto-save on, `finals/seg_001.mp4` appears in the project folder, and when the chain finishes, `finals/final_<timestamp>.mp4` as well.
 
-```
-ComfyUI-minimaxH3-SequenceForge/
-├─ __init__.py                 # 插件入口：注册两个节点、声明前端目录 WEB_DIRECTORY=./web、
-│                              #   挂载 HTTP 路由（扩展钩子 + PromptServer 双路兜底，杜绝 404/405）
-├─ nodes.py                    # 主节点 H3SeamlessChainSampler：多段提示词 → 逐段采样 → 段间无缝
-│                              #   续接 → 接缝处理 → 二采 → 拼接/自动成片落盘的总编排（核心，体量最大）
-├─ seam_doctor.py              # 体检节点 H3SeamDoctor：接缝根因诊断（时间断层/位移瞬移/颜色漂移/
-│                              #   内容切换/清晰度骤降/音频爆音），只测不治
-│
-├─ checkpoint.py               # 自动存档引擎：共享参数指纹 + 逐段提示词哈希 + manifest 原子读写
-│                              #   + 段 AV latent 落盘（断点续跑、任意段重跑的基础）
-├─ projects.py                 # 游戏式项目存档：扫描/新建/删除 output/h3_projects/ 项目文件夹，
-│                              #   合并导出（merged_*.mp4）的实现
-├─ cond_cache.py               # CLIP 文本编码缓存代理：按提示词文本 LRU 缓存 encode 结果，
-│                              #   二采与重复提示词段跳过大体积 TE（25.9GB 级）的重复前向
-│
-├─ qc.py                       # 桥帧质量门控：将成为重叠桥的尾帧打分（Laplacian 清晰度 + 曝光），
-│                              #   坏尾自动回退 0/17/34 帧
-├─ metrics.py                  # 接缝质量评测：五维 z-score（光流/LPIPS/嵌入/相机/姿态），
-│                              #   接缝验收（|z|<2.0）与 A/B 对比实验的数据来源
-├─ grid.py                     # H3 帧网格纯数学：token↔像素帧映射、音频窗换算（由官方常量推导）
-│
-├─ upscale.py                  # 潜空间放大二采（主循环内渲染通道）：神经放大 → 低强度重采样 → 解码，
-│                              #   整合 LBH 放大网络 + JZL 二采范式
-├─ upscale_net.py              # 二采放大网络定义（2D 残差骨干 / 纯 3D 卷积两种骨干 + 权重加载），
-│                              #   逐行移植自 LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler
-├─ routes.py                   # HTTP 路由（/h3chain/*）：项目列表/新建/删除、提示词回写、合并导出、
-│                              #   二采重置、重摇撤销等——导演台前端的数据接口（根路径 + /api 双注册）
-├─ media.py                    # PyAV 编解码共享：分段/成片/合并的 mp4 落盘与上传视频解码，
-│                              #   编码逻辑全插件只维护一份
-│
-├─ web/                        # 前端（随 WEB_DIRECTORY 分发，ComfyUI 自动加载）
-│   ├─ h3_director.js          # 「长片导演台」全屏一体化控制台 + 侧栏迷你入口（状态驱动架构：
-│   │                          #   模式/提示词/首帧/参考素材全部存节点「导演台状态」JSON）
-│   └─ h3_default_workflow.js  # 导演台配套默认工作流模板
-│
-├─ example_workflows/          # 示例工作流
-│   └─ 备用初始化导演台工作流.json   # 导演台初始化工作流（模型加载 + 主节点 + 提示词×3 预连线）
-│
-├─ docs/                       # 工程文档（不参与运行时）
-│   ├─ UPSTREAM.md             # 上游跟进台账（放大网络）：移植范围 / 锚点表 / 与上游的
-│   │                          #   差异台账 / 同步 SOP —— 改 upscale_net.py 前先读它
-│   └─ upstream_snapshot/      # 上游基线快照（按抓取日期存 nodes/*.py 原文，供 diff）
-│       └─ 2026-09-02/         #   d7c01b9：minimax_h3_latent_upscaler_{2d,3d}.py
-│
-├─ 放大模型放到latent_upscale_models/  # 预置的二采放大权重（仅本地暂存不入 git；安装时拷入 ComfyUI/models/latent_upscale_models/）
-│   └─ minimax_h3_latent_upscaler_3d_fp16.safetensors
-│
-├─ 总提示词框格式规范skill/     # 「📋 总提示词」框的格式规范（h3-video-prompts skill）：八标签 + 段头
-│   └─ SKILL.md                #   的机器解析契约文本写法，供 AI 助手/人工按规范生成可切分的总提示词
-│
-├─ pyproject.toml              # ComfyUI 插件元数据（名称/版本/许可）
-├─ requirements.txt            # 空依赖声明（仅注释：零第三方依赖）
-└─ README.md                   # 本文档
-```
+Model wiring inside the example workflow (all official nodes):
 
-运行时产出（不在仓库内）：成片 / 分段 / 存档统一落在 `ComfyUI/output/h3_projects/<项目名>/`，体检报告落在 `ComfyUI/output/h3_seam_doctor/`，详见「自动存档」章节。
+- **UNET** — t2v / i2v use `minimax_h3_fl2va_*`; r2v uses `minimax_h3_ref2va_*`. Feed it through the official **ModelSamplingMiniMaxH3** (shift video 12 / audio 3) into the node's *model* input.
+- **CLIP** — type must be `minimax` (Qwen3-VL).
+- **Video VAE** (`minimax_h3_video_vae`) and **audio VAE** (`minimax_h3_audio_vae`).
 
-## 上游跟进（放大网络）
+---
 
-二采的放大网络逐行移植自 [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)（只移植**网络结构与权重加载**，不移植它的节点层与推理接口）。跟进台账、与上游的差异清单、同步 SOP 全部记在 **[`docs/UPSTREAM.md`](docs/UPSTREAM.md)**——**改 `upscale_net.py` 之前请先读一遍**，避免把本地的刻意增强当 bug 修回去，也避免重复调研上游已经实现的东西。
+## 7. The Director Console
 
-## 版本要求
+The console is a full-screen, state-driven control surface. Mode, prompts, first-frame, reference assets, and per-segment settings all live in the node's *director state* JSON — nothing is stored in canvas wiring.
 
-- **建议 ComfyUI ≥ v0.34.0**。硬性下限为 v0.30.0（含官方 MiniMax H3 节点与 `comfy_api.latest`），低于 v0.30.0 插件不加载并在控制台提示。
-- 旧版本（0.30–0.33）可以加载，但段间引导的**多帧桥**与**音频锚定**需要 ComfyUI 含 [PR #15439](https://github.com/Comfy-Org/ComfyUI/pull/15439)（2026-08-09 之后构建）——旧 keyframe 协议每个锚点只收单帧 latent，插件会运行时自动探测并降级为**单帧桥 + 仅视频引导**（报告中注明，接缝质量受限）。**升级 ComfyUI 后无需改任何参数，自动恢复完整引导帧数**；r2v 链在旧版本上引导还会与参考素材冲突失效，务必升级。
+Key areas:
 
-## 使用（节点界面为中文）
+- **Left rail — project archive.** Live disk scan of every project (cover / progress / updated time). Click to **load** (switch the archive directory and load that project's prompts); **🗑 delete** removes the whole folder; **＋ new project** creates the folder and a 0-segment manifest on disk immediately.
+- **Center — segment cards.** One card per segment with its prompt, scene/character/soundscape/music fields, per-segment duration, reference chips, and controls: `🎲 reroll`, `⏸ pause`, `🔗 standalone`, `↺ reset second pass`, drag handle for reordering.
+- **Right rail — second pass, semantic bridge, performance, prompt optimization settings.**
+- **Asset library** — open from the left rail; also hosts **merge export** (see §18).
 
-1. 按官方 MiniMax H3 工作流加载模型：
-   - **UNET**：t2v / i2v 用 `minimax_h3_fl2va_*`；r2v 用 `minimax_h3_ref2va_*`
-   - UNET → 官方 **ModelSamplingMiniMaxH3**（shift video 12 / audio 3）→ 本节点「模型」
-   - **CLIP**：type 必须选 `minimax`（Qwen3-VL）→ 本节点「文本编码器」
-   - 视频 VAE（`minimax_h3_video_vae`）→「视频VAE」；音频 VAE（`minimax_h3_audio_vae`）→「音频VAE」
-2. **每段提示词独立输入**：导演台段卡片每段一个文本框（**1–64 段不限**），提示词只走「导演台状态」；画布提示词组入口已删除。
-3. **参考素材（r2v 链，零画布接线）**：素材**只走导演台三库面板**（瓦片拖放 / `@` 引用），运行时由导演台把素材清单写进链状态（`ds.ref_assets`）——画布上**不需要连任何线**，主节点原先的「资产包」输入与 `H3 Asset Bundle` 节点均已删除。单段上限定额与官方一致：
-   - 图片 **9 张**（`<Picture i>`）、视频 **3 个**（`<Video k>`，24fps 2–15 秒）、独立音频 **3 条**（`<Audio j>`，配乐/音效）；参考视频原声自动配对同号 `<Audio j>`
-   - 标签编号**按段内引用顺序从 1 数**（官方语义）；接了任一参考素材 → 整条链走 r2v，请换 `ref2va` UNET
-   - 旧链：四组 autogrow 画布输入、`H3AssetHub` / `H3 Asset Bundle` 节点、主节点「资产包」输入均已删除（老工作流残留连线加载时自动忽略）；素材清单的 JSON 格式校验仍保留在后端（`POST /h3chain/asset_check`）
-4. 输出：成片与分段由主节点「自动保存 / 自动成片」开关一体化落盘（见下节），无需接任何下游节点；若想手动控制编码，也可把「图像」「帧率」「音频」接官方 `Create Video` → `Save Video`。「报告」可右键预览每段执行摘要。
-5. **分段单独保存**：主节点「自动保存=分段」运行时每段自动存 `seg_*.mp4` 到项目文件夹（不重编码），去 `output/h3_projects/<项目名>/` 直接看片。主节点分段列表输出已删除，不再需要下游接线。
+The console's prompts are persisted **in the project folder** (debounced write-back to the manifest ~1.5 s after editing, plus on project switch/create). Cut the power, restart — nothing is lost.
 
-### 提示词写法（官方 H3 结构，自动组装）
+---
 
-按官方 [h3-prompt-writing](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing) skill 的规范，发给模型的提示词是**三字段结构**。本插件在运行时自动把你在导演台填的内容组装成该结构，**你只管写中文正文，结构层不用管**：
+## 8. Prompt authoring
+
+The plugin assembles the official three-field structure for you at runtime; **you only write the body text**.
 
 ```
-integrated_multimodal_description: [Shot 1] {场景}。{角色}。{主提示词：画面与动作时间线}
-overall_soundscape: {环境音 + 动作音，1-4 句}
-non_diegetic_music: {背景配乐：乐器 + 节奏 + 动态，1-3 句}
+integrated_multimodal_description: [Shot 1] {scene}. {characters}. {main prompt: picture and action timeline}
+overall_soundscape: {ambient + action sound, 1-4 sentences}
+non_diegetic_music: {score: instruments + tempo + dynamics, 1-3 sentences}
 ```
 
-- **组装来源**：导演台段卡片「分段处理」里的 场景提示词 / 角色提示词 / 环境音 / 配乐 四个框 + 主提示词文本框；画布直连模式（无导演台状态）的主提示词同样会被包装成官方结构。
-- **留空省略**：环境音 / 配乐留空则整个字段不出现在提示词里（= 不约束，而不是「无声」——官方 `N/A` 语义是明确请求静音，别乱用）。
-- **对白自动转换**：主提示词里的中文对白「……」自动转官方格式 `<d>[中文] ……</d>`；已手写 `<d>` 标签时不再自动转换。**说话人请标稳定 ID**：`短发女主 (S1) 轻声说：「……」`，同一角色跨段用同一编号，不出声的角色不编号。
-- **官方直通**：主提示词里只要含 `integrated_multimodal_description:` / `overall_soundscape:` / `detailed_description:` 任一标签，整段按你写的内容原样发送（贴官方完整格式的提示词不会被二次包装；r2v 用户可手写官方六段结构 `subject_definitions` / `summary` / `retention_analysis` / `detailed_description` / `overall_soundscape` / `non_diegetic_music`）。
-- **i2v 首段**：首帧来源为导演台 `first_frame` 文件名或资产标注「首帧图」时，首段提示词自动前置官方 I2VA 指令行 `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.`，续段不加（画布首帧图片入口已删除）。
-- **段级首尾帧图引用**：首帧视频模式下，段卡片「首尾帧图」行可逐段勾选是否参考首帧图/尾帧图（`segments[i].frame_refs`，缺省=首段参考首帧、末段参考尾帧）。中段勾首帧图=头部身份锚（keyframe 注入抑制长链漂移）；任意段勾尾帧图=该段末帧锚（优先于每段尾帧锚定）。改动进该段哈希，重跑自动从该段起重做；详见《更新说明_段级首尾帧图引用》。
-- **r2v 参考定义**：多参模式下，段内提示词没显式写 `<Picture k>` 时只补最小映射行（`[References]` + 每资源一行 `<Picture k> = 标签`，接线语义不写散文）；写了 tag 的段保持原样直通。
+- **Assembly sources:** the segment card's scene / character / soundscape / music fields plus the main prompt box; canvas-direct mode wraps the main prompt the same way.
+- **Empty = omitted.** Leaving soundscape / music blank drops the field entirely (= unconstrained, not "silent"). The official `N/A` value explicitly requests silence — do not use it casually.
+- **Dialogue auto-conversion.** Chinese dialogue `「…」` in the main prompt is converted to the official `<d>[中文] …</d>`; hand-written `<d>` tags are left alone. **Give speakers stable IDs** (`短发女主 (S1) 轻声说：「……」`), reusing the same number for the same character across segments; silent characters get no number.
+- **Official passthrough.** If the main prompt already contains any of `integrated_multimodal_description:` / `overall_soundscape:` / `detailed_description:`, the whole segment is sent verbatim (r2v users may hand-write the official six-section structure `subject_definitions` / `summary` / `retention_analysis` / `detailed_description` / `overall_soundscape` / `non_diegetic_music`).
+- **i2v first segment.** When the first frame comes from the console's `first_frame` (or an asset tagged "first frame"), the first segment's prompt is prefixed with the official I2VA instruction line.
+- **Per-segment frame references.** In first-frame video mode, each segment card can toggle whether it references the first / last frame image (`segments[i].frame_refs`; default = first segment references the first frame, last segment references the last frame). Toggling is part of that segment's hash, so changes re-run from that segment.
+- **r2v reference mapping.** In multi-reference mode, a segment that does not explicitly write `<Picture k>` gets only a minimal mapping block (`[References]` + one line per resource); segments that do write tags are passed through.
 
-**官方写法要点**（想手写完整官方格式时照这个来）：
+### Official writing notes
 
-| 要素 | 官方规范 |
+| Element | Official convention |
 |---|---|
-| 镜头记法 | `[Shot 1]` 开场无时间戳；换镜写 `[Shot 2] At 00:03.500, the camera cuts to...`，时间严格递增且在本段时长内 |
-| 运镜词汇 | `Push In / Pull Out / Pan Left / Pan Right / Truck Left / Truck Right / Tilt Up / Tilt Down / Pedestal Up / Pedestal Down / Arc Shot / Tracking Shot / Static Shot / POV`，可加 `with small/large amplitude`（幅度）与 `at slow/fast speed`（速度），写成句内自然动作：`The camera pushes in with small amplitude at slow speed toward the folded letter in her hands.` |
-| 对白 | `<d>[语言] 台词原文</d>`，语言标签用 [English] / [中文] 等；画外音写 `says in an off-screen voiceover`；台词被结尾截断用 `<cutoff>`，跨镜持续用 `<scenetrans>` |
-| 可见文字 | 屏幕上真正显示的文字（招牌/字幕/霓虹）用英文双引号并**保留原文不翻译**：`A red neon sign reading "营业中" glows above the doorway.` |
-| 环境音字段 | 只放环境声 + 动作声 + 非语言人声（风声、脚步、呼吸、笑声）；对白/角色唱歌/角色能听到的音乐**不放在这里**（属于描述行） |
-| 配乐字段 | 只放「角色听不到、只有观众能听到」的配乐：乐器、节奏、动态变化；角色能听到的收音机/街头演唱是场景事件，写在描述行 |
-| 禁则 | 避免抽象词（cinematic / beautiful 一类空话）、避免剧情摘要式写法、描述密度与本段时长匹配（4–15 秒）、参考标签必须定义且全文一致、音频内容不在两个字段间重复 |
+| Shot notation | `[Shot 1]` opens with no timestamp; a cut is `[Shot 2] At 00:03.500, the camera cuts to...`, timestamps strictly increasing and inside the segment duration |
+| Camera vocabulary | `Push In / Pull Out / Pan Left / Pan Right / Truck Left / Truck Right / Tilt Up / Tilt Down / Pedestal Up / Pedestal Down / Arc Shot / Tracking Shot / Static Shot / POV`, with `with small/large amplitude` and `at slow/fast speed` written as a natural clause |
+| Dialogue | `<d>[English] line</d>` (language tag as `[English]` / `[中文]` etc.); off-screen voiceover is `says in an off-screen voiceover`; truncated lines use `<cutoff>`, cross-shot continuation `<scenetrans>` |
+| Visible text | On-screen text (signs / subtitles / neon) goes in English double quotes and is **not translated**: `A red neon sign reading "营业中" glows above the doorway.` |
+| Soundscape field | Only ambience + action sound + non-verbal vocalization; dialogue / a character singing / music the character can hear do **not** belong here |
+| Music field | Only score the characters cannot hear; a radio or street performance they *can* hear is a scene event in the description line |
+| Don'ts | Avoid abstract words (cinematic / beautiful), avoid plot-summary style, match description density to segment length (4–15 s), define every reference tag and keep it consistent, do not duplicate audio content across the two fields |
 
-**段内多镜**：一段 5–15 秒内可以有切换，主提示词里直接写 `[Shot 2] At 00:03.500, ...` 即可（换镜应带来新信息：主体/空间/视角/时间变化；只改景别请用运镜词汇不切镜）。续拍链每段之间已经是无缝拼接，段内不需要刻意切镜。
+**Multiple shots in one segment:** write `[Shot 2] At 00:03.500, ...` directly in the main prompt. Chaining is already seamless — no need to force cuts between segments.
 
-### 任务链自动判定（无需选 task_type）
+### Task-chain auto-detection (no `task_type` selection)
 
-| 连接 | 链路 | UNET |
+| Wiring | Chain | UNET |
 |---|---|---|
-| 什么都不接 | 纯 t2v | fl2va |
-| 导演台 `first_frame` / 资产标注「首帧图」 | 首段 i2v + 续段 t2v | fl2va |
-| 「起始视频」（+ 可选音轨） | 序章（上传视频）+ 续段 t2v | fl2va |
-| 任一「参考」组 | 每段 r2v（提示词用 `<Picture i>` / `<Video k>` / `<Audio j>` 引用），可与序章共存 | ref2va |
+| Nothing connected | pure t2v | fl2va |
+| Console `first_frame` / asset tagged "first frame" | first segment i2v + continuation t2v | fl2va |
+| *start video* (+ optional audio) | prologue (uploaded video) + continuation t2v | fl2va |
+| Any reference group | every segment r2v (`<Picture i>` / `<Video k>` / `<Audio j>`), can coexist with the prologue | ref2va |
 
-### 关键参数（均为节点上的中文控件名）
+---
 
-- `每段帧数`：每段**可见**帧数 @24fps（124 ≈ 5 秒，模型训练范围约 124–362）。段 2 起实际采样帧数自动对齐到 `可见 + 引导帧数` 的 17k+5 网格。
-- `引导帧数`：段间重叠桥，取 关闭 / 1 / 5 / 22 / 39 / 56（数值档为模型 17k+5 帧网格点）。越大衔接越顺、越慢越吃显存，默认 22。`1` = 单帧锚（官方同款，只钉上段末尾稳住身份）；`关闭` = 段间不自动引用上段（硬切、各段独立采样），响度对齐仍生效，各段锚定里的显式段首锚不受影响。
-- `种子`：每段自动 +1（段 i 用 `种子 + i`）。
-- `审片模式`：默认关闭；「逐段确认」= 每次运行只生成一段新内容即返回（见下节）。
-- `重跑起始段`：默认 0 = 自动（沿用断点进度，改过提示词的段自动重做）；N = 从第 N 段起重做（见下节）。
-- `接缝处理`：默认 `潜空间精修`——跨缝窗口联合重去噪，根治段首偏差（机制见下节）；`smoothstep像素混合` = 旧「接缝混合」机制，偏差大时有叠影感，作为降级选项保留；`关闭` = 只测量不干预。**旧工作流里的「接缝混合」控件位会自动落到本控件**：原 `smoothstep` → `smoothstep像素混合`，其余 → `潜空间精修`，无需手改。不进断点指纹，改此参数不触发重跑。
-- `精修强度`：默认 0.45——跨缝窗口的重去噪强度（denoise），两侧各保留 `1−强度` 的原结构。0.2–0.3 改动小、调和弱；0.45 标准；0.6+ 过渡更顺但纹理细节改动大。症状对照：仍见轻微跳变 → 提高；画面细节变软/变糊 → 降低。
-- `精修窗口`：默认 `39`——跨缝窗口每侧帧数（22/39/56，均为 token 网格点）。窗口越大过渡越从容、精修越耗时（约为本段采样的 1/4–1/2，每缝约 +30–50s）。
-- `接缝重摇`：默认 `自动`——本段生成后缝差 > `重摇阈值` 时自动换种子重采本段（最多 `重摇上限` 次，各次尝试取缝差最小的一组），排除抽卡坏段；回放段（存档载入）不参与。
-- `重摇阈值`：默认 0.06（实测好缝约 0.02–0.03、坏缝 0.08+，取中间偏保守）；`重摇上限` 默认 1（每次重摇 = 一次完整段采样时长）。
-- `混合帧数`：smoothstep 模式=像素混合窗长（默认 6，≈0.25 秒 @24fps；运动越快窗应越短，主体位移差大时长窗会拉长叠影）；潜空间精修模式=精修区末端渐变回原帧的羽化帧数（防精修边界出现第二条微缝）。
-- `锚定加噪`：默认 0（关闭）。对引导桥锚定帧注入噪声比例（SkyReels-V2 `addnoise_condition` 同思路）：干净锚定帧会让模型起步「刹车」并在可见部分重演锚定内容，加噪让模型把锚定当「参考」而非逐帧复现。0.1 微调 / 0.2 标准（SkyReels 同值）/ 0.3+ 干预强但画面细节变软；音频加噪自动减半。不进断点指纹，改参数不触发重跑。
-- 默认采样参数：25 步、res_multistep + simple、CFG 1.0（蒸馏模型）。
+## 9. Key parameters
 
-### 自动存档（游戏式项目存档）
+All controls are on the node (labels are Chinese in the UI).
 
-**一个项目 = `output/h3_projects/` 下一个文件夹**，跟游戏的存读档一个逻辑：
+- **`宽高比` (aspect ratio) + `百万像素` (megapixels).** The canvas is the only source: aspect ratio (21:9 / 16:9 / 9:16 / 4:3 / 3:4 / 1:1) × megapixels (0.1–2.0), 32-aligned. Presets: 0.2 draft (608×352) / 0.5 fast preview (960×544) / 0.98 H3 native (1344×768) / 1.0 (1376×768) / 2.0 oversample (1920×1088). `宽度` / `高度` remain only as legacy compatibility slots and are overridden.
+- **`每段时长` (segment duration).** Visible seconds per segment @24 fps (0.5–15.0, default 8.0), auto-snapped to the 17k+5 frame grid (8.0 s → 192 frames, 5.0 s → 124 frames). Per-segment overrides live in the console.
+- **`引导帧数` (guide frames).** The overlap bridge: how many of the previous tail's frames are pinned to the next head. Options 关闭 / 1 / 5 / 22 / 39 / 56 (grid points; default 22). `1` = single-frame anchor (official style, cheap); `关闭` = no automatic reference to the previous segment (hard cut, independent sampling), loudness alignment still applies.
+- **`种子` (seed).** Segment *i* uses `seed + i`.
+- **`步数` (steps).** Default **8** (distilled models). `CFG` default 1.0; sampler `res_multistep`; scheduler `simple`.
+- **`自动存档` (auto archive).** Legacy compatibility switch, folded into *auto-save*; old workflows with `自动存档=自动存档` map to `自动保存=分段`.
+- **`存档目录` (archive directory).** Project name: one folder per project under `output/h3_projects/`. Empty = auto-name from a parameter fingerprint; a fixed name pins all runs to that folder.
+- **`桥帧门控` (bridge-frame gating).** Default **关闭**. `标注` = score and report only; `自动回退` = on a below-threshold tail, roll back 17/34 frames to a good one.
+- **`清晰度阈值` (sharpness threshold)** default 30.0, **`回退上限` (rollback cap)** default 34 (multiples of 17).
+- **`锚定加噪` (anchor noise)** default 0.0, **`递减锚定` (decaying anchor)** default 关闭. Both are *next-stage infrastructure*, off by default because measurement showed a net quality cost; kept as technical reserves.
+- **`审片模式` (review mode).** Default 关闭; `逐段确认` = one new segment per run.
+- **`自动保存` (auto-save).** Default `分段`; **`自动成片` (auto finalize)** default `开启`.
+- **`重跑起始段` (rerun from segment).** 0 = auto (follow archive progress, re-do changed prompts); N = discard the archive from segment N and regenerate.
+- **`接缝重摇` (seam reroll).** Default **关闭**. `自动` = re-sample a segment when its seam difference exceeds the threshold, keeping the smallest-difference attempt.
+- **`重摇阈值` (reroll threshold)** default 0.06 (good seams ~0.02–0.03, bad 0.08+), **`重摇上限` (reroll cap)** default 1.
+- **`生成模式` (generation mode).** Deprecated placeholder, folded and hidden — the chain is derived from actual references.
+- **`导演台状态` (director state).** JSON written by the console; takes precedence over canvas wiring when present. Stores only relative input filenames — no media, keys, or absolute paths.
+- **`起始视频` / `起始视频音轨`.** Prologue input (§15).
+- **`二采模型` (second-pass model).** Optional dedicated UNET for the high-res second pass (§19).
+- **`参考图像尺寸` (reference image size).** `match` (scale each reference to the generation canvas area, shrink-only) or `max` (2048 short side via the reference pipeline; best identity fidelity, potentially several times slower). Default `max`.
+- **`响度对齐强度` (loudness alignment strength)** default 1.0.
+- **`自定义Sigmas` (custom sigmas).** Optional sigma table for distilled LoRAs (§26).
+
+**Outputs (order matters — see §22):** `图像 / 音频 / 报告 / 帧率`.
+
+---
+
+## 10. Project archiving
+
+**One project = one folder under `output/h3_projects/`**, laid out like a game save:
 
 ```
 output/h3_projects/
-  h3chain_state.json              # 当前链指针（saver 画廊据此定位）
-  <项目名>/
-    manifest.json                 # 提示词 / 参数 / 进度 / 成片清单（原子写）
-    seg_001.mp4, seg_002.mp4 ...  # 每段视频（资源管理器直接可看）
-    thumb_001.png ...             # 段缩略图（导演台封面与卡片预览）
-    final_20260819_120000.mp4     # 成片（自动保存编码，直接落项目文件夹）
-    merged_20260820_180000.mp4    # 合并导出产物（导演台合并模式拼接，可多份）
-    uplast_001.png ...            # 二采尾帧锚（开启潜空间放大二采时，下段高清接缝平滑用）
-    keyframes/                    # 分镜模式关键帧
-    seg_001.pt ...                # 续拍 latent（约 5MB/段，前端不显示）
+  h3chain_state.json              # current chain pointer (report text lives here)
+  <project name>/
+    manifest.json                 # prompts / params / progress / finals (atomic write)
+    finals/
+      seg_001.mp4, seg_002.mp4 …  # per-segment videos
+      thumb_001.png …             # segment thumbnails
+      final_<timestamp>.mp4       # final cut
+      merged_<timestamp>.mp4      # merge-export output (may be several)
+    latent/
+      seg_001.pt …                # continuation latents (~5 MB each)
+    assets/                       # project-linked assets
+    texts/                        # prompt text files
 ```
 
-> 开启「潜空间放大二采」后 `seg_NNN.mp4` / `thumb_NNN.png` / 成片直接就是**二采后的高清结果**（同名覆盖，单份产物，不再有 `upseg_*` 副本族）——详见下文「潜空间放大二采」章节。
+- With `自动存档=自动存档` (or auto-save = segments), each finished segment writes its AV latent and the manifest atomically (per-segment seed / prompt hash / trim amount / title / `updated_at` / finals). After a crash at segment *k*, re-running with the same parameters loads segments 1…k from the archive (seconds) and resumes from *k+1*.
+- The project name is auto-derived from the **shared parameter** fingerprint (resolution / duration / guide frames / sampling params — prompts excluded). **Changing a shared parameter refuses to resume** (start a new chain). Changing one segment's prompt re-does just that segment.
+- The seed sequence is authoritative in the manifest; a multi-run resume is frame-identical to a single run.
+- **The console is the archive manager** — list, load, delete, and create projects against the live disk.
 
-- `自动存档=自动存档`：每段采样完成即写项目文件夹内 `seg_NNN.pt`（AV latent）+ `manifest.json`（原子写，含逐段种子 / 提示词哈希 / 裁剪量 / title / updated_at / finals）。第 k 段崩溃后**原参数重跑**，前 k 段自动从存档载入重解码（秒级），从第 k+1 段继续采样。
-- 项目名默认按**共享参数**（分辨率 / 段长 / 引导帧 / 采样参数等，不含提示词）指纹自动命名；`存档目录` 控件可指定固定名。**改共享参数会拒绝续跑**（报错提示开新链）；改某段提示词不再换链，而是自动从该段重做（见「任意段重跑」）；删掉某个 `seg_NNN.pt` 则该段起重采样。
-- 种子以 manifest 记录的**种子序列**为准：种子控件开着自动 +1，续跑 / 审片续接时报告会注明「控件种子仅在重跑起始段 > 0 时生效，当前沿用存档种子序列」——多轮运行与一次跑完逐帧一致。
-- **导演台 = 存档管理器**：打开长片导演台，左栏「项目存档」实时扫描磁盘列出全部项目（封面 / 进度 / 更新时间）——点击**读档**（切存档目录 + 载入该项目的提示词，「⚙ 套用参数到画布」一键回填共享参数）；🗑 **删除项目** = 删整个文件夹（视频 / 提示词 / latent 全删，删除的是当前链时指针自动清理）；已完成段卡片上有「▶ 从这段继续」——保留 1..N 段，从第 N+1 段连续生成到底；**「＋ 新建项目」当场在磁盘建好文件夹 + 0 段初始清单**（游戏存档槽语义：创建即可见，跑第一段之前项目就出现在列表里；目录名留空时仍按参数指纹自动命名、首跑时创建）。**项目的提示词以项目文件夹为持久源**：编辑后 1.5 秒防抖自动回写 manifest，切换/新建项目前也会先把当前提示词存回原项目——切来切去、断电重启都不丢词；回写只动 prompts/total/updated_at，改词段落照常在下次运行时按哈希自动重做。
-- 项目存档 HTTP 接口（`routes.py`，注册带运行期兜底，杜绝 404/405）：`GET /h3chain/ping`（诊断）、`GET /h3chain/projects`（列表）、`GET /h3chain/project?dir=`（详情）、`GET /h3chain/upscale_models`（二采放大权重列表）、`POST /h3chain/create_project`（新建项目落盘）、`POST /h3chain/save_prompts`（提示词回写）、`POST /h3chain/delete_project`（删项目）、`POST /h3chain/delete_file`（删项目内单文件）、`POST /h3chain/delete`（删 saver 输出文件）、`POST /h3chain/merge`（按序合并素材库条目/段/成片/外部视频，见「合并导出」）、`POST /h3chain/upscale_reset`（清某段二采记录与产物，见「潜空间放大二采」）、`POST /h3chain/redo_cancel`（撤销已提交未执行的重摇标记，见「选择性重做」）。**每条路由同时注册根路径与 `/api` 前缀两份**——ComfyUI 0.33.x 只给启动时已知的路由生成 `/api` 副本，而新版前端 `api.fetchApi()` 强制加 `/api` 前缀，双份注册才能让新旧前端都打得通。接口未注册时导演台顶部显示诊断横幅。
-- **迁移注记**：v3 起存档根目录为 `output/h3_projects/`（schema `h3seamless/ckpt-v3`），旧 `output/checkpoints/`、`output/h3_auto/` 不读不写，确认无用后可整目录手动删除。旧版叫「断点续拍 / 断点目录」，本版起改名「自动存档 / 存档目录」；旧工作流里下拉值 `自动续跑` 仍被接受。分镜节点（H3StoryboardChain）暂沿用旧叫法。
+### Archive HTTP routes
 
-### 逐段审片（长片推荐）
+Registered in `routes.py` with a runtime fallback so 404/405 cannot happen. Every route is registered **twice** — once at the root path and once under `/api` — because ComfyUI 0.33.x only generates `/api` copies for routes known at startup, while newer front-ends force the `/api` prefix. See [§31](#31-http-api) for the full list.
 
-`审片模式=逐段确认`：一次 Queue = 一段新内容，天然适配「生成 → 看 → 确认」节奏，无需任何前端交互：
+- **Migration note.** Since v3 the archive root is `output/h3_projects/` (schema `h3seamless/ckpt-v3`); the old `output/checkpoints/` and `output/h3_auto/` are neither read nor written and can be deleted manually.
 
-1. 运行 → 只生成第 1 段即返回。去项目文件夹 `output/h3_projects/<项目名>/` 看该段 `seg_001.mp4`（或导演台段卡片预览），主「图像 / 音频」输出当前已完成段的累计成片；报告提示下一步操作。
-2. 满意 → **直接重新运行**，自动从存档载入已完成段（秒级），生成第 2 段……依此到末段。
-3. 不满意 → 两个选择：
-   - 改导演台第 N 段提示词后运行 → 自动检测到该段提示词已变，**从第 N 段重做**（沿用原种子，只换词）；
-   - 设「重跑起始段 = N」并改「种子」→ 从第 N 段**重摇**（新种子只影响第 N 段及之后，之前的段与种子不变）。
-4. 全部段完成后再次运行 → 直接拼装输出完整成片，报告注明「本链已全部完成」。
+---
 
-说明：审片会自动启用自动存档（否则无法跨次运行续接），存档目录规则与上节一致；种子控件自动 +1 不影响结果（种子序列由存档权威记录）；「重跑起始段」确认无误后记得改回 0（报告会提醒）。
+## 11. Per-segment review
 
-### 自动保存（默认开，无需接线）
+`审片模式=逐段确认`: one queue = one new segment. Perfect for a "generate → watch → confirm" rhythm with no front-end interaction:
 
-采样器自带「自动保存=分段」（默认开）：跑链**不需要接任何下游节点**——每段生成完自动把分段 mp4 存到 `output/h3_projects/<项目名>/seg_NNN.mp4`；完整成片由「自动成片」开关独立控制（默认开）：开启则链尾（或逐段审片已确认的部分）自动拼成完整成片 `final_时间戳.mp4` 同目录，报告里注明路径，跑完直接去 output 目录看片。接 `H3SeamDoctor` 做接缝体检照常可接，两不误；分段复制不重编码（秒级），成片走 PyAV（ComfyUI 新视频栈自带），编码限 4 线程且分块搬运内存（不会打满 CPU / 撑爆内存），终端会打印编码开始与耗时。设为「关闭」则恢复纯输出模式。
+1. Run → only segment 1 is generated, then it returns. Watch `finals/seg_001.mp4` in the project folder (or the segment card preview). The `图像` / `音频` outputs are the accumulated cut of finished segments so far.
+2. Satisfied → **just run again**; finished segments load from the archive (seconds) and segment 2 is generated. Repeat to the end.
+3. Not satisfied → either edit segment *N*'s prompt and run (auto re-does from *N*), or set `重跑起始段 = N` and change the seed (reroll from *N*).
+4. When all segments are done, run once more to assemble the final cut.
 
-### 成片保存（主节点一体化收尾）
+Review mode auto-enables archiving (otherwise cross-run continuation is impossible).
 
-> 原 `H3ChainSaver` 节点已移除，成片保存现由主节点「自动成片」开关一体化完成：最终成片 PyAV 编码落盘 `output/h3_projects/<项目名>/final_时间戳.mp4`，分段视频即「自动保存=分段」落盘的 `seg_*.mp4`；成片统一在导演台「成片」区按 `manifest.finals` 展示、播放、下载、删除。无需再接任何保存节点。
+---
 
-### 接缝体检节点（跳变根因诊断）
+## 12. Re-running and rerolling segments
 
-怀疑"迷之跳变"时，把 `H3SeamDoctor` 接到采样器旁边即可（**只测不治**，不动生成逻辑）：「图像」「音频」「帧率」接采样器对应输出（主节点分段列表输出已删除，体检按帧差阈值自动检测跳变点）。每个接缝一段细粒度体检：
+- **Prompt-change auto re-run** (`重跑起始段=0`): per-segment prompt hashing. Changing segment *N* rebuilds **only segment *N*** — double-anchored against segment *N-1*'s archived tail and segment *N+1*'s archived head, then slotted back. No cascade. Changing sampling params (steps / CFG / sampler / scheduler / model) triggers **no** redo; it only affects newly generated segments. Changing resolution is the one hard constraint → whole-chain redo or a new chain.
+- **Targeted reroll** (`重跑起始段=N`): discard the archive from segment *N*, regenerate *N* and onward with `seed + segment number`. Without changing the seed it equals a plain redo; change the seed for new randomness.
 
-- `[曲线]` 缝前后逐帧差（▮ 标缝位），`[强度]` 缝差 = 全链中位的几倍
-- `[颜色]` 前后窗 RGB 均值 ΔE 与直方图分布差，`[清晰]` Laplacian 清晰度变化
-- `[结构]` NCC（同一画面延续 vs 内容真的换了）
-- `[位移]` 整体平移搜索——挪几个像素后残差骤降 = **位移瞬移**（运动矢量断裂）
-- `[断层]` 三角判别**时间断层**：缝差≈N 帧演化量 + 平移补不掉 + 同场景延续 → 时间轴缺帧
-- `[重复]` 缝后回放检测，`[音频]` RMS/质心/爆音，`[拼装]` smoothstep 是否生效、主输出与分段是否同源
-- 总结：接缝强度排名、类型分布、最差接缝定位（帧号 + 时间码）
+---
 
-把报告（重点最差接缝的 [曲线][位移][断层] 三行）反馈给开发即可针对性修复。**看报告的三种方式**：
+## 13. Selective redo
 
-1. **存盘文件（推荐）**：每次运行自动把报告写到 `ComfyUI/output/h3_seam_doctor/report_时间戳.txt`，记事本打开即读，中文完整；终端也会打印路径。
-2. **前端悬浮**：新版前端运行后鼠标悬停节点「报告」输出圆点显示内容；或点输出端口把值固定到 Node Feed 侧栏（取决于前端版本）。
-3. **Show Text 节点**：装了 ComfyUI-Custom-Scripts（pysssss）的话，「报告」→ Show Text 直接显示在画布（可选，非必需）。
+`▶ continue from here` cascades through all following segments. To swap out only a few segments and keep the rest:
 
-「对比图」输出是每接缝一行的 缝前帧|缝后帧|残差伪彩(×4) 拼图，接 `PreviewImage` 直观看。
+1. On a finished segment, click `🎲 reroll` → choose an **anchor mode** (default double) → *mark*. Mark as many segments as you like; cards show a `🔁 pending reroll · mode` badge.
+2. Submit with the footer's `🎲 reroll N marked segments`. A random seed is derived and review mode is temporarily enabled; the queue snapshot goes into `manifest.redo_queue`. Pending marks can be cancelled.
+3. Review mode advances **one segment per run**; when done, one more run reassembles the full cut (or use merge export).
+4. **Anchor modes** (temporary strategy for this reroll, independent of the segment's *standalone* attribute): double (seamless replacement) / previous only / next only / none (free, hard cut at both ends). Explicit identity anchors (last-frame image, per-segment tail anchor) take priority.
+5. **Seed bump:** if a rerolled segment's seed equals the archive's, it is auto-incremented → the segment fingerprint changes → its second-pass record is invalidated and re-rendered, **without** truncating later segments' second-pass records. This is where the time savings come from.
+6. Reroll marks and `⏸ pause` are mutually exclusive (enforced on both ends).
 
-### 从任意段重跑 / 重摇
+---
 
-- **改词自动重跑**（`重跑起始段=0`）：逐段提示词哈希比对，改了第 N 段 → 只重建**第 N 段**（双锚取段 N-1 存档 latent 尾帧 + 段 N+1 存档 latent 头帧对齐邻居，重建后塞回原位、接缝连续），段 1..N-1 与段 N+1..末段均沿用存档 latent，**不级联**；改采样参数（steps / cfg / 采样器 / 调度器 / 模型等）**不触发任何重做**，只影响此后新生成的段；改 `width`/`height` 分辨率是唯一硬约束 → 整链重做或新建链。
-- **指定段重摇**（`重跑起始段=N`）：从第 N 段起丢弃存档重新生成，段 N 及之后用**控件种子 + 段号**；不改种子则与原结果一致（等于纯重做），改种子 = 从该段起换随机性。
-- 两种方式都只影响所选段之后的内容；共享参数（分辨率 / 段长 / 引导帧 / 采样参数等）改动仍会被拒绝续跑，防止拼出不一致的成片。
+## 14. Segment ordering and disabling
 
-### 选择性重做（只重做标记段，其余段保留）
+- **Drag to reorder:** the `⠿` handle on a card reorders execution (with `⬆`/`⬇` fallbacks). Zero back-end changes — reordering changes the per-segment hash sequence, so it re-runs from the reorder point; reroll marks and second-pass selections inside the moved range are cleared.
+- **Disable a segment (`⏸ pause`):** keeps the segment in the chain but skips execution and excludes it from the final cut (translucent dashed outline). Slots stay stable, latents are kept, and toggling is **zero-cost**. The bridge across a disabled segment reuses the last executed tail. Both base-resolution and high-res final assembly exclude disabled segments.
 
-「从这段继续」会级联重做其后全部段落；只想换掉某几段、其余原样保留时用**重摇标记**：
+---
 
-1. 已完成段点「🎲 重摇」→ 弹窗选**锚定模式**（默认双锚）→「标记」（不立即执行，可连续标记任意多段，卡片出「🔁 待重摇·模式」徽章）；
-2. 页脚「🎲 重摇已标记 N 段」提交：随机种子 + 临时切逐段审片，队列快照写入 `manifest.redo_queue`；已提交未执行的标记可在弹窗「取消重摇标记」撤销；
-3. 审片模式**每运行推进一段**（报告提示剩余量），满意再运行继续；全部完成后**运行一次自动重拼全片**（或用合并导出即时取片）；
-4. **锚定模式**（本次重做的临时策略，与段属性「独立镜头」无关）：双锚（默认，无缝替换）/ 仅锚上段（结尾想大改）/ 仅锚下段（开头重新起手）/ 无锚（完全自由发挥两端硬切）；用户显式身份锚（尾帧图/每段尾帧锚定）优先于接缝锚，不受模式影响；
-5. **种子 bump**：重摇段种子与存档相同则自动 +1 → 段指纹必变 → 该段二采记录自动失效重渲（高清跟着换）；**不触发 truncate**（只换种子不改词）→ 保留段二采记录不清除——这是选择性重做省时的来源；
-6. 重摇标记与「⏸ 不上链」互斥（前后端同口径拦截）。
+## 15. Prologue: continue from an uploaded video
 
-### 段落编排（拖拽调序 / 段禁用）
+1. Wire `LoadVideo`'s `frames` → *start video*, and its `audio` → *start video audio track* (unwired = silent prologue).
+2. Run: the uploaded video is encoded as **segment 0 (prologue)** into the archive; the final cut starts with it and generation continues from its tail (segment numbers shift by one).
+3. Conventions: processed at **24 fps**; frames are floored to the 17k+5 grid; if longer than the segment duration, only the first part is taken. The prologue goes through one VAE re-encode (noted in the report).
+4. Changing the video = changing the chain (the prologue fingerprint is hashed); the prologue itself cannot be "rerolled".
+5. Mutually exclusive with a first-frame image (both are segment 1's visual origin); it **can** coexist with reference assets (r2v).
 
-- **拖拽调序**：段卡片标题 ⠿ 把手拖动换执行顺序（插入线吸附；hover 另有 ⬆/⬇ 兜底小按钮，按提示词段名次换位）。后端零改动：重排后逐段哈希序列变化，自动从重排点级联重做；拖动范围内的重摇标记与二采勾选自动清除。
-- **段禁用（不上链）**：段卡片「⏸ 不上链」让某段保留在链上但不执行、不进成片——半透明虚线框标记，只提供「▶ 重新上链」入口。槽位稳定不错位、latent 存档保留，禁用/启用**零重做成本**随时恢复；引导桥跨禁用段沿用最近已执行段的尾帧；成片（基础分辨率 / 二采高清拼接）两路同口径剔除禁用段（合并导出按素材库点选，与段禁用无关）。适合临时删掉某段看节奏、或先跳过不满意段集中跑其余段。
+---
 
-### 序章：从上传视频续拍
+## 16. Standalone shots (hard cut)
 
-手头已有一段实拍 / 生成好的视频，想让后面的段落从它的结尾无缝接下去：
+For a shot genuinely unrelated to the previous one (scene change, flashback, parallel narrative), forcing a continuation is harmful. Tick `🔗 standalone` on the segment card to disconnect everything:
 
-1. 接线：`LoadVideo` 的 `frames` → 「起始视频」、同节点 `audio` 输出 → 「起始视频音轨」（不接则序章按静音处理）。
-2. 运行：上传视频被编码为**第 0 段（序章）**存入存档，成片以它开头，第 1 个生成段从它的结尾续拍（报告 / 自动保存目录中段号相应 +1）。
-3. 约定：按 **24fps** 处理（与官方参考视频一致）；帧数向下对齐到 17k+5 网格，超过「每段帧数」只取前段；序章经一次 VAE 重编码（报告注明），画面会有极轻微的重编码损失。
-4. 换视频 = 换链：序章指纹（帧数 + 首帧统计）写入哈希链，更换上传视频后自动整链重做；序章本身不能「重摇」——「重跑起始段」对序章无效。
-5. 互斥：与首帧图（导演台 `first_frame` / 资产标注「首帧图」，i2v 起始）不能同时使用（同为第 1 段的视觉起点）；与参考素材（r2v 链）可以共存。
+- **No bridge injection** (video and audio both cut) — the segment starts from pure noise.
+- **No head trim** — the full segment is kept.
+- **No seam post-processing** and no head loudness alignment; seam metrics record `N/A`.
+- The previous segment does not construct a tail bridge for it either.
+- The card shows a *standalone* badge and the segment rail marks it in orange.
 
-### 段级独立镜头（与上段硬切）
+The flag is part of that segment's prompt hash (`unlink|` prefix), so toggling it re-runs from that segment. It only affects the seam between *this* segment and the previous one; two adjacent standalone segments are also hard-cut between themselves.
 
-长片里总有和上一段**毫无关联**的镜头——转场到新场景、闪回、平行叙事。对这类段强行续拍（注入上段尾帧引导桥 + 裁头 + 接缝处理）反而有害：引导桥把上段构图当锚，新场景起步被拖拽变形。导演台段卡片的「分段处理」里勾选 **「🔗 独立镜头（与上段断链）」**，本段即一键全断：
+---
 
-- **不注入**上段尾帧引导桥（video + audio 双路都断）——本段从纯噪声起步，按自己的提示词自由起画；
-- **不裁头**：普通续段头部有 `引导帧数` 重叠桥要裁掉，独立镜头整段输出全保留；
-- **不做**接缝精修 / 像素混合（缝两侧本来就是两镜硬切，混合只会重影）、不做段首响度对齐、不记接缝指标（报告与体检图该缝记 N/A）；
-- 上段也**不再为本段构造**尾帧桥（`_next_wants_bridge` 判定）——但上段本身的生成不受影响；
-- 段卡片显示「独立镜头」徽章，顶部段落导轨对应段为橙色条纹标记；报告开头汇总「独立镜头：N 段与上段断链（无桥接/硬切，段 …）」。
+## 17. Manual anchors
 
-断链标记进该段提示词哈希（`unlink|` 前缀）→ 勾选/取消勾选自动从该段起重做（其后段级联），不会静默沿用旧结果。开关只对**本段与上段的衔接**生效，本段与下段的衔接由下段的开关决定——两个独立镜头相邻 = 中间也是硬切。
+Pinning an external clip / image / previous tail / finished segment / latent-library entry to a specific position in a segment as a guide keyframe. Anchors act during **generation only** — they do **not** enter the final cut (to mix an external clip into the cut, use merge export).
 
-### 手动锚定（把外部片段 / 图片钉到某段某位置）
+Usage (the console's dual-track timeline):
 
-旧「插入视频段」「段级 latent_ref（段首桥外源）」「段尾锚 tail_src」「实验 mid_anchor」本质都是同一件事——**把某段 latent / 素材钉到本段某位置作为引导关键帧**。现已统一收敛为一个 **anchor（手动锚定）** 机制：它只在**生成期**把素材钉到本段指定位置、让模型从该位置的运动/身份继续画——**不进成片**（成片拼接属剪辑范畴，要混入外部视频请用「合并导出」）。
+1. **Source track:** pick the material — ① previous tail `prev_tail` (default bridge) ② finished segment `segment` ③ latent library `library` ④ external video `video` ⑤ image `image`. Drag a window on the frame strip to select the source frame range.
+2. **Target track:** pick where it lands — `head` / `mid` (any frame index, negative counts from the tail) / `tail` (single-frame identity anchor). Any number of anchors, fully free placement.
+3. **Window width:** locked to 17k+5 steps (5 / 22 / 39 / 56 / 73 …; cap 362 for a single encode); single-frame identity anchors use 1.
+4. **Branch:** image+audio / image-only / audio-only.
 
-用法（导演台双轨时间线）：
+Key semantics:
 
-1. **源轨**：选要钉的素材，来源五种——① 上段尾 `prev_tail`（默认续拍桥）② 已完成段 `segment` ③ latent 库 `library` ④ 外部视频 `video`（本地 mp4）⑤ 图片 `image`；在帧缩略图条上拉窗框选源内帧段（左闭右开，先裁后编）。
-2. **目标轨**：选钉到本段哪个位置——`head`（段首）/ `mid`（任意帧位，负值自尾部计数）/ `tail`（段尾，单帧身份锚）；落点完全自由，可加多个锚。
-3. **窗宽**：锁 17k+5 档位（5 / 22 / 39 / 56 / 73…，上限 362 单次编码护栏）；单帧身份锚取 1。
-4. **取用分支**：图像+音频 / 仅图像 / 仅音频 三态。
+- **The only hard constraint is resolution** (C/H/W must match, else the bridge cannot be assembled). With a source, the window is decoded and center-covered to the project canvas before VAE encoding; with **no usable source it errors out** (no silent fallback).
+- **Triggers redo:** changing the anchor / prompt / material / segment duration rebuilds that segment only (double-anchored; no cascade).
+- **Does not trigger redo:** sampling params (steps / CFG / sampler / scheduler / model / fade_ratio / gate) affect only newly generated segments.
+- **Old archives** whose manifest has a non-empty `inserts` (used the old "insert video" feature) error out and ask for a new project — no migration, no silent degradation.
 
-关键语义：
+Unlike the prologue, an anchor can land at any segment's head/mid/tail and never enters the cut.
 
-- **唯一硬约束是分辨率**（C/H/W 不匹配则桥拼不上）：有源时自动先裁后编（帧窗解码 → center-cover 到项目画幅 → VAE 编码）；**无源可用时硬报错**，不静默降级（旧「静默回落上段尾」已删除）。
-- **触发重做**：改 anchor / 提示词 / 素材 / 段时长 → 标记该段重建，**只重建该段、下游不动**（不级联）——用双锚对齐上下邻居（上锚取段 N-1 存档 latent 尾部，下锚取段 N+1 存档 latent 头部），重建后原样塞回。
-- **不触发重做**：改采样参数（steps / cfg / 采样器 / 调度器 / 模型 / fade_ratio / gate）**只影响此后新生成的段**，已生成段沿用存档。
-- **唯一硬约束级联**：改 `width`/`height` 分辨率 → 整链重做或新建链。
-- **旧存档**：manifest 含非空 `inserts`（用过旧「插入视频」功能）→ 运行时直接报错并提示新建项目，不迁移、不静默降级。
+---
 
-与「序章」区别：序章是第 0 段、走节点接线、进成片、链首已有视频；手动锚定可钉在任意段的 head/mid/tail，且**不进成片**。
+## 18. Merge export
 
-### 合并导出（任意素材拼一部片子）
+Concatenate existing segments / finals / external videos in a chosen order into one new file — no re-run. The entry point is in the **asset library** (left rail → open library → the **`⧉ merge export`** button at the far right of the title bar):
 
-不想重跑链、只想把**已生成的若干段 + 成片 + 外部视频**按顺序拼成一个新文件（出预告片、抽精选、补剪某几段）：**入口在素材库里**（左栏「🗂 打开素材库」→ **标题栏最右侧、✕ 关闭键左边**的 **「⧉ 合并导出」**）——
+1. Click `⧉ merge export` to enter selection mode; the same slot becomes `⧉ start merge` + `✕ exit merge`. The list shows videos only; **clicking a tile adds it to the list, and click order is concatenation order** (numbered 1/2/3/4 badges; click again to remove; double-click to preview).
+2. To mix in an external video, use the library's own upload, then click its tile.
+3. Click `⧉ start merge` → the back-end streams the concatenation (PyAV, H.264 + AAC, unified 24 fps) into `finals/merged_<timestamp>.mp4`; the console jumps to the final-cut area when done.
+4. Merge records are written to `manifest.merges` (never cleared, traceable). Exiting selection mode (or a successful merge) clears the list immediately.
 
-1. 点「⧉ 合并导出」进**选材模式**：入口自己让位，同一个席位上换成 **「⧉ 开始合并」** + **「✕ 退出合并」**（这两个按钮**只有进了选材模式才出现**）；列表自动只看视频，**点素材就排进清单，点击顺序就是拼接顺序**（瓦片上画 1 / 2 / 3 / 4 角标，再点一次取消；双击可预览）；
-2. 想混入外部视频：直接用素材库自带的「＋ 上传到XX」传进来，再点一下那张瓦片即可；
-3. 点「⧉ 开始合并（按 1→N 顺序）」→ `POST /h3chain/merge` 后端流式拼接（PyAV，H.264+AAC，24fps 统一），产物落项目目录 `finals/merged_时间戳.mp4`，秒级到分钟级（取决于总时长）；完成后自动跳到「成片」让你看产物；
-4. 合并记录写进 manifest.merges（不清除、可追溯），成片区「合并片段」区块逐条可看可播可删；退出选材模式（或合并成功）**立即清空清单**。
+Rules: the list is memory-only (no archive writes, no chain changes, no redos); the canvas follows project parameters (mismatched sources are scaled to fit; missing params fall back to the first source's actual size); silent sources get silence padding (output always has an audio track); sources may be library entries, segments, or any mp4 in the project / `input` directory (with directory-traversal checks). Only videos can be selected. While a merge runs, the console's generate buttons are paused.
 
-规则：清单纯内存（不落存档、不动链、不触发任何重做）；拼接画幅按项目参数（异画幅源自动缩放补齐；参数缺失回退首个源实际尺寸不缩放）；无音轨的源按视频时长补静音（输出始终有音轨，参数统一）；清单来源支持**素材库条目**（`{asset: "<scope>:<file>"}`，全局库素材走这条）、段（`{seg: n}`）、项目内任意 mp4 与 input 目录外部视频（`{file: f}`，防目录穿越校验）。**只有视频能进清单**：选材模式已把类型筛选锁成视频，非视频瓦片标灰且点不动。**合并导出进行中**导演台的生成按钮暂停（互斥标记 `window.H3Merge`），跑完自动恢复。
+---
 
-### 潜空间放大二采（高清重制）
+## 19. Latent-upscale second pass
 
-整合 [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) 的潜空间放大网络与 [wjluoxiao/ComfyUI-JZL-MiniMax-H3](https://github.com/wjluoxiao/ComfyUI-JZL-MiniMax-H3) 的二次采样范式。二采是**主循环内的渲染通道**：每段采样定稿后（重摇 / 门控 / 切镜 / 接缝决策全部完成、latent 存档之后、分段落盘之前）立即「**神经放大 H×W**（时间维不变，24 通道 H3 VAE latent，LATENTS_MEAN/STD 归一化）→ **低强度重采样**（官方 `common_ksampler`，denoise<1 补回高频细节）→ 解码」，**分段视频 `seg_NNN.mp4` 与成片直接保存二采后的高清结果**（同名覆盖，单份产物，无 `upseg_*` 副本）；段内机制零漂移（裁剪 / 门控决策原样套用，二采只接管「落盘的帧」）；节点主输出仍是基础链帧（画布预览不受影响）。
+Integrates the latent-upscale network from [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) and the second-sampling paradigm from [wjluoxiao/ComfyUI-JZL-MiniMax-H3](https://github.com/wjluoxiao/ComfyUI-JZL-MiniMax-H3). The second pass is a **render channel inside the main loop**: after a segment is finalized (reroll / gating / cut decisions all done, latent archived, before the segment is written) it immediately runs **neural upscale H×W** (time dimension unchanged, 24-channel H3 VAE latent, LATENTS_MEAN/STD normalized) **→ low-strength re-sample** (official `common_ksampler`, denoise < 1) **→ decode**. The saved segment video and the final cut are the high-res result directly.
 
-1. **装权重**：从 HuggingFace `LBH-123-AI/Minimax_h3_latent_Upscaler` 下载 `.pth` / `.safetensors`，放入 `ComfyUI/models/latent_upscale_models/`（目录不存在就新建）；
-2. 开导演台右栏 **「✦ 潜空间放大二采」** 面板选模式：
-   - **跟随生成**：每段采样定稿后立即二采——逐段审片时即「生成一段、二采一段」；记录有效的已完成段直接沿用不重复渲染；
-   - **手动选择**：在段落卡片勾选任意段（含序章），点「开始生成」执行；
-   - **关闭**：不执行（已产出的高清分段不受影响）；
-3. 基础参数：放大模型（目录扫描下拉）、网络架构（2D 残差骨干快 / 纯 3D 卷积时序一致性好，须与权重匹配——不匹配时明确报错）、放大倍率 1.0–4.0（latent 偶数对齐 = 像素 32 倍数，目标画布徽章实时显示）、二采强度 0.05–1.0（0.35–0.55 常用）、二采步数 / CFG（H3 常用 1.0）、精度 fp32/fp16/bf16；
-4. 抗糊增强：STG 跳块引导、多轮递降精化、latent / 像素双域锐化、标准 / 高清 / 极致编码档、二采独立采样器与调度器、细节增益重试。新增项默认全关或保持标准档，不改变旧工作流；启用项才进入二采指纹。完整代价与建议值见[更新说明_二采抗糊抗条纹](更新说明_二采抗糊抗条纹.md)；
-5. 全链记录齐且尺寸一致时成片**直接流式拼接高清分段** `final_时间戳.mp4`（沿用所选 CRF / preset / AQ 编码档，不再额外产出基础分辨率副本；记录不齐 / 混排 / 拼接失败回退基础编码，分段高清不受影响）；段卡片显示「二采 W×H」徽章，不满意的段点「↺ 重置二采」清记录下次重做。
+1. **Install weights** (§5.2).
+2. Open the right rail's **latent upscale second pass** panel and pick a mode: *follow generation* (run the second pass as each segment is finalized), *manual* (tick segments and run), or *off*.
+3. Base params: upscale model (scanned from the directory), architecture (must match the weights), scale 1.0–4.0 (latent even-aligned = pixel multiple of 32), second-pass strength 0.05–1.0 (0.35–0.55 typical), second-pass steps / CFG (1.0 typical for H3), precision fp32 / fp16 / bf16.
+4. Anti-blur extras: STG skip-block guidance, multi-round decaying refinement, latent / pixel dual-domain sharpening, standard / high / extreme encode tiers, independent second-pass sampler and scheduler, detail-gain retry. All new options default to off / standard and do not change old workflows; only enabled options enter the second-pass fingerprint.
+5. When records are complete and sizes match, the final cut **streams directly from the high-res segments** (`final_<timestamp>.mp4`, using the selected CRF / preset / AQ tier). Incomplete records / mixed sizes / a failed concat fall back to base-resolution encoding; the high-res segments are unaffected. Segment cards show a `second pass W×H` badge; `↺ reset second pass` clears the record for a re-render.
 
-关键语义：
+Key semantics:
 
-- **音轨沿用原声**：重采样输出的音频丢弃，分段与成片音轨 = 原轨（零音频回归，符合「拼接不动音频」铁律）；
-- **重做规则**：二采参数变（指纹变）→ 范围内段全部重渲染高清，基础链不动；基础链从段 k 重做 → 二采记录与文件 ≥ k 自动清除，重跑时补渲染；某段提示词 / 种子变（基础身份指纹变）→ 仅该段失效；单段二采只依赖「该段 latent + 本段桥锚 latent + 二采参数」，可独立重做；
-- **真二采（先放大后重采样）**：放大网络先把本节 latent 超分到 scale×，cond/桥锚/尾锚按**高清目标分辨率**构造（CondSync 放大桥同步注入），再在**高清 latent** 上低强度重采样——放大网络输出被重采样真正消费，不存在「白放大」；小画布（≤~0.5MP 基础）前提下 2× 高清重采样可跑；
-- **抢占式显存管理**：H3 UNET fp16 常驻 ~26GB，2× 高清激活约为基础 4 倍。重采样前 `unload_all_models()` 把 CLIP/videoVAE/audioVAE 卸到 CPU（`common_ksampler` 只回载 UNET），放大网络完成后也卸回 CPU；放大网络在主循环前加载**只为尽早报错**（权重缺失当场降级，不让每段撞同一个错），加载完立刻 `net.cpu()`，真正使用时由二采通道腾挪后搬回 GPU——它不受 ComfyUI 显存管理，常驻只会白白挤占一采显存；实际 OOM 先自动卸载驻留模型【原参】重试一次（零参数改动、零降级），仍失败或预检判定不足才停止整链并提示降倍率 / 步数 / σ，避免静默产出高清与基础分辨率混排；
-- **接缝质量**：二采在接缝判定前接管——上段有高清产物时高清帧段首做 smoothstep 平滑（锚定上段高清尾帧）；种子 = 基础段种子 + 1 派生，同输入重放一致；
-- **失败处理**：放大模型缺失 / 不匹配在开跑前报告并跳过本轮二采；画布 / 显存预检失败和采样 OOM（自动卸载重试后仍失败）会停止整链；其他单段异常记录后回退该段基础保存并强制重编码自愈；
-- 目标画布超 2.5MP 时报告警告显存压力；倍率 > 2 建议先小倍率试一段。
-- **二采可接独立模型 / LoRA**：主节点有可选的「二采模型」MODEL 槽（`UNETLoader → LoraLoader → 本槽`），专供高清精化二采使用；**不接则沿用一采「模型」**（旧行为不变）。只作用于高清精化二采——一采与接缝重摇仍用一采模型。可接不同量化 + 不同 LoRA 的独立链（t2v/i2v 用 fl2va、r2v 用 ref2va，别混接）。
-  - 二采模型的**结构签名**（8 位）会打在二采报告行与 `manifest.upscale.segs[N].model` 里留痕，但**不进二采指纹**——换二采模型**不会**自动重做已生成的高清分段（换模型后报告会给出 ⚠ 提示，要重做请设「重跑起始段」或点段卡片「↺ 重置二采」）。
-  - **独立二采模型的显存代价**：一采/二采是两份权重时，每段多 2 次 UNET 级换页（「卸 A 载 B / 卸 B 载 A」，各 26GB 级）。为把空闲显存并成整块、并让二采预检查到真实空闲，二采入口会**先卸载一采模型**（仅在与一采非同源时执行；只差 LoRA 的同 source 克隆不卸，否则等于把二采自己搬走）。注意这**不减少换页次数**，只是让每次换页发生在干净、连续的空间上。
-  - 一采 / 二采两个不同 UNET 时，逐段「一采 → 二采」交错会导致每段两次权重换页（时间代价，不是错误）；shift/STG/时间偏置等精化补丁与陌生量化不兼容时会自动去掉补丁用原模型重试，只报告、不中断。
+- **Audio is carried over untouched** — the re-sample's audio output is discarded; the segment and final tracks are the original (zero audio regression).
+- **Redo rules:** a second-pass param change (fingerprint change) re-renders all in-range segments' high-res versions; the base chain is untouched. A base-chain redo from segment *k* clears second-pass records ≥ *k* and re-renders on the next run. A prompt / seed change invalidates only that segment. A single-segment second pass depends only on that segment's latent + bridge-anchor latent + second-pass params.
+- **True second pass (upscale then re-sample):** the network super-resolves the latent to scale×, the cond / bridge / tail anchors are built at the **high-res target resolution** (CondSync upscale bridge), and the low-strength re-sample runs on the **high-res latent** — the upscale output is genuinely consumed, no "wasted upscale".
+- **Preemptive VRAM management:** H3 UNET fp16 is ~26 GB resident; 2× high-res activation is about 4× base. Before re-sampling, `unload_all_models()` moves CLIP / video VAE / audio VAE to CPU (only the UNET is reloaded); the upscale network is also moved back to CPU after use. An actual OOM first auto-unloads resident models and retries once (zero param change, zero degradation); if that still fails, or the pre-check judges it insufficient, the whole chain stops with a prompt to lower the scale / steps / σ — rather than silently mixing high-res and base-resolution segments.
+- **Failure handling:** a missing / mismatched upscale model is reported before the run and the second pass is skipped for that round; canvas / VRAM pre-check failures and sampling OOM stop the chain; other per-segment exceptions record and fall back to that segment's base save with a forced re-encode.
+- **Dedicated second-pass model / LoRA:** the optional *second-pass model* socket (`UNETLoader → LoraLoader → this socket`) supplies an independent chain for the high-res pass; unwired = reuse the base *model*. Its 8-char structural signature is recorded in the report and `manifest.upscale.segs[N].model` but does **not** enter the fingerprint — swapping it does not auto-redo existing high-res segments (the report warns; use `重跑起始段` or `↺ reset second pass` to force it).
 
+---
 
+## 20. Bridge-frame gating
 
-### 桥帧门控（防坏尾传播）
+- `桥帧门控=标注` (default **关闭**): score each segment tail into the report; no behavior change — run a few chains to see the score distribution before setting a threshold.
+- `桥帧门控=自动回退`: when the tail score is below `清晰度阈值`, roll back 17/34 frames (limited by `回退上限`, snapped to the 17k+5 grid) to a passing frame for the bridge; that segment's visible output shortens accordingly, and the timeline stays continuous. If no tier passes, the original tail is kept with a report warning.
 
-- `桥帧门控=标注`（默认）：每段结尾打分写进报告（`段2 桥帧总分 21.3 ↓ 低于阈值`），不改行为——先跑几条链看分数分布，再定 `清晰度阈值`。
-- `桥帧门控=自动回退`：尾帧总分低于 `清晰度阈值` 时，向前回退 17/34 帧（受 `回退上限` 限制，自动对齐 17k+5 网格）选达标帧构造续拍桥，该段可见输出同步剪短，时间线仍连续；全部档位不达标则保持原尾并在报告警告。
-- 回退后该段可见帧数减少 17/34 帧，总时长与「分段保存」的段长度会随之变化，报告逐段注明。
+---
 
-### 接缝处理（统一后端：一个下拉决定全部衔接参数）
+## 21. Seam Doctor
 
-段首偏差的根因：引导桥走的是 **conditioning 路径**（`minimax_keyframes` 每步重注入），但下段生成区 latent 仍从**纯噪声、denoise=1.0** 起步——锚定帧只是"建议"不是"约束"，模型每步都有偏离自由度，偏差大小取决于内容与种子的抽卡运气。开源共识的根治思路是让衔接内容进入 **latent 主路径**（Wan2.1 I2V 首帧 latent 落位 / SVI 2.0 尾 latent 直通 / SkyReels-V2 重叠区低噪共同去噪）。本插件落地其中与官方采样协议完全兼容的一种：**跨缝窗口联合重去噪**。
+Attach `H3SeamDoctor` next to the sampler (measure-only, it does not touch generation). Wire `图像` / `音频` / `帧率` to the sampler's matching outputs. Per seam:
 
-「接缝处理」下拉是**统一入口**（refine.resolve_profile）——预设档内部固化全部衔接参数，不再让 7 个旋钮自由组合（加噪 + 递减 + 高强度精修叠加正是接缝发糊的配方）：
+- `[curve]` per-frame difference around the seam (`▮` marks the seam), `[strength]` seam difference as a multiple of the chain median
+- `[color]` RGB-mean ΔE and histogram difference; `[sharp]` Laplacian sharpness change
+- `[structure]` NCC (same picture continuing vs content actually changed)
+- `[shift]` whole-frame translation search — residual collapse after a small shift = **motion teleport**
+- `[gap]` triangular test for a **time gap**: seam diff ≈ N frames of evolution + shift can't fix it + same scene continuing
+- `[repeat]` post-seam replay detection, `[audio]` RMS / centroid / pops, `[assembly]` consistency check
+- Summary: seam-strength ranking, type distribution, worst-seam location (frame + timecode)
 
-| 档位 | 精修强度分档（好/中/坏缝） | 窗口 | 羽化 | 锚定加噪/递减锚定 |
-|---|---|---|---|---|
-| **标准**（默认） | 0.30 / 0.45 / 0.55 | 39 帧 | 6 帧 | 关闭 |
-| **轻量** | 0.22 / 0.30 / 0.40 | 22 帧 | 4 帧 | 关闭 |
-| **强力** | 0.40 / 0.55 / 0.65 | 39 帧 | 8 帧 | 关闭 |
-| **自定义** | 读下方细粒度控件 | 控件 | 控件 | 读控件（实验用） |
-| 潜空间精修 / smoothstep像素混合 | 旧值兼容（=自定义档 / 纯像素） | 控件 | 控件 | 读控件 |
+**Three ways to read the report:**
 
-- 预设档的**锚定加噪与递减锚定一律关闭**——实测这两项对画质是净伤害（锚定偏软→细节变糊），只保留在自定义档供实验；
-- 精修机制：跨缝窗口（上段尾 W 帧 + 本段头 W 帧干净 latent 拼 token 网格）+ **双端锚定**（缝前侧整段 latent 锚窗口头、本段侧末端 5 帧锚窗口尾，模型只能改写中间区）+ 自适应强度分档，走官方 `common_ksampler` 重去噪；
-- **只替换本段头部**：上段已拼接的帧、存档 latent、分段 mp4 一概不动；精修区末端 smoothstep 羽化回原帧防第二条微缝；
-- **音频不精修**：音轨沿用生成期桥锚定 + 裁剪对齐 + 段首响度对齐路径；
-- 报告开头一行注明生效档位与固化参数，每缝精修行注明前后缝差（`段2 接缝精修：0.085 → 0.021 · 强度 0.45（自适应）· 双端锚定 · 窗口 90 帧 · 37s`）；
-- 窗口不足则**完全跳过该缝**（不回退像素混合——加权平均本身就是糊感来源）；仅精修抛异常时才用像素混合兜底。
+1. **Saved file (recommended):** every run writes `ComfyUI/output/h3_seam_doctor/report_<timestamp>.txt`.
+2. **Front-end hover:** hover the node's `报告` output dot to see the content, or pin the value to the Node Feed sidebar.
+3. **Show Text node:** if ComfyUI-Custom-Scripts (pysssss) is installed, `报告` → Show Text (optional).
 
-配套的**接缝自动重摇**在精修之前先排除抽卡坏段：本段生成后缝差 > `重摇阈值` → 换种子重采（最多 `重摇上限` 次，各次尝试取缝差最小的一组），最终种子写进 manifest 保证重放逐帧一致。精修种子 = 本段种子 + 1 派生，同输入重放结果一致。
+The `对比图` output is a per-seam `before | after | residual false-color (×4)` strip — wire it to `PreviewImage`.
 
-几点说明：
+---
 
-- 报告里的「接缝：帧差 / 响度跳变」仍是**处理前**的模型偏差（诊断价值：漂移大时优先重摇该段，而不是靠后处理硬压）；精修/重摇动作各自单独一行注明。
-- 纯后处理不进存档指纹：已完成的链改档位/强度/窗口都不触发重跑，存档回放段输出与一次跑完逐帧一致（回放链每缝仍会做一次精修采样，秒级–十秒级）；预设档之间生成期参数（加噪/递减）相同，档位互切换可无缝续跑。
-- 细粒度控件（锚定加噪/递减锚定/精修强度/精修窗口/混合帧数/自适应精修）**仅在「自定义」与旧值档时生效**，tooltip 已注明；旧工作流加载后行为与旧版完全一致。
-- 远期路线（需模型层改造或自写采样器，违反零 monkey-patch 铁律暂不采用）：首帧 latent mask 硬锁、SkyReels-V2 式重叠区 per-token sigma 共同去噪、时间 RoPE 全局偏移。
+## 22. Run report (wire-free)
 
-### 糊缝修复（统一后端批次）
+**The problem it solves.** The console's `报告` is a *wire output*, and ComfyUI stores wires **by slot index** (the workflow JSON's `links` records `origin_slot`). Change the output order once and an old archive's wire silently lands on another slot — the canvas still looks connected, but the downstream node receives nothing. This is exactly what happened when `帧率` was inserted before `报告`: the report wire fell onto the hidden `帧率` slot, so **every ComfyUI restart disconnected the console and the `PreviewAny` report node**.
 
-接缝发糊的来源及对策（已全部落地，且收拢进「接缝处理」统一档位）：
+**Two fixes:**
 
-- **自由组合旋钮配出糊缝配方**（加噪 + 递减 + 高强度精修叠加）→ 统一后端：预设档固化参数，加噪/递减一律关闭；
-- **整窗统一强度重去噪会把好缝也软化** → 自适应分档（按缝差 <0.04 / 0.04–0.08 / >0.08 三档），好缝轻修保细节、坏缝强调和；
-- **精修只锚缝前侧，模型自由改写无锚端** → **双端锚定**：缝前侧整段 latent 锚窗口头（index=0），本段侧窗口末 2 token（5 帧）锚窗口尾——模型只能改写中间区；
-- **精修后缝差反而升高时回退像素混合（越修越糊）** → 改为保留精修结果 + 报告 WARN；窗口不足完全跳过；像素混合仅在精修抛异常时兜底。
+1. **Structural (root cause, nothing for you to do).** The main node's output order is now `图像 / 音频 / 报告 / 帧率` — the `帧率` **parking slot** (never wired, never drawn) is moved to the end and `报告` is pinned back to **slot 2**. Archives written before rev3 used `origin_slot=2` too, so old and new archives are self-consistent, and hiding / trimming the trailing slot can never shift a visible port again. The old "realign wires by name after load" logic is kept as a fallback for historical misaligned files only.
+2. **Wire-free node (optional fallback).** `H3RunReport` has **zero input sockets**, so "the wire broke" cannot structurally occur. The report text is read by the front-end straight from `GET /h3chain/projects → state.report` (the report is already persisted per segment in `output/h3_projects/h3chain_state.json`), shown in a scrollable area with a `🔄 refresh` button and auto-refresh after each run.
 
-### 删帧止损（评测基线批次）
+**How to use it:** to drop wiring entirely, delete the `PreviewAny` attached to `报告` and drop in `H3RunReport` instead — **wire nothing**, place it anywhere. The original `PreviewAny` can also stay (the structural fix means it connects correctly again).
 
-三处删帧叠加曾是"30 秒视频被删 7 秒"的主因：智能切镜（段尾 1/3 无上限搜索，124 帧段最多丢约 41 帧）+ 门控回退（每段最多 34 帧）+ token 网格向下对齐（0–16 帧/段）。现在：
+> **Maintainer rule.** New outputs are always appended at the end; hidden / parking slots only ever go last. A visible port's index is a wire coordinate — moving it silently rewires every saved workflow. Changing `nodes.py`'s `outputs` order changes archive semantics. Guards: `tests/test_workflows_frozen.py`, `tests/js/desk_node_skin_check.js`, `tests/js/desk_slot_geometry_check.js`, `tests/test_run_report.py`.
 
-- `切镜最多丢帧`（默认 17，进存档指纹）：单段切镜丢帧上限，0=只标注切镜点不裁剪；
-- `全链丢弃预算`（默认 48 帧=2s，进存档指纹）：整链累计上限（三类丢弃合计），超预算后智能切镜自动降级为只标注不裁剪，门控回退仍生效但记 WARN；
-- 链尾汇总行 `累计丢弃 X 帧（X.Xs，占计划时长 Y%）`，逐段明细见 manifest `trims`。
+---
 
-## 评测与 A/B（metrics.py + tools/ab_report.py）
+## 23. Semantic bridge
 
-"缝好不好"不再只看单一帧差。采样器每缝自动测**五维 z-score**（缝处值 vs 段内稳健基线 median/1.4826×MAD），写入 manifest `seam_metrics`；接缝体检节点报告新增 `[基准]` 行，与存档同标定。
+`semantic_bridge.py` inlines the BUNNY H3 conditioning bridge (from FourBunny / JOKER141). Instead of a standalone node on a CONDITIONING line, the same computation runs inside the render chain: the cond tensor `[B, T, 5120]` is passed token-wise through a 5120→512→512→5120 bottleneck MLP and blended with the original by `alpha`:
 
-| 指标 | 实现 | 断续归因 |
+```
+out = t + alpha * (mlp(rms(t)) - t)
+```
+
+It helps H3 hold relationships like "who is doing what / prop ownership / attacker vs target / identity and state after occlusion". It is **not** a motion-repair tool and does not rewrite prompts. The author's own note: roughly 60% of cases improve, 20% are neutral, 10% introduce new errors — more strength is not better; compare at the same seed.
+
+The weight ships in `models/BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors` (≈22 MB, committed). The console's semantic-bridge panel scans `models/` for the dropdown. The scope switch exists because the cond tensor mixes text and vision tokens (H3 does not use a chat template; reference / first-frame images are spliced into the sequence as vision blocks) — scope lets you apply the bridge to text tokens only, vision tokens only, or all.
+
+---
+
+## 24. Enhance-A-Video / FETA
+
+`H3EAVFetaPatch` adapts Enhance-A-Video / FETA to H3: it measures and scales only the target-video attention rows of the packed sequence; text / conditioning / reference / audio rows are untouched. Wire it at the chain tail, after LoRA and accelerator nodes, before the sampler's *model* input. It needs no sigmas input (progress is read from the sampler's written sigma).
+
+- Default mode is **report-only** — check the CFI / g values in the console log before enabling *apply*.
+- The reference project measured g averaging only ~1.00034 on H3, i.e. a very small gain — measure before enabling.
+- `H3EAVFetaReport` (optional) outputs the last run's CFI / g statistics as JSON and passes the image through; not wiring it changes nothing.
+
+Source and license details are in [`docs/EAV_FETA.md`](docs/EAV_FETA.md).
+
+---
+
+## 25. Prompt optimizer and expander
+
+`optimizer.py` is a self-written prompt optimizer (cloud: OpenAI-compatible / Gemini / Responses; local: Transformers / GGUF). The console's **prompt optimize** and **AI expand + optimize** buttons call it. `tools/h3_prompt_expander/` is the standalone, executable version of the official MiniMax H3 prompt format (see its own [README](tools/h3_prompt_expander/README.md)).
+
+Two details worth knowing:
+
+- **Language has a single source.** The *prompt rules* field decides the language (`auto` = official English rules, default / `zh` = Chinese rules / `none` = no injection). There is no separate `output_language` field — two controls saying different things only fight.
+- **Reference marks have two numbering systems.** The mark shown to the LLM (`图片1`) and the official tag written into the body (`<Picture 1>`) are numbered differently and are not interchangeable. On the way back both are translated to `@<asset name>`; anything untranslatable (out-of-range index, asset no longer in the pool) is left as-is with a warning. `<Subject N>` is intentionally not translated (it is an abstract reusable-content label, not an asset reference).
+
+> **API keys** live only in `optimizer.local.json` (gitignored) and are never written into source. Guard: `tests/test_optimizer_glm.py::test_no_api_key_committed_in_source` — run it after touching any tool script.
+
+---
+
+## 26. Custom sigmas (distilled LoRAs)
+
+Distilled LoRAs (HyperFlow 8-step, H3 Turbo, …) are trained with their own sigma table; recomputing one from "steps + scheduler" does not match the distillation trajectory. The optional `自定义Sigmas` socket takes an external sigma table (e.g. from `ApplyHyperFlow` / `ManualSigmas` / `BasicScheduler`) and overrides `steps` and `scheduler` for the base pass (actual steps = number of sigma points − 1). Unwired, behavior is byte-identical to before. The HyperFlow official 8-step table is `1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0`. See [`docs/HyperFlow适配与自定义Sigmas.md`](docs/HyperFlow适配与自定义Sigmas.md).
+
+---
+
+## 27. Asset library
+
+`library.py` provides a browser over four scopes (assets / finals / latents / texts), modelled on Majoor Assets Manager. `asset_store.py` keeps the global-library + project-link two-layer model with the manifest as the single source of truth; `asset_hub.py` retains only the pure validation / tag-normalization functions. Reference assets reach the model **only** through the console's three panels (tile drag-drop / `@` references) — the console writes the asset list into the chain state (`ds.ref_assets`), so **no canvas wiring is needed**. Per-segment caps match the official node:
+
+- **9 images** (`<Picture i>`), **3 videos** (`<Video k>`, 24 fps, 2–15 s), **3 standalone audio** (`<Audio j>`). A reference video's own audio is auto-paired to the same-numbered `<Audio j>`.
+- Tag numbers count **from 1 in the order referenced within the segment** (official semantics). Any reference asset makes the whole chain r2v — switch to a `ref2va` UNET.
+
+---
+
+## 28. Performance settings
+
+`perf.py` holds hardware judgments and scenario strategy as pure functions. The console exposes machine-related settings that persist globally (across projects): OOM auto-retry, activation-peak probe, frame dtype, final-mode, tile splitting, block swap knobs, etc.
+
+> **VRAM note.** On a DynamicVRAM build, aimdo deliberately reserves `model_size × 10` of virtual address space as a weight page cache, so "free VRAM ≈ 0" is by design, not a leak. The real switch is `comfy.memory_management.aimdo_enabled` — do not inspect `sys.modules` for it (it is always `True`).
+
+> **Block swap.** Do not write your own block-swap logic — the official `comfy/ldm/minimax/model.py` prefetch queue runs unconditionally and will conflict with the official `partially_load` / vbar, break LoRAs, and hit aimdo's external-pin ban. Use only the three supported knobs: `blocks_swap_on` / `blocks_to_swap` / `blocks_prefetch`.
+
+---
+
+## 29. Seam metrics
+
+"Good seam?" is not just one frame difference. The sampler measures a **five-dimensional z-score** per seam (seam value vs the segment's robust median / 1.4826×MAD baseline), written to `manifest.seam_metrics`; the Seam Doctor report adds a `[baseline]` line.
+
+| Metric | Implementation | Attribution |
 |---|---|---|
-| 边界光流 flow_z / 加速度 flow_accel_z | OpenCV Farneback + 速度二阶差分 | motion 断续 |
-| LPIPS lpips_z | pip lpips（AlexNet），缺包降级梯度结构差 | 时序整体突变 |
-| 嵌入漂移 emb_z | open_clip 余弦距离，缺包降级 RGB 直方图 | appearance 漂移 |
-| 相机 cam_z | ORB + 仿射分解（平移/旋转/缩放速率） | camera 跳变 |
-| 姿态 pose_z | DWPose（controlnet_aux），默认关 | geometry 断续 |
+| boundary optical flow `flow_z` / acceleration `flow_accel_z` | OpenCV Farneback + second-order velocity difference | motion discontinuity |
+| `lpips_z` | `lpips` (AlexNet); falls back to gradient-structure difference if missing | overall temporal jump |
+| embedding drift `emb_z` | `open_clip` cosine distance; falls back to RGB histogram if missing | appearance drift |
+| camera `cam_z` | ORB + affine decomposition (translation / rotation / scale rates) | camera jump |
+| pose `pose_z` | DWPose (controlnet_aux), off by default | geometry discontinuity |
 
-- **验收线：|z| < 2.0 为合格缝**（缝处指标落在段内正常分布内）；
-- 依赖全部可选（cv2 ComfyUI 自带；lpips/open_clip 缺什么降级什么，绝不硬依赖）；
-- **A/B 规程**：同种子同提示词，每轮只改一个开关（开关进存档指纹自动校验）；两份存档对比：
-  ```
-  python tools/ab_report.py <基准存档> <实验存档> --md 对比.md
-  ```
-  输出每缝帧差/z 对比表、帧数守恒与丢弃统计、参数指纹差异自检（应只差被对照的那一项，否则结论不可信）；
-- 断续归因速查：CLIP/嵌入高 → appearance，光流高 → motion，相机高 → camera，LPIPS 高 → 时序整体，姿态高 → geometry。
+- **Acceptance line: `|z| < 2.0` is a good seam** (the seam metric lies inside the segment's normal distribution).
+- All dependencies are optional (`cv2` ships with ComfyUI; `lpips` / `open_clip` degrade gracefully) — never a hard dependency.
+- Attribution cheat-sheet: high CLIP / embedding → appearance, high flow → motion, high camera → camera, high LPIPS → overall temporal, high pose → geometry.
 
-## 分镜模式（H3StoryboardChain，即梦「智能多帧」本地版 —— 已移除）
+---
 
-> 该节点已从本插件移除（未纳入导演台主线）。下方为历史实现说明，供参考；如需恢复请联系维护者从 git 历史取回。
+## 30. Repository layout
 
-**范式**：先定锚后生成——N 张关键帧图把长片切成 N-1 段，段 i 从关键帧 i 画到关键帧 i+1。与续拍模式互补：
+```
+ComfyUI-minimaxH3-SequenceForge/
+├─ __init__.py               # Entry point: registers nodes, declares WEB_DIRECTORY=./web,
+│                            #   mounts HTTP routes (extension hook + PromptServer fallback)
+├─ nodes.py                  # H3SeamlessChainSampler — the main orchestration loop (largest file)
+├─ seam_doctor.py            # H3SeamDoctor — seam root-cause diagnostics (measure only)
+├─ run_report.py             # H3RunReport — wire-free run report node
+├─ eav_feta.py               # H3EAVFetaPatch / H3EAVFetaReport — Enhance-A-Video / FETA
+│
+├─ checkpoint.py             # Archive engine: shared-parameter fingerprint, per-segment prompt hash,
+│                            #   atomic manifest read/write, segment AV latent persistence
+├─ projects.py               # Game-style project archive + merge-export implementation
+├─ anchors.py                # Manual-anchor data structures (normalize / validate / migrate)
+├─ guides.py                 # Official MiniMaxH3AddGuide anchor-semantics alignment (pure functions)
+├─ grid.py                   # H3 frame-grid math: token↔pixel-frame mapping, audio-window conversion
+├─ qc.py                     # Bridge-frame scoring (Laplacian sharpness + exposure)
+├─ metrics.py                # Five-dimensional seam-quality metrics (z-scores)
+├─ cond_cache.py             # CLIP text-encode LRU cache (skip repeated TE forwards)
+├─ media.py                  # Shared PyAV encode/decode (segment / final / merge / upload decode)
+├─ latent_tools.py           # In-library latent transcode (extract latent from a video/final)
+├─ transcode_queue.py        # Background transcode job table + progress + cancel
+│
+├─ upscale.py                # Latent-upscale second pass (render channel inside the main loop)
+├─ upscale_net.py            # Second-pass upscale networks (2D residual / pure 3D) + weight loading
+├─ semantic_bridge.py        # BUNNY H3 semantic conditioning bridge (inlined)
+├─ sigmas_adapter.py         # External sigma-table adapter for distilled LoRAs
+├─ perf.py                   # Hardware profile & scenario strategy (pure functions)
+│
+├─ routes.py                 # HTTP routes (/h3chain/*) — the console's data API
+├─ optimizer.py              # Prompt optimizer back-end (cloud + local channels)
+├─ prompts.py                # Official H3 format contract (frame math / alignment / parsing)
+├─ library.py                # Asset-library index layer (four scopes)
+├─ asset_store.py            # Global library + project link, two-layer asset storage
+├─ asset_hub.py              # Asset-manifest validation & tag normalization (pure functions)
+├─ launch_ref.py             # ComfyUI launch-command reference (single source of truth)
+│
+├─ web/                      # Front-end (shipped via WEB_DIRECTORY, auto-loaded by ComfyUI)
+│   ├─ h3_director.js        # Director Console (full-screen) + sidebar mini-entry
+│   ├─ h3_default_workflow.js# Default workflow template
+│   ├─ h3_assets.js          # Asset panel
+│   ├─ h3_library.js         # Asset library UI
+│   ├─ h3_latent.js          # Latent library UI
+│   ├─ h3_prompts.js         # Mark codec + prompt rules (single source)
+│   ├─ h3_api.js             # API helpers
+│   ├─ h3_report.js          # Run-report node skin (scrollable + refresh)
+│   └─ h3d_anchor.js         # Manual-anchor dual-track timeline
+│
+├─ example_workflows/
+│   └─ 备用初始化导演台工作流.json   # Director-Console init workflow (models + main node + 3 prompts pre-wired)
+│
+├─ skills/                   # Agent skills shipped with the plugin
+│   ├─ README.md
+│   └─ h3-longvideo-prompt/  # "Write a multi-segment long-video prompt" skill (SKILL.md + references/)
+│
+├─ prompt/                   # Official prompt-writing rules (base + ref2v, EN + ZH)
+│   ├─ minimaxh3_base_prompt_writing{,_zh}.txt
+│   └─ minimaxh3_official_ref2v_prompt_writing{,_zh}.txt
+│
+├─ tools/                    # Dev / verification tools (not runtime)
+│   ├─ h3_prompt_expander/   # Standalone prompt expander (CLI + service) — has its own README
+│   ├─ anchor_ui_smoke.cjs   # Front-end smoke test (must be 0 errors before UI delivery)
+│   ├─ make_anchor_preview.py# Generates the anchor preview from web/ source
+│   └─ …                     # Benchmarks, probes, simulators
+│
+├─ tests/                    # 55 Python test modules + 30 jsdom front-end checks
+│
+├─ models/                   # Bundled semantic-bridge weight (~22 MB, committed)
+├─ docs/                     # Engineering documentation (not runtime)
+│   ├─ UPSTREAM.md           # Upstream tracking ledger (upscale network) — read before editing upscale_net.py
+│   ├─ EAV_FETA.md           # Enhance-A-Video / FETA sources & licensing
+│   ├─ HyperFlow适配与自定义Sigmas.md
+│   ├─ upstream_snapshot/    # Upstream baseline snapshots for diffing
+│   └─ …
+│
+├─ .deploy/                  # Reference deployment scripts for the cloud 3090 box
+│                            #   (model downloads, watchdog, safetensors verification)
+├─ pyproject.toml            # ComfyUI plugin metadata
+├─ requirements.txt          # Empty dependency declaration (comment only)
+└─ README.md                 # This document
+```
 
-| | 续拍 H3SeamlessChainSampler | 分镜 H3StoryboardChain |
-|---|---|---|
-| 锚定方式 | 边生成边定锚（上段尾 latent 直切钉下段头） | 先定锚后生成（关键帧图首尾双锚） |
-| 段间关系 | 无缝续接（同一镜头继续） | 镜头切换 / 转场 |
-| 误差传播 | 沿链传播（长链渐糊） | **不传播**（每段独立） |
-| 适用 | 一镜到底、连续动作 | 长叙事、多场景、先画分镜再补运动 |
+Runtime output (not in the repo): cuts / segments / archives live in `ComfyUI/output/h3_projects/<project>/`; Seam Doctor reports in `ComfyUI/output/h3_seam_doctor/`.
 
-### 双向锚定实现
+---
 
-- **首帧**：走官方 i2v 路径（`first_frame=关键帧 i`，质量最好的训练路径）；
-- **尾帧**：自注入官方 Add Guide keyframe 协议——关键帧 i+1 堆叠 5 帧编码为 2 token latent，钉 `resolved_frame_index=段尾-5`（天然踩 17k+5 网格 token 边界）；
-- r2v 链（带参考素材）官方无 first_frame 接口，首尾两锚均自注入，`<Picture i>` 等参考引用与续拍节点完全一致。
+## 31. HTTP API
 
-### 关键帧来源与两遍法
+All routes are registered under both the root path and `/api`. Groups:
 
-- `关键帧来源=上传`：「分镜图组」逐张接 `LoadImage`（序号即播放顺序，N 张定义 N-1 段，提示词数 = 段数）；
-- `关键帧来源=从断点导入`：填续拍链的项目名（`output/h3_projects/` 下，也可填旧 checkpoints 目录的绝对路径），插件读取各段 latent 解码出关键帧（首段首帧 + 各段尾帧）——**两遍法**：先用续拍模式跑粗剪 → 断点导入关键帧 → 换提示词分镜精修，N 段续拍链自动变成 N 段分镜链。
+- **Diagnostics / status:** `ping`, `busy`, `perf`, `launch_ref`, `vram_cleanup`, `grid_spec`
+- **Projects:** `projects`, `project`, `create_project`, `save_prompts`, `delete_project`, `delete_file`, `merge`, `upscale_reset`, `redo_cancel`, `latent_slice`, `latent_delete`, `trim`, `probe`, `move_media`, `split_av`
+- **Models / config:** `upscale_models`, `bridge_models`, `vae_files`
+- **Prompt optimization:** `optimize`, `optimize_stream`, `optimize_multi`, `optimize_multi_stream`, `expand`, `expand_multi`, `expand_validate`, `expand_optimize`, `expand_optimize_stream`
+- **Assets / library:** `assets`, `asset_check`, `asset_links`, `asset_link`, `asset_mark`, `asset_unlink`, `asset_mirror`, `assets_repair`, `import_asset`, `compile_refs`, `library_upload`, `library_file`, `lib_list`, `lib_item`, `lib_thumb`, `lib_raw`, `lib_status`, `lib_scan`, `lib_rate`, `lib_tag`, `lib_alias`, `lib_mirror`, `lib_archive`, `lib_stage`, `lib_zip`, `lib_zip_file`, `lib_delete`, `lib_ref`, `lib_role`, `lib_collections`, `lib_collection_save`, `lib_collection_delete`
+- **Anchors:** `anchor_sources`, `anchor_sheet`, `anchor_sheet_build`
+- **Transcoding:** `transcode_submit`, `transcode_jobs`, `transcode_job`, `transcode_cancel`
 
-### 断点与失效规则
+---
 
-复用 v2 断点引擎，段哈希 = 提示词 + 首尾关键帧哈希的组合：
+## 32. Upstream tracking
 
-- 改关键帧 i → 段 i-1（尾锚变了）与段 i（首帧变了）自动重跑，其余段沿用断点；
-- 改某段提示词 → 仅该段起重跑；
-- 关键帧副本存 `<断点目录>/keyframes/kf_NNN.png`（断点自包含，面板可显示）。
+The second-pass upscale network is ported line-by-line from [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) (only the **network structure and weight loading**, not its node layer or inference interface). The tracking ledger, the difference list vs. upstream, and the sync SOP are all in **[`docs/UPSTREAM.md`](docs/UPSTREAM.md)** — **read it before editing `upscale_net.py`** so you do not "fix" a deliberate local enhancement back into a bug or re-research something upstream already implements.
 
-### 特色控件
+---
 
-- `尾帧锚定`：默认开启；关闭则退化为关键帧首帧链（每段只锚首帧，尾帧自由发挥——段尾不受控但同样零误差传播，段间为纯转场）。
-- `锚定加噪`：与续拍节点同参语义，对首尾锚定帧生效。
-- `响度对齐`：默认开启。段首增益匹配上段尾 RMS（±6dB 钳制、1 秒内渐出）——分镜段间画面是镜头切换，但响度跳变仍会突兀；增益只作用于段首窗口、不沿链累积。
-- `每段帧数`：建议 124 或 141（17k+5 网格值，尾锚恰好钉在段尾）；非网格值模型会向上对齐（130→141）。
-- 报告含**尾锚达成度**：每段生成尾帧 vs 关键帧 i+1 的帧差（数值越小锚定越紧），链路总结给出全链平均与最差段。
+## 33. Removed in 1.0
 
-## 示例工作流
+The following were removed from the plugin. Historical notes are available in `docs/` and the git history:
 
-- `example_workflows/备用初始化导演台工作流.json`：导演台初始化工作流（模型加载器 ref2va UNET / Qwen3-VL CLIP / 视频+音频 VAE + 主节点导演台模式，共 8 个节点、零画布外联——素材与提示词全走导演台状态）——加载后打开导演台即可直接开工，是当前随插件分发的唯一示例。
-- 旧的 t2v / r2v / 分镜示例工作流（`h3_chain_t2v.json`、`h3_chain_r2v_official_base.json`、`h3_storyboard_base.json`、`h3_chain_storyboard_review.json`）已随分镜模式（`H3StoryboardChain`）与画廊保存节点（`H3ChainSaver`）移除，如需参考可从 git 历史取回。
+- **`H3StoryboardChain`** (storyboard chaining) — not part of the Director Console mainline.
+- **`H3ChainSaver`** (final-save gallery) — folded into the main node's *auto finalize* switch.
+- **`H3AssetHub` / `H3AssetBundle`** — assets now flow only through the console state.
+- **`H3MediaToLatent` / `H3LatentExtract` / `H3LatentUpscale`** — latent transcode / in-library upscale moved into the automatic path and `latent_tools.py`.
+- **Seam post-processing profiles** (latent refine / smoothstep pixel blend / smart cut) and their controls — removed; only *seam reroll*, *bridge-frame gating*, and *anchor noise / decaying anchor* remain.
+- **Old example workflows** (`h3_chain_t2v.json`, `h3_chain_r2v_official_base.json`, `h3_storyboard_base.json`, `h3_chain_storyboard_review.json`) — recoverable from git history.
 
-## 已知边界（V1）
+---
 
-- 不含 fl2v 尾帧组、v2v / rv2v 源视频编辑（属内容生成方式扩展，非段间引导核心，可后续加）。
-- 音频锚定为官方「从锚点向后展开」语义；有节拍的音乐接缝处如察觉轻微不自然，可尝试把 `引导帧数` 提到 39 或 56。
-- 旧版 ComfyUI（不含 PR #15439）上第二段起报 `shape mismatch: value tensor of shape [2835, 96] cannot be broadcast to indexing result of shape [405, 96]`：旧 keyframe 协议只收单帧 latent 所致，现已自动降级为单帧桥规避（报告注明）；升级 ComfyUI 可恢复完整桥。
-- 旧版（v1）断点目录不兼容本版本（报错并提示换目录名），需重新开链。
-- 审片模式下主「图像 / 音频」输出为**已完成段的累计成片**（未完成链不是最终成品）；完整成片在全部段确认完毕后的那次运行输出。
-- 逐段审看直接去项目文件夹 `output/h3_projects/<项目名>/` 播放 seg_NNN.mp4，或在导演台「成片」区按 `manifest.finals` / 分段列表查看（主节点分段列表输出已删除）。
+## 34. Credits and licensing
 
-## 参数与铁律速查（来自官方）
+This plugin is released under **Apache-2.0**.
 
-- 引导帧数取 关闭 / 1 / 5 / 22 / 39 / 56：数值必须踩 17k+5 网格点（5 / 22 / 39 / 56…），其他数值直接报错；`关闭` 与 `1` 由插件内部适配（关闭=不自动挂桥，1=单帧锚）。
-- CLIP type 必须选 `minimax`（Qwen3-VL）。
-- t2v / i2v → fl2va UNET；r2v → ref2va UNET，两种 UNET 别混接。
+It builds on and adapts several third-party projects. Their licenses are noted here for accuracy:
+
+- **MiniMax H3 prompt format** — official [`MiniMax-AI/MiniMax-H3`](https://github.com/MiniMax-AI/MiniMax-H3) `skills/h3-prompt-writing` (`SKILL.md` + `references/base-en.txt` + `references/ref-en.txt`). The skeleton is copied verbatim; the body is authored by the user.
+- **Latent-upscale network** — [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler).
+- **Second-sampling paradigm** — [wjluoxiao/ComfyUI-JZL-MiniMax-H3](https://github.com/wjluoxiao/ComfyUI-JZL-MiniMax-H3).
+- **Enhance-A-Video / FETA** — three layers: the paper ([arXiv:2502.07508v3](https://arxiv.org/abs/2502.07508)); the official implementation [NUS-HPC-AI-Lab/Enhance-A-Video](https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video) (**Apache-2.0**); and the H3 adaptation [T8mars/comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8) (**GPL-3.0-or-later**). "FETA" is **not** a paper term — it comes from the T8 source header. Details in [`docs/EAV_FETA.md`](docs/EAV_FETA.md).
+- **Semantic bridge** — FourBunny / JOKER141's BUNNY H3 Conditioning Bridge.
+- **Asset library** — interaction model modelled on Majoor Assets Manager (see `docs/三库重构方案_基于Majoor资产管理器.md`).

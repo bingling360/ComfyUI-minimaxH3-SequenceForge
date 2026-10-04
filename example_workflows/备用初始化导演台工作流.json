@@ -556,16 +556,16 @@
           "links": null
         },
         {
-          "name": "帧率",
-          "type": "INT",
-          "links": null
-        },
-        {
           "name": "报告",
           "type": "STRING",
           "links": [
             58
           ]
+        },
+        {
+          "name": "帧率",
+          "type": "INT",
+          "links": null
         }
       ],
       "title": "H3 Seamless Chain · 导演台主节点",
@@ -825,7 +825,7 @@
     [
       58,
       10,
-      3,
+      2,
       54,
       0,
       "STRING"

@@ -6,8 +6,11 @@
  *  ① 出（marksToText）：@素材名 → @标注；最长名优先，不误伤 a@b.com
  *  ② 回（textToMarks）：@标注 → @素材名；容错漏 @ / 带空格 / 加括号
  *  ③ **幂等**：回填后的文本再出一次，结果不变（往返不漂移）
- *  ④ 不碰官方 token：<Picture 1> 原样保留（它属于另一层编号）
+ *  ④ 不碰官方 token：<Picture 1> 原样保留（它属于另一层编号；回填另走 ⑤）
  *  ⑤ 池里没有的标注形态原样留下（不猜、不吞）
+ *  ⑥ officialToMarks（回填兜底）：官方 `<Picture N>` / `<Video N>` / `<Audio N>`
+ *     按送进 LLM 的 media 顺序译回 `@素材名` —— LLM 照官方规则写官方标签时，
+ *     这一跳保证引用不丢（见 web/h3_prompts.js 的注释）
  */
 const fs = require("fs");
 const path = require("path");
@@ -19,8 +22,8 @@ const src = fs.readFileSync(path.join(ROOT, "web", "h3_prompts.js"), "utf8");
 const win = {};
 new Function("window", src)(win);
 const HP = win.H3Prompts;
-if (!HP || typeof HP.marksToText !== "function") {
-    console.log("FAIL: h3_prompts.js 未导出 marksToText / textToMarks");
+if (!HP || typeof HP.marksToText !== "function" || typeof HP.officialToMarks !== "function") {
+    console.log("FAIL: h3_prompts.js 未导出 marksToText / textToMarks / officialToMarks");
     process.exit(1);
 }
 
@@ -75,5 +78,28 @@ eq(HP.marksToText(back, pool), out1, "幂等：再出一次结果相同");
 /* ④ 空池/无标注池：原样返回，不做任何替换 */
 eq(HP.marksToText("@阿依 撑伞", []), "@阿依 撑伞", "空池：原样");
 eq(HP.textToMarks("@图片1", []), "@图片1", "空池：原样（不回退瞎猜）");
+
+/* ⑤ 回填兜底：官方标签 -> 素材名（编号口径 = 送进 LLM 的 media 顺序）
+ *
+ * 场景：LLM 照官方 ref-en.txt 把正文写成 `<Picture 1>` 而不是 `@图片1`。
+ * 只译标注的话官方标签会原样落盘 → 提示词框里出现 picture1，且 refsFromText
+ * 扫不到 `@素材名` → 本段引用为空 → 素材不进模型。 */
+const media = [
+    { kind: "image", label: "图片1", images: ["d"] },
+    { kind: "image", label: "图片2", images: ["d"] },
+    { kind: "video", label: "视频1", images: ["d"] },
+    { kind: "audio", label: "音频1" },
+];
+eq(HP.officialToMarks("<Picture 1> 撑伞", media, pool), "@阿依 撑伞", "官方回填：<Picture N> 按图序译回");
+eq(HP.officialToMarks("<Picture 2> 站在门口", media, pool), "@阿依的家 站在门口", "官方回填：第二张图");
+eq(HP.officialToMarks("<Video 1> 的运镜", media, pool), "@片头 的运镜", "官方回填：<Video N> 独立编号");
+eq(HP.officialToMarks("<Audio 1> 起", media, pool), "@BGM 起", "官方回填：<Audio N> 独立编号");
+eq(HP.officialToMarks("<Picture 3>", media, pool), "<Picture 3>", "官方回填：编号越界不猜");
+eq(HP.officialToMarks("<Subject 1> 站着", media, pool), "<Subject 1> 站着",
+    "官方回填：<Subject N> 不动（抽象标签，非素材引用）");
+eq(HP.officialToMarks("<Picture 1>", [], pool), "<Picture 1>", "官方回填：无 media 原样（老调用点不受影响）");
+eq(HP.officialToMarks("<Picture 1>", media, []), "<Picture 1>", "官方回填：池里查不到标注就不译（不留假引用）");
+eq(HP.officialToMarks(HP.textToMarks("<Picture 1> 与 @图片2", pool), media, pool),
+    "@阿依 与 @阿依的家", "官方回填：与 textToMarks 串联（模拟 fromLLMText）");
 
 process.exit(fails ? 1 : 0);

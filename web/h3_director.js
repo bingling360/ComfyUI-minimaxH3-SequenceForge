@@ -440,10 +440,24 @@ function toLLMText(text, pool) {
     return String(text == null ? "" : text);
 }
 
-function fromLLMText(text, pool) {
+/** 回（LLM 产出）：`@标注` → `@素材名`，再补一跳**官方标签 → `@素材名`**。
+ *
+ *  `media` 是本段真正送进模型的图（`collectSegMedia` 的返回），它给出官方标签
+ *  `<Picture N>` 的编号口径（帧锚前置 + 参考素材顺延）。**不传 media 时退化成
+ *  旧行为**（只译标注、官方 token 原样保留）—— 老调用点/单测不受影响。
+ *
+ *  为什么必须带 media：模型有时照官方规则把正文写成 `<Picture 1>` 而不是 `@图片1`，
+ *  回填只译标注的话，官方标签会原样落盘 —— 提示词框里出现 picture1，
+ *  且 `refsFromText` 扫不到 `@素材名` → 本段引用为空 → 素材不进模型。
+ *  规则唯一在 h3_prompts.js（officialToMarks）。 */
+function fromLLMText(text, pool, media) {
     const HP = window.H3Prompts || {};
-    if (typeof HP.textToMarks === "function") return HP.textToMarks(text, pool);
-    return String(text == null ? "" : text);
+    let s = String(text == null ? "" : text);
+    if (typeof HP.textToMarks === "function") s = HP.textToMarks(s, pool);
+    if (Array.isArray(media) && media.length && typeof HP.officialToMarks === "function") {
+        s = HP.officialToMarks(s, media, pool);
+    }
+    return s;
 }
 
 /* 标注三原语全部走 h3_prompts（规则唯一，与后端 asset_store 同口径）。
@@ -4329,9 +4343,10 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
         if (r.body?.cancelled) return;      // 用户主动取消：不弹错，静默收场
         if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "优化失败"));
         /* LLM 返回的是 `@图片1` —— 译回 `@女主.png` 再落库（译不出的原样保留，
-         * 正文里会显示成红框，不静默丢）。 */
+         * 正文里会显示成红框，不静默丢）。第三参 media 用来把模型照官方规则
+         * 写下的 `<Picture N>` 也一并译回素材名（见 fromLLMText 注释）。 */
         const result = fromLLMText(String(r.body.prompt || "").trim() || before,
-            ds.ref_assets || []);
+            ds.ref_assets || [], mm.media);
         const key = optKey(node, idx);
         _optBefore.set(key, before);
         _optShown.set(key, "after");
@@ -4350,18 +4365,20 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
         if (ui.name) ui.name.textContent = settings.mode === "local"
             ? `本地: ${String(settings.local_model || "").split(/[\\/]/).pop() || "未选"}`
             : (settings.model || "").split("/").pop() || "API";
-        /* 悬空引用告警：<Picture N> 的编号超过实际送进模型的图片数。
-         * 编号是**按挂载顺序**分配的 —— collectSegMedia 先把首/尾帧排在最前，
-         * 再接 seg.refs，所以"挂了几张"和"产出里写了几号"可能对不上：
-         * 挂了 2 张却写 <Picture 3>、或事后调过挂载顺序，引用都会指向不存在的图。
-         * 只查 Picture：collectSegMedia 只传 kind==="image"，Video/Audio 不在其中。 */
-        const picIdx = [...String(finalText).matchAll(/<Picture\s+(\d+)>/g)].map((m) => Number(m[1]));
-        const maxPic = picIdx.length ? Math.max(...picIdx) : 0;
-        const nMedia = (mm.media || []).length;
-        if (maxPic > nMedia) {
-            setLed("warn", `已回填，但正文引用了 <Picture ${maxPic}>，而本段只有 ${nMedia} 张图`
-                + "送进模型 —— 超出的编号是悬空的，生成时不会有图。"
-                + "请到「引用素材」补挂对应图片，或删掉这些引用。");
+        /* 残留官方标签告警：回填兜底（fromLLMText → officialToMarks）之后，
+         * 正文里若还剩 `<Picture N>` / `<Video N>` / `<Audio N>`，说明有引用
+         * **没能译回素材名** —— 编号越界（挂了 2 张却写 <Picture 3>），或该素材
+         * 已经不在池里。这时 refsFromText 扫不到 `@素材名` → 本段引用为空 →
+         * 素材不进模型，出片才发现。必须让用户看见，不能静默通过。
+         * `<Subject N>` 不算：它是抽象可见内容标签，不是素材引用，正常保留。 */
+        const leftover = [...String(finalText).matchAll(/<(?:Picture|Video|Audio)\s+\d+>/g)]
+            .map((m) => m[0]);
+        if (leftover.length) {
+            const uniq = [...new Set(leftover)];
+            setLed("warn", `已回填，但有 ${leftover.length} 处官方标签没能译回素材名`
+                + `（${uniq.slice(0, 3).join("、")}${uniq.length > 3 ? " …" : ""}）：`
+                + "本段这些引用可能漏挂图。请到「引用素材」补挂对应素材，"
+                + "或把标签改成 @素材名。");
         } else {
             setLed("done", "优化已回填提示词框＋结构化结构（对齐指令已按首尾帧锚补回）");
         }
@@ -4428,8 +4445,9 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
         });
         if (r.body?.cancelled) return;      // 用户主动取消：不弹错
         if (!r.body?.ok) throw new Error(window.H3Api.errText(r, "扩写失败"));
+        /* 同上：`@标注` 与官方 `<Picture N>` 都要译回素材名（见 fromLLMText 注释）。 */
         const result = fromLLMText(String(r.body.prompt || "").trim() || before,
-            ds.ref_assets || []);
+            ds.ref_assets || [], mm.media);
         const key = optKey(node, idx);
         _optBefore.set(key, before);          // 原稿：误点了可以原样还原
         _optShown.set(key, "after");
@@ -4440,7 +4458,17 @@ async function runExpandOptimizeForSegment(node, idx, ta, ui) {
         _optAfter.set(key, finalText);
         optPersist(node, idx, "after");
         if (ui.reset) { ui.reset.style.display = ""; ui.reset.textContent = "原稿"; }
-        setLed("done", "扩写+优化已回填（点「原稿」可还原改写前的内容）");
+        /* 与 runOptForSegment 同口径：残留官方标签 = 有引用没译回素材名，要看得见。 */
+        const leftover = [...String(finalText).matchAll(/<(?:Picture|Video|Audio)\s+\d+>/g)]
+            .map((m) => m[0]);
+        if (leftover.length) {
+            const uniq = [...new Set(leftover)];
+            setLed("warn", `扩写+优化已回填，但有 ${leftover.length} 处官方标签没能译回素材名`
+                + `（${uniq.slice(0, 3).join("、")}${uniq.length > 3 ? " …" : ""}）：`
+                + "本段这些引用可能漏挂图，请到「引用素材」补挂对应素材，或把标签改成 @素材名。");
+        } else {
+            setLed("done", "扩写+优化已回填（点「原稿」可还原改写前的内容）");
+        }
         scheduleRefresh(200);
     } catch (e) {
         alert(`扩写+优化失败：${e.message || e}`);
@@ -11146,6 +11174,9 @@ function removeFab() {
  * 一律**按名字认，不按位次认**：位次会随控件增删漂移（输出位次还是连线的坐标），名字不会。
  * 端口本身留在 inputs/outputs 里没删 —— 删「帧率」会把「报告」从第 3 位挤到第 2 位，
  * 老工作流里连「报告」的线会静默接到「帧率」上，那是真事故。
+ * 2026-10-04：schema 已把「帧率」排到「报告」**之后**（nodes.py 的 outputs），
+ * 「报告」钉死在第 2 位。停机场槽只藏在末位，隐藏/裁剪都不会再挪动可见端口的位次 ——
+ * 「报告」的连线坐标从此与存档版本无关，见 nodes.py outputs 上方那段说明。
  */
 const H3_DESK_GRADIENT = ["#4285F4", "#9B72CB", "#D96570", "#F2A60C"];   // Gemini 图标四停
 const H3_DESK_HIDE_SLOTS = new Set(["起始视频", "起始视频音轨", "帧率", "分段图像", "分段音频"]);

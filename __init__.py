@@ -18,6 +18,17 @@ try:
         print("[ComfyUI_H3_SeamlessChain] EAV/FETA 子节点加载失败（其余节点不受影响）。详细错误：")
         traceback.print_exc()
 
+    # H3 运行报告（run_report.py）：**免连线**的报告预览节点。
+    # 导演台的「报告」输出是连线（按位次存），历史上输出顺序一变就会「重启即断连」；
+    # 这个节点没有输入端口，报告由前端直接读插件接口，结构上不存在断连这个故障模式。
+    # 单独 try：它只服务前端展示，加载失败不该拖垮主节点。
+    try:
+        from .run_report import NODES as _REPORT_NODES
+    except Exception:
+        _REPORT_NODES = []
+        print("[ComfyUI_H3_SeamlessChain] 运行报告节点加载失败（其余节点不受影响）。详细错误：")
+        traceback.print_exc()
+
     class H3SeamlessChainExtension(ComfyExtension):
         async def get_node_list(self):
             # P4d：H3AssetHub（被 Bundle 取代）、H3MediaToLatent（被自动专跑取代）已删除
@@ -25,7 +36,7 @@ try:
             #   资产包：导演台自己 poolFromManifest 拉 ds.ref_assets，画布单线无消费方；
             #   现抽存档 / 库内放大：非 OUTPUT_NODE 且报告输出未接下游，无执行入口，
             #   全部前端代码零引用。转码纯函数保留在 latent_tools.run_transcode_job。
-            return [H3SeamlessChainSampler, H3SeamDoctor] + _EAV_NODES
+            return [H3SeamlessChainSampler, H3SeamDoctor] + _EAV_NODES + _REPORT_NODES
 
         async def add_routes(self, routes):
             # 新版 ComfyUI / Comfy Desktop 官方路径：框架直接传入 routes 对象

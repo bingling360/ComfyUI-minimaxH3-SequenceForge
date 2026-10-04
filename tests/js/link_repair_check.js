@@ -334,14 +334,22 @@ const MODERN_LIVE = [{ id: 10, ports: [
         const res = repair(list, env.graph);
         assert.strictEqual(res.moved, 0, "同布局机器上出厂工作流不该被改动");
         assert.strictEqual(res.conflicts + res.dropped + res.rest.length, 0, "也不该有冲突/断开/待修");
-        /* 输出侧：模板「报告」带线（schema 4 槽制、末位），同布局零改动 */
+        /* 输出侧：模板「报告」带线，同布局零改动。
+         * rev3.4（2026-10-04）：「报告」钉在第 2 位（停机场槽「帧率」排到它后面），
+         * 所以模板连线的 origin_slot 必须是 2 —— 与 rev3 之前的历史存档位次自洽，
+         * 老文件载入后不需要任何搬线就能连对。这里按位次断言，防止再被挪回去。 */
         const oList = outIntents(tpl);
         assert.deepStrictEqual(Array.from(oList, (x) => x.name).sort(), ["报告"],
             "模板输出意图应只有「报告」：" + JSON.stringify(Array.from(oList, (x) => x.name)));
+        const repSlot = sampler.outputs.findIndex((o) => o.name === "报告");
+        assert.strictEqual(repSlot, 2, "「报告」必须钉在第 2 位（位次=连线坐标）：" + repSlot);
+        const it0 = oList[0];
         const outEnv = mkOutGraph(
             [{ id: sampler.id, outputs: sampler.outputs.map((o) => ({ name: o.name, links: o.links || [] })) },
-             { id: 54, type: "PreviewAny", inputs: [{ name: "源", link: 58 }] }],
-            { 58: { origin_id: sampler.id, origin_slot: 3, target_id: 54, target_slot: 0, type: "STRING" } });
+             { id: Number(it0.targetId), type: "PreviewAny",
+               inputs: [{ name: it0.targetName || "源", link: Number(it0.id) }] }],
+            { [it0.id]: { origin_id: sampler.id, origin_slot: repSlot,
+                          target_id: Number(it0.targetId), target_slot: 0, type: "STRING" } });
         const oRes = repairOut(oList, outEnv.graph);
         assert.strictEqual(oRes.moved, 0, "同布局机器上输出线不该被改动");
         assert.strictEqual(oRes.conflicts + oRes.dropped + oRes.rest.length, 0, "输出侧也不该有冲突/断开/待修");

@@ -85,8 +85,11 @@ for (const inp of ['io.Image.Input("起始视频"', 'io.Audio.Input("起始视�
     ok(nodesPy.includes(inp), `nodes.py 误删输入：${inp}`);
 }
 /* 模板输出 = schema 4 槽制（1.53.6 实测：运行时输出槽永远按 schema 建，序列化里的
- * outputs 数组对布局无效）；「报告」必须是最后一个输出条目且带着连线，连线表
- * origin_slot 按 schema 位次（3）解析——位次错了报告线会落到「帧率」上（rev3.1 真断过）。
+ * outputs 数组对布局无效）；「报告」带着连线且**钉在第 2 位**，连线表 origin_slot 按
+ * schema 位次解析——位次错了报告线会落到「帧率」上（rev3.1 真断过）。
+ * rev3.4（2026-10-04）：停机场槽「帧率」排在「报告」**之后**。夹在中间会把「报告」
+ * 从 2 号位挤到 3 号位，而 rev3 之前的存档写的正是 2 → 载入即断连（用户实测：
+ * 每次重启 ComfyUI，导演台和 PreviewAny 都断）。「报告」位次必须与历史存档自洽。
  * 输入侧相反：运行时输入由序列化数组重建，停机场槽（起始视频/起始视频音轨）不进模板。 */
 let tplWf = null;
 try {
@@ -99,12 +102,14 @@ if (tplWf) {
     ok(!!s, "默认工作流缺主节点");
     if (s) {
         const outs = (s.outputs || []).map((o) => o.name);
-        ok(JSON.stringify(outs) === JSON.stringify(["图像", "音频", "帧率", "报告"]),
-           `模板输出应为 schema 4 槽制，实际：${outs.join("/")}`);
+        ok(JSON.stringify(outs) === JSON.stringify(["图像", "音频", "报告", "帧率"]),
+           `模板输出应为 schema 4 槽制（图像/音频/报告/帧率），实际：${outs.join("/")}`);
         const rep = (s.outputs || []).find((o) => o.name === "报告");
         ok(!!rep && Array.isArray(rep.links) && rep.links.length > 0,
            "模板「报告」输出必须带连线（否则载入即断报告线）");
-        ok(outs.indexOf("报告") === outs.length - 1, "「报告」必须是最后一个输出条目（位次=连线坐标）");
+        ok(outs.indexOf("报告") === 2, "「报告」必须钉在第 2 位（位次=连线坐标，须与历史存档自洽）");
+        ok(outs.indexOf("帧率") === outs.length - 1,
+           "停机场槽「帧率」必须排在末位（夹在中间会把「报告」挤出 2 号位）");
         const ins = (s.inputs || []).map((i) => i.name);
         for (const gone of ["起始视频", "起始视频音轨"]) {
             ok(!ins.includes(gone), `模板不该带停机场槽「${gone}」（输入侧由序列化数组重建）`);

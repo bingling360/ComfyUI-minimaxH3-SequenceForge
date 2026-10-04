@@ -1097,11 +1097,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                         "不接则完全沿用「步数 + 采样器 + 调度器」，与旧行为逐字节一致。"
                                         "注意：只作用于本节点的一采（基础链），二采（潜空间放大高清）仍用自己的参数。"),
             ],
+            # ⚠ 输出**位次**是连线的坐标（工作流 JSON 的 links 存 origin_slot），不是随便排的：
+            # 1.53.6 前端运行时**永远按 schema 建输出槽**（序列化的 outputs 数组对布局无效，
+            # 真机 8189/8190 实测），所以改这个顺序 = 改所有已存工作流里「报告」线的落点。
+            # 2026-10-04：把「帧率」从第 3 位挪到末位。它是导演台**停机场槽**（永不接线、
+            # 画布上不露头），夹在「音频」与「报告」之间时会把「报告」从 2 号位挤到 3 号位；
+            # 而 rev3 之前存下的工作流里「报告」线写的正是 origin_slot=2 —— 载入后那根线
+            # 静默落到隐藏的「帧率」上：画布上看着还连着、下游实际收不到，这就是
+            # 「每次重启 ComfyUI，导演台和 PreviewAny(运行报告) 都断连」的根因。
+            # 「报告」钉回 2 号位后，各版本存档的位次全部自洽，不再依赖前端兜底修复。
+            # 守卫：tests/test_workflows_frozen.py + tests/js/desk_node_skin_check.js。
             outputs=[
                 io.Image.Output("图像"),
                 io.Audio.Output("音频"),
-                io.Int.Output("帧率"),
                 io.String.Output("报告"),
+                io.Int.Output("帧率"),
                 # P4d：分段图像/分段音频列表输出已删除（分段落盘由自动保存完成，
                 # 在项目文件夹直接看片）。旧工作流残留连线加载时自动忽略。
             ],
@@ -3950,11 +3960,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             share = drop_total / max(1, chain_frames + drop_total) * 100.0
             report.append(f"累计丢弃 {drop_total} 帧（{drop_total / 24:.1f}s，约占计划时长 {share:.1f}%）"
                           f"——含门控回退/网格对齐，逐段明细见 manifest trims")
+        # 返回值顺序必须与 define_schema 的 outputs 一致：图像 / 音频 / 报告 / 帧率
         return io.NodeOutput(
             images,
             {"waveform": all_wav, "sample_rate": sample_rate},
-            24,
             "\n".join(report),
+            24,
             # P4d：分段列表输出已删除（分段落盘由自动保存完成，去项目文件夹看片）
         )
 
@@ -4193,7 +4204,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
         print("[H3内联转码] " + " | ".join(lines), flush=True)
         images = torch.zeros(1, 64, 64, 3)
         silence = {"waveform": torch.zeros(1, 1, 0), "sample_rate": 24000}
-        return io.NodeOutput(images, silence, 24, "\n".join(lines))
+        # 顺序同 define_schema：图像 / 音频 / 报告 / 帧率
+        return io.NodeOutput(images, silence, "\n".join(lines), 24)
 
     @staticmethod
     def _apply_guide(cond, keyframes, sampled_fc):

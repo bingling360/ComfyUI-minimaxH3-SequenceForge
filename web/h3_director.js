@@ -3881,7 +3881,7 @@ function optGetSettings(node) {
 /* 服务端是否内置了 Key（optimizer.local.json）。前端 Key 框为空**不等于**不能用：
  * 服务端会在服务商与默认服务商一致时用自己的 Key 兜底。所以判"能不能跑"
  * 必须问一次服务端，只看输入框会把开箱可用的用户拦回设置面板。 */
-const _optBackend = { loaded: false, hasKey: false, providers: null };
+const _optBackend = { loaded: false, hasKey: false, providers: null, keys: [], global: null };
 
 async function optBackendProbe() {
     if (_optBackend.loaded) return _optBackend;
@@ -3891,6 +3891,12 @@ async function optBackendProbe() {
             if (r.body?.ok) {
                 _optBackend.hasKey = r.body.has_default_key === true;
                 _optBackend.providers = r.body.providers || null;
+                /* 本地私有文件里**配了 Key 的服务商名**（只给名字，不给 Key 本身）。
+                 * 判"留空能不能跑"必须按**当前服务商**看 —— 只看 has_default_key
+                 * （默认服务商那一把）会把"保存过自己服务商"的用户每次拦回来重填。 */
+                _optBackend.keys = Array.isArray(r.body.global_keys) ? r.body.global_keys : [];
+                _optBackend.global = (r.body.global && typeof r.body.global === "object")
+                    ? r.body.global : null;
                 optCapsLoad(r.body);
             }
         }
@@ -3905,17 +3911,44 @@ async function optNeedsSetup(node, st) {
         if (st.local_model) return false;
     } else if (String(st.api_key || "").trim()) {
         return false;
-    } else if ((await optBackendProbe()).hasKey) {
-        return false;
+    } else {
+        const bk = await optBackendProbe();
+        if (bk.hasKey) return false;
+        /* 服务端全局配置（optimizer.local.json）里存着**当前这个服务商**的 Key：
+         * 留空照样能跑，不该拦。 */
+        if (bk.keys.includes(String(st.provider || "glm").toLowerCase())) return false;
     }
     openOptSettings(node);
     return true;
 }
 
-function optSaveSettings(node, settings) {
+/** 保存 AI 优化设置：**双写** —— ① 当前工作流的「导演台状态」② 服务端本地私有文件。
+ *
+ * 为什么要双写：以前只有 ①。而 ① 是**跟着工作流走**的 —— 新建 / 导入别人的 /
+ * 载入默认模板都会换一份「导演台状态」控件，配置自然不在里面。用户看到的就是
+ * 「每次重新进入都要再设置一遍 API」（用户反馈的原话）。
+ * ② 落在 optimizer.local.json（已 gitignore），是**机器级**的：设一次，之后任何
+ * 工作流留空即用；Key 由后端在调用时从同一个文件兜底。
+ *
+ * 返回 { localOk, remote }：
+ *   localOk=false → 节点上没有「导演台状态」控件，配置没进工作流（服务端已存）；
+ *   remote.ok=false → 服务端写盘失败（工作流里已存）。
+ * 调用方**必须**把这两种失败说出来 —— 以前这里是纯 setDs、失败也没人管，
+ * 用户点了保存以为存上了，其实什么都没发生。 */
+async function optSaveSettings(node, settings) {
     const ds = getDs(node);
     ds.optimizer = Object.assign({}, settings);
-    setDs(node, ds);
+    const localOk = setDs(node, ds);
+    let remote = null;
+    try {
+        if (window.H3Api?.setOptimizerConfig) {
+            const r = await window.H3Api.setOptimizerConfig(settings);
+            remote = (r && r.body) || null;
+        }
+    } catch (e) {
+        remote = { ok: false, message: String((e && e.message) || e) };
+    }
+    return { localOk, remote };
 }
 
 function optTaskForMode(ds, idx) {
@@ -5345,9 +5378,17 @@ async function openLaunchRef() {
  * Key 随导演台状态保存，分享前请清空。 */
 async function openOptSettings(node, onSaved) {
     let current;
-    try { current = optGetSettings(node); }
+    /* 这份工作流自己存过配置没有？决定"要不要用服务端全局配置回填" —— 存档优先，
+     * 绝不覆盖用户在某份工作流里特意选过的值。 */
+    let hasLocalCfg = false;
+    try {
+        current = optGetSettings(node);
+        const savedCfg = getDs(node)?.optimizer;
+        hasLocalCfg = !!(savedCfg && typeof savedCfg === "object");
+    }
     catch (e) { current = optDefaultSettings(); }
     let hasDefaultKey = false;
+    let globalKeys = [];
     try {
         if (window.H3Api?.getOptimizerConfig) {
             const r = await window.H3Api.getOptimizerConfig();
@@ -5357,11 +5398,25 @@ async function openOptSettings(node, onSaved) {
                 if (Array.isArray(r.body.mmproj_models)) current._mmproj = r.body.mmproj_models;
                 if (r.body.llm_env && typeof r.body.llm_env === "object") current._env = r.body.llm_env;
                 hasDefaultKey = r.body.has_default_key === true;
+                globalKeys = Array.isArray(r.body.global_keys) ? r.body.global_keys : [];
                 _optBackend.loaded = true;
                 _optBackend.hasKey = hasDefaultKey;
                 _optBackend.providers = r.body.providers || null;
+                _optBackend.keys = globalKeys;
+                _optBackend.global = (r.body.global && typeof r.body.global === "object")
+                    ? r.body.global : null;
                 /* 思考能力表（型号名单）由后端下发，前端只做前缀匹配 */
                 optCapsLoad(r.body);
+                /* **服务端全局配置回填**：工作流里从没存过配置时（新建 / 导入别人的 /
+                 * 载入默认模板），用本地私有文件里的那份填上 —— 这正是「设一次、
+                 * 以后不用再设」的落点。Key 不回填明文（后端只给服务商名 + 占位符）。 */
+                if (!hasLocalCfg && _optBackend.global) {
+                    for (const k of Object.keys(_optBackend.global)) {
+                        const v = _optBackend.global[k];
+                        if (v === null || v === undefined || v === "") continue;
+                        current[k] = v;
+                    }
+                }
             }
         }
     } catch (e) { /* 用本地值 */ }
@@ -5404,8 +5459,11 @@ async function openOptSettings(node, onSaved) {
     /* 服务端内置了 Key 且当前就是默认服务商时，留空 = 用内置 Key。说清楚，
      * 否则用户会以为"必须填"而反复去找自己的 Key。 */
     const keyHint = () => {
-        key.placeholder = (hasDefaultKey && provider.value === "glm")
-            ? "已内置 Key，留空即用（也可在此覆盖）" : "sk-…";
+        /* 服务端**全局配置**里有这个服务商的 Key（用户保存过一次）—— 留空就是用它。
+         * 必须说清楚：不说的话用户会以为"每次进来都得重填一遍"。 */
+        const hasGlobal = globalKeys.includes(String(provider.value || "").toLowerCase());
+        key.placeholder = (hasGlobal || (hasDefaultKey && provider.value === "glm"))
+            ? "已保存过，留空即用（也可在此覆盖）" : "sk-…";
     };
     keyHint();
     const url = el("input", ""); url.type = "text";
@@ -5764,13 +5822,15 @@ async function openOptSettings(node, onSaved) {
             + "服务商 / 模型 / API Key / 本地模型 / 思考强度 / 提示词规则 / 扩写风格"
             + "全部回到默认（Key 会清空；服务端内置 Key 仍然可用）。")) return;
         const defs = optDefaultSettings();
-        optSaveSettings(node, defs);
+        /* 双写：工作流 + 服务端本地私有文件。Key 留空**不会**清掉服务端已有的
+         * （save_local_config 的"留空 = 不改"口径）—— 恢复默认不该把用户的 Key 弄丢。 */
+        void optSaveSettings(node, defs);
         close();
         if (onSaved) onSaved(defs);
         scheduleRefresh(120);
     };
     overlay.addEventListener("pointerdown", (ev) => { if (ev.target === overlay) close(); });
-    save.onclick = () => {
+    save.onclick = async () => {
         const preset = OPT_PROVIDERS[provider.value];
         apiKeys[provider.value] = key.value;
         providerModels[provider.value] = model.value;
@@ -5813,10 +5873,26 @@ async function openOptSettings(node, onSaved) {
         if (body.mode === "api" && !body.api_key && !hasDefaultKey) {
             alert("请填写 API Key（或改用本地模型）"); return;
         }
-        optSaveSettings(node, body);
+        /* 保存期间禁点，避免连点两次写两遍磁盘 */
+        save.disabled = true;
+        const res = await optSaveSettings(node, body);
+        save.disabled = false;
         close();
         if (onSaved) onSaved(body);
         scheduleRefresh(120);
+        /* 两种失败都要**说出来** —— 以前这里是静默的，用户点了保存以为存上了：
+         *   ① 没写进工作流：画布上找不到「导演台状态」控件；
+         *   ② 没写进服务端：换一份工作流时仍要重填。 */
+        const fails = [];
+        if (!res.localOk) {
+            fails.push("当前工作流：画布上没找到「导演台状态」控件，配置没写进这份工作流"
+                + "（重开同一份工作流时不会带上）。建议先点「⚙ 一键载入配套工作流」重建节点。");
+        }
+        if (res.remote && res.remote.ok === false) {
+            fails.push("服务端全局配置：写入 optimizer.local.json 失败 —— "
+                + (res.remote.message || "未知原因") + "\n（换新工作流时仍需重填。）");
+        }
+        if (fails.length) alert("配置没有完全保存：\n\n" + fails.join("\n\n"));
     };
     document.body.append(overlay);
 }

@@ -566,7 +566,7 @@ Two details worth knowing:
 - **Language has a single source.** The *prompt rules* field decides the language (`auto` = official English rules, default / `zh` = Chinese rules / `none` = no injection). There is no separate `output_language` field — two controls saying different things only fight.
 - **Reference marks have two numbering systems.** The mark shown to the LLM (`图片1`) and the official tag written into the body (`<Picture 1>`) are numbered differently and are not interchangeable. On the way back both are translated to `@<asset name>`; anything untranslatable (out-of-range index, asset no longer in the pool) is left as-is with a warning. `<Subject N>` is intentionally not translated (it is an abstract reusable-content label, not an asset reference).
 
-> **API keys** live only in `optimizer.local.json` (gitignored) and are never written into source. Guard: `tests/test_optimizer_glm.py::test_no_api_key_committed_in_source` — run it after touching any tool script.
+> **API keys** live only in `optimizer.local.json` (gitignored) and are never written into source. The settings panel's *Save* writes **both** the current workflow's chain state **and** that file (`POST /h3chain/optimizer-config`), so a key saved once is reused by every new workflow (new / imported / default template) instead of having to be re-entered each time — and the panel never echoes the key back (it only reports *which* providers have one). Guard: `tests/test_optimizer_glm.py::test_no_api_key_committed_in_source` — run it after touching any tool script.
 
 ---
 

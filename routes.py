@@ -50,6 +50,7 @@ ROUTES = [
     ("GET", "/h3chain/vae_files"),
     ("GET", "/h3chain/prompt-rules"),
     ("GET", "/h3chain/optimizer-config"),
+    ("POST", "/h3chain/optimizer-config"),
     ("POST", "/h3chain/optimize"),
     ("POST", "/h3chain/optimize_stream"),
     ("POST", "/h3chain/expand_optimize_stream"),
@@ -1297,6 +1298,39 @@ def add_routes(routes):
         except Exception:
             pass
         return web.json_response(resp)
+
+    async def optimizer_config_set(request):
+        """把 AI 优化设置写进**本地私有文件**（optimizer.local.json，已 gitignore）。
+
+        为什么需要这个接口：前端设置面板的「保存」以前只写进**当前工作流**的
+        「导演台状态」控件 —— 换一份工作流（新建 / 导入别人的 / 用默认模板）配置就
+        没了，用户表现为「每次重新进入都要再设置一遍 API」。这里给一个**机器级**
+        落点，与工作流解耦：新工作流留空即用（Key 由后端从同一个文件兜底）。
+
+        ⚠ 安全口径：
+          - 只写白名单键（optimizer.LOCAL_SAVE_KEYS），且**只落 optimizer.local.json**；
+          - 响应**不回 Key 明文**（只回"哪些服务商有 Key"），与 GET 同口径；
+          - 若把 ComfyUI 以 `--listen 0.0.0.0` 暴露到公网，任何能访问的人都**能写**
+            这份配置（但读不到明文）。生产部署请配合 nginx 鉴权。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            from . import optimizer as _opt
+        except ImportError:
+            import optimizer as _opt
+        res = _opt.save_local_config(data if isinstance(data, dict) else {})
+        if not res.get("ok"):
+            return _err(str(res.get("message") or "保存失败"),
+                        code="SAVE_FAILED", status=500)
+        try:
+            cfg = _opt.public_config(_opt.normalize_config(None))
+        except Exception:
+            cfg = {"ok": False}
+        return web.json_response({"ok": True, "saved": res.get("saved") or [],
+                                  "message": res.get("message") or "", **cfg})
 
     async def vram_cleanup(request):
         """显存清理：卸载 ComfyUI 当前驻留的全部模型 + 清空分配器缓存。
@@ -2943,6 +2977,7 @@ def add_routes(routes):
         ("GET", "/h3chain/vae_files", vae_files),
         ("GET", "/h3chain/prompt-rules", prompt_rules),
         ("GET", "/h3chain/optimizer-config", optimizer_config),
+        ("POST", "/h3chain/optimizer-config", optimizer_config_set),
         ("POST", "/h3chain/optimize", optimize),
         ("POST", "/h3chain/optimize_stream", optimize_stream),
         ("POST", "/h3chain/expand", expand),

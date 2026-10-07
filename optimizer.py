@@ -21,6 +21,7 @@ import gc
 import json
 import os
 import re
+import shutil
 import socket
 import time
 import urllib.error
@@ -52,6 +53,13 @@ DEFAULT_CONFIG = {
     "provider": "glm",
     "api_url": "https://open.bigmodel.cn/api/paas/v4",
     "api_key": "",
+    # 分服务商记忆的 Key：{provider: key}。**本地私有文件（optimizer.local.json）
+    # 里的这一项就是"全局兜底"的载体** —— 用户在设置面板保存一次，之后任何工作流
+    # （新建 / 导入别人的 / 用默认模板）留空都能用，不必每换一份工作流重填。
+    # 以前这个键**不存在于 DEFAULT_CONFIG**，于是本地文件里写下的 api_keys 会在
+    # default_config() 的「k in cur」过滤里被静默丢掉，只有单数的 api_key 能生效 ——
+    # 用户填的是自己的服务商（比如百炼）时，兜底永远不成立。
+    "api_keys": {},
     # glm-5.3-flashx：实测 18.8s 出 1330 字六字段（比 4.6v 快一档），
     # 代价是「始终思考」型号 —— 见 thinking 默认值的说明。
     "model": "glm-5.3-flashx",
@@ -143,11 +151,17 @@ def default_config() -> dict:
     """内置默认值 + 本地私有覆盖（optimizer.local.json）。"""
     cur = dict(DEFAULT_CONFIG)
     cur["expand"] = dict(DEFAULT_CONFIG["expand"])
+    cur["api_keys"] = dict(DEFAULT_CONFIG["api_keys"])
     for k, v in (LOCAL_DEFAULTS or {}).items():
         if v is None or (isinstance(v, str) and not v.strip()):
             continue
         if k == "expand" and isinstance(v, dict):
             cur["expand"].update(v)
+        elif k == "api_keys" and isinstance(v, dict):
+            # 只收非空 Key：本地文件里留一个空串槽位（前端保存过一次留空的服务商）
+            # 不该把该服务商已有的兜底顶掉 —— 与 normalize_config 对空串的口径一致。
+            cur["api_keys"].update({str(a): str(b or "") for a, b in v.items()
+                                    if str(b or "").strip()})
         elif k in cur:
             cur[k] = v
     return cur
@@ -276,10 +290,16 @@ def normalize_config(raw: dict | None) -> dict:
     else:
         api_key = raw.get("api_key")
         if api_key is None or not str(api_key).strip():
-            # 前端留空（或压根没下发 Key）时回落到本地私有默认 Key。
-            # **只在服务商正好等于本地默认服务商时回落** —— 否则会把 GLM 的 Key
-            # 发给 OpenAI，换回来一个 401，比"没填 Key"更难排查。
-            api_key = cur.get("api_key") if provider == str(cur.get("provider") or "").lower() else ""
+            # 前端留空（或压根没下发 Key）时回落到**本地私有文件**里的 Key。
+            # 顺序：① 本地文件里该服务商自己的 Key（用户在设置面板保存过就有 —— 这是
+            #          "设一次、以后所有工作流都免填"的关键）；
+            #       ② 本地文件的默认 Key，**只在服务商正好等于本地默认服务商时** ——
+            #          否则会把 GLM 的 Key 发给 OpenAI，换回来一个 401，比"没填 Key"
+            #          更难排查。
+            local_keys = cur.get("api_keys") if isinstance(cur.get("api_keys"), dict) else {}
+            api_key = str(local_keys.get(provider) or "").strip()
+            if not api_key and provider == str(cur.get("provider") or "").lower():
+                api_key = cur.get("api_key")
     provider_models = raw.get("provider_models") if isinstance(raw.get("provider_models"), dict) else {}
     pm = provider_models.get(provider)
     try:
@@ -349,13 +369,56 @@ def _clean_expand(raw, cur=None) -> dict:
     return {"style": style}
 
 
+# 本地私有文件里可以**回显给前端**的键。
+# **绝不含 api_key / api_keys**：那是磁盘上的秘密，回显给前端就等于又把它写回
+# 工作流，而工作流是会被导出、分享出去的（面板文案里"分享前请清空"就是为这个）。
+GLOBAL_PUBLIC_KEYS = ("provider", "api_url", "model", "protocol", "thinking",
+                      "reasoning_effort", "thinking_level", "timeout", "read_media",
+                      "max_tokens", "local_model", "local_mmproj", "local_device",
+                      "rule_file")
+
+
+def global_config_public() -> dict:
+    """本地私有文件里**可回显**的那部分（供前端在"工作流没存过配置"时回填）。
+
+    这是"设一次、以后新工作流免填"的实现支点：前端拿它填服务商 / 地址 / 模型，
+    Key 则由后端在调用时从同一个文件兜底（前端不回显、不落工作流）。
+    """
+    d = LOCAL_DEFAULTS if isinstance(LOCAL_DEFAULTS, dict) else {}
+    out = {}
+    for k in GLOBAL_PUBLIC_KEYS:
+        v = d.get(k)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        out[k] = v
+    return out
+
+
+def _local_key_providers() -> list:
+    """本地私有文件里**配了 Key 的服务商名**（只给名字，不含 Key 本身）。
+
+    前端用它判断"当前服务商留空能不能跑"。只看 `has_default_key`（= 默认服务商
+    那一把）是不够的：用户保存过自己的服务商之后，前端仍会以为"没 Key"而每次拦人。
+    """
+    d = LOCAL_DEFAULTS if isinstance(LOCAL_DEFAULTS, dict) else {}
+    keys = d.get("api_keys") if isinstance(d.get("api_keys"), dict) else {}
+    names = {str(k).lower() for k, v in keys.items() if str(v or "").strip()}
+    if str(d.get("api_key") or "").strip() and str(d.get("provider") or "").strip():
+        names.add(str(d["provider"]).lower())
+    return sorted(n for n in names if n)
+
+
 def public_config(cfg: dict) -> dict:
     out = dict(cfg)
     out["api_key"] = ""
+    # api_keys 也只给"哪些服务商有 Key"，绝不回明文（理由同 GLOBAL_PUBLIC_KEYS）
+    out["api_keys"] = {}
     out["has_api_key"] = bool(cfg.get("api_key"))
     # 前端据此判断"Key 留空也能跑"（服务端有本地私有 Key 兜底），
     # 从而不再因为输入框为空就把用户拦到设置面板里。
     out["has_default_key"] = bool(str(LOCAL_DEFAULTS.get("api_key") or "").strip())
+    out["global_keys"] = _local_key_providers()
+    out["global"] = global_config_public()
     out["providers"] = {k: {"url": v[0], "model": v[1], "protocol": v[2]}
                         for k, v in PROVIDERS.items()}
     # 思考能力表下发（**单一真相源**）：前端据此把「关闭思考」置灰、显示强度下拉。
@@ -376,6 +439,118 @@ def public_config(cfg: dict) -> dict:
     except Exception:
         out["mmproj_models"] = []
     return out
+
+
+# 允许写进本地私有文件的键（白名单）。
+# **故意不含 mode / expand**：那两个是弹窗里的交互态，写进"机器级"配置只会让
+# 下一份工作流莫名其妙地继承上一次弹窗里的临时选择。
+LOCAL_SAVE_KEYS = ("provider", "api_url", "model", "protocol", "api_key", "api_keys",
+                   "thinking", "reasoning_effort", "thinking_level", "timeout",
+                   "read_media", "max_tokens", "local_model", "local_mmproj",
+                   "local_device", "rule_file")
+
+# 备份保留份数。带时间戳的名字正好落在 .gitignore 的 `optimizer.local.json.bak-*`
+# 上 —— **绝不能用不带 `-` 的固定名**（如 `optimizer.local.json.bak`）：那不在忽略
+# 名单里，而里面含 Key，一次 `git add -A` 就送出去了。
+_LOCAL_BAK_KEEP = 3
+
+
+def _prune_local_baks(keep: int = _LOCAL_BAK_KEEP) -> None:
+    """只留最近 keep 份备份，别让每次保存都堆一个新文件。"""
+    try:
+        d = os.path.dirname(LOCAL_CONFIG_PATH)
+        base = os.path.basename(LOCAL_CONFIG_PATH) + ".bak-"
+        baks = sorted(n for n in os.listdir(d) if n.startswith(base))
+        for name in (baks[:-keep] if keep > 0 else baks):
+            try:
+                os.remove(os.path.join(d, name))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def save_local_config(patch: dict) -> dict:
+    """把设置合并写进 optimizer.local.json（已 gitignore），并**立即生效**。
+
+    为什么需要写盘：前端设置面板的「保存」以前只写进**当前工作流**的「导演台状态」
+    控件 —— 换一份工作流（新建 / 导入别人的 / 用默认模板）配置就没了，用户看到的
+    是「每次重新进入都要再设置一遍 API」。这里给一个**机器级**落点，与工作流解耦：
+    新工作流留空即用。
+
+    口径：
+      - 只接受 LOCAL_SAVE_KEYS 白名单键，其余一律忽略；
+      - 空串 / None **不覆盖**已有值（前端"留空 = 用已有的"）；
+      - 原子写（.part → os.replace），另存 .bak-<时间戳> 且只留最近几份；
+      - 写成功后**刷新模块级 LOCAL_DEFAULTS** —— 改完无需重启 ComfyUI 即生效
+        （以前只在 import 时读一次，改了文件必须重启才认）；
+      - 数值键做与 normalize_config 同口径的夹取，绝不把脏值写进磁盘。
+
+    返回 {"ok": bool, "saved": [键名], "message": str}。**永不抛**。
+    """
+    global LOCAL_DEFAULTS
+    if not isinstance(patch, dict):
+        return {"ok": False, "saved": [], "message": "配置必须是对象"}
+    cur = dict(LOCAL_DEFAULTS) if isinstance(LOCAL_DEFAULTS, dict) else {}
+    saved = []
+    for k in LOCAL_SAVE_KEYS:
+        if k not in patch:
+            continue
+        v = patch[k]
+        if k == "api_keys":
+            if not isinstance(v, dict):
+                continue
+            keep = {str(a): str(b).strip() for a, b in v.items() if str(b or "").strip()}
+            if not keep:
+                continue
+            merged = dict(cur.get("api_keys") or {}) if isinstance(cur.get("api_keys"), dict) else {}
+            merged.update(keep)
+            cur["api_keys"] = merged
+            saved.append(k)
+            continue
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue                      # 留空 = 不改（与 normalize_config 同口径）
+        if k == "timeout":
+            try:
+                v = max(30, min(1800, int(float(v))))
+            except (TypeError, ValueError):
+                continue
+        elif k == "max_tokens":
+            try:
+                v = max(512, min(32768, int(v)))
+            except (TypeError, ValueError):
+                continue
+        elif k == "read_media":
+            v = bool(v)
+        else:
+            v = str(v).strip()
+        if cur.get(k) == v:
+            continue
+        cur[k] = v
+        saved.append(k)
+    if not saved:
+        return {"ok": True, "saved": [], "message": "没有需要写入的变化"}
+    tmp = LOCAL_CONFIG_PATH + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cur, fh, ensure_ascii=False, indent=2)
+        if os.path.isfile(LOCAL_CONFIG_PATH):
+            try:
+                shutil.copy2(LOCAL_CONFIG_PATH,
+                             LOCAL_CONFIG_PATH + ".bak-" + time.strftime("%Y%m%d%H%M%S"))
+                _prune_local_baks()
+            except OSError:
+                pass                      # 备份失败不影响保存本身
+        os.replace(tmp, LOCAL_CONFIG_PATH)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return {"ok": False, "saved": [],
+                "message": "写入 optimizer.local.json 失败：%s" % e}
+    LOCAL_DEFAULTS = cur
+    return {"ok": True, "saved": saved, "message": "已写入本地配置"}
 
 
 def _llm_roots() -> list:

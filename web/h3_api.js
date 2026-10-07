@@ -186,6 +186,10 @@
     vaeFiles: () => _call("/h3chain/vae_files"),
     getPromptRules: () => _call("/h3chain/prompt-rules"),
     getOptimizerConfig: () => _call("/h3chain/optimizer-config"),
+    /* 保存 AI 优化设置到**服务端本地私有文件**（optimizer.local.json，已 gitignore）。
+     * 与工作流解耦：设一次，之后任何新工作流留空即用 —— 这是「每次重新进入都要
+     * 重设一遍 API」的根治手段（只写进工作流的话，换一份工作流就没了）。 */
+    setOptimizerConfig: (payload) => _json("POST", "/h3chain/optimizer-config", payload),
     optimize: (payload) => _json("POST", "/h3chain/optimize", payload),
     /* 同上，但边跑边推进度（SSE）。onEvent 每帧回调一次：
      *   {type:"progress", phase, reasoning_chars, content_chars, tokens, max_tokens, elapsed}

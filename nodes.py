@@ -451,6 +451,12 @@ def _vram_used_gb():
     用 `mem_get_info`（total − free）而不是 `torch.cuda.memory_allocated()`：
     后者只统计 torch 的 caching allocator，量不到 aimdo / DynamicVRAM 的权重池
     ——在 24GB 卡跑 32GB 模型时它会报 0.43GB 这种假象（既有口径，见 perf 模块）。
+
+    ⚠ **`--cuda-malloc`（cudaMallocAsync）下量不到池内预留**：块释放回池之后对
+    `cudaMemGetInfo` 仍算「已用」（要 `cudaMemPoolTrimTo` 才还给设备）。所以这个
+    口径适合回答「**峰值/总量被占了多少**」（腾挪账、激活峰值、精化峰值都靠它），
+    **不适合判「腾挪释放了多少」**——判后者要配 `torch.cuda.memory_summary()`。
+    实测签名：OOM 现场 torch 只占 859MiB，而 CUDA 报 0 字节空闲。
     """
     try:
         if torch.cuda.is_available():
@@ -2130,6 +2136,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 只打一次，避免每段刷屏。
         _reload_logged = [False]
         _perf_logged = [False]
+        # 显存预算账（阶段 0 只算一次）。留在作用域里给段内的「余量对账」用 ——
+        # 预算行（主动留空）与 LoRA 账行（建议留空）是分开打的，两行摆在一起
+        # 才看得出够不够；只打不判，用户只能自己猜。
+        _bd_box = [None]
         # 落盘守卫**接行为**：critical 且 guard_action=block → 禁止二采精化前的全卸
         # （Linux 无 swap 时一次全卸就是 OOM killer SIGKILL，连 except 都跑不到）。
         _guard_block = False
@@ -2173,6 +2183,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 显存预算账：主动留空多少 / 能给权重缓存多少 / 每步要重读多少。
                 # 「有没有把显存用满」的静态一半答案（实测一半看段末的精化峰值）。
                 _bd = perf.vram_budget(_hw, _hw.get("vram_policy"))
+                _bd_box[0] = _bd
                 _bd_line = perf.vram_budget_line(_bd)
                 if _bd_line:
                     print(f"[H3性能] {_bd_line}", flush=True)
@@ -3145,6 +3156,49 @@ class H3SeamlessChainSampler(io.ComfyNode):
         prev_tail_wav = None     # 上段末 0.25s 音频（接缝测量/响度对齐用）
         all_wav = None           # 成片音轨累积（首段直接取本段）
 
+        def _decode_rescue(vt, label):
+            """VAE 解码 + OOM 自救。返回 (frames, 自救次数)。
+
+            与主干采样同一套口径：**原参**重试（不改帧数/画布，只腾显存再试一次），
+            救不回来时给可行动的中文报错。为什么必须有：采样路径早就有这套，解码
+            路径却一直是裸 torch 堆栈——用户既看不懂，也不知道「已落盘的分段不受
+            影响」，而那正是他此刻最想知道的。
+
+            为什么 cleanup 用 `_vram_oom_cleanup`（内含 `unload_all_models`）：
+            `load_models_gpu([vae.patcher], ...)` 那条路对动态模型是 **no-op**——
+            `free_memory` 里 `is_dynamic() and for_dynamic` 会把 `memory_to_free`
+            置 0（注释原文「don't actually unload dynamic models for the sake of
+            other dynamic models」）。唯一走 `for_dynamic=False` → `model_unload`
+            → `detach` 的只有 `unload_all_models()`。代价是下段要重新流动权重。
+
+            ⚠ 报错归因必须是「解码与权重缓存抢显存」，**不要**写成「解码像素缓冲
+            ∝ 画布面积 × 帧数」：该 VAE 的全片像素缓冲分配在
+            `intermediate_device()`（默认是 **cpu**，见 comfy/ldm/minimax/vae.py），
+            根本不在显存上；解码的显存峰值是 per(时间 chunk × 空间 tile)。
+            """
+            if not _oom_autoretry:
+                return video_vae.decode(vt), 0
+
+            def _on_retry(n, e):
+                print(f"[H3性能] {label} 解码显存不足（第 {n} 次）——"
+                      "自动卸载驻留模型 + 回收残留引用 + empty_cache 后原参重试…",
+                      flush=True)
+
+            try:
+                return perf.oom_retry(lambda: video_vae.decode(vt),
+                                      cleanup=_vram_oom_cleanup,
+                                      tries=2, on_retry=_on_retry)
+            except Exception as _oe:
+                if not perf.is_oom_error(_oe):
+                    raise
+                raise RuntimeError(
+                    f"{label} VAE 解码显存不足（已自动卸载驻留模型、回收残留引用并"
+                    "empty_cache 后**原参**重试仍失败）：解码要与主干权重共用显存，"
+                    "而主干是「按需流动」的——显存被权重缓存占满时，没有任何一方会主动让路。"
+                    "请缩短帧数或降低画布，或给启动参数加 `--vram-headroom 1`"
+                    "（压低权重缓存上限、给解码留出余量），也可关闭二采 / 减少 LoRA。"
+                    "本段未产出，已落盘的分段不受影响。") from _oe
+
         if use_ckpt:  # 运行起点状态（面板据此定位当前链）
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll, "report": "",
@@ -3191,7 +3245,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                               + ("，超长仅取前段" if raw_fc > fc else "")
                               + "，经一次 VAE 重编码，按 24fps 处理"
                               + ("，未接音轨按静音处理" if 起始视频音轨 is None else "") + "）")
-            pframes = video_vae.decode(pv)
+            pframes, _presc = _decode_rescue(pv, "序章")
+            if _presc:
+                report.append("序章 解码 OOM：已自动腾挪并原参重试成功（参数与产物均无降级）")
             if len(pframes.shape) == 5:
                 pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
             pwav, sample_rate = _decode_audio(audio_vae, pa)
@@ -3244,7 +3300,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _t = time.perf_counter()
             sampled_fc = latent_t_to_frames(video_t.shape[2])
             vis_len = seg_lengths[i]
-            frames = video_vae.decode(video_t)
+            frames, _resc = _decode_rescue(video_t, f"段{gi + 1}")
+            if _resc:
+                lines.append(f"段{gi + 1} 解码 OOM：已自动腾挪并原参重试成功"
+                             "（参数与产物均无降级）")
             if len(frames.shape) == 5:
                 frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
             # 音频归一化只统计保留区（见 _decode_audio）：锚定区音频不计入 std
@@ -3589,7 +3648,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                 f"段{g + 1} 主干采样显存不足（已自动卸载驻留模型、回收残留引用并"
                                 "empty_cache 后**原参**重试仍失败）：峰值由 画布×帧数 决定"
                                 "（步数只影响耗时）——请缩短该段帧数或降低画布，或关闭 LoRA /"
-                                "降低放大倍率。本段未产出，已落盘的分段不受影响。") from _oe
+                                "降低放大倍率；也可给启动参数加 `--vram-headroom 1`"
+                                "给激活留出余量。本段未产出，已落盘的分段不受影响。") from _oe
 
                     try:
                         t0 = time.perf_counter()
@@ -3613,6 +3673,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                                "lora_weight_gb": _lf["lora_weight_gb"],
                                                "patches": _lf["patch_count"],
                                                "act_peak_gb": round(_act, 2)})
+                                    # 余量对账：把「主动留空」与「实测需求」连起来判够不够。
+                                    # 缺它的时候这两行同屏却没人判，而处方够不够（只加
+                                    # --vram-headroom 1 = +1GB 补不补得上缺口）也一直没算。
+                                    _gap = perf.headroom_gap_line(
+                                        (_bd_box[0] or {}).get("reserve_gb"),
+                                        perf.suggest_act_reserve(_act))
+                                    if _gap:
+                                        print(f"[H3性能] {_gap}", flush=True)
+                                        report.append(_gap)
                                 except Exception:
                                     pass
                         else:

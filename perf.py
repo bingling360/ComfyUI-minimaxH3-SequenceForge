@@ -2127,14 +2127,18 @@ def vram_headroom_advice(hw, policy=None, reserve_gb=0.0):
                 f"启动再加 `--vram-headroom 1` 仍能把余量再抬一档。")
     else:
         tail = ("建议启动加 `--vram-headroom 1`；仍不稳再加 `--disable-comfy-compiler`"
-                "（实测显存 100% → ~77%，代价约 5% 耗时）。"
+                "（实测显存占用 100% → ~77%，代价约 5% 耗时；"
+                "但另有实测出现「关掉编译器后失败点前移到一采采样」——"
+                "所以先加 `--vram-headroom`，它不稳再试它）。"
                 "⚠ 不想重启也能先救：面板的「显存预留（GB，直接填）」写的是 aimdo "
                 "**运行时可写**的进程级预留，改完立即生效。"
                 "注意：运行时改 EXTRA_RESERVED_VRAM 的第三方节点只影响 Python 侧记账，"
                 "盖不到 aimdo 原生预留。")
     return ("⚠ 显存余量策略为默认：DynamicVRAM 已启用但 `--vram-headroom` 为 0、"
-            "也未给 `--reserve-vram`——0.35 起显存会被吃到接近 100%，二采"
-            "（高清采样 + 放大网络）最先炸。"
+            "也未给 `--reserve-vram`——0.35 起显存会被吃到接近 100%，"
+            "**首段 VAE 解码与二采（高清采样 + 放大网络）最先炸**"
+            "（解码要与权重缓存共用显存，而「动态模型不卸动态模型」，"
+            "没有任何一方会主动让路）。"
             + ("；".join(bits) + "。" if bits else "")
             + tail)
 
@@ -2501,6 +2505,41 @@ def suggest_act_reserve(act_peak_gb, safety=1.2):
     if p <= 0:
         return None
     return round(p * float(safety or 1.2), 1)
+
+
+def headroom_gap_line(reserve_gb, need_gb, extra_gb=0.0):
+    """把「主动留空」与「实测需求」对起来 —— 只判够不够，并说清处方够不够。
+
+    `显存余量对账：主动留空 1.48GB < 实测需求 3.9GB（差 2.4GB）→ ...`
+
+    为什么需要它：预算行（「主动留空 1.48GB」）与 LoRA 账行（「建议留空 ≥3.9GB」）
+    是**分开打的**，两行同屏却没人把它们连起来 —— 而这两行摆在一起就已经证明
+    「本配置踩在悬崖上」。更要紧的是**处方对不对症**：只加 `--vram-headroom 1`
+    （+1GB）补不上 2.4GB 的洞，用户照做还是会炸，所以缺口必须自己算出来。
+
+    纯函数（只吃数字，不 import 任何东西）。`need_gb` 量不到（None/≤0）→ None，不编数字。
+    """
+    try:
+        reserve = float(reserve_gb)
+        need = float(need_gb)
+    except (TypeError, ValueError):
+        return None
+    if need <= 0 or reserve < 0:
+        return None
+    try:
+        extra = max(0.0, float(extra_gb or 0.0))
+    except (TypeError, ValueError):
+        extra = 0.0
+    want = need + extra
+    gap = want - reserve
+    if gap <= 0:
+        return (f"显存余量对账：主动留空 {reserve:.2f}GB ≥ 实测需求 {want:.2f}GB"
+                f"（余 {abs(gap):.2f}GB）—— 余量够用")
+    return (f"显存余量对账：主动留空 {reserve:.2f}GB < 实测需求 {want:.2f}GB"
+            f"（差 {gap:.2f}GB）→ 本配置在本卡上踩在采样/解码的边缘："
+            f"只加 `--vram-headroom 1`（+1GB）补不上这个洞；"
+            f"请把预留抬到 ≥{want:.1f}GB（启动参数或面板「显存预留」），"
+            f"或降低画布 / 缩短帧数")
 
 
 def lora_account_line(lora_weight_gb, patch_count, act_peak_gb=None, safety=1.2):

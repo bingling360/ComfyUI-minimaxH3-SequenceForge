@@ -3355,12 +3355,13 @@ function upTargetCanvas(node, up) {
  *  mp4，不会被基础分辨率覆盖。本段 latent 存档载入 → 神经放大重采样
  *  → 覆盖 seg_NNN.mp4，全程不碰视频编解码。
  *  二采渲染确定性：参数未变时重渲=同输出；价值在参数已变/记录缺失/补做时立即执行。
- *  健壮性（与 submitRedo 同口径）：①提交前自动套用存档共享参数——二采=同链重渲，
- *  后端 assert_match 硬校验参数一致，画布改过参数会整次运行失败（用户只看到
- *  "二采没生效"）；②临时清重摇标记/关审片逐段确认——残留的重摇会劫持本次提交
- *  （redo 优先走重采样），逐段审片会把全链回放打断成多次运行；③提交前校验放大
- *  权重文件在位——换卡/重装后权重丢失时 load_net 降级只有报告行，提前 alert；
- *  ④队列提交失败不再只 console.warn，LED 直接报出来。 */
+ *  健壮性（与 submitRedo 同口径）：①提交前套用存档共享参数——**只还原画幅**
+ *  （唯一硬约束）；步数/CFG/采样器等软参数按画布当前值走，不静默纠偏
+ *  （后端 assert_match 只硬校验分辨率，软参数变更只回报不报错）；②临时清重摇
+ *  标记/关审片逐段确认——残留的重摇会劫持本次提交（redo 优先走重采样），
+ *  逐段审片会把全链回放打断成多次运行；③提交前校验放大权重文件在位——换卡/
+ *  重装后权重丢失时 load_net 降级只有报告行，提前 alert；④队列提交失败不再只
+ *  console.warn，LED 直接报出来。 */
 async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
@@ -3401,11 +3402,18 @@ async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
             }
             return;
         }
-        /* 2. 存档参数静默套用（后端 assert_match 同口径）——二采段与链上其余段
-              共享锚定与采样配置，参数漂移会让整次运行在校验处失败 */
+        /* 2. 存档参数套用：软参数白名单（步数/CFG/采样器/调度器/门控）保留画布
+              当前值，其余（画幅/时长/引导帧数）按存档还原——与 submitRedo 同一份
+              redoParamPlan。例外：存档目录为空（参数指纹自动命名）时白名单作废，
+              否则改参数会让这次运行落到新项目目录去。 */
         let restored = [];
+        let kept = [];
         const mf = await fetchManifest(dir);
-        if (mf?.params) restored = applyChainParams(node, mf.params);
+        if (mf?.params) {
+            const plan = redoParamPlan(node, mf.params);
+            kept = plan.kept;
+            restored = applyChainParams(node, mf.params, { keep: plan.keep });
+        }
         /* 3. 临时切手动选择+只勾本段提交（原模式"关闭"时 parse_state 返回 None 不执行）；
               同时清残留重摇标记（redo 优先会劫持成本段重采样）、关审片逐段确认
               （会把全链回放打断成多次运行）——提交后立即全部还原，
@@ -3423,7 +3431,7 @@ async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
         setDs(node, ds);
         syncModeWidget(node, ds.mode);
         setLed("running", `段 ${dispNo} 重新二采已提交（其余段照常回放）`
-            + (restored.length ? `；已自动还原存档参数：${restored.join("、")}` : ""));
+            + redoParamNotice(restored, kept));
         try {
             await app.queuePrompt();
         } catch (e) {
@@ -6068,17 +6076,27 @@ async function stopGeneration() {
 /** 提交重摇（页脚 CTA）：随机种子 + 临时开审片（逐段推进：每重摇一段暂停审看），
  *  队列快照在服务端——提交后立即恢复控件并清 ds 标记（manifest 队列接管徽章显示）。
  *  redo 与「重跑起始段」互斥（后端 redo 优先）：提交时显式清零避免旧值干扰。
- *  共享参数自动套用存档值（applyChainParams）：重摇=同链换种子重做，参数必须与
- *  存档一致，画布控件若在成链后被改过会在后端 assert_match 硬报错——静默纠偏，
- *  实际改动项写进 LED 让用户知情。 */
+ *  共享参数**不再全量静默纠偏**：后端 `assert_match` 只硬校验分辨率，
+ *  steps/cfg/采样器/调度器/fade_ratio/gate 的变更「只回报、不报错、不触发重做」
+ *  （docs/手动锚定_分段latent参考规范化_实施规划.md §4.3）——用户在面板上把步数
+ *  从 8 改成 6 再点重摇，本来就该按 6 步重做这一段。老代码在这里把值写回存档值，
+ *  表现正是「步数改了没生效」。现在只做两件事：①画幅（唯一硬约束）不一致才还原，
+ *  并写进 LED；②其余差异只报「本次按画布当前值重做」，不碰控件。
+ *  例外：存档目录为空（按参数指纹自动命名）→ 参数进目录名，改参数＝换新项目，
+ *  必须全量还原，否则整条链会被丢掉。 */
 async function submitRedo() {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
     if (mergeJob.running) { alert("合并导出进行中：等它跑完再提交重摇"); return; }
     let restored = [];
+    let kept = [];
     if (lastDir) {
         const mf = await fetchManifest(lastDir);
-        if (mf?.params) restored = applyChainParams(node, mf.params);
+        if (mf?.params) {
+            const plan = redoParamPlan(node, mf.params);
+            kept = plan.kept;
+            restored = applyChainParams(node, mf.params, { keep: plan.keep });
+        }
     }
     const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
     const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
@@ -6092,7 +6110,7 @@ async function submitRedo() {
     setDs(node, ds);
     syncModeWidget(node, ds.mode);
     setLed("running", "重摇已提交（逐段审片推进，满意后继续）"
-        + (restored.length ? `；已自动还原存档参数：${restored.join("、")}` : ""));
+        + redoParamNotice(restored, kept));
     try {
         await app.queuePrompt();
     } catch (e) {
@@ -6453,19 +6471,46 @@ async function switchProject(dir) {
     scheduleRefresh(200);
 }
 
-/** 把 manifest 共享参数静默映射回画布控件，返回实际改动（值未变不记）的描述列表。
+/** 重摇 / 二采提交时**保留用户当前值**的共享参数（后端「软参数」白名单）。
+ *  依据 docs/手动锚定_分段latent参考规范化_实施规划.md §4.3 决策总表：
+ *  steps / cfg / 采样器 / 调度器 / fade_ratio / gate 改了「不拦截、不重做」——
+ *  重摇本来就只重做这一段，用用户刚改的值才对。
+ *  **时长（length）与引导帧数（ctx）不在表内**：它们挪动每段帧数与引导窗坐标，
+ *  只重做一段会连带下游锚点错位，仍按存档还原（但会写进 LED，不再无声）。 */
+const KEEP_ON_REDO = ["步数", "CFG", "采样器", "调度器",
+    "递减锚定", "桥帧门控", "清晰度阈值", "回退上限"];
+
+/** 把 manifest 共享参数映射回画布控件，返回改动（值未变不记）的描述列表。
  *  覆盖进指纹的全部共享参数：画幅/时长/引导帧数/步数/CFG/采样器/调度器/
- *  递减锚定/桥帧门控三件套——重摇提交前自动调用纠偏参数漂移（后端
- *  assert_match 同口径），也供手动「套用参数」按钮复用。
+ *  递减锚定/桥帧门控三件套。手动「套用参数」按钮走默认全量口径。
+ *
+ *  ★ `opts.keep = [控件名]`：命中的控件**保留用户当前值**，不回写存档值。
+ *  重摇 / 二采提交传 `KEEP_ON_REDO` —— 后端 `checkpoint.assert_match` 自
+ *  2026-09-16 起只硬校验 width/height，软参数变更「只回报、不报错、不触发重做」。
+ *  老代码在这里**全量静默纠偏**，于是用户改完步数点「重摇」，值被悄悄写回存档值
+ *  —— 表现就是「步数改了没生效，还是跑的 8 步」。
+ *  例外：存档目录为空（按参数指纹自动命名）时参数进**目录名**，改参数＝开新项目，
+ *  那种情况一律不豁免（调用方传 `keep: []`）。
+ *
+ *  ★ `opts.dry === true`：只算差异、不写控件（提交前把「本次与存档不一致」报给
+ *  用户知情）。与真写共用同一份映射表，杜绝两套口径漂移；同一组入参下 dry 的
+ *  结果与真写逐条对应，可直接做差集。
+ *
  *  画幅一律映射到 AR×MP 档位：精确命中用之，无命中反推最近档位（「自定义」
  *  画幅已删，2026-09-27——只写宽/高控件不生效）。 */
-function applyChainParams(node, params) {
+function applyChainParams(node, params, opts) {
     if (!node || !params) return [];
+    const dry = !!(opts && opts.dry);
+    const keep = (opts && opts.keep) || [];
     const applied = [];
-    /* setWidgetValue 的带回报版：值变化才写并记录描述（幂等重放不产生噪音） */
+    /* setWidgetValue 的带回报版：值变化才写并记录描述（幂等重放不产生噪音）；
+     * keep 命中的不写也不报；dry 只记录不落值——差异文案写成「存档 X → 当前 Y」，
+     * 只报一个值会被读成"当前值"（用户会以为提示在说反话） */
     const put = (name, value, label) => {
         const wd = (node.widgets || []).find((x) => x.name === name);
         if (!wd || String(wd.value ?? "") === String(value)) return false;
+        if (keep.includes(name)) return false;
+        if (dry) { applied.push(`${name}：存档 ${value} → 当前 ${wd.value}`); return true; }
         return setWidgetValue(node, name, value) ? (applied.push(label), true) : false;
     };
     const w = Number(params.width), h = Number(params.height);
@@ -6476,10 +6521,15 @@ function applyChainParams(node, params) {
         const exact = !!matchCanvasCombo(w, h);
         const oldAr = String(getWidgetValue(node, W_AR) ?? "");
         const oldMp = String(getWidgetValue(node, W_MP) ?? "");
-        setWidgetValue(node, W_AR, combo[0]);
-        setWidgetValue(node, W_MP, combo[1]);
         if (oldAr !== combo[0] || oldMp !== String(combo[1])) {
-            applied.push(`画幅 ${combo[0]}·${combo[1]}MP（${exact ? "" : "近似 "}${w}×${h}）`);
+            if (dry) {
+                applied.push(`画幅：存档 ${combo[0]}·${combo[1]}MP（${w}×${h}）`
+                    + ` → 当前 ${oldAr || "—"}·${oldMp || "—"}MP`);
+            } else {
+                applied.push(`画幅 ${combo[0]}·${combo[1]}MP（${exact ? "" : "近似 "}${w}×${h}）`);
+                setWidgetValue(node, W_AR, combo[0]);
+                setWidgetValue(node, W_MP, combo[1]);
+            }
         }
     }
     if (params.length) {
@@ -6513,6 +6563,31 @@ function applyChainParams(node, params) {
     /* 回退上限：指纹存的是 //17*17 对齐值，直接写回同值（limit 已对齐再对齐不变） */
     if (gate.limit != null) put("回退上限", gate.limit, `回退上限 ${gate.limit}`);
     return applied;
+}
+
+/** 重摇 / 二采提交的参数口径：同一份映射表跑两遍 dry 做差集，算出
+ *  - `kept`       = 用户改了、且按白名单保留的（本次按画布当前值重做）
+ *  - `willRestore`= 用户改了、但会被写回存档值的（硬约束/时长/引导帧数/
+ *                   自动命名模式）——供调用方写进 LED，不再无声改动用户的值
+ *  - `keep`       = 交给真写那次用的白名单 */
+function redoParamPlan(node, params) {
+    const keep = getDirValue(node) ? KEEP_ON_REDO : [];
+    const all = applyChainParams(node, params, { dry: true });
+    const willRestore = applyChainParams(node, params, { dry: true, keep });
+    return { keep, kept: all.filter((x) => !willRestore.includes(x)), willRestore };
+}
+
+/** 重摇 / 二采提交的「参数口径」提示（写进 LED）。两件事各自说清：
+ *  哪些被写回存档值（硬约束/结构参数/自动命名模式），
+ *  哪些本次按用户画布上的当前值走（软参数，只影响本次重做的段）。 */
+function redoParamNotice(restored, kept) {
+    const parts = [];
+    if (restored.length) parts.push(`已自动还原存档参数：${restored.join("、")}`);
+    if (kept.length) {
+        parts.push(`本次按画布当前值重做：${kept.join("、")}`
+            + "（只影响本次重做的段，其余段沿用存档）");
+    }
+    return parts.length ? `；${parts.join("；")}` : "";
 }
 
 /** 把项目 manifest 的共享参数映射回画布控件（画幅优先尝试 宽高比×MP combo 匹配）。 */

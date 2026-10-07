@@ -18,6 +18,9 @@
 .workbuddy/
 .workbuddy-ai/
 
+# 「鼠标不动就慢」诊断工具（一次性排障用，不随插件分发）
+idle_probe/
+
 # 本地私有默认值：内含 API Key / 默认服务商，**绝不入库**
 optimizer.local.json
 optimizer.local.json.bak-*
@@ -47,3 +50,7 @@ logs/
 
 # 提示词产出与运行时目录（个人创作产出 + 未来的 h3_projects 存档，不属于插件本体）
 output/
+
+# 宣传片工程：成片 mp4（22MB）+ 生成的 music.wav（35MB）+ 截图，合计 ~65MB。
+# 个人创作产出，不属于插件本体 —— 进一次 public 仓库就永久留在历史里，不可逆。
+promo_video/

@@ -4775,11 +4775,17 @@ const H3_PERF_FIELDS = [
 
     /* ═══ ⑤ 成片与编码 ═══ */
     { key: "final_mode", label: "成片合成方式", kind: "sel", group: "成片与编码 · 合成",
-      opts: [["auto", "能拼就拼（推荐）"], ["stream", "强制流式拼接"], ["memory", "强制内存帧编码"]],
-      hint: "stream = 用分段 mp4 流式拼接，**全程不碰全链内存帧**（NLE 的一贯做法）；auto 在分段齐全时自动走 stream" },
+      opts: [["auto", "能拼就拼（推荐）"], ["stream", "强制流式拼接"],
+             ["memory", "强制内存帧编码（保留全链帧）"]],
+      hint: "stream = 用分段 mp4 流式拼接，**全程不碰全链内存帧**（NLE 的一贯做法）；auto 在分段齐全时自动走 stream。"
+          + "**只有 memory 会把全链帧留在内存**（内存帧编码的唯一前提）——auto / stream 都不留，"
+          + "长链可省几十 GB（544×960×5895 帧 = 36.9GB）。代价：分段 mp4 不齐时无法回退内存帧编码，"
+          + "此时用素材库「合并导出」出片" },
     { key: "frames_dtype", label: "全链帧存储精度", kind: "sel", group: "成片与编码 · 合成",
       opts: [["float32", "float32（现状）"], ["uint8", "uint8（内存 ×¼）"]],
-      hint: "uint8：帧存内存降到 ¼，且成片改为预分配逐段填充 —— 峰值从 2× 全链帧降到约 1.25×。输出的 IMAGE 仍是 float32。**内存紧就开**" },
+      hint: "**仅在 final_mode=memory 时生效**（auto / stream 不留全链帧，本项无作用）。"
+          + "uint8：帧存内存降到 ¼，且成片改为预分配逐段填充 —— 峰值从 2× 全链帧降到约 1.25×。"
+          + "输出的 IMAGE 仍是 float32。**内存紧就开**" },
     { key: "guard_action", label: "落盘守卫行为", kind: "sel", group: "成片与编码 · 合成",
       opts: [["warn", "只报告"], ["block", "critical 时禁止全卸"]],
       hint: "block：判定会挤到 swap 时跳过二采精化前的全卸 —— Linux 无 swap 机器上全卸不是变慢，是进程被 OOM killer 直接杀掉" },

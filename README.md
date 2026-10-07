@@ -332,6 +332,13 @@ All controls are on the node (labels are Chinese in the UI).
 
 **Outputs (order matters — see §22):** `图像 / 音频 / 报告 / 帧率`.
 
+**Note on the `图像` output.** By default it is a **single placeholder frame**. Final rendering
+goes through streaming concatenation of the per-segment mp4s, so the full-chain frame tensor is
+never materialised in RAM — that tensor is **36.9GB** for 544×960 × 5895 frames (~4 min), and it
+was what blew up a 64GB machine with `DefaultCPUAllocator: not enough memory`. Set the perf
+setting `final_mode = memory` (强制内存帧编码) if you genuinely need the full-chain IMAGE output;
+in that mode `frames_dtype = uint8` cuts the footprint to a quarter.
+
 ---
 
 ## 10. Project archiving

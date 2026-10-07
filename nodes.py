@@ -1150,6 +1150,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _act_peak_probe = bool(_pf.get("act_peak_probe", True))
         _frames_uint8 = str(_pf.get("frames_dtype") or "float32").lower() == "uint8"
         _final_mode = str(_pf.get("final_mode") or "auto").lower()
+        # 全链帧是否留在内存：**只有强制内存帧编码（final_mode=memory）才必须留**。
+        # auto / stream 都走流式拼接（从盘上分段 mp4 拼，见 _stream_final_basic），
+        # 帧不必落内存 → 省 n×h×w×12 字节（544×960×5895 帧 = 36.9GB，
+        # 曾把 64GB 机器的 CPU 分配打爆：DefaultCPUAllocator not enough memory）。
+        # ⚠ 别为了「下游可能要用 IMAGE」改回无条件保留——默认工作流里主节点的
+        # 「图像」输出 links 是空数组（web/h3_default_workflow.js），根本没人接。
+        _keep_frames = (_final_mode == "memory")
         _act_first = [True]   # 激活峰值只在首段采样时量一次
         # LoRA 权重的那一半账：ComfyUI 的 `model_size()` 把 patches 算进去了，
         # 这里独立再算一遍是为了**交叉验证**（两边对不上说明有补丁没走 patches）。
@@ -3117,7 +3124,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
         prompt_list = (["「序章（上传视频）」"] if off else []) + [
             seg_prompts[it[1]] for it in exec_items]
         thumbs, videos, seams, bridge_scores = [], [], [], []
-        all_frames = []
+        all_frames = []          # 全链帧：仅 _keep_frames（final_mode=memory）时非空
+        # 每段帧数：len()/sum() 的用途全部走它，不持有帧本身 —— 默认口径下
+        # all_frames 是空的，凡是「拿它当段计数/总帧数」的地方都必须改用它。
+        _frame_counts = []
         seg_wavs = []
         trims = []
         seam_metrics_rows = []   # 每缝五维 z-score（与 seams 列表对齐；无缝/指标不可用为 None）
@@ -3201,9 +3211,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             bridge_scores.append(None)
             seam_metrics_rows.append(None)
             # 全链帧只此一份：它就是「等拼成片」的唯一持有者（float32 时即原帧
-            # 本身；uint8 时是量化后的副本）——别再另存一份，否则 ¼ 的收益被抵掉
+            # 本身；uint8 时是量化后的副本）——别再另存一份，否则 ¼ 的收益被抵掉。
+            # 默认口径（_keep_frames=False）下**不持有**：成片走流式拼接，帧用完即弃。
             _cf = pframes.cpu()
-            all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
+            _frame_counts.append(int(_cf.shape[0]))
+            if _keep_frames:
+                all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
             seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
             all_wav = pwav.cpu()
             prev_tail_frame = pframes[-1].cpu()
@@ -3705,7 +3718,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # ⚠ 这一份必须是全链帧的**唯一**持有者：以前另有 seg_frames 列表存
             # 同一份 float 帧（只被 len() 用），uint8 开着时那份 float 没省掉、
             # 白加一份 uint8 副本 → 常驻反而 1.25×。已删，勿复活。
-            all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
+            # 默认口径（_keep_frames=False）不持有帧；段计数改由 _frame_counts 承担
+            # （轻量 int 列表，不是当年的 seg_frames —— 别再把两者混为一谈）。
+            _frame_counts.append(int(_cf.shape[0]))
+            if _keep_frames:
+                all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
             seg_wav = wav.cpu()
             seg_wavs.append({"waveform": seg_wav, "sample_rate": sample_rate})
             all_wav = seg_wav if all_wav is None else torch.cat([all_wav, seg_wav], dim=-1)
@@ -3871,7 +3888,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                        "trims": trims}, done),
             })
             if review:
-                if len(all_frames) == _final_segs:
+                if len(_frame_counts) == _final_segs:
                     report.append("审片：本链已全部完成")
                 if reroll > 0:
                     report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
@@ -3883,28 +3900,36 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if all_frames:
             images = _build_chain_images(all_frames, height, width, _frames_uint8)
         else:
-            # 全禁用链：无帧可拼——单帧黑场占位保下游节点不崩，报告说明（无成片内容）
+            # 单帧黑场占位保下游节点不崩。两种来源必须分开报：
+            # ① 链跑过了、但默认口径不留帧（成片走流式拼接）——**预期行为**；
+            # ② 全禁用链（没有任何段上链）——真的无内容可拼。
             images = torch.zeros(1, height, width, 3)
-            if all_wav is None:
-                all_wav = torch.zeros(1, 2, 24000)
-                sample_rate = 24000
-            report.append("注意：所有段均已禁用（不上链）——输出为单帧黑场占位，无成片内容")
+            if _frame_counts:
+                report.append("图像输出：默认不留全链帧（成片走流式拼接），本口输出单帧占位；"
+                              "需要全链图像请把性能设置 final_mode 设为 memory")
+            else:
+                if all_wav is None:
+                    all_wav = torch.zeros(1, 2, 24000)
+                    sample_rate = 24000
+                report.append("注意：所有段均已禁用（不上链）——输出为单帧黑场占位，无成片内容")
         # 自动成片：完整链（或审片已确认部分）编码成片，直接落项目文件夹。
         # 二采开启且全链高清记录齐时优先流式拼接高清分段（单份产物，成片=二采结果）；
-        # 链未完成/记录不齐/尺寸混排/拼接失败回退内存帧编码基础分辨率成片。
+        # 否则走基础分辨率流式拼接。**回退内存帧只在留了全链帧时可行**（final_mode=memory）
+        # ——默认口径不留帧，流式不成就没有成片，报告里给明去路。
         # 禁用段两路同口径剔除：高清拼接传 skip_slots，内存帧本就不含禁用段
         if autosave_final:
             if not (up_cfg and upscale.try_final(root, up_cfg, report, skip_slots=_off_slots)):
-                if _redo_started and len(all_frames) < _final_segs:
+                if _redo_started and len(_frame_counts) < _final_segs:
                     # 重摇审片中段 break：内存帧只有已处理段，编码会产出半截成片污染
                     # finals；重摇段 mp4 已覆盖、保留段沿用，全部分段都在盘——下次
                     # 全链运行（redo 队列清空）自动重拼全片，或用合并导出即时取片
                     report.append("重摇：本次为部分重做（审片中段），跳过自动成片——"
                                   "剩余段全部确认后运行一次自动重拼全片，或用合并导出")
                 else:
-                    # 基础分辨率成片优先走**流式拼接分段 mp4**：全程不碰全链内存帧。
+                    # 基础分辨率成片走**流式拼接分段 mp4**：从盘上分段拼，不碰全链内存帧。
                     # 这是 D3 的正解（NLE 从不把整条时间线的 RGB 帧同时放内存里），
                     # 也是二采高清路径早就在用的同一套（upscale.try_final）。
+                    # ⚠ 默认口径下 all_frames 本就是空的（见 _keep_frames），流式是唯一出路。
                     final_name, enc_err = None, None
                     if _final_mode in ("auto", "stream"):
                         final_name, enc_err = _stream_final_basic(
@@ -3913,13 +3938,25 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if final_name:
                             report.append("成片：流式拼接分段 mp4（未经全链内存帧，"
                                           "内存峰值不随段数翻倍）")
-                        elif _final_mode == "stream":
-                            report.append(f"成片：final_mode=stream 但分段 mp4 不齐"
-                                          f"（{enc_err}）——回退内存帧编码")
                     if final_name is None:
-                        final_name, enc_err = _autosave_final(root, images, all_wav, sample_rate,
-                                                       crf=_bcrf, preset=_bpreset, aq_mode=_baq,
-                                                       dither=_bdith)
+                        if all_frames:
+                            final_name, enc_err = _autosave_final(
+                                root, images, all_wav, sample_rate,
+                                crf=_bcrf, preset=_bpreset, aq_mode=_baq, dither=_bdith)
+                        else:
+                            # 走到这里说明没有可用的全链帧。两种来源分开说：
+                            # ① 默认口径（auto/stream）压根不留帧——流式又没成，本次无成片；
+                            # ② memory 档但链为空（全禁用）——没有东西可编。
+                            _why = enc_err or ("链为空（无可编码的段）" if not _frame_counts
+                                               else "分段 mp4 不齐")
+                            if _keep_frames:
+                                report.append(f"成片：无可编码的全链帧（{_why}）")
+                            else:
+                                report.append(
+                                    f"成片：流式拼接未成（{_why}），且当前设置不保留全链帧"
+                                    f"（final_mode={_final_mode}）→ 本次未生成成片。"
+                                    "要出片：把性能设置 final_mode 设为 memory 后重跑，"
+                                    "或直接用素材库「合并导出」拼盘上的分段 mp4")
                     if final_name:
                         try:
                             _frel = os.path.relpath(final_name, root).replace("\\", "/")
@@ -3956,7 +3993,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                               f"（|z|<2 合格；明细 manifest.seam_metrics）")
         drop_total = sum(t for t in trims if t)
         if drop_total > 0:
-            chain_frames = sum(f.shape[0] for f in all_frames)
+            chain_frames = sum(_frame_counts)
             share = drop_total / max(1, chain_frames + drop_total) * 100.0
             report.append(f"累计丢弃 {drop_total} 帧（{drop_total / 24:.1f}s，约占计划时长 {share:.1f}%）"
                           f"——含门控回退/网格对齐，逐段明细见 manifest trims")

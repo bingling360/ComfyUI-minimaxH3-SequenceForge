@@ -176,7 +176,11 @@ DEFAULT_PERF = {
     "keep_upscaler_resident": True,
 
     # 内存：成片合成
-    "final_mode": "auto",          # auto=能拼就拼 / stream=强制流式 / memory=强制内存帧
+    # auto=能拼就拼 / stream=强制流式 / memory=强制内存帧
+    # ⚠ memory 是**唯一会把全链帧留在内存**的档（内存帧编码的前提）。
+    #   auto / stream 都不留帧、成片走流式拼接 —— 长链省 n×h×w×12 字节
+    #   （544×960×5895 帧 = 36.9GB）。消费端见 nodes._keep_frames。
+    "final_mode": "auto",
     "frames_dtype": "float32",     # float32 / uint8（帧存内存 ×¼）
 
     # 内存

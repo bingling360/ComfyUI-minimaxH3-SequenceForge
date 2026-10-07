@@ -2,6 +2,18 @@ import traceback
 
 WEB_DIRECTORY = "./web"  # 导演台前端（h3_director.js）随插件分发
 
+# 显存探针（h3probe.py）：**只读、零行为改动**，在 VAE 解码前后与每次腾挪时把显存账打进控制台。
+# 它回答的是「解码那一刻那十几 GB 在谁手里、为什么腾不出来」——这个问题事后从任何日志都推不出来。
+# 默认开启（默认模式下只在解码与「可疑腾挪」时出声）；启动前 `set H3PROBE=0` 可完全关掉。
+# 单独 try：探针绝不能把插件本体带崩。
+try:
+    from .h3probe import install as _install_h3probe
+
+    _install_h3probe()
+except Exception:
+    print("[ComfyUI_H3_SeamlessChain] 显存探针加载失败（不影响插件本体）。详细错误：")
+    traceback.print_exc()
+
 try:
     from comfy_api.latest import ComfyExtension
 

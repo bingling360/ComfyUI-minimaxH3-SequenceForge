@@ -487,6 +487,156 @@ def _vram_oom_cleanup():
         pass
 
 
+def _loaded_models_gb():
+    """所有驻留模型的**账本**之和（GB）；量不到 → None。
+
+    口径与探针 `h3probe._models_lines` 一致：遍历 `current_loaded_models`，
+    累加每个 patcher 的 `loaded_size()`。dynamic patcher 的这个值来自
+    `vbar.loaded_size() + model_loaded_weight_memory` —— 它回答的是
+    「**账本上**还占着多少」，**不是**「设备上实际占了多少」。两者之差正是
+    下面 `_reclaim_orphan_vram` 要抓的东西。
+    """
+    try:
+        import comfy.model_management as _mm
+
+        total = 0.0
+        for lm in list(getattr(_mm, "current_loaded_models", []) or []):
+            m = getattr(lm, "model", None)
+            if m is None:
+                continue
+            try:
+                total += float(m.loaded_size())
+            except Exception:
+                continue
+        return total / (1024.0 ** 3)
+    except Exception:
+        return None
+
+
+def _reclaim_orphan_vram(threshold_gb=2.5, tag=""):
+    """「无主显存」超阈值 → 强制回收（gc + empty_cache）。返回报告 dict 或 None。
+
+    为什么必须补这条判据（2026-10-08 实测）：
+      aimdo 的池会持有**已释放的块**而不还给设备，而 ComfyUI 的 `free_memory()`
+      只认 `current_loaded_models` 那本账。于是会出现这种它完全无从下手的状态：
+
+          设备 6.00/6.00GB 已用 · CUDA 报空闲 0.00GB · torch allocated 0.31GB
+          #0 MiniMaxH3VideoVAE loaded=0.00GB · vbar resident=0
+          #1 MiniMaxH3         loaded=0.00GB · vbar resident=0
+          free_memory 要求释放 5.07GB → 卸了 0 个 · 实释放 0.00GB
+
+      —— **约 5.7GB 不在任何账本上**。`free_memory` 找不到可卸对象，解码就在
+      这个状态下反复尝试，表现为「卡住不动」（实测多段链第 1 段解码入口
+      16 分钟零进展：CPU 满载、磁盘几乎不读，直到 interrupt 才抛异常退出）。
+
+    与 ComfyUI 自带路径的区别：`free_memory()` 里的 `soft_empty_cache()` 是
+    **有条件**触发的（`mem_free_torch > mem_free_total * 0.25`），而池里的空闲块
+    **不计入** `mem_free_torch` —— 本机实测该条件恒为假，**池永远不回收**。
+    这里补一条独立判据：**设备占用 − 账本占用 > 阈值** 就回收。
+
+    阈值取 2.5GB：CUDA context + 框架自身在空闲时约占 1.0GB（实测），
+    留 1.5GB 余量避免误触发。只清分配器缓存、**不卸载模型**——模型真在用时
+    卸载代价很大；这条路径处理的是「账本已空、设备没还」的情形。
+
+    回收用官方 `soft_empty_cache()`（synchronize + empty_cache + ipc_collect）
+    而不是裸 `torch.cuda.empty_cache()`：它才是 `/h3chain/vram_cleanup` 手动
+    「点一下」走的同一条路，口径与已验证有效的手段一致。（`free_memory()` 里
+    那次 `soft_empty_cache()` 是**有条件**触发的，而函数本身无条件 —— 所以这里
+    直接调函数、绕过那个条件。）
+    """
+    used = _vram_used_gb()
+    loaded = _loaded_models_gb()
+    if used is None or loaded is None:
+        return None
+    orphan = used - loaded
+    if orphan <= threshold_gb:
+        return None
+    gc.collect()
+    try:
+        import comfy.model_management as _mm
+
+        _mm.soft_empty_cache()
+    except Exception:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    after = _vram_used_gb()
+    return {"tag": tag, "orphan_gb": orphan, "used_before_gb": used,
+            "used_after_gb": after,
+            "freed_gb": (used - after) if after is not None else None}
+
+
+def _comfy_exec_cleanup():
+    """补做 ComfyUI「每次节点执行结束」的那套清理（`execution.py` 的 finally 块）。
+
+    为什么插件必须自己在段间补做（2026-10-08 实测更正了「显存池占满」的旧判断）：
+      导演台的多段链是**一次**节点执行里跑完 N 段的，而 ComfyUI 这套清理挂在
+      「节点执行结束」这个点上 —— 于是**段间从不发生**。手动逐段跑则每段各是一次
+      执行、每段都清一次。这正是「手动逐段 + 点一下清理就正常」的真正机制。
+
+    段间不清会累积三样都不在模型账本上的显存：
+      ① `model_prefetch` 的 CUDA 图（`module._comfy_graph`）—— 图的显存池既不计入
+         torch 分配器、也不计入 `current_loaded_models`，且
+         **`torch.cuda.empty_cache()` 对它完全无效**。
+         实测卡住那一轮：采样期 torch_reserved 只有 96–128MB（权重全在 aimdo
+         VBAR 里），而设备占用已 5GB —— 差额就是这一类。
+      ② cast buffer / 脏 mmap / cross-step state（`reset_cast_buffers`）。
+      ③ VBAR 的 watermark limit —— 它按上一段的压力调过，不重置就会一直按旧压力
+         驱逐页。
+
+    三步与 ComfyUI 同源，逐条 try/except：某一步不可用（如非 aimdo 环境）
+    不影响其余。**成本只有一次 stream 同步**，不卸载模型、不丢缓存。
+    """
+    try:
+        import comfy.model_prefetch as _mp
+
+        _mp.cleanup_prefetch_queues()
+    except Exception:
+        pass
+    try:
+        import comfy.model_management as _mm
+
+        _mm.reset_cast_buffers()
+    except Exception:
+        pass
+    try:
+        import comfy_aimdo.model_vbar as _mv
+
+        _mv.vbars_reset_watermark_limits()
+    except Exception:
+        pass
+
+
+def _segment_end_cleanup(tag=""):
+    """段末清理：执行级清理（`_comfy_exec_cleanup`）+ 无主显存回收。
+
+    返回回收报告 dict（无实质回收时返回 None）。
+    """
+    _comfy_exec_cleanup()
+    return _reclaim_orphan_vram(tag=tag)
+
+
+def _log_reclaim(rec, prefix):
+    """把一次回收结果打一行 `[H3性能]`；没有实质释放就不出声。"""
+    if not rec:
+        return
+    try:
+        freed = float(rec.get("freed_gb"))
+    except (TypeError, ValueError):
+        return
+    if freed < 0.2:
+        return
+    af = rec.get("used_after_gb")
+    aft = f"{af:.2f}" if af is not None else "?"
+    try:
+        print(f"[H3性能] {prefix}回收无主显存：设备 "
+              f"{rec['used_before_gb']:.2f}→{aft}GB"
+              f"（无主 {rec['orphan_gb']:.2f}GB · 释放 {freed:.2f}GB）", flush=True)
+    except Exception:
+        pass
+
+
 def _frames_to_uint8(frames_f):
     """[N,H,W,3] float 0-1 -> uint8（帧存内存 ×¼）。"""
     return frames_f.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
@@ -3175,7 +3325,19 @@ class H3SeamlessChainSampler(io.ComfyNode):
             ∝ 画布面积 × 帧数」：该 VAE 的全片像素缓冲分配在
             `intermediate_device()`（默认是 **cpu**，见 comfy/ldm/minimax/vae.py），
             根本不在显存上；解码的显存峰值是 per(时间 chunk × 空间 tile)。
+
+            ⚠ **解码前先补做执行级清理 + 主动回收「无主显存」**：
+            下面那套 `oom_retry` 只在**抛 OOM 异常**后才触发，而实测的失效形态是
+            **根本不抛异常、原地卡住**（第 4 步耗时 597s 而磁盘只读了 20.2GB，
+            速率从 225MB/s 塌到 34MB/s = 32MiB 一页/秒的抖动）——那条路径救不到它。
+            所以必须在 decode 之前就动手：
+              · `_comfy_exec_cleanup()` 补做 ComfyUI「每次执行结束」才做的那套清理
+                （段间从不发生；手动逐段跑就正常，正是因为它每段都做一次）；
+              · `_reclaim_orphan_vram()` 再按「设备占用 − 账本占用」判据回收一次。
             """
+            _comfy_exec_cleanup()
+            _log_reclaim(_reclaim_orphan_vram(tag=f"{label} 解码前"),
+                         f"{label} 解码前")
             if not _oom_autoretry:
                 return video_vae.decode(vt), 0
 
@@ -3913,6 +4075,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 })
 
             pbar.update(1)
+
+            # 段末清理 —— 这是「跨段累积」那一半。多段链在**一次**节点执行里跑完
+            # N 段，而 ComfyUI 的执行级清理挂在「节点执行结束」上 → 段间从不发生；
+            # 手动逐段跑每段各清一次，所以手动正常。不清就会累积 CUDA 图 /
+            # cast buffer / VBAR watermark（三样都不在模型账本上、empty_cache 也
+            # 收不走）。实测依据见 `_comfy_exec_cleanup` 的说明。
+            _log_reclaim(_segment_end_cleanup(tag=f"段{g + 1} 段末"), f"段{g + 1} 段末")
 
             if review and not replay and item_i + 1 < len(exec_items):
                 if _redo_mode is not None:

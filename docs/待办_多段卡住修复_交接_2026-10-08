@@ -1,0 +1,272 @@
+# 待办：多段链「卡住不动」修复（交接文档）
+
+> 2026-10-08 诊断 + 部分修复。本文是给下一个对话继续用的，所有结论都有实测或源码依据。
+>
+> ⚠ **第二轮（接手对话）更正了根因** —— 第 3 节「显存池被占满」不是卡住的原因，
+> 真根因是**段间缺 ComfyUI「每次执行结束」的那套清理**。**先读第 8 节**，第 3 节
+> 只在「解释那个 5.7GB 无主显存是哪来的」时还有用。
+>
+> ✅ **修复已实测通过**（2026-10-08 17:17 重启后复跑 3 段：`Prompt executed in 00:32:48`，
+> 3 段全部完成、不再卡）—— 证据见 §8.5。
+
+---
+
+## 1. 用户报的现象
+
+> 三段、每段 10 秒，自动跑时**第二段卡在 25% 不动**；改成手动逐段跑、
+> **每段跑之前点一次「清理显存」**就正常。问能不能自动生成一段清理一次。
+
+**结论：反馈属实，已复现，根因已定位。不是用户操作问题。**
+
+---
+
+## 2. 复现结果（两次对照实验，同一台机器，都是 3 段）
+
+| 配置 | 结果 |
+|---|---|
+| 0.1MP × 1 秒/段 | **完全正常**。段耗时 131 / 111 / 100 秒（越跑越快），磁盘累计读 278 GB |
+| 0.5MP × 2 秒/段 | **复现卡住**。第 1 段 355 秒跑完 4/4 后，**841 秒仍在原地**（8 分钟零进展） |
+
+- 复现工作流：`tools/_h3_probe_3seg.json`（3 段、0.5MP、2 秒/段）
+- 采样数据：`output/h3_mem_probe/run3seg_big_trace.csv`（卡住那份）、
+  `run3seg_trace.csv`（正常那份，作基线）
+- 卡住进程状态：**CPU 109%（在算，不是死锁）**、磁盘读仅 **12.9 MB/s**（正常约 230 MB/s）
+
+---
+
+## 3. 根因（代码级）
+
+### 3.1 直接现场（ComfyUI 日志原文，VAE 解码失败那一刻）
+
+```
+[H3PROBE] ===== VAE.decode 失败现场 [VAE] =====
+[H3PROBE]   设备 6.00/6.00GB 已用 · CUDA 报空闲 0.00GB · torch allocated 0.31GB reserved 1.53GB
+[H3PROBE]   comfy 口径：设备空闲 1.22GB · torch 可复用 1.22GB
+[H3PROBE]   #0 MiniMaxH3VideoVAE  loaded=0.00GB · vbar loaded=0.00GB pages=191 resident=0
+[H3PROBE]   #1 MiniMaxH3         loaded=0.00GB · resident=0
+[H3PROBE]   #2 MiniMaxH3TEModel_ loaded=0.00GB · resident=0
+[H3PROBE]   #3 MiniMaxH3AudioVAE loaded=0.00GB · resident=0
+[H3PROBE] vbar.free_memory 请求 全部 → 实得 0.00GB      ← ×4，四个模型全为 0
+[H3PROBE] free_memory 要求释放 5.07GB → 卸了 0 个 · 实释放 0.00GB
+[INFO] 0 models unloaded.
+```
+
+**核心矛盾：设备 6.00/6.00 GB 全满、CUDA 报 0 空闲，而 torch 只用 0.31 GB、
+四个模型账本全是 0 → 约 5.7 GB 显存不在任何账本上。**
+
+且 ComfyUI 与 CUDA 的判断直接冲突：
+`comfy 口径设备空闲 1.22GB`（= mem_free_cuda 0.00 + mem_free_torch 1.22）vs `CUDA 报 0.00GB`。
+ComfyUI 以为池里的 1.22 GB 可复用 → 基于错误信息继续推进 → 陷在里面。
+
+### 3.2 三条代码级根因
+
+| # | 位置 | 问题 |
+|---|---|---|
+| ① | `comfy/model_management.py:930-936` | `free_memory()` 只认 `current_loaded_models` 账本；池里的已释放块在它视野之外 → 「卸了 0 个」 |
+| ② | 同上 | `soft_empty_cache()` **有条件**触发：`mem_free_torch > mem_free_total * 0.25`。本机实测 `0.10 > 0.95×0.25=0.2375` 为 **False** → **池永远不回收** |
+| ③ | `comfy/model_patcher.py:1784-1789` 附近 | VBAR 预留「模型大小 × 10」虚拟地址；页驱逐后物理块回到池但不还给设备 |
+
+### 3.3 责任归属（已回答用户）
+
+- **不是导演台的分配机制问题** —— 插件没有自己的显存分配器，全走 ComfyUI 标准接口
+  （`load_models_gpu` / `unload_all_models` / `empty_cache`），且已在多处主动腾挪。
+  那 5.7 GB 不属于插件的任何对象。
+- **根因在 ComfyUI 原生 + aimdo 池的协作缺陷**。
+- **但插件放大了它**：UNET + TE + 2 个 VAE **四个同时长期驻留**，多段循环 = 反复
+  加载/驱逐 = 池持续膨胀；而原生单次工作流跑完即结束、池随之回收。**段末不清理是放大因素。**
+- **"点一下清理就好"的机制**：`POST /h3chain/vram_cleanup`（`routes.py:1335`）是
+  **无条件**调 `empty_cache()` 的，而 ComfyUI 自动路径有条件 → 手动有效、自动不触发。
+
+### 3.4 一个附带的坑
+
+`vram_cleanup` 路由在**生成中会返回 423 BUSY** —— 所以用户只能"停下来、点一下、
+再跑下一段"，这正是他 workaround 的成因。
+另：`interrupt` 过了 **16 分 05 秒**才生效（卡在 torch 操作内部，Python 层标志检查不到）。
+
+---
+
+## 4. 已做的代码改动（本轮，`nodes.py`）
+
+| 位置 | 改动 |
+|---|---|
+| `nodes.py:490` | 新增 `_loaded_models_gb()` —— 遍历 `current_loaded_models` 累加 `loaded_size()`，得"账本占用" |
+| `nodes.py:516` | 新增 `_reclaim_orphan_vram(threshold_gb=2.5, tag="")` —— **设备占用 − 账本占用 > 2.5GB** 就 `gc.collect()` + `empty_cache()`，返回报告 dict |
+| `nodes.py:3254` | `_decode_rescue()` 内、**在 `video_vae.decode()` 之前**调用 `_reclaim_orphan_vram`，释放 ≥0.2GB 时打一行 `[H3性能]` 日志 |
+
+`py_compile nodes.py` **已通过**。
+
+### 为什么插在解码前
+
+`_decode_rescue` 里原有的 `oom_retry` 只在**抛 OOM 异常**后才触发；而实测的失效形态是
+**根本不抛异常、原地卡住** → 那条路径救不到它。所以必须在 decode 之前主动把池收干净。
+
+### 阈值 2.5 GB 的依据
+
+CUDA context + 框架自身在空闲时约占 1.0 GB（实测），留 1.5 GB 余量避免误触发。
+判据用 `设备占用 − 账本占用`，两者都不含"池"，所以差值正好暴露池。
+
+---
+
+## 5. 还没做（下一个对话从这里接）
+
+1. **⚠ 重启 ComfyUI** —— 改了 `nodes.py` 必须重启才生效（项目已知坑：
+   `git merge/checkout` 只改工作区、`__pycache__` 不失效）。判据：启动时间要晚于
+   `nodes.py` 的 mtime；旁证：`custom_nodes/<插件>/__pycache__/nodes.*.pyc` 重新生成。
+2. **段末清理（跨段累积）** —— 主循环 `nodes.py:3376`
+   `for item_i, item in enumerate(exec_items)` 的段末，按需调 `_reclaim_orphan_vram`。
+   这是用户"跨段累积"直觉对应的那一半，目前只做了段内解码前。
+3. **实测验证** —— 用 `tools/probe_h3_memory.py` + `tools/_h3_probe_3seg.json`
+   （0.5MP × 2 秒 × 3 段）重跑，确认：不再卡住、且日志出现「解码前回收无主显存」。
+4. **测试与守卫**：
+   - `tests/test_no_undefined_names.py`（F821）
+   - `tests/test_oom_reports.py`（可能锁了 `_decode_rescue` 行为，注意别破坏）
+   - 全量基线 **1061 passed / 5 failed**（那 5 个是遗留：4×`test_merge_assets.py` +
+     1×`test_watch_vram_peak_stops_thread_on_exit`）
+5. 视情况给上游提 issue（① ② 两条）。
+
+---
+
+## 6. 本轮建立的实测工具（可直接复用）
+
+| 文件 | 用途 |
+|---|---|
+| `tools/probe_h3_memory.py` | 外部零侵入探针（不 import torch，不建 CUDA context）。边采边写 CSV |
+| `tools/analyze_h3_trace.py` | CSV + websocket 事件 → 阶段账 |
+| `tools/make_mem_report.py` | 生成自包含 HTML 报告 |
+| `tools/_h3_probe_min.json` | 单段最小图（0.1MP × 0.5s × 4 步） |
+| `tools/_h3_probe_3seg.json` | 三段图（当前 0.5MP × 2 秒） |
+
+**两个必须踩对的点**：
+- websocket 参数名是驼峰 **`clientId`**（`server.py:276`），写成 `client_id` 一个事件都收不到
+- ComfyUI 有**执行缓存**：同图同参第二次提交 0.03 秒返回 → 换种子（探针有 `--seed`）才能真跑
+- 提交给 `/prompt` 的 JSON **不能含非节点键**（如 `_comment`），否则 `validate_prompt` 报 500
+
+---
+
+## 7. 本轮顺带更正的事实
+
+- **`nvidia-smi` 本机可用**（NVML 595.97 / Driver 595.97 / CUDA 13.2，
+  `C:\Windows\System32\nvml.dll` 在）。旧记"不可用"是错的，已改 `MEMORY.md`。
+- 真在跑的实例是 **ComfyUI 0.38.2 / torch 2.12.1+cu130 / comfy-aimdo 0.5.5**（不是 0.36.0）。
+- 模型实际在 `D:\Comfy-Desktop\ComfyUI-Shared\models`（Comfy Desktop 的
+  `--extra-model-paths-config` 指向），不在仓库里。
+- 默认工作流里二采 UNET 指向 `..._b25-49_w6a8.safetensors`，**该文件不存在**。
+- 页大小 **32 MiB**（`comfy_aimdo/model_vbar.py:78` `#define VBAR_PAGE_SIZE (32 << 20)`）。
+- `CoreModelPatcher` 在 aimdo 启用时被替换成 `ModelPatcherDynamic`（`main.py:300`）
+  → **TE 和 VAE 也都是 dynamic**，卸载语义与 UNET 一致（只 `vbar.free_memory()`，
+  `device_to` 参数根本没用）。
+
+---
+
+## 8. 第二轮（接手对话，2026-10-08 下午）—— 根因更正 + 落地
+
+### 8.1 根因更正：不是「显存池被占满」
+
+第 3 节那个「设备 6.00/6.00 全满 + 账本全空 = 5.7GB 无主」的快照**是真的**，
+但它**不是卡住的原因**。把 `run3seg_big_trace.csv` 按秒拆开看：
+
+| 阶段 | 耗时 | 磁盘读 | 速率 | 显存 |
+|---|---|---|---|---|
+| 采样步 1–3 | 各 ~82s | 各 ~18GB | 0.22 GB/s | 5156–5262MB |
+| 采样步 4 + 解码 | **597s** | **20.2GB**（≈UNET 全量） | **0.034 GB/s** | 4688–5686MB（**始终留 ~1GB 空闲**）|
+
+- 采样期 `torch_reserved` 只有 **96–128MB** → 权重全在 aimdo VBAR 里，torch 账上几乎没东西；
+  到 t=356（第 4 步之后）才跳到 ~1.5GB —— 那是**解码激活**。
+- 卡住全程显存**没顶满**（4.7–5.7GB 震荡、free 750–1400MB），内存也还剩 ~1.6GB。
+- 597s 里只读了 20.2GB ≈ 一整个 UNET → 就是 **32MiB 一页、约 1 页/秒**的换页抖动。
+
+所以病根**不是**「显存被占满所以腾不出来」，而是**段间没有重置执行级状态**。
+
+### 8.2 真根因：段间缺 ComfyUI「每次执行结束」的那套清理
+
+`execution.py:548-554` 的 finally 块，每次**节点执行结束**都做三件事：
+
+```python
+comfy.model_prefetch.cleanup_prefetch_queues()          # 清预取队列 + 丢 CUDA 图
+comfy.model_management.reset_cast_buffers()             # cast buffer / 脏 mmap / cross-step
+comfy_aimdo.model_vbar.vbars_reset_watermark_limits()   # 重置 VBAR 驱逐水位
+```
+
+而导演台的多段链是**一次**节点执行里跑完 N 段的 → **段间从不发生**；
+手动逐段跑则每段各是一次执行、每段都清一次。
+**这就是「手动逐段 + 点一下清理就正常」的真正机制** —— 不是 `empty_cache` 本身，
+也不是「卸模型腾显存」（手动路由 `unload_all_models` 只是顺带）。
+
+为什么这三样正好就是「不在任何账本上的显存」：
+
+- `cleanup_prefetch_queues()` 会 `_drop_graph()` 丢掉 `module._comfy_graph`。
+  **CUDA 图的显存池既不计入 torch 分配器、也不计入 `current_loaded_models`，
+  而且 `torch.cuda.empty_cache()` 对它完全无效** —— 第 3 节那 5.7GB「无主」正是这一类。
+- VBAR 的 watermark limit 按上一段的压力调过，不重置就会一直按旧压力驱逐页 → 抖动。
+
+### 8.3 本轮落地（`nodes.py`）
+
+| 位置 | 改动 |
+|---|---|
+| `nodes.py:570` | 新增 `_comfy_exec_cleanup()` —— 补做上面那三件事，逐条 try/except |
+| `nodes.py:611` | 新增 `_segment_end_cleanup(tag)` = 执行级清理 + 无主显存回收 |
+| `nodes.py:620` | 新增 `_log_reclaim(rec, prefix)` —— 统一日志；释放 <0.2GB 不出声；**不许抛** |
+| `nodes.py:3338` | `_decode_rescue` 解码前：`_comfy_exec_cleanup()` + `_reclaim_orphan_vram()` |
+| `nodes.py:4084` | 主段循环**段末**（`pbar.update(1)` 之后、审片 break 之前）调 `_segment_end_cleanup` |
+| `_reclaim_orphan_vram` | 回收从裸 `torch.cuda.empty_cache()` 改为官方 `soft_empty_cache()`（= 手动「点一下」同一条路；该函数忽略 `force` 参数、本身就是无条件执行） |
+
+第一轮的 `_loaded_models_gb()` / `_reclaim_orphan_vram()` **保留**，降级为
+**可度量的第二道保险**（判据「设备占用 − 账本占用 > 2.5GB」仍然有效，只是不再是主因）。
+
+### 8.4 测试
+
+- 新增 `tests/test_segment_vram_release.py`（13 个守卫，AST 口径）：钉住「三步都在」
+  「解码前必调」「段末必调且在该段落盘之后」「判据是设备−账本」「回收走 soft_empty_cache」
+  「`_log_reclaim` 任何输入都不许抛」。
+- 全量：**1095 passed / 5 failed**。5 个失败 = 文档记录的遗留集合
+  （4×`test_merge_assets.py` 是 Windows 8.3 短路径 `ADMINI~1` 的比较差异 +
+  1×`test_watch_vram_peak_stops_thread_on_exit` 线程退出偶发）。**无回归**。
+- `tests/test_oom_reports.py`（锁 `_decode_rescue`）**未破坏**。
+
+### 8.5 实测验证（2026-10-08 17:17 重启后，**已通过**）
+
+进程重启 `spawnedAt` = **17:17:17** > `nodes.py` mtime **17:11:46** → 新代码已加载；
+`__pycache__/nodes.cpython-313.pyc` 里 5 个新函数名齐全。
+
+复跑 `tools/probe_h3_memory.py --prompt tools/_h3_probe_3seg.json --seed 880012`
+（0.5MP × 2s × 4 步 × 3 段）。数据：`output/h3_mem_probe/run3seg_fix_trace.csv`。
+
+**结果：`Prompt executed in 00:32:48`，3 段全部完成**（`VAE.decode 完成` × 6 = 3 段 × 视频+音频）。
+对照第一轮：第 1 段解码入口就卡死、597s 零进展、16 分钟后靠 interrupt 退出。
+
+**最硬的证据 —— 每次「新段视频解码入口」的设备占用：**
+
+| 解码入口 | 设备占用 | CUDA 空闲 |
+|---|---|---|
+| 段1 视频 | **1.06 / 6.00GB** | 4.94GB |
+| 段1 音频 | 4.97 / 6.00GB | 1.03GB（视频解码激活还在） |
+| 段2 视频 | **1.06 / 6.00GB** | 4.94GB |
+| 段2 音频 | 4.94 / 6.00GB | 1.06GB |
+| 段3 视频 | **1.06 / 6.00GB** | 4.94GB |
+
+第一轮那份失败快照是「**设备 6.00/6.00GB 已用 · CUDA 报空闲 0.00GB**」。
+现在每段解码都在 **4.94GB 空闲**里跑，且**段 2、段 3 也复位到 1.06GB**
+→ 段末清理确实在段间生效（否则状态会累积）。
+
+**清理确实被调用的直接证据**：日志里三次
+`[INFO] Comfy model compiler graph breaks: 2 / 1 / 1, rogues: …`
+—— 这行只由 `cleanup_prefetch_queues()` 打印（`MALLOC_GRAPH_USED` 为真时），
+且位置紧贴每次「新段视频解码入口」之前 = `_decode_rescue` 里那次清理。
+
+**解码期不再抖动**：解码阶段磁盘读数基本冻结（段 1 解码 117s 内只读 0.47GB，
+0.004GB/s），而第一轮是 20.2GB / 0.034GB/s 的逐页抖动。
+整轮显存峰值 **5494/6144MB**（第一轮是 6144/6144 顶满）。
+
+⚠ **注意日志签名**：`_reclaim_orphan_vram` 一次都没出声（`[H3性能] … 回收无主显存` 0 行）
+—— 因为执行级清理已经把「无主」压到阈值以下，这正是设计意图
+（清理是主手段、回收是第二道保险）。**判「清理有没有跑」要看 `graph breaks` 那行 +
+解码入口的设备占用，不要等 `回收无主显存`。**
+
+### 8.6 还没做（下一个对话从这里接）
+
+1. 视情况给上游提 issue：`free_memory()` 里 `soft_empty_cache()` 的条件判据
+   （`mem_free_torch > mem_free_total * 0.25` 本机恒为假）+ 多段链场景缺执行级清理。
+2. 若日后在别的机器上仍见卡顿，先按 §8.1 的「按秒算速率」口径取证再下结论；
+   `--disable-cuda-graphs` 可作「CUDA 图到底占多少」的对照实验。
+
+

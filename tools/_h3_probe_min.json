@@ -1,0 +1,89 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "63": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": ["1", 0],
+      "lora_name": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+      "strength_model": 1.0
+    }
+  },
+  "64": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": ["63", 0],
+      "lora_name": "Motion_Repair_V2.safetensors",
+      "strength_model": 0.6
+    }
+  },
+  "10": {
+    "class_type": "H3SeamlessChainSampler",
+    "inputs": {
+      "模型": ["64", 0],
+      "文本编码器": ["2", 0],
+      "视频VAE": ["3", 0],
+      "音频VAE": ["4", 0],
+      "宽高比": "16:9",
+      "百万像素": 0.1,
+      "宽度": 416,
+      "高度": 256,
+      "每段时长": 0.5,
+      "引导帧数": "关闭",
+      "种子": 20261008,
+      "步数": 4,
+      "CFG": 1.0,
+      "采样器": "res_multistep",
+      "调度器": "simple",
+      "自动存档": "关闭",
+      "存档目录": "",
+      "桥帧门控": "关闭",
+      "清晰度阈值": 30.0,
+      "回退上限": 34,
+      "锚定加噪": 0.0,
+      "审片模式": "关闭",
+      "自动保存": "关闭",
+      "重跑起始段": 0,
+      "接缝重摇": "关闭",
+      "重摇阈值": 0.06,
+      "重摇上限": 1,
+      "递减锚定": "关闭",
+      "生成模式": "文生视频",
+      "自动成片": "关闭",
+      "导演台状态": "{\"mode\":\"文生视频\",\"prompts\":[\"一只橘猫坐在窗台上打哈欠，阳光斜射进来，镜头缓慢推近。\"],\"first_frame\":\"\",\"end_frame\":\"\",\"last_frame\":\"\",\"ref_images\":[],\"ref_assets\":[],\"segments\":[{\"scene_prompt\":\"\",\"character_prompt\":\"\",\"soundscape\":\"\",\"music\":\"\",\"seconds\":null,\"refs\":[],\"frame_img\":null,\"unlink\":false,\"disabled\":false,\"auto_ref\":null,\"auto_seq\":null,\"frame_refs\":null,\"latent_save\":null,\"latent_ref\":null,\"tail_src\":null}]}",
+      "参考图像尺寸": "match",
+      "响度对齐强度": 1.0
+    }
+  },
+  "54": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": ["10", 2]
+    }
+  }
+}

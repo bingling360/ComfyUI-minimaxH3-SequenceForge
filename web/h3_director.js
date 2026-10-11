@@ -2267,7 +2267,7 @@ function defaultBridge() {
 function defaultUpscale() {
     /* 潜空间放大二采：主循环内渲染通道（每段采样定稿后、段落盘前），参数不进基础链指纹。
        schema 2：steps=尾段精化步数（与 denoise=尾段起始σ 解耦），旧 JSON 由 getDs 迁移。
-       time_bias / mix / stg / sharpen / pixel_sharpen 默认 0=关、adaptive / retry
+       mix / stg / sharpen / pixel_sharpen 默认 0=关、adaptive / retry
        默认 false=关、passes=1=单轮——仅启用时进后端指纹（不使既有记录失效）。
        抗糊武器库详见《更新说明_二采抗糊抗条纹》。
        2026-10-01：默认值与新版默认工作流同源（1.4× · 去噪 0.35 ·
@@ -2279,7 +2279,7 @@ function defaultUpscale() {
              /* 目标尺寸模式：倍率（现状默认）/ 目标尺寸 / 百万像素 */
              size_mode: "倍率", target_w: 1280, target_h: 704, megapixels: 1.0,
              denoise: 0.35, steps: 4, cfg: 1.0, precision: "fp16",
-             time_bias: 0.0, mix: 0.0, adaptive: false, shift: 6.0,
+             mix: 0.0, adaptive: false, shift: 6.0,
              stg: 0.0, stg_block: 25, passes: 1, decay: 0.5,
              sharpen: 0.0, pixel_sharpen: 0.0,
              /* 3D 时序分块（`chunk`）与放大网络强制卸载（`force_unload`）**已迁到
@@ -2503,7 +2503,6 @@ function getDs(node) {
             steps: upSteps,
             cfg: upNum(upRaw.cfg, 1.0, 0.0, 100.0),
             precision: UP_PRECISIONS.includes(upRaw.precision) ? upRaw.precision : "fp16",
-            time_bias: upNum(upRaw.time_bias, 0.0, 0.0, 0.2),
             mix: upNum(upRaw.mix, 0.0, 0.0, 1.0),
             adaptive: upRaw.adaptive === true,
             shift: upNum(upRaw.shift, 0.0, 0.0, 100.0),
@@ -10191,7 +10190,7 @@ function upscaleSig(data) {
     const up = data.ds?.upscale || {};
     return JSON.stringify([
         up.mode ?? "", up.model ?? "", up.arch ?? "", up.scale ?? 0, up.denoise ?? 0,
-        up.steps ?? 0, up.cfg ?? 0, up.precision ?? "", up.time_bias ?? 0, up.mix ?? 0,
+        up.steps ?? 0, up.cfg ?? 0, up.precision ?? "", up.mix ?? 0,
         up.adaptive === true, up.shift ?? 0, (up.include || []).join(","),
         up.stg ?? 0, up.stg_block ?? 25, up.passes ?? 1, up.decay ?? 0.5,
         up.sharpen ?? 0, up.pixel_sharpen ?? 0,
@@ -10256,12 +10255,12 @@ function renderUpscaleZone(sec, data) {
      * 只有明确属于「抗糊 / 自适应 / 细节」的字段改写进 agrid。
      * 三层的展开态都由 foldSection 记忆：改一个参数触发重渲时不会再弹回去。 */
     const basicBox = foldSection("up-basic", false,
-        "<summary>⚙ 基础二采设置（模型 / 尺寸 / 采样 / 编码）</summary>");
+        "<summary>⚙ 基础二采设置（模型 / 尺寸 / 采样）</summary>");
     basicBox.classList.add("h3d-upsub");
     const body = el("div", "h3d-adv-grid");
     basicBox.append(body);
     const advBox = foldSection("up-adv", false,
-        "<summary>🧪 高级二采设置（抗糊增强 / 细节混合 / 段自适应）</summary>");
+        "<summary>🧪 高级二采设置（放大网络 / 采样 / 抗糊增强 / 细节混合）</summary>");
     advBox.classList.add("h3d-upsub");
     const agrid = el("div", "h3d-adv-grid");
     advBox.append(agrid);
@@ -10294,6 +10293,16 @@ function renderUpscaleZone(sec, data) {
     body.append(modeField);
 
     if (on) {
+        /* 高级面板首组：放大网络与采样。
+         * 「网络架构 / 精度 / 设备」原本在基础面板——三项都是**排错或专用卡**才
+         * 动的（架构默认自动按权重判定、设备默认交给 ComfyUI 调度），放基础面板
+         * 徒增噪音；「二采 CFG」同理（H3 常用 1.0，基本不动）。四项统一挪进高级
+         * 面板，基础面板只留日常要调的模型 / 尺寸 / 强度 / 步数。
+         * ⚠ agrid 的显示顺序 = 本函数的 append 执行顺序：本徽章与下面三个字段在
+         * 代码里就排在「细节混合」之前，所以它们落在高级面板最上面。 */
+        agrid.append(el("div", "h3d-convbadge",
+            "⟡ 放大网络与采样（架构 / 设备 / 精度 / 二采 CFG）"));
+
         /* 保存一采分段成片：二采成功时 seg_NNN.mp4 会被高清结果**同名覆盖**，
          * 一采那版分段就没了。开它则一采解码结果另存 base_seg_NNN.mp4，
          * 段卡上「一采分段成片」/「二采分段成片」两个入口分别取两版。
@@ -10361,7 +10370,8 @@ function renderUpscaleZone(sec, data) {
         body.append(modelField);
         upOnly.push(modelField);
 
-        /* 网络架构：自动（按权重判定，默认）/ 2D 残差骨干 / 纯 3D 卷积 */
+        /* 网络架构：自动（按权重判定，默认）/ 2D 残差骨干 / 纯 3D 卷积。
+         * 挂高级面板（默认自动，基本不用动）。 */
         const archField = el("div", "h3d-param");
         archField.append(el("label", "", "网络架构"));
         const archSel = document.createElement("select");
@@ -10380,10 +10390,10 @@ function renderUpscaleZone(sec, data) {
         }
         archSel.onchange = () => setUpscaleField(node, "arch", archSel.value);
         archField.append(archSel);
-        body.append(archField);
+        agrid.append(archField);
         upOnly.push(archField);
 
-        /* 精度 */
+        /* 精度（挂高级面板） */
         const precField = el("div", "h3d-param");
         precField.append(el("label", "", "精度"));
         const precSel = document.createElement("select");
@@ -10399,10 +10409,10 @@ function renderUpscaleZone(sec, data) {
         }
         precSel.onchange = () => setUpscaleField(node, "precision", precSel.value);
         precField.append(precSel);
-        body.append(precField);
+        agrid.append(precField);
         upOnly.push(precField);
 
-        /* 设备：自动（交给 ComfyUI 调度，默认）/ cuda / rocm / cpu */
+        /* 设备：自动（交给 ComfyUI 调度，默认）/ cuda / rocm / cpu。挂高级面板 */
         const devField = el("div", "h3d-param");
         devField.append(el("label", "", "设备"));
         const devSel = document.createElement("select");
@@ -10420,7 +10430,7 @@ function renderUpscaleZone(sec, data) {
         }
         devSel.onchange = () => setUpscaleField(node, "device", devSel.value);
         devField.append(devSel);
-        body.append(devField);
+        agrid.append(devField);
         upOnly.push(devField);
 
         /* ⛔ 「时序分块」与「强制卸载」两个控件**已从这里迁走**（2026-09-23）。
@@ -10498,13 +10508,13 @@ function renderUpscaleZone(sec, data) {
         body.append(upNumField("二采步数", up.steps, 1, 100, 1,
             "尾段精化步数：在 [强度σ → 0] 区间内的实际采样步数，与强度解耦（建议 3-8，参考工作流常用 3-5）",
             (v) => setUpscaleField(node, "steps", v)));
-        body.append(upNumField("二采 CFG", up.cfg, 0.0, 100.0, 0.1,
+        /* 二采 CFG 挂高级面板（H3 常用 1.0，基本不动）。
+         * ⛔「时间偏置」控件已下线（2026-10-12）：Detail-Daemon 类 timestep 偏置，
+         * 实测收益不明显、徒增一个旋钮；后端 time_bias_sigma / time_bias_guard 与
+         * 指纹键一并删除。别再往本面板加回来。 */
+        agrid.append(upNumField("二采 CFG", up.cfg, 0.0, 100.0, 0.1,
             "重采样 CFG：H3 常用 1.0（官方推荐低 CFG），与主链可不同",
             (v) => setUpscaleField(node, "cfg", v)));
-        body.append(upNumField("时间偏置", up.time_bias, 0.0, 0.2, 0.005,
-            "尾段精化窗口内把模型看到的时间向更干净方向偏置（Detail-Daemon/T8 机制，零额外前向）："
-            + "0=关（默认）；0.025-0.05 常用，过大可能过锐/伪细节。仅在 >0 时进二采指纹",
-            (v) => setUpscaleField(node, "time_bias", v)));
         agrid.append(upNumField("细节混合", up.mix, 0.0, 1.0, 0.05,
             "频域分层混合：把精化结果的低频（结构）换回纯放大 latent、只保留精化补出的高频细节"
             + "——对冲精化带花/内容漂移，段间接缝更稳：0=关（默认，完全用精化结果）；"

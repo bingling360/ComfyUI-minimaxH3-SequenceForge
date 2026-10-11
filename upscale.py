@@ -167,7 +167,6 @@ def parse_state(ds):
         "steps": steps,
         "cfg": _num("cfg", 1.0, 0.0, 100.0),
         "precision": precision,
-        "time_bias": _num("time_bias", 0.0, 0.0, 0.2),
         "mix": _num("mix", 0.0, 0.0, 1.0),
         "adaptive": up.get("adaptive") is True,
         "shift": _num("shift", 0.0, 0.0, 100.0),
@@ -398,9 +397,8 @@ def pixel_sharpness(frames, max_frames=8):
 def refine_progress(sigma_v, sigma_start):
     """精化局部进度 p = 1 − σ/σ₀（钳 [0,1]）：本段精化进行到哪了。
 
-    与 time_bias_sigma 同口径（不做 shift 逆变换——σ₀ 与喂给模型的 timestep
-    同在 model_sampling 域，比值即进度，自洽且与 shift 取值无关）。
-    STG 激活窗与重试判定共用。
+    进度定义不做 shift 逆变换——σ₀ 与喂给模型的 timestep 同在 model_sampling
+    域，比值即进度，自洽且与 shift 取值无关。STG 激活窗与重试判定共用。
     """
     s0 = float(sigma_start)
     if s0 <= 0.0:
@@ -487,29 +485,10 @@ def resolve_refine_sigma(cfg, video_t):
     return sigma, tier, motion
 
 
-def time_bias_sigma(sigma_v, sigma_start, bias, start_progress=0.70,
-                    end_progress=1.0):
-    """尾段时间偏置核心数学（Detail-Daemon 类，T8mars 机制移植，纯函数可单测）。
-
-    精化进度 p = 1 − σ/σ₀（0=精化开始，1=收尾）；在 [start_progress,
-    end_progress] 尾窗内以 smoothstep 渐入，把模型「看到的 σ」向更干净方向
-    （更小）偏置 bias。不加噪声、不改积分 σ 与前向次数——只是模型时间观感。
-    bias≤0 或 σ₀≤0 时原样返回（关）。σ clamp ≥0（精化网格最小评估 σ 远大于
-    bias，钳 0 仅兜底）。
-    """
-    if bias <= 0.0 or sigma_start <= 0.0:
-        return sigma_v
-    p = 1.0 - min(sigma_v / sigma_start, 1.0)
-    span = max(end_progress - start_progress, 1e-6)
-    w = min(max((p - start_progress) / span, 0.0), 1.0)
-    w = w * w * (3.0 - 2.0 * w)             # smoothstep 渐入
-    return max(sigma_v - w * bias, 0.0)
-
-
 def _hash_params(cfg):
     """进指纹/记录的参数字典（params_hash 与 write_record.params 同口径）。
 
-    time_bias / mix / shift 仅在 >0、adaptive 仅在开启时进指纹——默认全关
+    mix / shift 仅在 >0、adaptive 仅在开启时进指纹——默认全关
     不改变哈希，既有二采记录不因新增参数而失效重做。adaptive 开启后每段
     生效 σ 由该段基础 latent（经 base_hash 指纹）决定论派生，无需逐段进
     指纹也不会串档。size_mode 始终进指纹（切换模式改变目标尺寸）；目标
@@ -527,8 +506,6 @@ def _hash_params(cfg):
         else:                                   # 百万像素
             keys["megapixels"] = cfg["megapixels"]
         keys.pop("scale", None)                 # 该模式下 scale 无效，不进指纹
-    if cfg.get("time_bias"):
-        keys["time_bias"] = cfg["time_bias"]
     if cfg.get("mix"):
         keys["mix"] = cfg["mix"]
     if cfg.get("adaptive"):
@@ -572,7 +549,7 @@ def _hash_params(cfg):
 def params_hash(cfg):
     """二采参数 -> 8 位指纹（mode/include 不进：不影响单段输出）。
 
-    time_bias / mix / shift 仅在 >0、adaptive 仅在开启时进指纹——默认全关
+    mix / shift 仅在 >0、adaptive 仅在开启时进指纹——默认全关
     不改变哈希，既有二采记录不因新增参数而失效重做。adaptive 开启后每段
     生效 σ 由该段基础 latent（经 base_hash 指纹）决定论派生，无需逐段进
     指纹也不会串档。
@@ -1341,28 +1318,6 @@ def preflight(模型, cfg, net, video_t, audio_t, report=None):
     return lines
 
 
-def time_bias_guard(dit, sigma_start, bias):
-    """尾段时间偏置守卫：patch dit.forward，返回恢复函数（try/finally 调用）。
-
-    Detail-Daemon 类技巧（T8mars/comfyui-minimax-h3-audio-T8 机制移植，GPL）：
-    在精化尾窗内只把喂给共享 AV Transformer 的 timestep（=σ×1000）向更干净方向
-    偏置——模型「看到稍干净的时间」从而多抠细节；不加噪声、NFE 不变。二采
-    输出的音频 latent 被丢弃，偏置波及音频 token 的时间嵌入也不影响产物。
-    与 cond_audio_rows_guard（挂 _cond_audio_rows 属性）不冲突；bias≤0 不安装。
-    """
-    orig_forward = dit.forward
-
-    def patched_forward(x, timestep, context, transformer_options={}, **kwargs):
-        sigma_v = float((timestep.flatten()[0] / 1000.0).clamp(min=1e-6))
-        seen = time_bias_sigma(sigma_v, sigma_start, bias)
-        if seen != sigma_v:
-            timestep = torch.full_like(timestep, seen * 1000.0)
-        return orig_forward(x, timestep, context, transformer_options, **kwargs)
-
-    dit.forward = patched_forward
-    return lambda: setattr(dit, "forward", orig_forward)
-
-
 def _shifted_model(model, shift_video):
     """二采专用 shift 模型（镜像官方 MiniMaxH3SigmaShift 节点，路线⑤）。
 
@@ -1839,7 +1794,6 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # σ 起点先过段自适应（路线④：基础 latent 运动档位偏移，与 render_segment
     # 报告行同口径）；shift>0 时采样器换二采专用 shift 克隆模型（路线⑤）。
     sigma0, _tier, _motion = resolve_refine_sigma(cfg, video_t)
-    tb = float(cfg.get("time_bias") or 0.0)
     sh = float(cfg.get("shift") or 0.0)
     stg = float(cfg.get("stg") or 0.0)
     stg_block = int(cfg.get("stg_block") if cfg.get("stg_block") is not None else 25)
@@ -1899,8 +1853,8 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                 f" · UNET权重 {_unet}")
 
     def _refine_once(sigma_start, cur_latent, cur_seed, round_desc=""):
-        """单轮尾段精化：STG / time-bias / shift 各开关在此拼装（每轮 σ₀ 不同，
-        time-bias 窗口与 STG 窗口跟着本轮 σ₀ 走）。OOM → UpscaleAbortError；
+        """单轮尾段精化：STG / shift 各开关在此拼装（每轮 σ₀ 不同，
+        STG 激活窗口跟着本轮 σ₀ 走）。OOM → UpscaleAbortError；
         设备不匹配（魔改分页运行时下克隆模型易触发）→ 去掉全部克隆/补丁用
         原模型重试一次，仍失败才上抛（带设备清单）。"""
         # 轮间清理（2026-08-25 实测：passes≥2 时首轮 σ₀ 成功、次轮 σ₀·decay
@@ -1912,75 +1866,67 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         ks_steps, ks_denoise = tail_refine_args(sigma_start, cfg["steps"])
 
         def _attempt(plain):
-            restore_tb = time_bias_guard(模型.model.diffusion_model, ks_denoise, tb) \
-                if (tb > 0.0 and not plain) else None
+            ks_model = 模型
+            if not plain:
+                if sh > 0.0:
+                    ks_model = _shifted_model(模型, sh)
+                if stg > 0.0:
+                    # STG 挂在 shift 克隆之上（两次 clone 共享权重，近零成本）
+                    ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
+
+            def _ksample():
+                # 采设备级显存峰值：这是「精化到底需要多少显存」的唯一硬数，
+                # 也是判断「精化前那次全卸该不该做」的依据（详见 1629 行待办）。
+                # torch 的 max_memory_allocated 量不到权重池，必须走采样线程。
+                with perf.watch_vram_peak() as _w:
+                    _out = comfy_nodes.common_ksampler(
+                        ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
+                        ks_scheduler, cond, negative, cur_latent,
+                        denoise=ks_denoise)[0]
+                if _w["peak"] is not None:
+                    _refine_peak[0] = _w["peak"] if _refine_peak[0] is None \
+                        else max(_refine_peak[0], _w["peak"])
+                return _out
+
             try:
-                ks_model = 模型
-                if not plain:
-                    if sh > 0.0:
-                        ks_model = _shifted_model(模型, sh)
-                    if stg > 0.0:
-                        # STG 挂在 shift 克隆之上（两次 clone 共享权重，近零成本）；
-                        # 弱分支同样过 time_bias patch 的 dit.forward——两边同偏置，
-                        # 差分语义保持
-                        ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
-
-                def _ksample():
-                    # 采设备级显存峰值：这是「精化到底需要多少显存」的唯一硬数，
-                    # 也是判断「精化前那次全卸该不该做」的依据（详见 1629 行待办）。
-                    # torch 的 max_memory_allocated 量不到权重池，必须走采样线程。
-                    with perf.watch_vram_peak() as _w:
-                        _out = comfy_nodes.common_ksampler(
-                            ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
-                            ks_scheduler, cond, negative, cur_latent,
-                            denoise=ks_denoise)[0]
-                    if _w["peak"] is not None:
-                        _refine_peak[0] = _w["peak"] if _refine_peak[0] is None \
-                            else max(_refine_peak[0], _w["peak"])
-                    return _out
-
+                return _ksample()
+            except RuntimeError as e:
+                if not _is_oom(e):
+                    raise
+                # 一级自救（fee12e1 机制回归）：全卸驻留模型 + 回收 Python 残留引用 +
+                # 清缓存后【原参】重试一次——参数零改动、产物零降级；仍 OOM 才按
+                # 既定语义硬停整链。gc.collect 先于 empty_cache：引用不回收，
+                # CUDA 块归不了还
+                comfy.model_management.unload_all_models()
+                gc.collect()
+                torch.cuda.empty_cache()
                 try:
                     return _ksample()
-                except RuntimeError as e:
-                    if not _is_oom(e):
+                except RuntimeError as e2:
+                    if not _is_oom(e2):
                         raise
-                    # 一级自救（fee12e1 机制回归）：全卸驻留模型 + 回收 Python 残留引用 +
-                    # 清缓存后【原参】重试一次——参数零改动、产物零降级；仍 OOM 才按
-                    # 既定语义硬停整链。gc.collect 先于 empty_cache：引用不回收，
-                    # CUDA 块归不了还
-                    comfy.model_management.unload_all_models()
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    try:
-                        return _ksample()
-                    except RuntimeError as e2:
-                        if not _is_oom(e2):
-                            raise
-                        e = e2
-                    msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样超出当前可回收显存 "
-                           "{1:g}GB，已自动卸载驻留模型并回收残留后原参重试仍失败）："
-                           "峰值显存由画布×帧数决定——请降低放大倍率或缩短该段帧数"
-                           "（精化步数/起始σ只影响耗时、不影响峰值），或增大显存。"
-                           "当前精化 {2} 步 @ σ≈{3:g}{4}。本段尚未落盘二采产物。".format(
-                               cfg["scale"], _vram_gb(模型), ks_steps, ks_denoise,
-                               round_desc))
-                    if report is not None:
-                        report.append(msg)
-                    raise UpscaleAbortError(msg) from e
-            finally:
-                if restore_tb is not None:
-                    restore_tb()
+                    e = e2
+                msg = ("二采显存不足（放大后 {0:g}× 高清 latent 上的重采样超出当前可回收显存 "
+                       "{1:g}GB，已自动卸载驻留模型并回收残留后原参重试仍失败）："
+                       "峰值显存由画布×帧数决定——请降低放大倍率或缩短该段帧数"
+                       "（精化步数/起始σ只影响耗时、不影响峰值），或增大显存。"
+                       "当前精化 {2} 步 @ σ≈{3:g}{4}。本段尚未落盘二采产物。".format(
+                           cfg["scale"], _vram_gb(模型), ks_steps, ks_denoise,
+                           round_desc))
+                if report is not None:
+                    report.append(msg)
+                raise UpscaleAbortError(msg) from e
 
         try:
             return _attempt(plain=False)
         except RuntimeError as e:
             # 设备不匹配兜底：克隆模型（shift/STG）与魔改 DynamicVRAM 分页互锁时，
-            # 权重被二次 stage、部分层激活滞留 CPU（mat1 on cpu）。shift/时间偏置
+            # 权重被二次 stage、部分层激活滞留 CPU（mat1 on cpu）。shift/STG
             # 只是画质微调，砍掉换「这一段能出高清」——重试仍失败才真正上抛
-            if _is_dev_err(e) and (sh > 0.0 or stg > 0.0 or tb > 0.0):
+            if _is_dev_err(e) and (sh > 0.0 or stg > 0.0):
                 if report is not None:
                     report.append(f"⚠ 段{seg_no} 精化张量设备不匹配（疑似运行时分页与"
-                                  "克隆模型互锁）——已去除 shift/STG/时间偏置，用原模型重试")
+                                  "克隆模型互锁）——已去除 shift/STG，用原模型重试")
                 print(f"[H3二采] 段{seg_no}：精化设备不匹配，去除克隆/补丁用原模型重试…",
                       flush=True)
                 comfy.model_management.unload_all_models()
@@ -1999,16 +1945,16 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
             # 二采独立模型（不同量化 / 上游挂过第三方补丁节点）时，模型构造类补丁
             # 会抛构造类异常：_stg_model 检测到已有 sampler_post_cfg_function 或
             # double_block replacement 直接抛错（拒绝叠加），_shifted_model 读
-            # model_config 也可能失败。这些都不是致命错误——shift/STG/时间偏置只是
+            # model_config 也可能失败。这些都不是致命错误——shift/STG 只是
             # 画质微调，砍掉换「这一段能出高清」。
             # UpscaleAbortError 是 RuntimeError 子类、不在此列，OOM 与预检硬停
             # 仍按既定语义上抛，不会被这里吞掉。
-            if not (sh > 0.0 or stg > 0.0 or tb > 0.0):
+            if not (sh > 0.0 or stg > 0.0):
                 raise
             if report is not None:
                 report.append(f"⚠ 段{seg_no} 精化补丁与本二采模型不兼容"
                               f"（{type(e).__name__}: {e}）——"
-                              "已去除 shift/STG/时间偏置，用原模型重试")
+                              "已去除 shift/STG，用原模型重试")
             print(f"[H3二采] 段{seg_no}：{type(e).__name__}（精化补丁与本模型不兼容），"
                   "去除克隆/补丁用原模型重试…", flush=True)
             gc.collect()
@@ -3046,7 +2992,6 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                             hf_gain=hf_gain, motion=_mo, sharp=sharp,
                             model_tag=model_tag)
     _n, _d = tail_refine_args(_sig, cfg["steps"])   # _n=执行步数，_d=σ 起点
-    _tb = float(cfg.get("time_bias") or 0.0)
     _mix = float(cfg.get("mix") or 0.0)
     _sh = float(cfg.get("shift") or 0.0)
     _stg = float(cfg.get("stg") or 0.0)
@@ -3069,7 +3014,6 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   f"细节 {hf_gain:+.0%} · 清晰 {sharp:.1f} · "
                   f"{time.perf_counter() - t0:.0f}s"
                   + (" · 桥锚" if bridged else "")
-                  + (f" · 偏置{_tb:g}" if _tb > 0 else "")
                   + (f" · 混合{_mix:g}" if _mix > 0 else "")
                   + (f" · 自适应σ{_tier}({_mo:.2f})" if _tier else "")
                   + (f" · shift{_sh:g}" if _sh > 0 else "")

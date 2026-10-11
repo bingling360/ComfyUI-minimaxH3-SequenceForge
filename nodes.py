@@ -2605,14 +2605,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
         except Exception:
             pass
         # ★ 这里必须重新起一个 `if up_cfg:` —— 它不是新加的条件，是**修一处既有
-        # 缩进 bug**：二采报告这一段（_tb … 以及它的 `elif _up_err:`）本来就该挂在
+        # 缩进 bug**：二采报告这一段（`_mix` 起始的这段以及它的 `elif _up_err:`）本来就该挂在
         # `if up_cfg:` 下，但历史上某个「在它前面插入 if 块」的改动把这两个分块安装
         # 块塞进了守卫与它的函数体之间，于是这段变成了「只有开了分块才生成二采报告」，
         # 而 `elif _up_err:` 改挂到了 `if _ff_tokens > 0:` / `if _ah_n > 1:` 上
         # （HEAD 里就已经是这样）。后果：关着分块时报告里整段二采参数消失、二采跳过
         # 原因挂到无关条件上。此处一行复原，不改任何行为语义之外的判定。
         if up_cfg:
-            _tb = float(up_cfg.get("time_bias") or 0.0)
             _mix = float(up_cfg.get("mix") or 0.0)
             _sh = float(up_cfg.get("shift") or 0.0)
             _stg = float(up_cfg.get("stg") or 0.0)
@@ -2629,7 +2628,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           f"精化 {up_cfg['steps']} 步"
                           + (f"×{_passes}轮" if _passes > 1 else "")
                           + " @ σ≈" + "/".join(f"{s:g}" for s in _sig_list)
-                          + (f" · 时间偏置 {_tb:g}" if _tb > 0 else "")
                           + (f" · 细节混合 {_mix:g}" if _mix > 0 else "")
                           + (" · 段自适应σ" if up_cfg.get("adaptive") is True else "")
                           + (f" · 二采shift {_sh:g}" if _sh > 0 else "")

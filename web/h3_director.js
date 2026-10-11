@@ -6532,7 +6532,7 @@ const KEEP_ON_REDO = ["步数", "CFG", "采样器", "调度器",
 
 /** 把 manifest 共享参数映射回画布控件，返回改动（值未变不记）的描述列表。
  *  覆盖进指纹的全部共享参数：画幅/时长/引导帧数/步数/CFG/采样器/调度器/
- *  递减锚定/桥帧门控三件套。手动「套用参数」按钮走默认全量口径。
+ *  递减锚定/桥帧门控三件套。手动「恢复项目上次参数」按钮走默认全量口径。
  *
  *  ★ `opts.keep = [控件名]`：命中的控件**保留用户当前值**，不回写存档值。
  *  重摇 / 二采提交传 `KEEP_ON_REDO` —— 后端 `checkpoint.assert_match` 只回报不报错
@@ -6643,13 +6643,14 @@ function redoParamNotice(restored, kept) {
     return parts.length ? `；${parts.join("；")}` : "";
 }
 
-/** 把项目 manifest 的共享参数映射回画布控件（画幅优先尝试 宽高比×MP combo 匹配）。 */
+/** 「⚙ 恢复项目上次参数」按钮的实现：把项目 manifest 的共享参数映射回画布控件
+ *  （画幅优先尝试 宽高比×MP combo 匹配）。 */
 function applyParamsToCanvas(node, params) {
     const applied = applyChainParams(node, params);
     scheduleRefresh(300);
     alert(applied.length
-        ? `已套用参数到画布：\n\n${applied.join("\n")}`
-        : "当前画布参数已与存档一致（或无可套用的参数）");
+        ? `已恢复项目上次参数：\n\n${applied.join("\n")}`
+        : "画布参数已与该项目上次一致（或没有可恢复的参数）");
 }
 
 /* ---------- LED 状态灯 ---------- */
@@ -7040,8 +7041,9 @@ function injectStyles() {
     .h3d-rail span.offchain{background:repeating-linear-gradient(90deg,#3a414c 0 3px,#22272e 3px 6px)}
     .h3d-cards{display:grid;gap:10px}
     .h3d-card{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;padding:10px;border:1px solid #3f4854;border-radius:9px;background:#262c36}
-    .h3d-card.todo{opacity:.72}
-    .h3d-card.todo:hover{opacity:1}
+    /* 未生成（todo）段卡不再降透明度：鼠标移入/移出视觉一致。
+     * 原 .h3d-card.todo{opacity:.72} + .todo:hover{opacity:1} 已删（用户反馈这种
+     * 「不悬停就发虚」的差异没必要）。todo class 仍保留，供需要时做其他区分。 */
     /* .h3d-card.mergeable / .mergeable-off 已删：段卡上的合并勾选框随合并模式
      * 重构一起下线，合并清单改在素材库里点选（见 h3_library.js 的合并模式）。 */
     /* 拖拽调序：把手 / 拖动中的源卡 / 插入线（线画在目标位卡片的上沿或链尾卡的下沿） */
@@ -7984,8 +7986,9 @@ function renderLeftColumn(sec, data) {
     newBtn.onclick = openNewProjectModal;
     newrow.append(newBtn);
     if (node && mf?.params && Object.keys(mf.params).length) {
-        const ap = el("button", "h3d-btn", "⚙ 套用参数到画布");
-        ap.title = "把当前项目的共享参数（画幅/每段时长/引导帧数/步数/采样器等）写回节点控件";
+        const ap = el("button", "h3d-btn", "⚙ 恢复项目上次参数");
+        ap.title = "把该项目上次运行时用的共享参数（画幅/每段时长/引导帧数/步数/采样器等）恢复到节点控件"
+            + "—— 读档 / 切项目后画布不会自动跟着换，点这里把参数拉回本项目那一套";
         ap.onclick = () => applyParamsToCanvas(node, mf.params);
         newrow.append(ap);
     }

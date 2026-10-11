@@ -138,12 +138,12 @@ async function boot(dir, steps) {
             "LED 报出画幅按当前值重做", last());
     }
 
-    /* ---------- 4) 手动「套用参数」按钮仍是全量口径（白名单只给重摇/二采） ---------- */
+    /* ---------- 4) 手动「恢复项目上次参数」按钮仍是全量口径（白名单只给重摇/二采） ---------- */
     {
         const { w, node } = await boot("PROJ", 6);
         w.applyParamsToCanvas(node, MANIFEST.params);
         ok(wv(node, "步数") === 8,
-            "「套用参数」按钮照旧把步数写成存档值（用户主动要的）", wv(node, "步数"), 8);
+            "「恢复项目上次参数」按钮照旧把步数写成存档值（用户主动要的）", wv(node, "步数"), 8);
     }
 
     console.log(bad ? `\n${bad} 个用例不符` : "\n全部通过");

@@ -1851,7 +1851,7 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
 # 旧项目的画幅，而后端 assert_match 拿它跟画布控件比对，不一致就硬报错——
 # 于是"新建的项目改不了分辨率"，用户会以为分辨率被锁死，实际是复制时被旧档
 # 钉住了。params 留空则由首跑按**当前画布值**写入，正是"新项目用新参数"该有的
-# 语义；想沿用旧参数请用「套用参数」按钮显式套一次。
+# 语义；想沿用旧参数请用「恢复项目上次参数」按钮显式套一次。
 _COPY_CONTENT_KEYS = ("prompts", "seg_fields", "inserts", "assets", "asset_links",
                       "has_prologue", "upscale", "total")
 

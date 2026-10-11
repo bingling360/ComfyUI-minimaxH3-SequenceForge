@@ -30,6 +30,7 @@ const pool = [
     { label: "阿依", kind: "image", file: "images/a.png", asset_id: "a_111111111111", mark: "图片1", roles: [] },
     { label: "回廊", kind: "image", file: "images/b.png", asset_id: "a_222222222222", mark: "图片3", roles: [] },
     { label: "片头", kind: "video", file: "videos/c.mp4", asset_id: "a_333333333333", mark: "视频1", roles: [] },
+    { label: "BGM", kind: "audio", file: "audio/d.mp3", asset_id: "a_444444444444", mark: "音频1", roles: [] },
 ];
 for (let i = 0; i < 9; i++) {
     pool.push({ label: `群图${i}`, kind: "image", file: `images/g${i}.png`,
@@ -89,5 +90,37 @@ const hint = bar.el.querySelector(".h3d-secs-hint");
 ok(!!hint && hint.textContent.indexOf("超官方单段上限") >= 0,
     "超过 9 张图时给出上限警告：" + (hint ? hint.textContent : "(无)"));
 ok(!!hint && hint.classList.contains("h3d-refhint-bad"), "上限警告用红色样式类");
+
+/* ⑤ 音频号必须把「参考视频的音轨」算进去。官方 tokenizer 会为每条
+ * ref_video_audio_N 插一条 <Audio j>: 标签（排在 <Video k> 之前），而节点对每个
+ * 参考视频都塞了音轨槽 → 同段「视频 + 独立音频」时独立音频是 <Audio 2>，
+ * 不是 <Audio 1>。否则正文里的 <Audio j> 会指向视频音轨、独立音频等于没被引用。
+ * 与后端 nodes._kind_tokens / asset_store.compile_refs 同规则，三处必须一致。 */
+const mapOf = (b) => {
+    const m = {};
+    for (const r of b.el.querySelectorAll(".h3d-refmap-row")) {
+        const c = [...r.children].slice(0, 3).map((n) => n.textContent);
+        m[c[1]] = c[2];
+    }
+    return m;
+};
+bar = mkBar(["片头", "BGM"]);
+bar.paint();
+let m = mapOf(bar);
+eq(m["片头"], "<Video 1>", "参考视频编号不受影响");
+eq(m["BGM"], "<Audio 2>", "独立音频号 = 2（视频音轨占了 Audio 1）");
+
+/* ⑥ 无参考视频时音频号仍是 1（确认修复没有过度偏移） */
+bar = mkBar(["阿依", "BGM"]);
+bar.paint();
+m = mapOf(bar);
+eq(m["BGM"], "<Audio 1>", "无参考视频时独立音频仍是 Audio 1");
+eq(m["阿依"], "<Picture 1>", "图片编号不受影响");
+
+/* ⑦ 上限判定用的是「素材个数」，不能被音轨预扣污染（1 图 + 1 视频 + 1 音频 = 3 个） */
+bar = mkBar(["阿依", "片头", "BGM"]);
+bar.paint();
+ok(!bar.el.querySelector(".h3d-secs-hint")?.classList.contains("h3d-refhint-bad"),
+    "音轨预扣不得让 9/3/3 上限误报");
 
 process.exit(fails ? 1 : 0);

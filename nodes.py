@@ -44,7 +44,8 @@ from comfy_api.latest import io
 from . import anchors
 from . import checkpoint
 from . import prompts as _P
-from .prompts import L2VA_HEAD, FL2VA_HEAD
+# 对齐句常量（L2VA_HEAD / FL2VA_HEAD）不再直接引用：注入统一走
+# _P.alignment_lines()，否则同一套句式会有两个真相（这里是它曾经成为死导入的原因）。
 from . import metrics
 from . import guides
 from . import grid
@@ -779,7 +780,17 @@ def _load_input_image(filename, _project_root=None):
 
 
 def _decode_video_file(abs_path, filename=""):
-    """绝对路径视频 -> (帧张量, 音轨)，与 _load_input_video 同格式（含静音兜底）。"""
+    """绝对路径视频 -> (帧张量, 音轨)，与 _load_input_video 同格式（含静音兜底）。
+
+    ⚠ 无音轨视频**故意**回一个静音 dict 而不是 None：官方 tokenizer 按
+    `ref_video_audio_N` 这个键**是否存在**决定要不要插 `<Audio j>: ` 标签
+    （`MiniMaxH3ReferenceToVideo` 里 `if soundtrack is not None:`），也就是说
+    「每个参考视频必占一个音频号」。若这里改成 None，编号就取决于"这个视频文件
+    到底有没有音轨"——而前端（映射条 / 段卡预览）拿不到这个信息、无法预测同一个
+    序号，界面显示与实跑就会对不上。所以口径定为：**只要挂了参考视频，就必占一个
+    音频号**，静音与否都一样（`_kind_tokens` / 前端 `paintAll` /
+    `asset_store.compile_refs` 三处都按这条规则预扣）。
+    """
     from comfy_api.latest import InputImpl
     comps = InputImpl.VideoFromFile(abs_path).get_components()
     if comps.images is None or not getattr(comps.images, "shape", None):
@@ -936,8 +947,25 @@ def _kind_tokens(label_order):
 
     同一标签重复出现（一段内引用多次）**只编号一次**：编号是素材的身份，不是
     出现次数；重复引用靠正文里多写几次 @标签（编译后同一个 <Picture k> 出现多次）。
+
+    ⚠ 音频号必须先给**每个参考视频的音轨**预扣一个。官方 tokenizer 会为每条
+    `ref_video_audio_N` 都插一条 `<Audio j>: `（`MiniMaxH3ReferenceToVideo` 源码原话：
+    "the soundtrack gets its own <Audio j> label, emitted before <Video k>"），
+    而本节点对每个参考视频都塞了 `ref_video_audio_N`（`_decode_video_file` 对
+    无音轨视频也回一个静音 dict）→ 官方那边 `soundtrack is not None` 恒成立。
+    所以官方音频号的分配顺序是「视频音轨（按视频顺序）→ 独立音频」；不预扣的话
+    同段独立音频会整体错位（1 个视频偏 1、2 个偏 2），正文里写出去的 `<Audio j>`
+    实际指向视频音轨 —— 独立音频等于没被引用（官方硬规则：软引用必须在文本里
+    出现对应 tag，模型才会真正使用该素材）。
+    同规则还有前端映射条（h3_director.js `paintAll`）与 `asset_store.compile_refs`，
+    三处必须一起改，否则界面显示与实跑对不上。
     """
     counters = {"image": 0, "video": 0, "audio": 0}
+    _seen_video = set()
+    for kind, lbl in label_order:
+        if kind == "video" and lbl not in _seen_video:
+            _seen_video.add(lbl)
+            counters["audio"] += 1        # 该视频的音轨占掉一个 <Audio j>
     mapping = {}
     for kind, lbl in label_order:
         if lbl in mapping:
@@ -1001,6 +1029,10 @@ def _reference_tags_minimal(label_order):
     H3 模型硬约束：软引用必须在文本里出现对应 tag，模型才会真正使用该素材
     （官方模板亦然）。勾选了引用但正文没写 tag 时，只补这几行声明、不再自动
     生成英文长文；写了 tag 的段保持原样直通。
+
+    返回值**带 `subject_definitions:` 字段头**（官方六段式里这些条目就属于该字段，
+    头独占一行、条目逐行跟后面，照官方完整示例）。不带头的裸条目会落在所有字段
+    之前变成"前言"，被 prompts.validate_compiled 判 E_OVERRIDE_PREAMBLE。
     无 ComfyUI 可单测（纯函数，仅依赖 _normalize_order/_kind_tokens）。
     """
     mapping = _kind_tokens(_normalize_order(label_order))
@@ -1029,7 +1061,18 @@ def _reference_tags_minimal(label_order):
             # 我们不知道它配给谁，退到官方另一种写法（被复制/参考的音频信号）。
             lines.append(f'<Audio {tok[7:-1]}> is the reference audio signal that is '
                          f'reused in the target video, the file "{lbl}".')
-    return "\n".join(lines)
+    if not lines:
+        return ""
+    # ⚠ 必须挂 `subject_definitions:` 字段头。官方六段式里 <Subject N> / <Video N> /
+    # <Audio N> 的定义全部属于 subject_definitions 字段（ref2v 文档 §2：
+    # "subject_definitions defines each piece of referenced content … such as a
+    # person, an environment, a source video's structure, or an audio track"），
+    # 字段头写法照官方完整示例（头独占一行，条目逐行跟在后面）。
+    # 旧实现只吐裸条目 → 它们落在所有字段**之前**，成了"前言"：
+    # 本插件自己的 prompts.validate_compiled 判它 E_OVERRIDE_PREAMBLE
+    # （"覆盖文本首行既不是官方字段头、也不是关键帧对齐指令"）—— 模型收到的是
+    # 一段结构错位的文本。
+    return "subject_definitions:\n" + "\n".join(lines)
 
 
 def _uncovered_tags(full, mapping):
@@ -1062,8 +1105,10 @@ def _compose_official(scene, char, prompt, soundscape, music):
     - prompt 已是官方格式（三字段任一标签）→ 原样直通（含 [[标签]] 等待后续替换）
     - 否则组装三字段：描述体 = 场景。角色。主提示词（句号连接，各剥尾部标点），
       主提示词已以 [Shot 开头时不重复加 [Shot 1] 前缀
-    - 环境音/配乐留空则整个字段省略（不写 N/A——官方 N/A = 明确请求无声，
-      省略 = 不约束）
+    - 环境音留空则整个字段省略（官方只在"明确要求全片静音"时才写 N/A，
+      省略 = 不约束，所以这里省略是对的）
+    - **配乐字段必须存在**：官方 base-en.txt §4.7「Use `N/A` when there is no
+      non-diegetic music」—— 无配乐写 `N/A`，不能整字段省略
     - 主提示词未含 <d> 时自动把「……」转 <d>[中文] …</d>
     返回 (组装文本, 对白转换次数)。
     """
@@ -1089,8 +1134,13 @@ def _compose_official(scene, char, prompt, soundscape, music):
         lines.append(f"integrated_multimodal_description: {prefix}{body}")
     if str(soundscape or "").strip():
         lines.append(f"overall_soundscape: {str(soundscape).strip()}")
-    if str(music or "").strip():
-        lines.append(f"non_diegetic_music: {str(music).strip()}")
+    # ⚠ 配乐字段**无条件写**（空则 N/A）。旧实现留空就整字段省略，理由是
+    # "官方 N/A = 明确请求无声，省略 = 不约束" —— 那是把 overall_soundscape 的
+    # 规则错套到配乐上了：base-en.txt §4.7 明写 "Use `N/A` when there is no
+    # non-diegetic music"，而 §4.6 的 N/A 才表示"明确要求全片静音"。
+    # 后果：前端根本没有配乐输入框 → 每一段都缺这个官方必填字段，
+    # 本插件自己的 prompts.validate_compiled 判它 E_NO_MUSIC（"无配乐写 N/A"）。
+    lines.append(f"non_diegetic_music: {str(music).strip() or 'N/A'}")
     return "\n".join(lines), dialogues
 
 
@@ -1638,10 +1688,34 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     mapping = _kind_tokens(_normalize_order(order))
                     full = _apply_label_tokens(full, order)
                     uncovered = _uncovered_tags(full, mapping)
-                    if uncovered:
+                    # 帧锚（首帧图/尾帧图）也会进 order（要拿 <Picture k> 的 vision block），
+                    # 但**不该由 subject_definitions 声明**：
+                    #   · 纯帧锚段（I2VA/FL2VA/L2VA → base 三字段）：声明由对齐指令句承担
+                    #     （"<Picture 1> (from [Shot 1]) is fully referenced."）；而
+                    #     subject_definitions 属于 Ref2VA 字段，写进去校验器判 E_FIELD_SET；
+                    #   · 混合段（帧锚 + 参考素材 → Ref2VA 六段式）：帧锚同样是"被跟踪的
+                    #     可见内容"，按官方 ref2v §2 就该进 subject_definitions。
+                    _anch_lbls_i = set(_anchors_of(i))
+                    _real_refs = [(k, l) for k, l in order if l not in _anch_lbls_i]
+                    _decl = uncovered if _real_refs else \
+                        [l for l in uncovered if l not in _anch_lbls_i]
+                    if _decl:
                         sub = [(k, lbl) for k, lbl in _normalize_order(order)
-                               if lbl in uncovered]
+                               if lbl in _decl]
                         full = _reference_tags_minimal(sub) + "\n" + full
+                    if _real_refs:
+                        # ⚠ 有参考素材 = 官方 **Ref2VA**，主字段名必须是 detailed_description。
+                        # 官方 ref2v 文档的字段对照表写死：base 任务用
+                        # integrated_multimodal_description，全参考六段式用 detailed_description。
+                        # 旧实现无论有没有参考都写 base 名 —— 本插件自己的
+                        # prompts.validate_compiled 会判 "Ref2VA 不应含字段
+                        # ['integrated_multimodal_description']"，随后按 REF_MAIN_FIELD
+                        # 取不到正文 → E_EMPTY_DESC / E_NO_SHOT，也就是**整段描述对模型
+                        # 等于不存在**（只声明了引用，没给正文）。这就是"有参考的镜头
+                        # 提示词遵循度明显变差"的结构性原因。
+                        # 只改行首那一个字段头（正文里若恰好出现同名文字不动），且只改一次。
+                        full = re.sub(r"(?m)^integrated_multimodal_description:",
+                                      "detailed_description:", full, count=1)
             composed_prompts.append(full)
         seg_prompts = composed_prompts
 
@@ -1829,20 +1903,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
         pool_tensors = {"image": {}, "video": {}, "audio": {}}
         _pool_loaded = set()   # 已加载标签（_ensure_pool_tensors 幂等守卫）
         refs = {"ref_videos": {}, "ref_video_audios": {}, "ref_audios": {}}
-        # i2v 首段官方指令行（官方 I2VA 固定格式：声明首帧 = <Picture 1> 锚）；
-        # 已是官方格式的段不注入（用户自管的完整结构里可能自带指令行）。
-        # 纯 i2v 起手（首段无素材引用，引用集合已最终确定）才写指令行；
-        # 首段同时有引用时走 r2v + 头锚 keyframe（_apply_guide 叠加），
-        # 此处不写指令行避免编号错位。
-        # 帧锚**不算**"参考素材"：判定首段是不是混合模式（帧锚+素材）时要把帧锚
+        # 帧锚**不算**"参考素材"：判定一段是不是混合模式（帧锚+素材）时要把帧锚
         # 排除掉，否则帧锚一进池就把本段判成 Ref2VA、永远不生成对齐句。
+        # （官方对齐指令的注入见下方「官方对齐指令」块，按每段自己的锚与模式算。）
         _anchors0 = set(_anchors_of(0)) if seg_label_orders else set()
         _seg0_has_refs = bool([1 for k, l in (seg_label_orders[0] if seg_label_orders else [])
                                if l not in _anchors0])
-        if has_first_eff and seg_first_on[0] and not _seg0_has_refs and seg_prompts \
-                and not _OFFICIAL_FIELD_RE.search(seg_prompts[0]):
-            seg_prompts[0] = ("For the target video, at 0.00 seconds into the target video, "
-                              "<Picture 1> (from [Shot 1]) is fully referenced.\n" + seg_prompts[0])
         # 状态池是唯一的引用来源（P4d：画布接线已删除，无需覆盖逻辑）
         has_refs = bool(_needed)
         # 链路自动推导（无手动模式）：有有效引用即走 ref conditioning；首帧可与
@@ -1868,16 +1934,68 @@ class H3SeamlessChainSampler(io.ComfyNode):
         print(f"[H3画布] {_canvas_line}", flush=True)
         length = _snap_seconds(每段时长)
         seg_lengths = [length if s is None else s for s in seg_secs]
-        # 末段尾帧锚：官方 L2VA 句式（逐字照抄 h3-dialect.md §1.2）。
-        # **时间点由段长帧数换算**（frames_to_seconds），与前端锚定栏预览同口径 ——
-        # 以前这里写 `seg_lengths[-1] / 24.0`、前端写 `seg.seconds`，同一个锚两边
-        # 算出 5.17 与 5.00 两个值。Shot N 取本段最后一镜（官方要求），不是硬编码 1。
-        if has_end_eff and seg_end_on[-1] and seg_prompts \
-                and not _OFFICIAL_FIELD_RE.search(seg_prompts[-1]):
-            _end_s = _P.frames_to_seconds(seg_lengths[-1])
-            _last_shot = len(re.findall(r"\[Shot\s+\d+\]", seg_prompts[-1])) or 1
-            seg_prompts[-1] = (L2VA_HEAD.format(shot=_last_shot, t=_end_s) + "\n"
-                               + seg_prompts[-1])
+
+        # ---- 官方对齐指令注入（I2VA / FL2VA / L2VA）----
+        # 官方 h3-prompt-writing §2.1：I2VA / FL2VA / L2VA **always uses** 一句对齐
+        # 指令，且必须是最终提示词的**第一行**，空一行再接三字段。
+        #
+        # ⚠ 幂等守卫 = 首行是否已是对齐句（prompts.has_alignment_head）。**不能**再用
+        # `_OFFICIAL_FIELD_RE.search()`：上面的组装对任何非空提示词都必然写出
+        # `integrated_multimodal_description:` / `overall_soundscape:`，那个守卫恒为假
+        # —— 这就是"官方要求的那句话从来没进过文本编码器"的根因（FL2VA_HEAD 因此
+        # 成了死导入，而前端 stripAlignmentLines 却提示"已按首尾帧锚补回"）。
+        #
+        # 落点与前端 v2InstrLines / prompts.alignment_lines 同口径，按**每段自己**
+        # 的帧锚算：本节点每段都是一次独立生成（自己的长度、自己的首尾帧锚、自己的
+        # 种子），所以每段自己就是官方语义里的那个 "target video"；中段的首帧图头锚 /
+        # 尾帧图尾锚同样是「本段第 0 帧 / 末帧」，都该带自己的那一句。
+        #
+        # 只写「帧锚真的进了本段图池」的那些段：帧锚没进 ref_images 就没有对应的
+        # <Picture k>，写出去是悬空引用。尾帧锚走 keyframe latent、**不会**自动进
+        # ref_images（官方 ImageToVideo 的 last_frame= 参数本节点从没用过），只有
+        # 段级 frame_img 里的图才会被 _anchors_of 收进池。
+        def _lbl_of(_rel):
+            return _file_to_label.get(str(_rel).replace("\\", "/").lstrip("./")) if _rel else None
+
+        _align_notes = []
+        for _i in range(len(seg_prompts)):
+            _p = seg_prompts[_i]
+            if not _p or _P.has_alignment_head(_p):
+                continue
+            _anch = _anchors_of(_i)          # 顺序：首帧 → 尾帧（只含能落到池标签的）
+            _anch_set = set(_anch)
+            # 混合模式（帧锚 + 参考素材 = Ref2VA）不注入：官方 Ref2VA 六段式本来就
+            # 不带对齐指令，帧锚改由 subject_definitions 里的 <Picture k> 承载。
+            if any(l not in _anch_set for _k, l in seg_label_orders[_i]):
+                continue
+            _fi = _frame_imgs_early[_i] if _i < len(_frame_imgs_early) else ("", "")
+            _lbl_s, _lbl_e = _lbl_of(_fi[0]), _lbl_of(_fi[1])
+            _has_s = bool(_lbl_s) and _anch[:1] == [_lbl_s]      # 首帧锚占 <Picture 1>
+            _has_e = bool(_lbl_e) and _lbl_e in _anch
+            if _has_s and _has_e:
+                _mode = "FL2VA"                                   # 单句双锚
+            elif _has_s:
+                _mode = "I2VA"
+            elif _has_e and _anch[:1] == [_lbl_e]:                # 只有尾帧锚 → 也是 <Picture 1>
+                _mode = "L2VA"
+            elif (_i == 0 and seg_first_on[0] and 首帧图片 is not None
+                  and not seg_label_orders[0]):
+                # 纯 i2v 起手：链级首帧走官方 first_frame= 参数，官方节点自己产出
+                # "<Picture 1>: " + vision block，所以这句是安全的（此时本段无任何
+                # 引用，Picture 1 一定是它）。
+                _mode, _has_s, _has_e = "I2VA", True, False
+            else:
+                continue
+            _n_shots = len(re.findall(r"\[Shot\s+\d+\]", _p)) or 1
+            _lines = _P.alignment_lines(_mode, _P.frames_to_seconds(seg_lengths[_i]),
+                                        _has_s, _has_e, _n_shots)
+            if not _lines:
+                continue
+            # 指令句 + 空行 + 三字段（官方：指令在字段之外，必须是第一行）
+            seg_prompts[_i] = "\n".join(_lines) + "\n\n" + _p
+            _align_notes.append(f"段{_i + 1} {_mode}")
+        if _align_notes:
+            print(f"[H3提示词] 官方对齐指令已注入：{'、'.join(_align_notes)}", flush=True)
         # 「关闭」=0：只关**自动**段首桥（显式头锚优先，见 _eff_inject），响度对齐不受影响
         ctx = 0 if str(引导帧数).strip() == "关闭" else int(引导帧数)
         gate_limit = max(0, int(回退上限) // 17 * 17)

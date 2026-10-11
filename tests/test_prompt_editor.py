@@ -7,7 +7,7 @@
 1) `refsFromText` 真跑（抽出 shipped 源码交给 node 执行）：正文 → 引用集合，
    与后端 compile_refs / _find_refs 同口径（负向后顾、最长优先、允许重复计数）。
 2) 源码断言：富文本编辑器、✕ 清全部引用、正文=唯一真相（setPromptText 同步 refs）、
-   锚定方式（引用语）为常驻模式且带官方 retention 标记。
+   「锚定方式」句式下拉已整档移除（裸 @标签 + 用户自写角色语义）。
 3) 引用监控即时性（本轮修复）：卡片轻量重绘钩子 + 活池/活别名表 + 晚到别名即时补框。
 4) 两层 ✕ 语义分层：绿框 ✕ 只取消一处（removeOneTag），引用条 chip ✕ 清全部（removeTag）。
 """
@@ -159,20 +159,25 @@ def test_two_level_remove_semantics():
 
 
 def test_anchor_mode_source_points():
+    """「锚定方式」句式下拉已整档移除（2026-10）：引用只插裸 @标签。
+
+    句式是创作决定，固定档位常与素材真实角色对不上（反而写进错误的保留标记），
+    改由用户在正文里自己写（官方六段式 subject_definitions / retention_analysis）。
+    守卫：模板库 / 档位常量 / 按段状态 / 下拉样式一律不得回流。
+    """
     d = _src()
-    # 引用语 = 常驻「锚定方式」模式（选方式 → 点素材 → 按方式写入正文）
-    assert "const _refTpl = new Map()" in d
-    assert "const REF_TPL_DEFAULT = 0" in d
+    assert "REF_TEMPLATES" not in d
+    assert "REF_TPL_DEFAULT" not in d
+    assert "_refTpl" not in d
+    assert "h3d-reftpl" not in d
+    assert "锚定方式：" not in d
     # 三栏引用互不串味：主框引用条只写正文，不再往结构化里存第二份
     assert "applyRefAnchorToV2" not in d
     assert "const refBars = []" in d          # 意图/剧本/结果 各一条
     assert "gate: true" in d                  # 只有「③ 结果」那条进模型
-    # 模板带官方 retention 标记与角色句
-    assert '"fully_preserved"' in d and '"partially_preserved"' in d and '"weak_reference"' in d
-    # 裸引用模板仍在，且**只此一档**：原「无」与它插入的正文完全一样，已合并掉
-    assert "裸引用（不加描述）" in d
-    assert "锚定方式：无" not in d
-    assert 'mkOpt("", "锚定方式' not in d
+    # 引用条 chip 点击 = 只插裸 @标签（不再按句式写入）
+    i = d.index("c.addEventListener(\"mousedown\", guard(() => {")
+    assert "ed.insertTag(key);" in d[i:i + 400], "chip 点击必须只插裸 @标签"
 
 
 def test_ref_state_timely_source_points():

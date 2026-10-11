@@ -61,39 +61,11 @@ const KIND_ICON = { image: "🖼", video: "🎞", audio: "🎵" };
 const KIND_TOKEN = { image: "Picture", video: "Video", audio: "Audio" };
 const KIND_CAPS = { image: 9, video: 3, audio: 3 };
 const KIND_ACCEPT = { image: "image/*", video: "video/*", audio: "audio/*" };
-/* 引用语模板库：插入到提示词光标处，@标签 由后端按段压实为 <Picture k> */
-/* 引用语 = **锚定方式**：先选一种，再点参考素材，句式按该方式写进正文。
- * 每条同时带官方 `retention_analysis` 保留标记与 `subject_definitions` 角色句
- * （具象化段会一并写进 v2 结构，编译时进官方字段；主提示词段只用句式文本）。
- * 官方标记：fully_preserved / partially_preserved / weak_reference（见
- * prompt/minimaxh3_official_ref2v_prompt_writing.txt 第 4 节）。 */
-const REF_TEMPLATES = [
-    ["裸引用（不加描述）", (l) => `@${l}`, "partially_preserved", ""],
-    ["主角出场", (l) => `主角 @${l} 全程出镜，主体身份、外观与服饰全程保持一致`,
-        "fully_preserved",
-        "the main subject; keep identity, facial features and outfit consistent across every shot"],
-    ["配角出场", (l) => `画面中出现的 @${l} 为次要角色，身份与外观保持一致`,
-        "fully_preserved",
-        "a supporting character; keep identity and appearance consistent"],
-    ["场景还原", (l) => `场景以 @${l} 为准，延续其环境、光照与空间布局`,
-        "partially_preserved",
-        "the environment reference; keep layout, lighting and spatial arrangement"],
-    ["风格参考", (l) => `整体画风、色调与质感参考 @${l}`,
-        "weak_reference",
-        "a style reference; keep overall palette, texture and rendering feel"],
-    ["镜头参考", (l) => `运镜方式参考 @${l}（可用官方词汇：Push In / Pan Left / Truck Right / Tracking Shot，加 with small amplitude at slow speed 等修饰）`,
-        "weak_reference",
-        "a camera-movement reference; keep motion direction and pacing only"],
-    ["音频参考", (l) => `声音以 @${l} 为准（音色、节奏与情绪延续）`,
-        "weak_reference",
-        "an audio reference; keep timbre, rhythm and mood"],
-    ["说话人", () => `短发女主 (S1) 轻声说：「……」`, "", ""],
-];
-/** 每段的锚定方式选择（seg idx → REF_TEMPLATES 下标），重绘不丢。
- *  默认 0 = 裸引用：**没有单独的「无」档**——「无」与「裸引用（不加描述）」插入的
- *  正文完全一样（都是裸 @标签），两个选项只会让人以为有区别。 */
-const _refTpl = new Map();
-const REF_TPL_DEFAULT = 0;
+/* 引用 = **裸 @标签**：点参考素材即在提示词光标处插一个绿框（`@别名`），
+ * 后端按段压实为 <Picture k> / <Video k> / <Audio j>。素材的角色/保留语义
+ * 一律由用户在正文里自己写（官方六段式 subject_definitions / retention_analysis），
+ * 界面不再提供「锚定方式」句式下拉——句式是创作决定，不该由固定档位代劳
+ * （2026-10 移除：档位与素材角色常对不上，反而写进错误的保留标记）。 */
 
 /* 卡片轻量重绘钩子（每次 buildCards 重置，当前渲染出的段卡各自注册一个）：
  * 焦点守卫会跳过整卡重建，若此时什么都不做，卡片内的即时状态（引用 chips / 计数 /
@@ -1211,7 +1183,6 @@ function buildRefBar(RB) {
              * —— 正文里就有 N 个 @别名，编译后是同一个 <Picture k> 出现 N 次；
              * chip 旁的「✕」= 取消本段对它的**全部**引用（正文里的绿框一起清掉）。
              * 素材个数上限仍按官方 9/3/3（去重算），重复次数另有软上限。
-             * 下拉 = 锚定方式（先选方式再点素材，按方式把句式写进正文）。
              * 末尾两个按钮：本段的首帧图 / 尾帧图参考（从项目里的图片选或现传）。
              * **不再要求"建卡时已有素材"**：素材晚到时 chips 由 syncChips 自动补出来，
              * 引用条本身不必等整卡重建才出现（否则零素材时上传第一张会"没反应"）。 */
@@ -1221,10 +1192,6 @@ function buildRefBar(RB) {
             refbar.append(counter);        // 计数先入位：chips 一律插在它前面（syncChips 用）
             /* 素材池取**活**的节点状态（上传/改名/删除素材后 chips 与别名表立即跟上），
              * 建卡快照 pool 只作回落 —— 快照会一直停在建卡那一刻。 */
-                            /* 锚定方式（引用语）：下标=REF_TEMPLATES，默认「裸引用（不加描述）」。
-             * 按段记住（_refTpl），重绘不丢。 */
-            let refTpl = _refTpl.has(RB.tplKey) ? _refTpl.get(RB.tplKey) : REF_TPL_DEFAULT;
-            if (!REF_TEMPLATES[refTpl]) refTpl = REF_TPL_DEFAULT;
             /* 官方 tag 预览：按「本段勾选顺序」对三类各自独立编号（与后端
              * compile_refs 同口径，重复引用只占一个编号）—— 让用户直接看到
              * @女主 会变成 <Picture 1>，写几次就出现几次。 */
@@ -1259,7 +1226,6 @@ function buildRefBar(RB) {
                     || c.appendChild(Object.assign(document.createElement("span"),
                         { className: "h3d-chipbtn-text" }));
                 txt.textContent = `${lbl}${roles}`;
-                const armedName = (REF_TEMPLATES[refTpl] || [])[0] || "裸引用（不加描述）";
                 c.title = `${KIND_NAME[a.kind] || ""}「${lbl}」${roles}：`
                     + (n > 0
                         ? `本段已引用${token ? `（正文里每个 @${key} 都会编译成 ${token}）` : ""}`
@@ -1267,7 +1233,7 @@ function buildRefBar(RB) {
                     + "\n点一次 = 在提示词框里插一个绿框（图标+别名，点两次=引用两次）；"
                     + "右侧 ✕（或右键本 chip）= 取消本段对它的全部引用。"
                     + "\n（正文里绿框自带的 ✕ 是「只取消那一处」，点一次少一处。）"
-                    + `\n当前锚定方式「${armedName}」：点它会按这个方式写入正文。`;
+                    + "\n点它就把裸 @别名 写进正文——素材的角色/保留语义请在正文里自己描述。";
             };
             const chips = [];
             let chipKeys = null;      // 已建 chips 的别名序列（与 livePool 对齐；池变了才重建 DOM）
@@ -1348,15 +1314,29 @@ function buildRefBar(RB) {
                 const live = livePool();
                 syncChips(live);
                 const refs = RB.readRefs();
-                const cnt = { image: 0, video: 0, audio: 0 };
+                const cnt = { image: 0, video: 0, audio: 0 };   // 素材个数（卡官方 9/3/3 上限）
+                const ord = { image: 0, video: 0, audio: 0 };   // 官方 token 序号
                 const tokens = {};
-                for (const l of new Set(refs)) {          // 编号按素材，不看重复
-                    const hit = live.find((x) => refKeyOf(x) === l) || pool.find((x) => refKeyOf(x) === l);
+                const uniq = [...new Set(refs)];                // 编号按素材，不看重复
+                const hitOf = (l) => live.find((x) => refKeyOf(x) === l)
+                    || pool.find((x) => refKeyOf(x) === l);
+                /* 音频号先给每个参考视频的音轨预扣一个：官方 tokenizer 会为每条
+                 * ref_video_audio_N 插一条 <Audio j>（排在 <Video k> 之前），而节点
+                 * 对每个参考视频都塞了音轨槽 → 不预扣会让同段独立音频整体错位
+                 * （1 个视频偏 1、2 个偏 2），正文里的 <Audio j> 会指向视频音轨。
+                 * 与后端 nodes._kind_tokens / asset_store.compile_refs 三处同规则。 */
+                for (const l of uniq) {
+                    const hit = hitOf(l);
+                    if (hit && (hit.kind || "image") === "video") ord.audio += 1;
+                }
+                for (const l of uniq) {
+                    const hit = hitOf(l);
                     if (!hit) continue;
                     const k = hit.kind || "image";
                     if (cnt[k] === undefined) cnt[k] = 0;
                     cnt[k] += 1;
-                    tokens[l] = String(TOK_FMT[k] || TOK_FMT.image).replace("{}", cnt[k]);
+                    ord[k] = (ord[k] || 0) + 1;
+                    tokens[l] = String(TOK_FMT[k] || TOK_FMT.image).replace("{}", ord[k]);
                 }
                 for (const rec of chips) {
                     const n = refs.filter((x) => x === refKeyOf(rec.a)).length;
@@ -1422,19 +1402,9 @@ function buildRefBar(RB) {
                 c.addEventListener("mousedown", guard(() => {
                     if (RB.gate && !canAddRef(node, segIdx, key)) return;
                     if (!ed) return;                       // 没有可写正文（只读/无节点）
-                    {
-                        const tplDef = REF_TEMPLATES[refTpl];
-                        if (tplDef) {
-                            /* 锚定方式：按句式写入（@别名 落成绿框，前后文一起进正文） */
-                            const phrase = tplDef[1](key);
-                            const m = /^(.*?)@([^\s]+)([\s\S]*)$/.exec(phrase);
-                            if (m) ed.insertTag(key, m[1], m[3]);
-                            else ed.insertText(phrase);
-                        } else {
-                            ed.insertTag(key);
-                        }
-                        RB.commit(ed);
-                                                }
+                    /* 裸引用：只往正文里插一个 @别名 绿框（句式由用户自己写）。 */
+                    ed.insertTag(key);
+                    RB.commit(ed);
                     RB.repaint();              // chip + 计数 + 绿框一次到位（不等刷新）
                     scheduleRefresh(240);
                 }));
@@ -1473,29 +1443,6 @@ function buildRefBar(RB) {
             /* 段级首尾帧参考图：从项目里的图片选（或现传一张），作为本段的
              * 首帧 / 尾帧参考（段头 / 段尾身份锚；首段首帧图 = i2v 起手帧）。 */
             if (RB.showFrames) refbar.append(mkFrameBtns(node, segIdx, () => scheduleRefresh(240)));
-                            /* 锚定方式（引用语）：**先选方式，再点参考素材** —— 点哪个素材就按该方式
-             * 把句式写进正文（`场景以 @X 为准…`）。
-             * 选择是"常驻模式"（切段/重绘后仍保持）；默认「裸引用（不加描述）」= 只插
-             * 裸 @标签（原「无」档与它插入的正文完全一样，已合并成一个选项）。 */
-            const tpl = document.createElement("select");
-            tpl.className = "h3d-reftpl";
-            const mkOpt = (v, txt) => {
-                const o = document.createElement("option");
-                o.value = String(v);
-                o.textContent = txt;
-                return o;
-            };
-            REF_TEMPLATES.forEach(([name], ti) => tpl.append(mkOpt(ti, `锚定方式：${name}`)));
-            tpl.value = String(refTpl);
-            tpl.title = "选一种锚定方式，再点上面的参考素材：该素材会按这个方式写进提示词。"
-                + "\n选「裸引用（不加描述）」= 只插 @标签，用法自己在正文里描述。";
-            tpl.onchange = () => {
-                const v = Number(tpl.value);
-                refTpl = Number.isInteger(v) && REF_TEMPLATES[v] ? v : REF_TPL_DEFAULT;
-                _refTpl.set(RB.tplKey, refTpl);
-                paintAll();
-            };
-            refbar.append(tpl);
             return { el: refbar, paint: paintAll };
 }
 /** 正文 → 本段引用集合（正文是唯一真相）：按首次出现顺序，允许重复计数。
@@ -4392,7 +4339,9 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
         _optBefore.set(key, before);
         _optShown.set(key, "after");
         setPromptText(node, idx, result);
-        /* 对齐指令**不写进正文**：它是编译产物（锚定栏展示 + 实跑时由后端注入）。
+        /* 对齐指令**不写进正文**：它是编译产物，实跑时由后端按本段帧锚注入
+         * （nodes.py「官方对齐指令注入」块，口径与 prompts.alignment_lines 一致：
+         * I2VA / FL2VA / L2VA；混合模式 Ref2VA 不注入）。
          * LLM 有时会自己抄一句 "Picture 1 aligns with…" 进产出，这里必须剥掉 ——
          * 留着会跟实跑注入的那句重复，锚一变还变成指向不存在图片的陈旧指令。
          * 剥完再同步屏幕上的编辑器，否则用户一动键盘旧文本又回写。 */
@@ -4421,7 +4370,7 @@ async function runOptForSegment(node, idx, ta, ui, srcTa) {
                 + "本段这些引用可能漏挂图。请到「引用素材」补挂对应素材，"
                 + "或把标签改成 @素材名。");
         } else {
-            setLed("done", "优化已回填提示词框＋结构化结构（对齐指令已按首尾帧锚补回）");
+            setLed("done", "优化已回填提示词框（对齐指令不入正文，实跑时按本段帧锚由后端注入）");
         }
         scheduleRefresh(200);
     } catch (e) {
@@ -7288,8 +7237,6 @@ function injectStyles() {
     .h3d-refchip.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
     .h3d-refchip .h3d-thumb{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
     .h3d-refchip.on .h3d-thumb{outline-color:#2f6e57}
-    .h3d-reftpl{max-width:118px;border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:3px 4px;font-size:11px;outline:none;margin-left:auto}
-    .h3d-reftpl:focus{border-color:#a8d8bd}
     .h3d-chipbtn{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 3px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit;max-width:240px}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
@@ -8336,7 +8283,9 @@ function mkFrameBtns(node, segIdx, onChange) {
 
 /* 「对齐指令预览」（原 mkAlignPreview / .h3d-alignprev）已整块删除：它只是
  * "提交时会自动往正文前拼什么"的一句只读预览，用户既不能改也不用看，却占着
- * 锚定栏一整行。对齐指令改由后端 nodes.py 注入，前端只管锚点本身。
+ * 锚定栏一整行。对齐指令改由后端 nodes.py 按**本段**帧锚注入（口径与
+ * prompts.alignment_lines 一致：I2VA / FL2VA / L2VA；混合模式 Ref2VA 不注入；
+ * 帧锚没进本段图池的段也不注入，避免写出悬空的 <Picture k>），前端只管锚点本身。
  * v2InstrLines / segAlignSeconds / defaultV2Mode 仍被后端口径的其它入口使用，
  * 一并保留（tests/js/alignment_lines_check.js 锁着它们）。 */
 

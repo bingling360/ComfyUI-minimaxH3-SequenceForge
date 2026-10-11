@@ -108,6 +108,25 @@ def detect_mode(prompt, *, has_start=False, has_end=False):
     return "T2VA"
 
 
+def has_alignment_head(text):
+    """文本首行是否已是官方对齐指令（是则不再注入，避免重复）。
+
+    官方格式（base-en.txt §2.1）：指令句是最终提示词的**第一行**，空一行再接三字段。
+    所以只查第一个非空行 —— 只认整行匹配（`_KF_RE.fullmatch`），不做子串搜索：
+    正文里提到 "Picture 1 aligns with…" 这类叙述不该被当成已有的指令句。
+
+    存在的理由：注入侧原先用 `_OFFICIAL_FIELD_RE.search()` 当守卫（"已是官方格式
+    就不注入"），但组装后的文本**必然**含 `integrated_multimodal_description:`，
+    守卫恒为假、注入从来没发生过。判"首行是不是对齐句"才是真正的幂等条件。
+    """
+    for line in str(text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        return bool(_KF_RE.fullmatch(s))
+    return False
+
+
 def alignment_lines(mode, seconds, has_start, has_end, n_shots=1):
     """本段的官方对齐指令行（纯函数，无状态）—— 后端实跑与前端预览同口径。
 
@@ -256,11 +275,19 @@ def validate_compiled(compiled):
 # 优化链路的 task 可能是 HYBRID（首尾帧锚 + 参考素材的混合模式），官方模式名里没有它 —— 归 Ref2VA：
 # 官方六段式本来就能同时承载帧锚与参考素材（见 detect_mode 的说明）。
 _MODE_ALIAS = {"HYBRID": "Ref2VA"}
+# ⚠ 大小写归一表。`_norm_mode` 先把入参 .upper()，而 VALID_MODES 里的 "Ref2VA"
+# 是**混合大小写** —— 拿大写串直接 `in VALID_MODES` 必然失败、一路退化成 T2VA。
+# 而 optimizer.py 传的正是 `str(task).upper()`（即 "REF2VA"）→ Ref2VA 的
+# finalize_optimized / validate_text **曾经全部按 base 规则跑**：
+#   · finalize 取不到主字段（六段式是 detailed_description）→ 剥时间戳/补 no cuts 全静默跳过
+#   · validate 用 BASE_FIELDS 当白名单 → 六段式的 subject_definitions/retention_analysis
+#     全被判 E_FIELD_SET（"T2VA 不应含字段"），一个合法的 Ref2VA 稿被误报为错
+_MODE_BY_UPPER = {m.upper(): m for m in VALID_MODES}
 
 
 def _norm_mode(mode):
     s = str(mode or "T2VA").upper()
-    return _MODE_ALIAS.get(s, s if s in VALID_MODES else "T2VA")
+    return _MODE_ALIAS.get(s, _MODE_BY_UPPER.get(s, "T2VA"))
 
 
 # 对齐指令的宽容识别：模型可能把 em dash 写成 - 或 –，也可能只写半句。

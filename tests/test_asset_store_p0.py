@@ -153,8 +153,36 @@ def test_kind_numbering_independent(store):
     ], None)
     r = store.compile_refs(reg, ["图", "片", "乐"])
     assert r["ok"] and [b["token"] for b in r["blocks"]] == [
-        "<Picture 1>", "<Video 1>", "<Audio 1>"]
+        "<Picture 1>", "<Video 1>", "<Audio 2>"]
     assert r["tag_map"]["图"] == "<Picture 1>"
+
+
+def test_audio_ordinal_reserves_video_soundtrack(store):
+    """音频号必须给每个参考视频的音轨预扣一个 —— 否则同段独立音频整体错位。
+
+    官方 tokenizer 会为每条 `ref_video_audio_N` 都插一条 `<Audio j>: `（排在
+    `<Video k>` 之前），而节点对每个参考视频都塞了音轨槽（静音也塞）→
+    「视频 + 独立音频」同段时，独立音频是 `<Audio 2>` 而不是 `<Audio 1>`。
+    写错的话正文里的 `<Audio j>` 会指向视频音轨，独立音频等于没被引用。
+    与 nodes._kind_tokens / 前端映射条同规则，三处必须一致。
+    """
+    reg = store.build_registry(None, [
+        {"asset_id": "a_111111111111", "alias": "片1", "kind": "video"},
+        {"asset_id": "a_222222222222", "alias": "片2", "kind": "video"},
+        {"asset_id": "a_333333333333", "alias": "乐A", "kind": "audio"},
+        {"asset_id": "a_444444444444", "alias": "乐B", "kind": "audio"},
+    ], None)
+    r = store.compile_refs(reg, ["片1", "片2", "乐A", "乐B"])
+    assert r["ok"]
+    toks = {b["alias"]: b["token"] for b in r["blocks"]}
+    assert toks == {"片1": "<Video 1>", "片2": "<Video 2>",
+                    "乐A": "<Audio 3>", "乐B": "<Audio 4>"}
+    # 无视频时音频号不受影响（确认没有过度偏移）
+    reg2 = store.build_registry(None, [
+        {"asset_id": "a_333333333333", "alias": "乐A", "kind": "audio"},
+    ], None)
+    r2 = store.compile_refs(reg2, ["乐A"])
+    assert r2["blocks"][0]["token"] == "<Audio 1>"
 
 
 def test_seg_caps(store):

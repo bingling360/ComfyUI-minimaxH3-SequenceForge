@@ -125,7 +125,9 @@ def test_kernel_parity_ok(store, asset_hub):
     old = asset_hub.check_segment_refs(items, refs, 1)
     new = store.compile_refs(_reg_from_pool(store, pool), refs, 1)
     assert old == [] and new["ok"] is True
-    assert [b["token"] for b in new["blocks"]] == ["<Picture 1>", "<Video 1>", "<Audio 1>"]
+    # 音频号 = 2：参考视频「片」的音轨在官方 tokenizer 里已占掉 <Audio 1>
+    # （见 tests/test_asset_store_p0.py::test_audio_ordinal_reserves_video_soundtrack）
+    assert [b["token"] for b in new["blocks"]] == ["<Picture 1>", "<Video 1>", "<Audio 2>"]
 
 
 def test_kernel_parity_unknown(store, asset_hub):

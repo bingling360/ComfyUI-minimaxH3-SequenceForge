@@ -66,7 +66,6 @@ const code = [
     extractDecl("KIND_ICON", "{", "}"),
     extractDecl("KIND_TOKEN", "{", "}"),
     "const REF_REPEAT_MAX = 9;",
-    extractDecl("REF_TEMPLATES", "[", "]"),
     extractConstLine("_CHIP_EXT_RE"),
     // 引用键：ref_name（含后缀）优先、别名兜底 —— refsFromText / canAddRef 都依赖它
     extractConstLine("refKeyOf"),
@@ -118,7 +117,7 @@ const make = new Function("window", "document", "Event", "alert", "getDs", "setD
     "cancelPromptWrite", "schedulePromptFlush", "scheduleRefresh", "setLed",
     code + "\nreturn { createPromptEditor, canAddRef, addSegmentRef, removeSegmentRef," +
     " applyPromptEdit, syncRefsFromText, refsFromText, refCount," +
-    " REF_TEMPLATES, KIND_ICON, thumbSig };");
+    " KIND_ICON, thumbSig };");
 const M = make(window, window.document, window.Event, alert, getDs, setDs,
     cancelPromptWrite, schedulePromptFlush, scheduleRefresh, setLed);
 
@@ -146,7 +145,7 @@ ok(!threw, `insertTag 抛错：${threw && threw.message}`);
 eq(ta.value, "开头 @阿依 站着 @阿依", "insertTag 结果");
 eq(ds.segments[0].refs, ["阿依"], "插入后 refs 由正文同步");
 
-// ② 引用语句式（锚定方式）：前后文一起进正文
+// ② insertTag 可带前后文：前后文与绿框一起进正文（编辑器通用能力）
 ta.insertTag("阿依的家", "场景以 ", " 为准");
 ok(ta.value.endsWith("场景以 @阿依的家 为准"), `句式插入：${ta.value}`);
 
@@ -165,19 +164,16 @@ M.applyPromptEdit(node, 0, ta);
 eq(ds.prompts[0], ta.value, "applyPromptEdit 写正文");
 eq(ds.segments[0].refs, ["阿依的家", "阿依"], "refs 顺序=正文出现顺序");
 
-// ⑥ chip 点击链路（含锚定方式）：不抛错、正文含句式
+// ⑥ chip 点击链路：只插裸 @别名（「锚定方式」句式下拉已移除）
 threw = null;
 try {
     const a = ds.ref_assets[0];
-    const tplDef = M.REF_TEMPLATES[3];                 // 场景还原
-    const phrase = tplDef[1](a.label);
-    const m = /^(.*?)@([^\s]+)([\s\S]*)$/.exec(phrase);
-    ok(!!m, "模板句式应含 @别名");
-    if (m) ta.insertTag(a.label, m[1], m[3]); else ta.insertText(phrase);
+    ta.insertTag(a.label);
     M.applyPromptEdit(node, 0, ta);
 } catch (e) { threw = e; }
 ok(!threw, `chip 点击链路抛错：${threw && threw.message}`);
-ok(ta.value.includes("场景以 @阿依 为准"), `锚定方式句式未写入：${ta.value}`);
+ok(ta.value.includes("@阿依"), `裸引用未写入：${ta.value}`);
+ok(!ta.value.includes("场景以 @阿依 为准"), `不该再自动写句式：${ta.value}`);
 
 // ⑦ ✕ 清零：正文里该素材的绿框全部清掉，其它素材不动
 ta.removeTag("阿依");
@@ -225,12 +221,13 @@ eq(removedLabel, "阿依", "✕ 应触发 onRemove（引用条据此刷新）");
 eq(ta3.tagCount("阿依"), 0, "✕ 后该素材绿框清零");
 eq(ta3.tagCount("阿依的家"), 1, "✕ 不误伤长别名");
 
-/* ⑪ 锚定方式：原「无」与「裸引用（不加描述）」插入的正文完全一样（都是裸 @标签），
- * 已合并成一个选项——裸引用即默认档，源码里不得再留「锚定方式：无」。 */
-ok(M.REF_TEMPLATES[0][0] === "裸引用（不加描述）", `第 0 档应为裸引用：${M.REF_TEMPLATES[0][0]}`);
-eq(M.REF_TEMPLATES[0][1]("阿依"), "@阿依", "裸引用句式=裸 @标签");
-ok(M.REF_TEMPLATES[0][2] !== "" , "裸引用仍带官方保留标记（语义差异化保留）");
-ok(!src.includes("锚定方式：无"), "不应再有「锚定方式：无」选项");
+/* ⑪ 「锚定方式」句式下拉已整档移除：源码里不得再有模板库 / 下拉 / 档位常量，
+ * 素材角色语义改由用户自己在正文里写（官方六段式）。 */
+ok(!src.includes("REF_TEMPLATES"), "不应再有 REF_TEMPLATES 模板库");
+ok(!src.includes("REF_TPL_DEFAULT"), "不应再有 REF_TPL_DEFAULT 档位常量");
+ok(!src.includes("_refTpl"), "不应再有按段记住档位的 _refTpl");
+ok(!src.includes("锚定方式："), "不应再有「锚定方式：xxx」下拉选项文案");
+ok(!src.includes("h3d-reftpl"), "不应再有 .h3d-reftpl 下拉样式");
 
 /* ⑫ 绿框 ✕ = 只取消**这一处**（本轮修复）：同一素材引用 N 次时点一下只少一处
  * （正文少一个 @别名 → refs 少一条 → 引用条 N 降到 N-1），而不是一次清光；

@@ -619,7 +619,8 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
     """段引用编译 -> {ok, blocks, tag_map, errors}。
 
     blocks 保序：[{asset_id, alias, kind, token, use?}]，token 按类型独立 1-based
-    （与 nodes._kind_tokens 同规则）；单段 9/3/3 超限与未知引用返回 errors
+    （与 nodes._kind_tokens 同规则，**含"每个参考视频的音轨先占一个音频号"**）；
+    单段 9/3/3 超限与未知引用返回 errors
     （code 复用 E_REF_UNKNOWN / E_MEDIA_LIMIT，前端可沿用旧文案）。
     """
     by_id = (registry or {}).get("by_id") or {}
@@ -658,6 +659,15 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
                                       f"超过官方单段上限 {cap} 个（{picked}）"})
             break
     blocks, tag_map, counters = [], {}, {k: 0 for k in KINDS}
+    # ⚠ 音频号先给每个参考视频的音轨预扣一个：官方 tokenizer 为每条
+    # ref_video_audio_N 都插一条 <Audio j>（排在 <Video k> 之前），而节点对每个
+    # 参考视频都塞了音轨槽 → 不预扣会让同段独立音频整体错位（1 个视频偏 1）。
+    # 与 nodes._kind_tokens / 前端映射条同规则，三处必须一致。
+    _seen_v = set()
+    for rec, _use in order:
+        if rec["kind"] == "video" and rec["asset_id"] not in _seen_v:
+            _seen_v.add(rec["asset_id"])
+            counters["audio"] += 1
     for rec, use in order:
         counters[rec["kind"]] = counters.get(rec["kind"], 0) + 1
         tok = _TOKEN_FMT[rec["kind"]].format(counters[rec["kind"]])

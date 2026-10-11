@@ -3055,9 +3055,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 seg_head_img_latent[_i] = _frame_img_latent(_f)
             if _e and not (_i == len(seg_prompts) - 1 and _tail_seg):
                 seg_end_img_latent[_i] = _frame_img_latent(_e)
-        if any(seg_head_img_latent) or any(seg_end_img_latent):
-            _fs = [str(i + 1) for i, v in enumerate(seg_head_img_latent) if v is not None]
-            _es = [str(i + 1) for i, v in enumerate(seg_end_img_latent) if v is not None]
+        # ⚠ 这两个列表装的是 video_vae.encode() 的**裸张量**（不是 dict），所以
+        # 绝不能写 `any(列表)` —— any() 会逐项求 bool()，多元素张量取真值直接抛
+        # `RuntimeError: Boolean value of Tensor with more than one value is ambiguous`。
+        # 判「有没有」一律用 `is not None`（与下面报告用的同一判据）。
+        _fs = [str(i + 1) for i, v in enumerate(seg_head_img_latent) if v is not None]
+        _es = [str(i + 1) for i, v in enumerate(seg_end_img_latent) if v is not None]
+        if _fs or _es:
             report.append("段级首尾帧参考图："
                           + ("、".join(f"段{n}头锚" for n in _fs) if _fs else "")
                           + (" · " if _fs and _es else "")

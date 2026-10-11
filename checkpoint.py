@@ -16,6 +16,13 @@ v5（2026-09-16）：变更检测改**区间模型**（重做最小单位 = 单�
   隐含级联语义）已删除——级联不是默认行为，留着就是第二个真相。
 - `assert_match` 收窄为**只校验 width/height**，其余参数变更只回报不报错、不触发重做。
 
+v6（2026-10-12）：**链参数不再强制整链一致**——分辨率也不再是硬约束。
+- `assert_match` 从此**从不抛错**，只回报差异（含分辨率），由调用方写进报告。
+  中途改分辨率时：旧段保留旧分辨率、此后新段用新分辨率；相邻段分辨率不同则由
+  `nodes.py` 跳过「自动引用上段尾帧」与接缝测量，成片阶段跳过自动合成——都只提示。
+- 自动项目目录名不再跟参数走（旧版 `h3chain_<w>x<h>_..._<指纹>` 会让「改个分辨率
+  就换项目」）：空存档目录时固定用 `h3chain`，并沿用最近更新过的旧版自动目录。
+
 v3：存档根目录迁至 output/h3_projects/<项目名>/（游戏式一项目一文件夹），
 manifest 增加 title/created_at/updated_at/finals 键；旧 checkpoints 目录不读不写。
 
@@ -30,6 +37,10 @@ import tempfile
 import threading
 
 SCHEMA = "h3seamless/ckpt-v3"
+
+# 自动项目目录名（「存档目录」留空时用）。**刻意不含任何参数**：旧版把分辨率/时长/
+# 指纹写进目录名，导致「改个分辨率就换了项目」——2026-10-12 起改为固定名。
+AUTO_PROJECT_NAME = "h3chain"
 
 # ---- 生成互斥锁（剪辑/转码与采样不能同时执行） ----
 # nodes.execute 进入时 +1、退出时 -1；trim/slice/move/split 等路由遇忙回 423，
@@ -66,6 +77,9 @@ def fingerprint(params: dict) -> str:
 
     params 由调用方保证不含提示词与种子：种子控件开着 control_after_generate
     每次运行自动 +1，提示词改动走逐段哈希校验而非换链。
+
+    ⚠ 2026-10-12 起**不再用于自动项目目录命名**（那正是「改个分辨率就换项目」的
+    根因）。保留供诊断/复现比对用。
     """
     blob = json.dumps(params, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:8]
@@ -166,19 +180,58 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
     return out
 
 
+def _adopt_legacy_auto_project(proot: str) -> str:
+    """旧版「按参数指纹自动命名」的自动项目目录：`h3chain_<w>x<h>_..._<指纹>`。
+
+    自动名改固定 `h3chain` 后，若固定名目录还不存在，就沿用**最近更新过**的那个
+    旧版自动目录（必须是已有 manifest.json 的目录）——否则老用户升级后自动项目
+    会凭空多出一个空壳，看着像进度丢了。目录名保持原样，不搬家。
+    没有可用旧目录时返回空串（调用方回落到固定名）。
+    """
+    best, best_mt = "", -1.0
+    try:
+        names = os.listdir(proot)
+    except OSError:
+        return ""
+    for n in names:
+        if n == AUTO_PROJECT_NAME or not n.startswith(AUTO_PROJECT_NAME + "_"):
+            continue
+        d = os.path.join(proot, n)
+        if not os.path.isdir(d) or not os.path.isfile(os.path.join(d, "manifest.json")):
+            continue
+        try:
+            mt = os.path.getmtime(d)
+        except OSError:
+            continue
+        if mt > best_mt:
+            best, best_mt = d, mt
+    return best
+
+
 def ckpt_dir(params: dict, custom: str = "") -> str:
-    """项目根目录：output/h3_projects/<自定义名> 或按参数指纹自动命名。
+    """项目根目录：output/h3_projects/<自定义名> 或自动项目目录。
+
+    自动项目名**不跟参数走**（2026-10-12）：旧版按
+    `h3chain_<w>x<h>_<len>f_ctx<ctx>_<指纹>` 命名，于是「改个分辨率/时长就换了
+    项目」——用户必须切项目才能改参数，这正是要根除的体验。现在空「存档目录」
+    固定落 `h3chain`；同名目录不存在时**沿用最近更新过的旧版自动目录**
+    （`h3chain_*`，老用户的自动项目不会凭空消失），都没有才新建 `h3chain`。
+
+    参数仍写进 manifest.params（诊断/`_describe_canvas` 用），只是不再参与命名。
 
     四库规范：顺手建好 assets/finals/latent/texts（幂等，旧项目懒建）。
     """
     from folder_paths import get_output_directory
 
+    proot = os.path.join(get_output_directory(), "h3_projects")
     if custom:
-        root = os.path.join(get_output_directory(), "h3_projects", custom)
+        root = os.path.join(proot, custom)
     else:
-        name = (f"h3chain_{params['width']}x{params['height']}"
-                f"_{params['length']}f_ctx{params['ctx']}_{fingerprint(params)}")
-        root = os.path.join(get_output_directory(), "h3_projects", name)
+        root = os.path.join(proot, AUTO_PROJECT_NAME)
+        if not os.path.isdir(root):
+            legacy = _adopt_legacy_auto_project(proot)
+            if legacy:
+                root = legacy
     os.makedirs(root, exist_ok=True)
     ensure_project_dirs(root)
     return root
@@ -243,35 +296,52 @@ def load_manifest(root: str):
         return json.load(f)
 
 
+def resolution_changed(old: dict, new: dict) -> bool:
+    """存档参数与当前参数的**分辨率**是否不同（旧档缺宽高视为未变）。"""
+    old, new = old or {}, new or {}
+    if old.get("width") is None or old.get("height") is None:
+        return False
+    try:
+        return (int(old.get("width")), int(old.get("height"))) != (
+            int(new.get("width")), int(new.get("height")))
+    except (TypeError, ValueError):
+        return False
+
+
 def assert_match(old: dict, new: dict, hint: str = ""):
-    """只校验**分辨率**（唯一硬约束）；其余参数变更只回报，不报错、不触发重做。
+    """逐键比对存档参数与当前参数；**从不抛错**，只回报差异（调用方写进报告）。
 
-    为什么只有分辨率是硬约束：`PackedLayout` 按行预留，C/H/W 不同则桥拼不上，
-    链根本走不通，只能整链重做或新建链。其余参数（steps/cfg/采样器/调度器/模型
-    /fade_ratio/gate/实验开关）都只影响**此后要采样的段**——已完成段是盘上的
-    张量，与参数没有任何耦合，改参数不会让它们"画风不一致"。
-    （旧 docstring 声称"参数不同 = 链混搭画风不一致"，是伪问题，已证伪。）
+    2026-10-12 起**分辨率也不再是硬约束**。链参数不再强制整链一致：中途改分辨率时
+    旧段保留旧分辨率、此后新段用新分辨率。相邻段分辨率不同时，`nodes.py` 会跳过
+    「自动引用上段尾帧」（latent 桥按行预留，C/H/W 不同拼不上）与接缝测量，成片阶段
+    跳过自动合成——三处都只提示、不报错、不阻断生成。
 
-    佐证：模型权重根本不在 params 里——换模型连检测都没有，而它对画风影响最大。
+    旧实现（2026-09-16 ~ 2026-10-11）对 width/height 不一致直接抛 ValueError，逼用户
+    「改回存档分辨率或换新存档目录开新链」——用户反馈的最痛点就是这条。
 
-    `hint`：可选补充说明（调用方拼好的"本次画布四个控件谁在生效"），只在抛错时
-    附在末尾。分辨率不一致的**最常见**成因不是"用户改错了宽高"，而是**改错了控件**
-    ——画布侧是「宽高比/百万像素/宽/高」四件：非自定义时改宽高无效，自定义时改
-    百万像素无效。报错里只有两个数字时，用户会一直改那个不生效的控件。
+    除分辨率外其余参数（steps/cfg/采样器/调度器/模型/fade_ratio/gate/实验开关）本就
+    只影响**此后要采样的段**：已完成段是盘上的张量，与参数没有任何耦合。
 
-    返回：变了但不影响已有段的参数说明列表（调用方写进报告），无变化返回 []。
-    分辨率不一致直接抛 ValueError（这是硬约束）。
+    `hint`：可选补充说明（调用方拼好的"本次画布四个控件谁在生效"），只附在分辨率
+    那一条上——用户改错控件（改宽高而实际由宽高比×百万像素换算）时只有两个数字
+    是看不出来的。
+
+    返回：变了但只影响此后新生成段的参数说明列表（分辨率那条恒排在最前）；无变化返回 []。
     """
     old, new = old or {}, new or {}
-    for key in ("width", "height"):
-        if key in new and old.get(key, new[key]) != new[key]:
-            raise ValueError(
-                f"存档分辨率与当前不一致（{key}: 存档={old.get(key)!r} 当前={new[key]!r}）。"
-                "分辨率是唯一硬约束——C/H/W 不同则 latent 桥拼不上，链无法延续。"
-                "请把分辨率改回存档值，或换个新存档目录开新链"
-                + (f"\n{hint}" if hint else ""))
-    return [f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}"
-            for k in new if old.get(k, new[k]) != new[k]]
+    notes = []
+    if resolution_changed(old, new):
+        _msg = (f"分辨率: 存档={old.get('width')}×{old.get('height')} "
+                f"当前={new.get('width')}×{new.get('height')}")
+        if hint:
+            _msg += f"（{hint}）"
+        notes.append(_msg)
+    for k in new:
+        if k in ("width", "height"):
+            continue          # 已并入上面那一条（一起说才看得出是"画幅变了"）
+        if old.get(k, new[k]) != new[k]:
+            notes.append(f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}")
+    return notes
 
 
 def seg_path(root: str, idx: int) -> str:

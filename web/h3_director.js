@@ -3274,9 +3274,9 @@ function upTargetCanvas(node, up) {
  *  mp4，不会被基础分辨率覆盖。本段 latent 存档载入 → 神经放大重采样
  *  → 覆盖 seg_NNN.mp4，全程不碰视频编解码。
  *  二采渲染确定性：参数未变时重渲=同输出；价值在参数已变/记录缺失/补做时立即执行。
- *  健壮性（与 submitRedo 同口径）：①提交前套用存档共享参数——**只还原画幅**
- *  （唯一硬约束）；步数/CFG/采样器等软参数按画布当前值走，不静默纠偏
- *  （后端 assert_match 只硬校验分辨率，软参数变更只回报不报错）；②临时清重摇
+ *  健壮性（与 submitRedo 同口径）：①提交前套用存档共享参数——**只还原时长/引导
+ *  帧数**（帧坐标是硬结构）；画幅与步数/CFG/采样器等按画布当前值走，不静默纠偏
+ *  （后端 assert_match 只回报不报错，2026-10-12 起分辨率也不再硬拦）；②临时清重摇
  *  标记/关审片逐段确认——残留的重摇会劫持本次提交（redo 优先走重采样），
  *  逐段审片会把全链回放打断成多次运行；③提交前校验放大权重文件在位——换卡/
  *  重装后权重丢失时 load_net 降级只有报告行，提前 alert；④队列提交失败不再只
@@ -3321,10 +3321,10 @@ async function doUpscaleSeg(btn, dir, segNo, dispNo, done, total) {
             }
             return;
         }
-        /* 2. 存档参数套用：软参数白名单（步数/CFG/采样器/调度器/门控）保留画布
-              当前值，其余（画幅/时长/引导帧数）按存档还原——与 submitRedo 同一份
-              redoParamPlan。例外：存档目录为空（参数指纹自动命名）时白名单作废，
-              否则改参数会让这次运行落到新项目目录去。 */
+        /* 2. 存档参数套用：白名单（步数/CFG/采样器/调度器/门控/画幅）保留画布当前值，
+              其余（时长/引导帧数）按存档还原——与 submitRedo 同一份 redoParamPlan。
+              画幅 2026-10-12 起进白名单：链参数不再强制整链一致，改分辨率就按新分辨率
+              重做这一段（相邻段分辨率不同时后端跳过尾帧桥并提示）。 */
         let restored = [];
         let kept = [];
         const mf = await fetchManifest(dir);
@@ -6079,14 +6079,13 @@ async function stopGeneration() {
 /** 提交重摇（页脚 CTA）：随机种子 + 临时开审片（逐段推进：每重摇一段暂停审看），
  *  队列快照在服务端——提交后立即恢复控件并清 ds 标记（manifest 队列接管徽章显示）。
  *  redo 与「重跑起始段」互斥（后端 redo 优先）：提交时显式清零避免旧值干扰。
- *  共享参数**不再全量静默纠偏**：后端 `assert_match` 只硬校验分辨率，
- *  steps/cfg/采样器/调度器/fade_ratio/gate 的变更「只回报、不报错、不触发重做」
- *  （docs/手动锚定_分段latent参考规范化_实施规划.md §4.3）——用户在面板上把步数
- *  从 8 改成 6 再点重摇，本来就该按 6 步重做这一段。老代码在这里把值写回存档值，
- *  表现正是「步数改了没生效」。现在只做两件事：①画幅（唯一硬约束）不一致才还原，
- *  并写进 LED；②其余差异只报「本次按画布当前值重做」，不碰控件。
- *  例外：存档目录为空（按参数指纹自动命名）→ 参数进目录名，改参数＝换新项目，
- *  必须全量还原，否则整条链会被丢掉。 */
+ *  共享参数**不再全量静默纠偏**：后端 `assert_match` 只回报不报错（2026-10-12 起
+ *  连分辨率也不再硬拦），steps/cfg/采样器/调度器/fade_ratio/gate 的变更
+ *  「只回报、不报错、不触发重做」（docs/手动锚定_分段latent参考规范化_实施规划.md §4.3）
+ *  ——用户在面板上把步数从 8 改成 6 再点重摇，本来就该按 6 步重做这一段。老代码在这里
+ *  把值写回存档值，表现正是「步数改了没生效」。现在只做两件事：①时长/引导帧数
+ *  （帧坐标硬结构）不一致才还原，并写进 LED；②其余差异只报「本次按画布当前值重做」，
+ *  不碰控件。 */
 async function submitRedo() {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
@@ -6481,19 +6480,20 @@ async function switchProject(dir) {
  *  **时长（length）与引导帧数（ctx）不在表内**：它们挪动每段帧数与引导窗坐标，
  *  只重做一段会连带下游锚点错位，仍按存档还原（但会写进 LED，不再无声）。 */
 const KEEP_ON_REDO = ["步数", "CFG", "采样器", "调度器",
-    "递减锚定", "桥帧门控", "清晰度阈值", "回退上限"];
+    "递减锚定", "桥帧门控", "清晰度阈值", "回退上限", W_AR, W_MP];
 
 /** 把 manifest 共享参数映射回画布控件，返回改动（值未变不记）的描述列表。
  *  覆盖进指纹的全部共享参数：画幅/时长/引导帧数/步数/CFG/采样器/调度器/
  *  递减锚定/桥帧门控三件套。手动「套用参数」按钮走默认全量口径。
  *
  *  ★ `opts.keep = [控件名]`：命中的控件**保留用户当前值**，不回写存档值。
- *  重摇 / 二采提交传 `KEEP_ON_REDO` —— 后端 `checkpoint.assert_match` 自
- *  2026-09-16 起只硬校验 width/height，软参数变更「只回报、不报错、不触发重做」。
- *  老代码在这里**全量静默纠偏**，于是用户改完步数点「重摇」，值被悄悄写回存档值
- *  —— 表现就是「步数改了没生效，还是跑的 8 步」。
- *  例外：存档目录为空（按参数指纹自动命名）时参数进**目录名**，改参数＝开新项目，
- *  那种情况一律不豁免（调用方传 `keep: []`）。
+ *  重摇 / 二采提交传 `KEEP_ON_REDO` —— 后端 `checkpoint.assert_match` 只回报不报错
+ *  （2026-10-12 起**分辨率也不再硬拦**）。老代码在这里**全量静默纠偏**，于是用户
+ *  改完步数点「重摇」，值被悄悄写回存档值 —— 表现就是「步数改了没生效，还是跑的 8 步」。
+ *  画幅（宽高比/百万像素）2026-10-12 起也进白名单：链参数不再强制整链一致，用户
+ *  把分辨率改了就按新分辨率重做这一段（相邻段分辨率不同时后端跳过尾帧桥并提示）。
+ *  例外**已取消**：旧版「存档目录为空 → 参数进目录名，改参数＝开新项目」的前提没了
+ *  （自动目录名现在固定 `h3chain`，与参数无关），所以不再有全量还原那种情况。
  *
  *  ★ `opts.dry === true`：只算差异、不写控件（提交前把「本次与存档不一致」报给
  *  用户知情）。与真写共用同一份映射表，杜绝两套口径漂移；同一组入参下 dry 的
@@ -6517,7 +6517,7 @@ function applyChainParams(node, params, opts) {
         return setWidgetValue(node, name, value) ? (applied.push(label), true) : false;
     };
     const w = Number(params.width), h = Number(params.height);
-    if (w && h) {
+    if (w && h && !keep.includes(W_AR) && !keep.includes(W_MP)) {
         /* 「自定义」画幅已删（2026-09-27）：精确命中 AR×MP 就用之，否则反推
          * 最近档位（比例就近 + 面积就近 0.1MP）——只写宽/高控件不再有任何效果。 */
         const combo = matchCanvasCombo(w, h) || nearestCanvasCombo(w, h);
@@ -6574,7 +6574,9 @@ function applyChainParams(node, params, opts) {
  *                   自动命名模式）——供调用方写进 LED，不再无声改动用户的值
  *  - `keep`       = 交给真写那次用的白名单 */
 function redoParamPlan(node, params) {
-    const keep = getDirValue(node) ? KEEP_ON_REDO : [];
+    /* 白名单恒生效（2026-10-12）：旧版「存档目录为空 → 参数进目录名，改参数＝换项目」
+     * 的例外已随自动目录名固定化取消——自动项目名现在是 `h3chain`，与参数无关。 */
+    const keep = KEEP_ON_REDO;
     const all = applyChainParams(node, params, { dry: true });
     const willRestore = applyChainParams(node, params, { dry: true, keep });
     return { keep, kept: all.filter((x) => !willRestore.includes(x)), willRestore };
@@ -6775,6 +6777,27 @@ function statusLine(state, mf, plan) {
     return { text: `段 ${done}/${total} 已完成 · 将生成段 ${done + 1}`, next: true };
 }
 
+/* 链提示（2026-10-12）：链参数不再强制整链一致 → 分辨率不一致时后端**只提示不报错**
+ *（相邻段跳过「引用上段尾帧」、本次不自动成片）。报告抽屉默认收起，容易漏看，
+ * 这里把报告里出现过的关键提示在顶栏再亮一条。判据是报告原文，不另建一套状态。 */
+const CHAIN_NOTICE_MARKS = [
+    ["自动成片已跳过：全链分辨率不一致", "本次未自动成片（全链分辨率不一致）"],
+    ["跳过自动引用上段尾帧", "相邻段分辨率不同：已跳过「引用上段尾帧」"],
+];
+function chainNoticeText(state) {
+    const rep = String((state && state.report) || "");
+    if (!rep) return "";
+    const hits = CHAIN_NOTICE_MARKS.filter(([m]) => rep.includes(m)).map(([, t]) => t);
+    return hits.length ? `提示：${hits.join("；")}（详见下方「上次运行报告」）` : "";
+}
+function paintChainNotice(state) {
+    const box = desk && desk.zones && desk.zones.notice;
+    if (!box) return;
+    const txt = chainNoticeText(state);
+    box.textContent = txt;
+    box.style.display = txt ? "" : "none";
+}
+
 function segMediaHtml(state, mf, idx) {
     const done = mf?.done ?? 0;
     const g = idx + planOff(mf);   // 全局槽位：序章占 0，manifest 数组按全局槽位索引
@@ -6903,6 +6926,7 @@ function injectStyles() {
     .h3d-close{width:36px;height:36px;border:1px solid var(--h3d-line);border-radius:7px;background:#2d333b;color:var(--h3d-bone);cursor:pointer;font-size:15px}
     .h3d-close:hover{filter:brightness(1.2)}
     .h3d-banner{display:none;padding:9px 18px;border-bottom:1px solid #8a4a3f;background:#3a2620;color:#ffc9b8;font-size:12px;line-height:1.6}
+    .h3d-notice{display:none;padding:8px 18px;border-bottom:1px solid #8a7a3f;background:#38320f;color:#ffe9a8;font-size:12px;line-height:1.6;cursor:default}
     .h3d-stage{min-height:0;display:grid;grid-template-columns:minmax(255px,300px) minmax(400px,1fr) minmax(255px,300px);gap:1px;background:var(--h3d-line)}
     .h3d-col{min-width:0;min-height:0;background:var(--h3d-panel);overflow:auto}
     .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#22272eee;backdrop-filter:blur(8px);border-bottom:1px solid #3f4854}
@@ -7463,8 +7487,8 @@ function renderMini(data) {
 
     const head = el("div", "h3d-mini-head");
     const brand = el("div", "h3d-mini-brand", "长片导演台");
-    /* 空存档目录 = 按参数指纹自动开项目：如实标注，不拿上次项目名冒充当前链
-     * （否则参数一变悄悄换项目，用户只看到「名字没变却新开了项目」） */
+    /* 空存档目录 = 固定的自动项目目录（h3chain），与参数无关（2026-10-12 起）：
+     * 如实标注，不拿上次项目名冒充当前链 */
     brand.append(el("small", "", escapeHtml(node
         ? (String(getDirValue(node) || "").trim() || "未命名链 · 自动存档")
         : "无节点")));
@@ -7632,6 +7656,12 @@ function openDesk() {
     banner.textContent = apiErrorText;
     banner.style.display = apiErrorText ? "" : "none";
 
+    /* 链提示横幅（2026-10-12）：链参数不再强制整链一致后，「分辨率不一致」这类
+     * 情况后端**只提示不报错**（相邻段跳过「引用上段尾帧」、本次不自动成片）。
+     * 报告抽屉默认是收起的，容易漏看 —— 顶栏再亮一条，点它展开报告。 */
+    const notice = el("div", "h3d-notice");
+    notice.style.display = "none";
+
     /* 主舞台三栏（侧栏各含两个固定分区，渲染器只填充分区内容） */
     const stage = el("div", "h3d-stage");
     const colL = el("aside", "h3d-col left");
@@ -7670,7 +7700,7 @@ function openDesk() {
     const run = el("button", "h3d-btn h3d-btn-cta h3d-run", "▶ 开始生成");
     footer.append(footInfo, stop, run);
 
-    page.append(topbar, banner, stage, footer);
+    page.append(topbar, banner, notice, stage, footer);
     document.body.append(page);
     page.focus();
 
@@ -7682,7 +7712,7 @@ function openDesk() {
             lProj, lHist,
             rParams, rBridge, rUpscale,
             footInfo, run, stop,
-            zoneErr,
+            zoneErr, notice,
         },
         cardsSig: "",
         histSig: "",
@@ -7779,6 +7809,7 @@ function updateDesk(data) {
     const dirName = state?.dir || (node ? getDirValue(node) : "") || "无当前链";
     z.project.textContent = `项目 · ${dirName}`;
     paintLeds();
+    paintChainNotice(state);   // 分辨率不一致这类「只提示不报错」的链提示，顶栏亮一条
 
     /* 左栏：项目与链（含「素材库」入口，见 renderV2Section）+ 成片（左栏底部） */
     runZone("项目与链", () => renderLeftColumn(z.lProj, data));
@@ -7824,21 +7855,20 @@ function renderLeftColumn(sec, data) {
     sec.append(el("div", "h3d-sechead",
         "<strong>项目存档</strong><small>一个项目一个文件夹 · 点击读档继续拍</small>"));
 
-    /* 「存档目录」为空 = 按画布参数指纹自动命名：参数一变即静默开新项目
-     * （用户视角就是「保存有时新建项目、有时又不建」）。把隐式行为亮出来：
-     * 提示成因 + 一键固定到上次运行的项目，之后参数漂移会被后端明确拦下 */
+    /* 「存档目录」为空 = 用固定的自动项目目录（`h3chain`）。2026-10-12 起自动目录名
+     * **不再跟参数走**（旧版按画布参数指纹命名，于是「改个分辨率就换项目」）。
+     * 仍把隐式行为亮出来：提示成因 + 一键固定到上次运行的项目 */
     const autoNamed = !!node && !String(getDirValue(node) || "").trim();
     if (autoNamed) {
         const hint = el("div", "h3d-autohint");
         hint.append(el("div", "",
-            "「存档目录」为空：保存按画布参数指纹自动开项目——参数（画幅/每段时长/"
-            + "步数/CFG/采样器/门控/递减锚定等）一变就换新项目，不变则续用同一个。"
+            "「存档目录」为空：保存进固定的自动项目目录（h3chain）——改参数（画幅/每段时长/"
+            + "步数/CFG/采样器/门控等）不会换项目，同一个目录里继续跑。"
             + (state?.dir ? `上次运行存入 ${escapeHtml(state.dir)}。` : "")
-            + "固定项目：读档任一项目，或点下方按钮。"));
+            + "想给这条链单独一个文件夹：读档任一项目，或点下方按钮。"));
         if (state?.dir) {
             const pin = el("button", "h3d-btn h3d-btn-cyan", "📌 固定当前项目");
-            pin.title = `把「${state.dir}」写进存档目录：此后保存固定进这个项目，`
-                + "参数变化时后端会明确报「存档参数与当前不一致」而不是静默开新项目";
+            pin.title = `把「${state.dir}」写进存档目录：此后保存固定进这个项目`;
             pin.onclick = () => {
                 if (!setDirValue(node, state.dir)) { alert("节点上没有「存档目录/断点目录」控件"); return; }
                 setLed("idle", `已固定项目「${state.dir}」，此后保存都进这个文件夹`);

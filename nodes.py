@@ -2824,6 +2824,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 选择性重做（重摇标记）：{全局槽位: 锚定模式}，队列 = 未跑完的标记快照
         redo_map, redo_queue, _redo_started = {}, [], False
         off = 1 if 起始视频 is not None else 0
+        # 旧存档分辨率基准（逐段账见下方 _archived_res / _slot_res）：旧档没有
+        # manifest.seg_res 逐段记录，整链按 manifest.params 的宽高算。2026-10-12 起
+        # 链参数不再强制整链一致——分辨率变了也不报错，只提示 + 跳过跨分辨率的桥接。
+        _arch_res = (int(width), int(height))
+        _arch_seg_res = None
+        _res_moved = False
         if use_ckpt:
             root = checkpoint.ckpt_dir(ckpt_params, 存档目录.strip())
             manifest = checkpoint.load_manifest(root)
@@ -2839,6 +2845,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     raise ValueError(f"存档目录格式不认识（{manifest.get('schema')}），请换一个目录名；"
                                      "旧版 v1 存档不兼容本版本，请清空旧目录或换新名字")
                 _old_p = manifest.get("params") or {}
+                _res_moved = checkpoint.resolution_changed(_old_p, ckpt_params)
+                _arch_res = (int(_old_p.get("width") or width),
+                             int(_old_p.get("height") or height))
+                if isinstance(manifest.get("seg_res"), list):
+                    _arch_seg_res = manifest["seg_res"]
                 _hint = (f"本次画布 {width}×{height}（{_canvas_src}；"
                          f"反解 {_describe_canvas(width, height)}）"
                          f" ≠ 存档 {_old_p.get('width')}×{_old_p.get('height')}"
@@ -2849,6 +2860,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     report.append("参数已变更（" + "；".join(_pnotes) + "）——"
                                   "仅影响此后新生成的段；已有段是盘上张量、与采样参数无耦合，"
                                   "不会因此重做")
+                if _res_moved:
+                    # 链参数不再强制整链一致（2026-10-12）：分辨率变了照跑，旧段保留
+                    # 原分辨率、此后新段用当前画布。跨分辨率的桥接/成片只提示不阻断。
+                    _rmsg = ("分辨率已变：存档段保留原分辨率，此后新段用当前画布；"
+                             "相邻段分辨率不同的地方会自动跳过「引用上段尾帧」，"
+                             "全链分辨率不一致时本次不自动成片（改用素材库「合并导出」拼片）")
+                    report.append(_rmsg)
+                    print(f"[H3链] {_rmsg}", flush=True)
                 if 起始视频 is None and manifest.get("has_prologue"):
                     off = 1  # 输入已断开仍沿用存档序章（LoadVideo 可 bypass），哈希校验跳过
                 elif 起始视频 is not None and not manifest.get("has_prologue"):
@@ -2940,6 +2959,36 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if review and autosave:
             report.append(f"审片：分段视频每段落盘 → output/h3_projects/{os.path.basename(root) or '…'}/seg_XXX.mp4，"
                           "成片为运行结束时的已确认部分")
+
+        # ---- 逐段分辨率账（2026-10-12：链参数不再强制整链一致） ----
+        # 已存档段用**存档时**的分辨率（manifest.seg_res 逐段记；旧档没这键就整链
+        # 用 manifest.params 的宽高），本次新生成的段用当前画布。相邻段分辨率不同时：
+        # ① 跳过「自动引用上段尾帧」（latent 桥按行预留，C/H/W 不同拼不上）；
+        # ② 跳过接缝帧差/五维评测（跨分辨率比帧没有意义）；
+        # ③ 成片阶段跳过自动合成。三处都只提示、不报错、不阻断生成。
+        _seg_res_map = {}
+        _prev_exec_res = None
+
+        def _archived_res(g):
+            """槽 g 存档时的分辨率（旧档无逐段记录 → 整链一个值）。"""
+            if isinstance(_arch_seg_res, list) and g < len(_arch_seg_res):
+                _r = _arch_seg_res[g]
+                if isinstance(_r, (list, tuple)) and len(_r) == 2:
+                    try:
+                        return (int(_r[0]), int(_r[1]))
+                    except (TypeError, ValueError):
+                        pass
+            return _arch_res
+
+        def _slot_res(g):
+            """槽 g 本次实际用的分辨率：走存档回放的段=存档分辨率，新生成=当前画布。"""
+            if use_ckpt and root is not None and g < done and redo_map.get(g) is None \
+                    and os.path.exists(checkpoint.seg_path(root, g)):
+                return _archived_res(g)
+            return (width, height)
+
+        def _fmt_res(r):
+            return f"{r[0]}×{r[1]}"
 
         # ---- 资产加载与锚解析（root 已确定）：引用集张量 + 标注锚 + 身份锚编码 ----
         def _project_root_for_assets():
@@ -3125,6 +3174,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             return {k: _merged_list(v, _old_lists.get(k, []), upto)
                     for k, v in new_lists.items()}
 
+        def _res_list(upto):
+            """manifest.seg_res：逐段分辨率 [w, h]（槽位对齐，跨次运行续跑用）。
+
+            这是「链参数不再强制一致」的落点——没有它，下次运行就分不清哪些段是
+            旧分辨率、哪些是新分辨率，跨分辨率桥接的跳过判定与成片闸门都无从谈起。
+            """
+            return [list(_seg_res_map.get(x, (width, height))) for x in range(upto)]
+
         prev_end_t = None   # 上一处理生成段的输出末端 token 边界（重摇 unlink 段上锚对齐用；序章重置 None）
 
         # 三库携带：主循环的 manifest 全量覆写必须带上三库/文本键，否则一次运行
@@ -3240,6 +3297,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 return None
             if prev_g >= off and prev_g - off >= len(exec_items):
                 return None
+            # 跨分辨率不接桥（本段重摇按当前画布重采样，上段存档是旧分辨率时拼不上）
+            _pv_res = _archived_res(prev_g)
+            if _pv_res != (width, height):
+                _rmsg = (f"段{g + 1} 重摇：上段分辨率 {_fmt_res(_pv_res)} ≠ 本段 "
+                         f"{_fmt_res((width, height))}，跳过自动引用上段尾帧")
+                report.append(_rmsg)
+                print(f"[H3链] {_rmsg}", flush=True)
+                return None
             try:
                 pv, pa = checkpoint.load_segment(root, prev_g)
             except Exception:
@@ -3259,6 +3324,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if root is None or ni < 0 or ni >= len(exec_items):
                 return None
             if nxt_g >= done or nxt_g in redo_map:
+                return None
+            # 跨分辨率不接下锚：本段按当前画布重采样，下段存档是旧分辨率时拼不上。
+            # 只提示不报错——重摇本身照跑，只是尾锚缺省。
+            if _archived_res(nxt_g) != (width, height):
+                _rmsg = (f"段{g + 1} 重摇：下段分辨率 {_fmt_res(_archived_res(nxt_g))} ≠ 本段 "
+                         f"{_fmt_res((width, height))}，跳过接下段首帧尾锚")
+                report.append(_rmsg)
+                print(f"[H3链] {_rmsg}", flush=True)
                 return None
             kind, idx = exec_items[ni]
             if kind != "prompt" or seg_unlink[idx] or seg_disabled[idx]:
@@ -3518,6 +3591,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
                         "seam_metrics": [None], "seam_refine": seam_refine,
+                        "seg_res": [[int(width), int(height)]],   # 序章槽：当前画布
                         "upscale": proj_upscale,
                         "redo_queue": list(redo_queue),
                         "assets": list(_carry.get("assets") or []),
@@ -3555,6 +3629,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 默认口径（_keep_frames=False）下**不持有**：成片走流式拼接，帧用完即弃。
             _cf = pframes.cpu()
             _frame_counts.append(int(_cf.shape[0]))
+            # 序章槽分辨率：新编码=当前画布；存档回放=存档分辨率（跨分辨率接桥要跳过）
+            _pro_res = (width, height) if prologue_fresh else _archived_res(0)
+            _seg_res_map[0] = _pro_res
+            _prev_exec_res = _pro_res
             if _keep_frames:
                 all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
             seg_wavs.append({"waveform": pwav.cpu(), "sample_rate": sample_rate})
@@ -3564,7 +3642,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
             seam_n0 = max(1, int(sample_rate * 0.25))
             prev_tail_wav = pwav.cpu()[..., -seam_n0:]
             _profpi = exec_items[0][1] if exec_items and exec_items[0][0] == "prompt" else -1
-            guide = _inject_guide(pv, pa, _profpi)
+            _pro_nxt_res = _slot_res(off) if _profpi >= 0 else None
+            if _pro_nxt_res is not None and _pro_nxt_res != _pro_res:
+                guide = None
+                report.append(f"序章 → 段{off + 1}：分辨率不同（{_fmt_res(_pro_res)} ≠ "
+                              f"{_fmt_res(_pro_nxt_res)}），跳过自动引用上段尾帧")
+                print(f"[H3链] 序章 → 段{off + 1}：分辨率不同（{_fmt_res(_pro_res)} ≠ "
+                      f"{_fmt_res(_pro_nxt_res)}），跳过自动引用上段尾帧", flush=True)
+            else:
+                guide = _inject_guide(pv, pa, _profpi)
             report.append(f"段1/{total}：{prologue_origin} 序章 留{pframes.shape[0]}帧 · 种子 — | guide=无（序章）")
 
         # 每段耗时账（⏱ 报告行数据源）：cond=一采条件构建（TE/参考编码）、
@@ -3670,6 +3756,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 def _old_rec(k, default):
                     seq = (_old_lists or {}).get(k) or []
                     return seq[g] if g < len(seq) else default
+                _seg_res_map[g] = _slot_res(g)   # 禁用段不进成片，仅占位保持槽位对齐
                 thumbs.append(_old_rec("thumbs", ""))
                 videos.append(_old_rec("videos", ""))
                 seams.append(_old_rec("seams", None))
@@ -3690,6 +3777,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _redo_mode = redo_map.get(g)
             replay = (use_ckpt and g < done and _redo_mode is None
                       and os.path.exists(checkpoint.seg_path(root, g)))
+            # 本段实际分辨率（回放=存档分辨率 / 新生成=当前画布）+ 与上一执行段的异同。
+            # 分辨率不同的相邻段之间不做跨分辨率干预（尾帧桥/接缝测量），只提示。
+            _cur_res = _archived_res(g) if replay else (width, height)
+            _seg_res_map[g] = _cur_res
+            _res_same_prev = (_prev_exec_res is None) or (_prev_exec_res == _cur_res)
             next_wants_bridge = _next_wants_bridge(item_i)
             # 本段是否接收上段桥：事实首段没有上源；_eff_inject 已内含 unlink（返回 0）。
             _eff_fr, _has_v, _has_a = _eff_inject(i)
@@ -3984,7 +4076,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
                         _decode_crop(i, video_t, audio_t, skip_f, gi=g, next_bridge=next_wants_bridge)
                     d_raw = None
-                    if prev_tail_frame is not None and not seg_unlink[i] and _visual_bridge(i):
+                    # 接缝重摇的判据也是帧差：跨分辨率比不了，直接不重摇（不阻断生成）
+                    if prev_tail_frame is not None and not seg_unlink[i] \
+                            and _visual_bridge(i) and _res_same_prev:
                         d_raw = qc.seam_metrics(prev_tail_frame, frames[0])[0]
                     if best is None or (d_raw is not None and (best[0] is None or d_raw < best[0])):
                         best = (d_raw, (frames.cpu(), wav.cpu(), sample_rate,
@@ -4033,18 +4127,23 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 接缝后验测量（测而不干预）：上一段最后可见帧 vs 本段首帧。
             # 只对真接了视觉桥的段有意义：断链段（unlink）与引导关闭的硬切段
             # 帧差必然巨大，测出来只会每段误报「建议人工检查」。
+            # 跨分辨率同样不测：帧差/五维评测要求上下段同画布，形状不同连帧都拼不上
+            # （与「跳过引用上段尾帧」同一条根因，这里只是别报出无意义的数字）。
+            _seam_ok = bool(not seg_unlink[i] and _visual_bridge(i) and _res_same_prev)
+            if not _seam_ok and not seg_unlink[i] and _visual_bridge(i) \
+                    and prev_tail_frame is not None:
+                report.append(f"段{g + 1}：与上段分辨率不同（{_fmt_res(_prev_exec_res)} ≠ "
+                              f"{_fmt_res(_cur_res)}），跳过接缝测量")
             seam_n = int(sample_rate * 0.25)
             seam_d, seam_db = None, None
-            if (item_i > 0 or off) and prev_tail_frame is not None \
-                    and not seg_unlink[i] and _visual_bridge(i):
+            if (item_i > 0 or off) and prev_tail_frame is not None and _seam_ok:
                 seam_d, seam_db = qc.seam_metrics(prev_tail_frame, frames[0],
                                                   prev_tail_wav, wav[..., :seam_n], rate=sample_rate)
                 db_txt = f"{seam_db:+.1f} dB" if seam_db is not None else "—"
                 flag = " ↑ 建议人工检查" if seam_d > 0.08 or (seam_db is not None and abs(seam_db) > 6.0) else ""
                 report.append(f"段{g + 1} 接缝：帧差 {seam_d:.3f} · 响度跳变 {db_txt}{flag}")
 
-            if (item_i > 0 or off) and prev_tail_frame is not None \
-                    and not seg_unlink[i] and _visual_bridge(i):
+            if (item_i > 0 or off) and prev_tail_frame is not None and _seam_ok:
                 seams.append([round(seam_d, 4), None if seam_db is None else round(seam_db, 2)])
             else:
                 seams.append(None)
@@ -4052,8 +4151,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 本段头 48 帧的局部基线评测，在最终成帧上测。
             # 写入 manifest seam_metrics（tools/ab_report.py 的 A/B 对比数据源）
             z_row = None
-            if (item_i > 0 or off) and prev_tail_clip is not None \
-                    and not seg_unlink[i] and _visual_bridge(i):
+            if (item_i > 0 or off) and prev_tail_clip is not None and _seam_ok:
                 try:
                     z_row = metrics.evaluate_local(prev_tail_clip, frames[:48].cpu())
                     z_txt = metrics.fmt_seam_z(z_row)
@@ -4061,8 +4159,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         report.append(f"段{g + 1} 接缝基准：{z_txt}（|z|<2 合格）")
                 except Exception:
                     z_row = None
-            seam_metrics_rows.append(z_row if ((item_i > 0 or off) and not seg_unlink[i]
-                                               and _visual_bridge(i)) else None)
+            seam_metrics_rows.append(z_row if ((item_i > 0 or off) and _seam_ok) else None)
 
             _cf = frames.cpu()
             # 帧存 uint8（内存 ×¼）：全链帧 tensor 是内存峰值的大头（D3：
@@ -4074,6 +4171,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 默认口径（_keep_frames=False）不持有帧；段计数改由 _frame_counts 承担
             # （轻量 int 列表，不是当年的 seg_frames —— 别再把两者混为一谈）。
             _frame_counts.append(int(_cf.shape[0]))
+            _prev_exec_res = _cur_res   # 供下段判「相邻分辨率是否一致」
             if _keep_frames:
                 all_frames.append(_frames_to_uint8(_cf) if _frames_uint8 else _cf)
             seg_wav = wav.cpu()
@@ -4125,7 +4223,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 以前按 seg_unlink 与 audio_latent 猜，于是断链段上的显式头锚被说成
             # "guide=无"（其实钉了）、「仅音频」锚被说成"上段尾N帧+音频"（其实没钉画面）。
             # 回放段不注入接片，这里仍读交棒位（与旧报告口径一致）。
-            if guide is None or not _takes_bridge(i):
+            if not _res_same_prev and _takes_bridge(i) and not seg_unlink[i]:
+                # 与上段分辨率不同 → 本段没拿到尾帧桥（交棒端已按同一判据跳过）
+                note = (f"guide=无（与上段分辨率不同 {_fmt_res(_prev_exec_res)} ≠ "
+                        f"{_fmt_res(_cur_res)}，跳过自动引用上段）")
+            elif guide is None or not _takes_bridge(i):
                 if seg_unlink[i]:
                     note = "guide=无（关闭自动引用上段·断链）"
                 elif ctx <= 0 and _head_anchor(i) is None:
@@ -4164,7 +4266,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 分段优先：按下段的 latent_ref.frames/分支取桥。
             _nxt_pi = _next_consumer(item_i)
             if _nxt_pi >= 0 and _takes_bridge(_nxt_pi):
-                guide = _inject_guide(video_t, audio_t, _nxt_pi, end_tokens=end_t)
+                # 下一段的全局槽位（`_next_consumer` 给的是提示词段索引，不是槽位）
+                _nxt_g = next((_k + off for _k, _it in enumerate(exec_items)
+                               if _it[0] == "prompt" and _it[1] == _nxt_pi), -1)
+                _nxt_res = _slot_res(_nxt_g) if _nxt_g >= 0 else (width, height)
+                if _nxt_res != _cur_res:
+                    # 跨分辨率不生成尾帧桥：latent 桥按行预留，C/H/W 不同拼不上。
+                    # 只提示不报错——链参数不再强制整链一致（2026-10-12）。
+                    guide = None
+                    _bmsg = (f"段{g + 1} → 段{_nxt_g + 1}：分辨率不同"
+                             f"（{_fmt_res(_cur_res)} ≠ {_fmt_res(_nxt_res)}），"
+                             "跳过自动引用上段尾帧")
+                    report.append(_bmsg)
+                    print(f"[H3链] {_bmsg}", flush=True)
+                else:
+                    guide = _inject_guide(video_t, audio_t, _nxt_pi, end_tokens=end_t)
 
             if use_ckpt and not replay:
                 # 选择性重做不倒退进度：重摇段完成后 done 保持全链完成数
@@ -4191,6 +4307,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "clips": list(_carry.get("clips") or []),
                     "merges": list(_carry.get("merges") or []),
                     "seg_fields": list(_carry.get("seg_fields") or []),
+                    "seg_res": _res_list(done),   # 逐段分辨率（跨分辨率跳过判定的真源）
                     **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
                            "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
                            "trims": trims}, done),
@@ -4243,6 +4360,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "clips": list(_carry.get("clips") or []),
                 "merges": list(_carry.get("merges") or []),
                 "seg_fields": list(_carry.get("seg_fields") or []),
+                "seg_res": _res_list(done),   # 逐段分辨率（跨分辨率跳过判定的真源）
                 **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
                        "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
                        "trims": trims}, done),
@@ -4278,7 +4396,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # ——默认口径不留帧，流式不成就没有成片，报告里给明去路。
         # 禁用段两路同口径剔除：高清拼接传 skip_slots，内存帧本就不含禁用段
         if autosave_final:
-            if not (up_cfg and upscale.try_final(root, up_cfg, report, skip_slots=_off_slots)):
+            # 全链分辨率闸门（2026-10-12）：链参数不再强制整链一致，于是成片可能
+            # 面对混合分辨率的段——分段各自分辨率不同，拼成一条成片没有意义，
+            # 本次不自动合成，只提示（改用素材库「合并导出」自行拼片）。
+            _res_set = {tuple(_seg_res_map[g]) for g in _seg_res_map if g not in _off_slots}
+            if len(_res_set) > 1:
+                _rlist = "、".join(_fmt_res(r) for r in sorted(_res_set))
+                _cmsg = (f"自动成片已跳过：全链分辨率不一致（{_rlist}）——"
+                         "各段分辨率不同，拼不出成片；想合成请先把各段分辨率改成一致，"
+                         "或用素材库「合并导出」自行拼片")
+                report.append(_cmsg)
+                print(f"[H3链] {_cmsg}", flush=True)
+            elif not (up_cfg and upscale.try_final(root, up_cfg, report, skip_slots=_off_slots)):
                 if _redo_started and len(_frame_counts) < _final_segs:
                     # 重摇审片中段 break：内存帧只有已处理段，编码会产出半截成片污染
                     # finals；重摇段 mp4 已覆盖、保留段沿用，全部分段都在盘——下次

@@ -117,8 +117,8 @@ def test_copy_project_inherits_content_and_files(P, projroot):
     assert mf["assets"][0]["file"] == "assets/girl.png"
     assert mf["asset_links"][0]["asset_id"] == "a_0123456789ab"
     # params **不继承**：它是"这条链是用什么分辨率跑出来的"运行指纹，带过去会让
-    # 新项目一落地就被旧画幅钉住（后端 assert_match 拿它比对画布，改分辨率就报错）。
-    # 留空则由首跑按当前画布值写入 —— 新项目用新参数。
+    # 新项目一落地就被旧画幅钉住（旧行为下后端 assert_match 拿它比对画布，改分辨率
+    # 就报错）。留空则由首跑按当前画布值写入 —— 新项目用新参数。
     assert mf["params"] == {}, "复制项目不得继承 params（否则新项目改不了分辨率）"
     assert "params" not in P._COPY_CONTENT_KEYS
     assert (mf["done"], mf["total"]) == (0, 3), "内容 3 段照带，进度归零"

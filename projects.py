@@ -167,7 +167,7 @@ def read_project(name: str):
 # 「裸名且根目录没有、finals//assets/ 有」的条目换成真实位置即可，查不到
 # 原样保留；manifest 本体零改动，旧项目与新代码互不污染。
 _MEDIA_EXTS = (".mp4", ".png", ".jpg", ".jpeg", ".webp", ".wav")
-_MEDIA_LIST_KEYS = ("videos", "thumbs", "seams", "finals", "merges")
+_MEDIA_LIST_KEYS = ("videos", "thumbs", "seams", "finals", "merges", "base_videos")
 
 
 def _viewable_media(name: str, root: str):
@@ -190,8 +190,10 @@ def _viewable_media(name: str, root: str):
 def with_viewable_paths(name: str, manifest):
     """返回给 UI 的 manifest 副本：白名单媒体字段里的裸名换成真实位置。
 
-    只认 {_MEDIA_LIST_KEYS} 五个字段的两种形态（纯字符串列表 / {file:...}
+    只认 {_MEDIA_LIST_KEYS} 里的字段的两种形态（纯字符串列表 / {file:...}
     字典列表）；其余字段原样共享，manifest 本体零改动。
+    `base_videos`（一采分段另存，二采基础设置「保存一采分段成片」）一并纳入，
+    它写的本来就是 finals/ 前缀路径，走这里只是与其他媒体键同口径兜底。
     """
     if not isinstance(manifest, dict) or not safe_name(name):
         return manifest

@@ -393,6 +393,39 @@ def upscale_files(idx: int) -> dict:
     }
 
 
+def base_seg_files(idx: int) -> dict:
+    """一采（基础）分段**另存**产物文件名（二采基础设置「保存一采分段成片」开启时）。
+
+    为什么需要单独一份：二采成功时 `finals/seg_NNN.mp4` 会被高清结果**同名覆盖**，
+    一采那版分段就永久没了。开启该选项后，主循环把一采解码结果另存
+    `finals/base_seg_NNN.mp4`（缩略图 `finals/base_thumb_NNN.png`），与高清版并存
+    —— 段卡上「一采分段成片」/「二采分段成片」两个入口分别取两版。
+    """
+    return {
+        "mp4": f"base_seg_{idx:03d}.mp4",
+        "thumb": f"base_thumb_{idx:03d}.png",
+    }
+
+
+def remove_base_seg(root: str, idx: int) -> None:
+    """删掉一采另存产物（base_seg_NNN.mp4 / base_thumb_NNN.png）。
+
+    什么时候用：该段**重新采样**过（内容变了）又没重新另存 —— 旧件已是上一版
+    内容，必须清掉。只清 manifest 记录不删文件是不够的：下次运行该段是回放
+    （replay），另存走 `fresh=False`，会把盘上那份旧件当"现件"直接沿用，用户
+    点开「一采分段成片」看到的是一段对不上的旧视频。
+
+    ⚠ **不碰 `seg_NNN.mp4`**：那是段视频本体（二采关着时它就是当前的一采成片），
+    删了等于把成片删掉。旧格式裸名与 finals/ 双路径都清。
+    """
+    for name in base_seg_files(idx).values():
+        for cand in (os.path.join(root, "finals", name), os.path.join(root, name)):
+            try:
+                os.remove(cand)
+            except OSError:
+                pass
+
+
 def upscale_legacy_files(idx: int) -> tuple:
     """旧版二采独立产物文件名（重渲染该段时清理，防新旧文件混淆）。"""
     return (f"upseg_{idx:03d}.pt", f"upseg_{idx:03d}.mp4", f"upthumb_{idx:03d}.png")
@@ -490,13 +523,16 @@ def load_state():
         return None
 
 
-def save_thumb(seg_dir: str, idx: int, frame) -> str:
+def save_thumb(seg_dir: str, idx: int, frame, name: str = None) -> str:
     """段可见首帧 -> finals/thumb_NNN.png（长边 256）。Pillow 缺失时返回空串（面板降级占位）。
+
+    name=显式文件名（不带目录），默认 thumb_NNN.png；一采另存的分段缩略图走它
+    （见 base_seg_files）。
 
     四库规范：新文件一律写 finals/，返回 "finals/thumb_NNN.png"；
     旧根目录文件读走 resolve_project_file 双路径兼容，不主动搬。
     """
-    name = f"thumb_{idx:03d}.png"
+    name = name or f"thumb_{idx:03d}.png"
     rel = f"finals/{name}"
     try:
         from PIL import Image
@@ -515,11 +551,15 @@ def save_thumb(seg_dir: str, idx: int, frame) -> str:
 
 def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
                      fps: int = 24, fresh: bool = True, crf: int = 20,
-                     preset: str = "veryfast", aq_mode=None, dither=False) -> str:
+                     preset: str = "veryfast", aq_mode=None, dither=False,
+                     name: str = None) -> str:
     """段可见帧 + 音轨 -> seg_NNN.mp4（编码实现在 media.save_av_mp4，与成片保存共用）。
 
     crf/preset/aq_mode/dither 为编码质量旋钮（默认值=现状兼容；二采 HQ 档
     由 upscale.render_segment 按编码档位解析后传入，基础链仍走默认）。
+
+    name=显式文件名（不带目录），默认 seg_NNN.mp4；一采另存分段走 base_seg_NNN.mp4
+    （见 base_seg_files）。
 
     缺失或编码失败返回空串（上游回退为缩略图，不影响主流程）。
     fresh=False（存档回放）且文件已存在时直接沿用，避免每次续跑全链重编码。
@@ -527,7 +567,7 @@ def save_segment_mp4(seg_dir: str, idx: int, frames, wav, sample_rate: int,
     四库规范：新文件写 finals/seg_NNN.mp4，返回 "finals/seg_NNN.mp4"；
     fresh=False 时 finals/ 与旧根目录双路径命中即沿用（返回实际命中的相对路径）。
     """
-    name = f"seg_{idx:03d}.mp4"
+    name = name or f"seg_{idx:03d}.mp4"
     rel = f"finals/{name}"
     path = os.path.join(finals_dir(seg_dir), name)
     if not fresh:

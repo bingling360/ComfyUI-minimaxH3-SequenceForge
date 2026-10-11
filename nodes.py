@@ -2399,6 +2399,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 一采/二采是否是两份独立权重：True 时每段二采入口先卸一采（见 _up_hi）。
         # 同 base 的克隆（只差 LoRA）不卸——卸了等于把二采自己搬走，纯浪费。
         _up_swap = upscale.models_distinct(模型, _up_model)
+        # 「保存一采分段成片」（二采基础设置，默认关）：二采成功时 finals/seg_NNN.mp4
+        # 被高清结果同名覆盖 → 一采那版分段没了。开启后，凡在二采范围内的段，一采
+        # 解码结果**先**另存 finals/base_seg_NNN.mp4 再去二采（哪怕二采随后失败/
+        # 中断，一采产物也已落盘）。只在二采开启时才有意义，故与 up_cfg 同源。
+        _keep_base_seg = bool(up_cfg and up_cfg.get("keep_base_seg"))
         _up_swap_logged = [False]
         # 阶段 0 只读探测：同 base 只差 LoRA 时到底有没有真的回载权重（§5.3）。
         # 只打一次，避免每段刷屏。
@@ -3173,7 +3178,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 直接写 [:done] 会丢保留段记录，写盘前用 _merged_list 补尾）
         _old_lists = ({k: list(manifest.get(k) or [])
                        for k in ("thumbs", "videos", "seams", "bridge_scores",
-                                 "seam_metrics", "trims")}
+                                 "seam_metrics", "trims", "base_videos")}
                       if (use_ckpt and manifest is not None) else None)
 
         def _ml(new_lists, upto):
@@ -3182,6 +3187,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 return {k: list(v)[:upto] for k, v in new_lists.items()}
             return {k: _merged_list(v, _old_lists.get(k, []), upto)
                     for k, v in new_lists.items()}
+
+        def _old_val(key, idx, default=""):
+            """槽位 idx 的旧记录（无则 default）——与 `_ml` 同一份 `_old_lists` 快照。
+
+            用途：**这次没重算的槽位要沿用旧值，不能写空**。`_ml` 在「新列表已经
+            填满 upto」时是**纯截断**（不再从旧列表补），所以凡是"本次没重新产出"
+            的槽位，写空串等于把它抹掉。base_videos 就是这种键：手动选择模式
+            （「重新二采此段」）只有一段在范围内，其余段若写空，段卡上的一采入口
+            会集体变灰，而文件其实好好躺在盘上。
+            """
+            seq = (_old_lists or {}).get(key) or []
+            return seq[idx] if idx < len(seq) else default
 
         def _res_list(upto):
             """manifest.seg_res：逐段分辨率 [w, h]（槽位对齐，跨次运行续跑用）。
@@ -3501,6 +3518,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         prompt_list = (["「序章（上传视频）」"] if off else []) + [
             seg_prompts[it[1]] for it in exec_items]
         thumbs, videos, seams, bridge_scores = [], [], [], []
+        # 一采分段另存（「保存一采分段成片」开启时的 finals/base_seg_NNN.mp4）：
+        # 与 thumbs/videos 槽位对齐，空串=该槽没有一采另存产物。manifest.base_videos。
+        base_videos = []
         all_frames = []          # 全链帧：仅 _keep_frames（final_mode=memory）时非空
         # 每段帧数：len()/sum() 的用途全部走它，不持有帧本身 —— 默认口径下
         # all_frames 是空的，凡是「拿它当段计数/总帧数」的地方都必须改用它。
@@ -3610,6 +3630,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         "schema": checkpoint.SCHEMA, "done": 1, "has_prologue": True,
                         "seeds": [0], "trims": [0], "prompt_hashes": [prologue_hash],
                         "total": total, "thumbs": [], "videos": [], "prompts": prompt_list,
+                        "base_videos": [],   # 序章是外部成品素材，不做二采、也不另存一采
                         "seams": [None], "bridge_scores": [None], "params": ckpt_params,
                         "seam_metrics": [None], "seam_refine": seam_refine,
                         "seg_res": [[int(width), int(height)]],   # 序章槽：当前画布
@@ -3642,6 +3663,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _u_files = checkpoint.upscale_files(0)
                 thumbs.append(_u_files["thumb"])
                 videos.append(_u_files["mp4"])
+            base_videos.append("")   # 序章槽没有一采另存（外部素材不二采）
             seams.append(None)
             bridge_scores.append(None)
             seam_metrics_rows.append(None)
@@ -3781,6 +3803,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _seg_res_map[g] = _slot_res(g)   # 禁用段不进成片，仅占位保持槽位对齐
                 thumbs.append(_old_rec("thumbs", ""))
                 videos.append(_old_rec("videos", ""))
+                base_videos.append(_old_rec("base_videos", ""))
                 seams.append(_old_rec("seams", None))
                 bridge_scores.append(_old_rec("bridge_scores", None))
                 seam_metrics_rows.append(_old_rec("seam_metrics", None))
@@ -4227,6 +4250,47 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         end_frame_latent
                         if (seg_end_on[i] and end_frame_latent is not None)
                         else _anchor_tail(i))
+                # 「保存一采分段成片」（二采基础设置）：**先**把一采解码结果另存，
+                # 再交给二采接管 seg_NNN.mp4（二采成功会同名覆盖）。
+                # ⚠ 顺序有意为之——放在 `_up_hi` 之前：二采预检/显存致命会抛
+                # UpscaleAbortError **终止整链**，放后面就一段都留不下；放前面则
+                # 「开了一采另存」就一定能拿到一采成片，与二采成败无关。
+                # 只在二采范围内另存（范围外的段 seg_NNN.mp4 本就是基础版，另存=白占盘）。
+                # fresh=not replay：存档回放且已另存过就沿用，不每次续跑重编码一遍。
+                #
+                # 三态（顺序不能乱，尤其别把 replay 那档写成空串）：
+                #   ① 开了开关且在范围内        → 另存，记录新路径
+                #   ② 这次没另存，但本段是**回放** → 内容没变，旧件仍对应本段 → 沿用旧记录
+                #   ③ 这次没另存，且本段**重新采样** → 旧件是上一版内容 → 清记录 + 删文件
+                # ②写空串的后果：`_ml` 在列表填满时纯截断 → 「重新二采此段」
+                # （手动选择模式只有一段在范围内）或「二采关着再跑一遍」会把其余段的
+                # 记录全冲成空，段卡上一采入口集体变灰而文件还在盘上。
+                # ③不删文件的后果：下次回放带着 fresh=False 把旧件当现件沿用。
+                _bv_old = _old_val("base_videos", g)
+                if _keep_base_seg and up_cfg and upscale.in_scope(up_cfg, g):
+                    _bf = checkpoint.base_seg_files(g)
+                    _bmp4 = checkpoint.save_segment_mp4(
+                        root, g, frames, wav, sample_rate, fresh=not replay,
+                        crf=_bcrf, preset=_bpreset, aq_mode=_baq, dither=_bdith,
+                        name=_bf["mp4"])
+                    if _bmp4:
+                        checkpoint.save_thumb(root, g, frames[0], name=_bf["thumb"])
+                        base_videos.append(_bmp4)
+                    else:
+                        report.append(f"段{g + 1} 一采分段另存失败"
+                                      f"（base_seg_{g:03d}.mp4 未写出）——二采产物不受影响")
+                        if not replay:
+                            checkpoint.remove_base_seg(root, g)   # 写坏/写不出就别留残件
+                        base_videos.append(_bv_old if replay else "")
+                elif replay:
+                    # 旧件在盘上才保留记录（被手工删过就清掉，免得点开是黑屏）
+                    _bv_ok = bool(_bv_old) and os.path.isfile(
+                        checkpoint.resolve_project_file(root, _bv_old))
+                    base_videos.append(_bv_old if _bv_ok else "")
+                else:
+                    if _bv_old:
+                        checkpoint.remove_base_seg(root, g)
+                    base_videos.append("")
                 hi_ready, hi_tried = _up_hi(g, video_t, audio_t, "prompt", i,
                                             _up_guide_kf, _up_tail_kf, _head_kf,
                                             cur_seed, skip_f, frames.shape[0],
@@ -4244,6 +4308,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             else:
                 thumbs.append("")
                 videos.append("")
+                base_videos.append("")
 
             # 本段 latent 注入开关（旧字段 latent_ref.on）：旧档才带，现由
             # migrate_legacy_seg 迁走、新状态里已无此概念 —— 故取空字典，
@@ -4341,9 +4406,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     "merges": list(_carry.get("merges") or []),
                     "seg_fields": list(_carry.get("seg_fields") or []),
                     "seg_res": _res_list(done),   # 逐段分辨率（跨分辨率跳过判定的真源）
-                    **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
-                           "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
-                           "trims": trims}, done),
+                    **_ml({"thumbs": thumbs, "videos": videos, "base_videos": base_videos,
+                           "seams": seams, "bridge_scores": bridge_scores,
+                           "seam_metrics": seam_metrics_rows, "trims": trims}, done),
                 })
 
             pbar.update(1)
@@ -4394,15 +4459,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "merges": list(_carry.get("merges") or []),
                 "seg_fields": list(_carry.get("seg_fields") or []),
                 "seg_res": _res_list(done),   # 逐段分辨率（跨分辨率跳过判定的真源）
-                **_ml({"thumbs": thumbs, "videos": videos, "seams": seams,
-                       "bridge_scores": bridge_scores, "seam_metrics": seam_metrics_rows,
-                       "trims": trims}, done),
+                **_ml({"thumbs": thumbs, "videos": videos, "base_videos": base_videos,
+                       "seams": seams, "bridge_scores": bridge_scores,
+                       "seam_metrics": seam_metrics_rows, "trims": trims}, done),
             })
             if review:
                 if len(_frame_counts) == _final_segs:
                     report.append("审片：本链已全部完成")
                 if reroll > 0:
                     report.append(f"注意：「重跑起始段」={reroll} 已生效，确认无误后请改回 0")
+            # 一采分段另存的落盘回执（只报一行，逐段报会把报告刷成流水账）
+            _n_base = sum(1 for _x in base_videos if _x)
+            if _n_base:
+                report.append(f"一采分段另存：本次 {_n_base} 段 → base_seg_NNN.mp4"
+                              "（二采基础设置「保存一采分段成片」已开；段卡「一采分段成片」可看）")
             report.append(f"项目文件夹（视频/提示词/latent 全在此，删项目=删整个文件夹）：{root}")
             checkpoint.save_state({"dir": os.path.basename(root), "total": total, "done": done,
                                    "review": bool(review), "reroll": reroll,

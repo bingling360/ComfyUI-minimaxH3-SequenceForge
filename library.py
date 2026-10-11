@@ -416,9 +416,15 @@ def scan_scope(scope, project=None) -> list:
                 k = kind_of(rel)
                 if k not in MEDIA_KINDS:
                     continue
+                base = os.path.basename(rel)
                 label = {"videos": "分段", "finals": "成片",
                          "merges": "合并", "clips": "剪辑"}.get(sub, sub)
-                items.append(_entry("finals", k, os.path.basename(rel), rel, full,
+                # 一采另存件（二采基础设置「保存一采分段成片」，checkpoint.base_seg_files）
+                # 也叫 xxx.mp4 躺在 finals/ 里，混着报「成片」会让人以为是重复文件 ——
+                # 单独标出来，一眼能分辨哪份是一采、哪份是二采。
+                if base.startswith("base_seg_") or base.startswith("base_thumb_"):
+                    label = "一采分段"
+                items.append(_entry("finals", k, base, rel, full,
                                     origin=f"成片 · {label}"))
         return items
 

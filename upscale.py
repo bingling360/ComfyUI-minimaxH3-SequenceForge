@@ -181,6 +181,13 @@ def parse_state(ds):
         "scheduler": str(up.get("scheduler") or "").strip(),
         "retry": up.get("retry") is True,
         "retry_target": _num("retry_target", 0.15, 0.05, 1.0),
+        # 「保存一采分段成片」（默认关）：二采成功时 finals/seg_NNN.mp4 被高清结果
+        # **同名覆盖**，一采那版分段就没了。开启后一采解码结果另存
+        # finals/base_seg_NNN.mp4（见 nodes.py 主循环），段卡上「一采分段成片」/
+        # 「二采分段成片」两个入口分别取两版。
+        # ⚠ **不进 params_hash**：它只决定「多存一份什么」，不改二采本身的输出，
+        # 进指纹会让这个开关一拨就把既有高清段全部判失效重做。
+        "keep_base_seg": up.get("keep_base_seg") is True,
         "include": include,
         # ⛔ `chunk` / `force_unload` / `encode` **不在这里解析**（2026-09-23 迁走）。
         #
@@ -557,6 +564,8 @@ def _hash_params(cfg):
         keys["scheduler"] = cfg["scheduler"]
     if cfg.get("retry"):
         keys["retry"] = cfg["retry_target"]
+    # ⛔ `keep_base_seg`（保存一采分段成片）**故意不进指纹**：它只多存一份一采产物，
+    # 二采输出本身一个像素都不变。进指纹等于「拨一下开关 = 全链高清段重做」。
     return keys
 
 

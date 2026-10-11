@@ -2287,6 +2287,10 @@ function defaultUpscale() {
               * 「放大网络 · 分块 / 常驻」两组。别再往这里加回来。 */
              device: "auto",
              sampler: "euler", scheduler: "simple", retry: false, retry_target: 0.15,
+             /* 保存一采分段成片（默认关）：二采成功时 seg_NNN.mp4 被高清结果同名覆盖，
+                开它才会把一采解码结果另存 base_seg_NNN.mp4（见 upscale.parse_state）。
+                不进二采指纹 —— 拨开关不会让既有高清段重做。 */
+             keep_base_seg: false,
              include: [] };
 }
 
@@ -2520,6 +2524,8 @@ function getDs(node) {
             scheduler: typeof upRaw.scheduler === "string" ? upRaw.scheduler.trim() : "",
             retry: upRaw.retry === true,
             retry_target: upNum(upRaw.retry_target, 0.15, 0.05, 1.0),
+            /* 保存一采分段成片（旧 JSON 缺键 = 关，后端 parse_state 同口径） */
+            keep_base_seg: upRaw.keep_base_seg === true,
             include: (Array.isArray(upRaw.include) ? upRaw.include : [])
                 .map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0),
         };
@@ -6862,7 +6868,34 @@ function segMediaHtml(state, mf, idx) {
     return null;
 }
 
-/* 段片轻量信息（瘦身卡片用）：只回 URL，不在卡内嵌大播放器，点击走全屏浮层 */
+/* 段片轻量信息（瘦身卡片用）：只回 URL，不在卡内嵌大播放器，点击走全屏浮层。
+ *
+ * 一采 / 二采两版分段：
+ *   · `upUrl`  = 二采版。二采成功时 seg_NNN.mp4 被高清结果**同名覆盖**，
+ *                所以 mf.videos[g] 就是高清那版（有 upscale 记录才拿它当二采版）。
+ *   · `baseUrl`= 一采版。二采基础设置开了「保存一采分段成片」时后端另存
+ *                mf.base_videos[g]（finals/base_seg_NNN.mp4）；没开（或该段没做
+ *                二采、seg_NNN.mp4 本就是基础版）时回落到段视频本身。
+ *                两者都没有 = 一采版没留（二采覆盖了且当时没开另存）。 */
+/** 槽位 g 的**有效**二采记录（无效/没有 → null）。
+
+ * 有效性 = 记录的 `base_hash` 等于本段此刻的 `prompt_hashes[g]|seeds[g]`
+ * （与后端 `upscale.base_hash` 同口径）。
+ *
+ * 为什么不能只看 `done`：二采关着时改了某段提示词，该段会重新采样并把
+ * `seg_NNN.mp4` 写回基础版，但旧的高清记录**不会被自动清掉**（后端只在二采
+ * 开着时才走 `record_stale` 重做）。此时 `seg_NNN.mp4` 其实是基础分辨率，却仍被
+ * 判成"高清" —— 一采入口被错误置灰、二采入口指向一段基础分辨率视频。
+ * `prompt_hashes` 缺失（极老存档）时退回只看 `done`，行为与从前一致。 */
+function upRecValid(mf, g) {
+    const rec = (mf?.upscale?.segs || [])[g];
+    if (!rec || !rec.done) return null;
+    const ph = (mf.prompt_hashes || [])[g];
+    const sd = (mf.seeds || [])[g];
+    if (ph === undefined || sd === undefined) return rec;
+    return rec.base_hash === `${ph}|${sd}` ? rec : null;
+}
+
 function segMediaInfo(state, mf, idx) {
     const done = mf?.done ?? 0;
     const g = idx + planOff(mf);
@@ -6871,10 +6904,22 @@ function segMediaInfo(state, mf, idx) {
     const videoFile = (mf.videos || [])[g];
     const thumbFile = (mf.thumbs || [])[g];
     if (!videoFile && !thumbFile) return null;
+    const baseFile = (mf.base_videos || [])[g] || "";
+    const upRec = upRecValid(mf, g);
+    const upDone = !!upRec;
+    const segUrl = videoFile ? viewUrl(sub, videoFile) : "";
+    const thumbUrl = thumbFile ? viewUrl(sub, thumbFile) : "";
     return {
-        videoUrl: videoFile ? viewUrl(sub, videoFile) : "",
-        thumbUrl: thumbFile ? viewUrl(sub, thumbFile) : "",
+        videoUrl: segUrl,               // 段视频（= 二采结果，若该段做过二采）
+        thumbUrl,
         file: videoFile || thumbFile || "",
+        baseUrl: baseFile ? viewUrl(sub, baseFile)
+            : (upDone ? "" : segUrl),   // 无二采记录 → 段视频就是基础版
+        baseFile: baseFile || (upDone ? "" : (videoFile || "")),
+        upUrl: upDone ? segUrl : "",
+        upFile: upDone ? (videoFile || "") : "",
+        upDone,
+        baseSaved: !!baseFile,
     };
 }
 
@@ -8794,16 +8839,54 @@ function buildCards(data) {
         const redoMode = isDone ? redoMarks.get(idx + off) : null;
         const redoChip = redoMode ? badge(`🔁 待重摇·${redoMode}`, "warn") : "";
         const upRec = isDone ? (mf?.upscale?.segs || [])[idx + off] : null;
-        const upChip = upRec?.done
-            ? badge(`二采${upRec.size?.length ? ` ${upRec.size[0]}×${upRec.size[1]}` : "✓"}`, "cyan") : "";
+        /* 徽章按**有效**记录打：该段被重新采样过（提示词/种子变了）而记录没跟上时，
+           段视频其实已是基础版，还挂着「二采」徽章就是假账（同 upRecValid 注释）。 */
+        const upRecOk = isDone ? upRecValid(mf, idx + off) : null;
+        const upChip = upRecOk
+            ? badge(`二采${upRecOk.size?.length ? ` ${upRecOk.size[0]}×${upRecOk.size[1]}` : "✓"}`, "cyan") : "";
         const title = el("div", "h3d-ctitle",
             `<span>段 ${idx + 1}</span>${stateChip}${offChip}${unlinkChip}${redoChip}${upChip}`);
-        /* 段片全屏入口（瘦身后唯一浏览口）：有成片才显示 */
+        /* 段片全屏入口（瘦身后唯一浏览口）：一采 / 二采两版分段各一个入口。
+         *   一采分段成片 = 「保存一采分段成片」另存的 base_seg_NNN.mp4
+         *                  （没开另存、且该段没做二采时，段视频本身就是基础版）；
+         *   二采分段成片 = 段视频（二采成功时被高清结果同名覆盖），没做二采就不出现。
+         * 这里的一采入口就是原来的「预览」按钮（2026-10-12 改名并拆成两个）。 */
         if (mediaInfo && (mediaInfo.videoUrl || mediaInfo.thumbUrl)) {
-            const pv = el("button", "h3d-btn h3d-previewbtn", mediaInfo.videoUrl ? "▶ 预览" : "🖼 查看");
-            pv.title = "全屏浏览本段成片（视频/缩略图），不占卡片空间";
-            pv.onclick = () => openSegViewer(mediaInfo, `段 ${idx + 1} 成片`);
-            title.append(pv);
+            if (!mediaInfo.videoUrl) {
+                /* 只有缩略图（视频未落盘/编码失败）：维持原来的单入口「查看」 */
+                const pv = el("button", "h3d-btn h3d-previewbtn", "🖼 查看");
+                pv.title = "全屏查看本段缩略图（视频尚未落盘），不占卡片空间";
+                pv.onclick = () => openSegViewer(mediaInfo, `段 ${idx + 1} 缩略图`);
+                title.append(pv);
+            } else {
+                const bv = el("button", "h3d-btn h3d-previewbtn", "一采分段成片");
+                if (mediaInfo.baseUrl) {
+                    bv.title = "全屏播放本段**一采（基础分辨率）**成片，可下载。"
+                        + (mediaInfo.baseSaved
+                            ? "（二采基础设置已开「保存一采分段成片」→ base_seg 另存件）"
+                            : "（本段未做二采，段视频即基础版）");
+                    bv.onclick = () => openSegViewer(
+                        { videoUrl: mediaInfo.baseUrl, thumbUrl: mediaInfo.thumbUrl,
+                          file: mediaInfo.baseFile },
+                        `段 ${idx + 1} 一采分段成片`);
+                } else {
+                    bv.disabled = true;
+                    bv.title = "本段的一采成片没有留存：二采成功时 seg_NNN.mp4 被高清结果同名覆盖，"
+                        + "而当时没开「保存一采分段成片」。\n"
+                        + "想以后留住一采版：右栏「二采放大 → 基础二采设置」勾上「保存一采分段成片」"
+                        + "后重跑一次（已有高清段不会重做，只补一采另存）。";
+                }
+                title.append(bv);
+                if (mediaInfo.upDone && mediaInfo.upUrl) {
+                    const uv = el("button", "h3d-btn h3d-previewbtn", "二采分段成片");
+                    uv.title = "全屏播放本段**二采（高清）**成片，可下载：seg_NNN.mp4 即高清结果";
+                    uv.onclick = () => openSegViewer(
+                        { videoUrl: mediaInfo.upUrl, thumbUrl: mediaInfo.thumbUrl,
+                          file: mediaInfo.upFile },
+                        `段 ${idx + 1} 二采分段成片`);
+                    title.append(uv);
+                }
+            }
         }
         /* 段卡上**不再有**合并勾选框：合并清单改在素材库里点选（点击顺序即合并
          * 顺序），不再需要"逐段切屏勾选"。段卡只负责链本身。 */
@@ -10116,6 +10199,8 @@ function upscaleSig(data) {
         up.device ?? "auto",
         up.size_mode ?? "倍率", up.target_w ?? 0, up.target_h ?? 0, up.megapixels ?? 0,
         up.sampler ?? "", up.scheduler ?? "", up.retry === true, up.retry_target ?? 0,
+        /* 一采分段另存：拨开关要当场刷新面板（徽章/脚注跟着变），也得进 sig */
+        up.keep_base_seg === true,
         (data.upscaleModels || []).join(","),
         data.mf?.upscale?.hash ?? "",
         (data.mf?.upscale?.segs || []).filter((r) => r && r.done).length,
@@ -10209,6 +10294,26 @@ function renderUpscaleZone(sec, data) {
     body.append(modeField);
 
     if (on) {
+        /* 保存一采分段成片：二采成功时 seg_NNN.mp4 会被高清结果**同名覆盖**，
+         * 一采那版分段就没了。开它则一采解码结果另存 base_seg_NNN.mp4，
+         * 段卡上「一采分段成片」/「二采分段成片」两个入口分别取两版。
+         * 只多存一份产物、不改二采输出，故不进二采指纹（拨开关不会重做既有高清段）。 */
+        const kbField = el("div", "h3d-param");
+        kbField.append(el("label", "", "保存一采分段成片"));
+        const kbRow = el("div", "h3d-seedrow");
+        const kbCb = document.createElement("input");
+        kbCb.type = "checkbox";
+        kbCb.checked = up.keep_base_seg === true;
+        kbCb.title = "勾选：二采范围内的每段，一采解码结果先另存一份 base_seg_NNN.mp4（同时保留 latent 与解码产物），"
+            + "再让二采接管 seg_NNN.mp4 —— 段卡上「一采分段成片」/「二采分段成片」可分别查看与下载。\n"
+            + "不勾（默认）：二采成功时段视频就是高清结果，一采那版不留（省一份磁盘与一次编码）。\n"
+            + "二采失败或未在范围内时，段视频本就是基础分辨率版本，不受影响。\n"
+            + "该开关不进二采指纹 —— 拨动它不会让既有高清段重做；打开后重跑一次即可补齐已生成段的一采另存。";
+        kbCb.onchange = () => setUpscaleField(node, "keep_base_seg", kbCb.checked);
+        kbRow.append(kbCb);
+        kbField.append(kbRow);
+        body.append(kbField);
+
         /* 神经放大开关：关掉 = 只做低强度重采样精化，不加载放大网络 */
         const upOnly = [];
         function showUp() {
@@ -10555,7 +10660,9 @@ function renderUpscaleZone(sec, data) {
         footBits.push(`已二采 ${upDone}/${done} 段`
             + (upFinals.length ? ` · 高清成片×${upFinals.length}` : ""));
     }
-    footBits.push("产物在项目文件夹：seg_*.mp4 即高清分段（同名覆盖基础段）/ final_*.mp4 高清成片；音轨沿用原声");
+    footBits.push("产物在项目文件夹：seg_*.mp4 即高清分段（同名覆盖基础段）"
+        + (on && up.keep_base_seg ? " / base_seg_*.mp4 一采分段（已开另存）" : "")
+        + " / final_*.mp4 高清成片；音轨沿用原声");
     if (on && !up.model && models.length) footBits.push("⚠ 未选择放大模型：运行时会报错提示");
     det.insertAdjacentHTML("beforeend",
         `<div class="h3d-foot">${footBits.map(escapeHtml).join("<br>")}</div>`);

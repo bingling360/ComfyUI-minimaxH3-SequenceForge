@@ -572,7 +572,10 @@ def test_segment_tabs_and_optimizer_ui():
     assert "场景提示词" not in d and "角色提示词" not in d
     # 段片瘦身：无大 thumb 网格，全屏入口保留
     assert "segMediaInfo" in d and "openSegViewer" in d and "h3d-viewer" in d
-    assert "▶ 预览" in d
+    # 段卡入口拆成两版分段成片（2026-10-12）：原「▶ 预览」改名「一采分段成片」，
+    # 二采版另给一个按钮（二采成功时 seg_NNN.mp4 被同名覆盖，两版必须能分别取）
+    assert "一采分段成片" in d and "二采分段成片" in d
+    assert "▶ 预览" not in d
     # 结构化提示词已整体下线（2026-09-22）：源码里不许再有它的入口
     assert "openStructuredModal" not in d and "renderPromptV2Panel" not in d
     assert "_segStructView" not in d

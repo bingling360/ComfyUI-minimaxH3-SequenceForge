@@ -72,7 +72,7 @@ eq(rows.length, 1, "映射条只有 1 行");
 const cells = rows.length ? [...rows[0].children].map((n) => n.textContent) : [];
 eq(cells.slice(0, 3), ["图片3", "回廊", "<Picture 1>"],
     "映射行 = 标注 · 素材名 → 官方 token（标注3 编译成 Picture 1）");
-ok(!!rows[0] && rows[0].querySelector("button"), "映射行带「改」按钮（改标注入口）");
+ok(!!rows[0] && !rows[0].querySelector("button"), "映射行不再带「改」按钮（标注由后端自动发号，无手改入口）");
 
 /* 三类混排：图片/视频各自独立编号 */
 bar = mkBar(["阿依", "片头", "回廊"]);

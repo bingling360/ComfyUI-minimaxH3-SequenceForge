@@ -1258,31 +1258,8 @@ function buildRefBar(RB) {
              * 独立编号** —— token 按"本段挂载顺序"每段重算，标注是全局稳定号。
              * 只显示一层的界面会让人以为「图片3」编译出去还是 3，实际本段只挂它
              * 一张图时是 1。差异写在这里，一眼可核对。
-             * 「改」= 改这个素材的标注（写库，走 /h3chain/asset_mark）。 */
+             * 行尾「改」按钮已下线（标注由后端按池子自动发号/去重，不再手改）。 */
             const mapBox = el("div", "h3d-refmap");
-            const editMark = async (a) => {
-                const cur = markTextOf(a);
-                const raw = window.prompt(
-                    `给「${refKeyOf(a)}」改标注（图片N / 视频N / 音频N，N 为 1-999）\n`
-                    + "留空 = 清除，下次自动补号", cur);
-                if (raw === null) return;
-                const mk = cleanMark(raw);
-                if (String(raw || "").trim() && !mk) {
-                    window.alert("标注只能是「图片N / 视频N / 音频N」（N 为 1-999），例如：图片2");
-                    return;
-                }
-                try {
-                    await window.H3Api.assetMark({
-                        dir: getDirValue(node), mark: mk,
-                        asset_id: String((a && a.asset_id) || ""),
-                        alias: String((a && a.label) || ""),
-                    });
-                    setLed("done", mk ? `标注已改成 ${mk}` : "标注已清除（下次自动补号）");
-                    scheduleRefresh(120);
-                } catch (e) {
-                    window.alert(`改标注失败：${e?.message || e}`);
-                }
-            };
             const paintRefMap = (refs, tokens, live) => {
                 mapBox.replaceChildren();
                 const seen = new Set();
@@ -1301,11 +1278,6 @@ function buildRefBar(RB) {
                         sp.textContent = txt;
                         row.append(sp);
                     }
-                    const bEdit = el("button", "h3d-refmap-edit", "改");
-                    bEdit.type = "button";
-                    bEdit.title = "改这个素材的标注（图片N / 视频N / 音频N）";
-                    bEdit.addEventListener("mousedown", guard(() => { editMark(hit); }));
-                    row.append(bEdit);
                     mapBox.append(row);
                 }
                 mapBox.style.display = mapBox.children.length ? "" : "none";
@@ -7229,8 +7201,6 @@ function injectStyles() {
     .h3d-refmap-mark{color:var(--h3d-copper);font-weight:600;flex:none}
     .h3d-refmap-name{color:var(--h3d-bone);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .h3d-refmap-tok{color:#7fe0b0;flex:none}
-    .h3d-refmap-edit{border:1px solid #3a352c;border-radius:5px;background:#25221c;color:var(--h3d-muted);font:10px ui-monospace,Consolas;padding:0 5px;cursor:pointer;margin-left:auto;flex:none}
-    .h3d-refmap-edit:hover{filter:brightness(1.3)}
     .h3d-refhint-bad{color:var(--h3d-danger,#c0392b);font-weight:600}
     .h3d-refchip{display:inline-flex;gap:5px;align-items:center;padding:3px 8px 3px 3px;border:1px solid #3a352c;border-radius:12px;background:#25221c;color:#a8a294;cursor:pointer;font-size:11px;font-family:inherit}
     .h3d-refchip:hover{border-color:#46604f}

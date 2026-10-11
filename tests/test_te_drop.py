@@ -63,7 +63,8 @@ def _enc(p, text="你好"):
 # ── 1) perf 键声明 ──
 
 def test_perf_key_declared():
-    assert perf.DEFAULT_PERF.get("te_drop_after_cond") == "auto"
+    # 2026-10-12 起出厂默认改**强制开**（True，不再随 OS 分档）；"auto" 仍是合法取值
+    assert perf.DEFAULT_PERF.get("te_drop_after_cond") is True
     t = perf.PERF_TYPES.get("te_drop_after_cond")
     assert t is not None and bool in t and "auto" in t
 

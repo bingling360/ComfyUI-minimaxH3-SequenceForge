@@ -61,7 +61,7 @@ MAGNITUDE_MATCH = "per_token"
 """原值的三种 RMS 对齐口径（per_token / global / none）里作者推荐的默认，固定不暴露：
 上游 README 的推荐起始配置就是它，多一个旋钮只会多一个说不清的变量。"""
 
-DEFAULT_ALPHA = 0.15
+DEFAULT_ALPHA = 0.1
 DEFAULT_SCOPE = "all"
 SCOPES = ("all", "text")
 
@@ -115,7 +115,7 @@ def path_of(name):
 
 
 def config(ds):
-    """ds.bridge -> 生效配置。缺键/旧档一律收敛到「关闭 + alpha 0.15 + 全量」。
+    """ds.bridge -> 生效配置。缺键/旧档一律收敛到「关闭 + alpha 0.1 + 全量」。
 
     关闭时 apply 直接返回原 cond —— 不加载权重、不碰张量，也不进任何指纹，
     所以对没开语义桥的项目零影响。

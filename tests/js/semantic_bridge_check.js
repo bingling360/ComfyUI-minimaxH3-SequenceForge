@@ -24,9 +24,10 @@ function t(name, fn) {
 const { w, errors } = load({});
 
 const mkSec = () => w.document.createElement("div");
-/* 面板夹具基线 = **关闭态**（显式给，不跟 defaultBridge 走）：2026-10-01 起
- * defaultBridge 与默认工作流同源（开启），关闭态的置灰/未勾渲染逻辑仍要有用例守着 */
-const BRIDGE_OFF = { enabled: false, adapter: "", alpha: 0.15, scope: "all" };
+/* 面板夹具基线 = **关闭态**（显式给，不跟 defaultBridge 走）：2026-10-12 起
+ * defaultBridge 与默认工作流同源（关闭 · alpha 0.1），关闭态的置灰/未勾渲染逻辑
+ * 仍要有用例守着 */
+const BRIDGE_OFF = { enabled: false, adapter: "", alpha: 0.1, scope: "all" };
 const mkData = (node, bridge, models) => ({
     node,
     ds: { bridge: Object.assign({}, BRIDGE_OFF, bridge || {}) },
@@ -52,11 +53,11 @@ const MODEL = "BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors";
 
 console.log("\n== 语义桥面板 ==");
 
-t("defaultBridge 契约：默认开启 / BUNNY V2 / alpha 0.15 / 全量过桥（与默认工作流同源）", () => {
+t("defaultBridge 契约：默认关闭 / BUNNY V2 / alpha 0.1 / 全量过桥（与默认工作流同源）", () => {
     const b = w.defaultBridge();
-    assert.strictEqual(b.enabled, true, "2026-10-01 起默认开启（与新版默认工作流同源）");
+    assert.strictEqual(b.enabled, false, "2026-10-12 起默认关闭（与新版默认工作流同源）");
     assert.strictEqual(b.adapter, MODEL);
-    assert.strictEqual(b.alpha, 0.15);
+    assert.strictEqual(b.alpha, 0.1);
     assert.strictEqual(b.scope, "all");
 });
 
@@ -64,7 +65,7 @@ t("getDs 缺键（老存档）：保守补关闭态，不跟 defaultBridge 一�
     const n = mkNode({ prompts: ["x"] });
     const b = w.getDs(n).bridge;
     assert.strictEqual(b.enabled, false);
-    assert.strictEqual(b.alpha, 0.15);
+    assert.strictEqual(b.alpha, 0.1);
     assert.strictEqual(b.scope, "all");
     assert.strictEqual(b.adapter, "");
 });
@@ -99,10 +100,10 @@ t("作用范围选项与后端同口径：全量过桥 / 仅文本过桥", () =>
     assert.deepStrictEqual([...p.sels[0].options].map((o) => o.value), ["all", "text"]);
 });
 
-t("默认态：开关未勾、alpha=0.15、范围选中「全量过桥」", () => {
+t("默认态：开关未勾、alpha=0.1、范围选中「全量过桥」", () => {
     const p = paint(NODE, {}, [MODEL]);
     assert.strictEqual(p.cbs[0].checked, false);
-    assert.strictEqual(Number(p.nums[0].value), 0.15);
+    assert.strictEqual(Number(p.nums[0].value), 0.1);
     assert.strictEqual(p.sels[0].value, "all");
 });
 

@@ -217,9 +217,12 @@ DEFAULT_PERF = {
     # cond 出口释放 TE 驻留（2026-09-30）：64GB 无 swap 云端实测，1MP 单段一采
     # 峰值 59.5G/64G，段间残留 +2G/段 → 第 3-4 段必撞顶被 cgroup 整容器杀掉
     # （断连 + 运行记录消失）。编码完就把 TE 的权重副本丢掉，采样/解码全程
-    # 不背 25.9GB —— 单段峰值降到 ~35G。auto = Linux 开 / Windows 关（见
+    # 不背 25.9GB —— 单段峰值降到 ~35G。
+    # 2026-10-12 起出厂默认改**强制开**（用户拍板）：不再随 OS 分档，Linux/Windows
+    # 一律在 cond 编码完就丢 TE 驻留，把峰值压到最低（代价是每段首次编码多 ~45s）。
+    # 仍保留三态：「auto」= Linux 开 / Windows 关，可手动拨回（见
     # te_drop_after_cond_enabled 的 docstring）。消费端：cond_cache.CachedClipProxy。
-    "te_drop_after_cond": "auto",
+    "te_drop_after_cond": True,
 
     # 编码。**一个「质量数值」跟着编码器换含义**（面板上按 encoder 值显隐）：
     #   encoder=libx264     -> 读 `x264_crf`（恒定质量，越小越清晰）
@@ -249,7 +252,7 @@ DEFAULT_PERF = {
     # 素材库
     "index_mode": "fingerprint",  # fingerprint（目录指纹）/ ttl（3 秒硬过期）
     "thumb_on_import": True,      # 入库即生成缩略图
-    "thumb_max_mp": 4,            # 缩略图源图解码上限（百万像素）
+    "thumb_max_mp": 10,           # 缩略图源图解码上限（百万像素）
 
     # ⛔ `probe` 已连根删除（2026-09-23 本轮）：全仓零读取方，前端也无字段，
     # 属「名字在表里、功能不存在」。诊断走专门的工具（tools/ 下独立 runner）

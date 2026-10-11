@@ -106,8 +106,8 @@ def test_dim_is_h3_text_encoder_width():
 
 
 def test_defaults_match_the_agreed_starting_point():
-    """alpha 0.15、全量过桥、per_token 幅度对齐 —— 用户拍板的起始配置。"""
-    assert BR.DEFAULT_ALPHA == 0.15
+    """alpha 0.1、全量过桥、per_token 幅度对齐 —— 用户拍板的起始配置（2026-10-12 由 0.15 改 0.1）。"""
+    assert BR.DEFAULT_ALPHA == 0.1
     assert BR.DEFAULT_SCOPE == "all"
     assert BR.MAGNITUDE_MATCH == "per_token"
     assert tuple(BR.SCOPES) == ("all", "text")
@@ -125,7 +125,7 @@ def test_frontend_scope_table_matches_backend():
 
 def test_frontend_default_alpha_matches_backend():
     """前端 defaultBridge 的 alpha 默认值必须等于后端 DEFAULT_ALPHA，
-    否则「没碰过这个控件」的项目在前端显示 0.15、后端实际跑另一个数。"""
+    否则「没碰过这个控件」的项目在前端显示 0.1、后端实际跑另一个数。"""
     src = _read("web/h3_director.js")
     body = src.split("function defaultBridge()", 1)[1].split("\n}", 1)[0]
     m = re.search(r"alpha:\s*([0-9.]+)", body)
@@ -137,7 +137,7 @@ def test_frontend_default_alpha_matches_backend():
 
 def test_config_defaults_when_missing():
     cfg = BR.config({})
-    assert cfg == {"enabled": False, "adapter": "", "alpha": 0.15, "scope": "all"}
+    assert cfg == {"enabled": False, "adapter": "", "alpha": 0.1, "scope": "all"}
 
 
 @pytest.mark.parametrize("ds", [None, {}, {"bridge": None}, {"bridge": "x"},

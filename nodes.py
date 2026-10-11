@@ -1283,9 +1283,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 旧工作流残留连线加载时自动忽略。
                 # —— 新控件一律加在**本列表末尾**（= widgets_values 末尾）：旧工作流值不足时
                 #    按默认值补齐；插进中间会顶掉它之后所有控件的既有取值。
-                io.Combo.Input("参考图像尺寸", options=["match", "max"], default="max",
+                io.Combo.Input("参考图像尺寸", options=["match", "max"], default="match",
                                tooltip="参考图缩放口径（官方 Reference to Video 同款）："
-                                       "match=每张参考图按本次生成画幅的像素面积等比缩小（只缩不放，省显存与时间）；"
+                                       "match（默认）=每张参考图按本次生成画幅的像素面积等比缩小（只缩不放，省显存与时间）；"
                                        "max=走参考管线的 2048 短边，身份保真最好，"
                                        "但参考 token 每步采样都参与，可能慢数倍。"),
                 io.Float.Input("响度对齐强度", default=1.0, min=0.0, max=1.0, step=0.1,

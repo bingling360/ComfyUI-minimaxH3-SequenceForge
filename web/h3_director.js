@@ -2276,11 +2276,11 @@ function defaultDs() {
  * 开启时进 ckpt_params 指纹（`scope`/`alpha`/权重任一变化 → 整链重做）：cond 变了，
  * 只重做一半会做出「前几段带桥、后几段不带」的半条链，比整链重做糟得多。
  *
- * 2026-10-01：默认值与新版默认工作流同源（开启 · BUNNY V2 · alpha 0.15 · 全量过桥）。
+ * 2026-10-12：默认值与新版默认工作流同源（关闭 · BUNNY V2 · alpha 0.1 · 全量过桥）。
  * getDs 对**缺键的老存档**另有保守填充（关，见那段内联 default），不经过这里 ——
  * 既有项目不会被静默改写；「恢复默认 / 全局重置 / 新建项目」走本函数。 */
 function defaultBridge() {
-    return { enabled: true, adapter: "BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors", alpha: 0.15, scope: "all" };
+    return { enabled: false, adapter: "BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors", alpha: 0.1, scope: "all" };
 }
 
 function defaultUpscale() {
@@ -2548,7 +2548,7 @@ function getDs(node) {
         const bridge = {
             enabled: brRaw.enabled === true,
             adapter: typeof brRaw.adapter === "string" ? brRaw.adapter.trim() : "",
-            alpha: upNum(brRaw.alpha, 0.15, 0.0, 1.0),
+            alpha: upNum(brRaw.alpha, 0.1, 0.0, 1.0),
             scope: BRIDGE_SCOPES.includes(brRaw.scope) ? brRaw.scope : "all",
         };
         return {
@@ -4775,7 +4775,7 @@ const H3_PERF_FIELDS = [
     { key: "upcast_attention", label: "Upcast Attention", kind: "tri", group: "通用与机器 · 运行时",
       hint: "attention 强制走 fp32：更稳但更吃显存、更慢。**小显存卡通常关**；auto = 跟随启动参数。改动立即生效" },
     { key: "te_drop_after_cond", label: "cond 后释放文本编码器", kind: "tri", group: "通用与机器 · 运行时",
-      hint: "★ 64GB 无 swap 云端实测：1MP 单段一采峰值 59.5/64G，段间残留 +2G/段，第 3-4 段必撞顶被**整个容器**杀掉（断连+记录消失）。"
+      hint: "★ **默认开**（2026-10-12 用户拍板改强制开）。64GB 无 swap 云端实测：1MP 单段一采峰值 59.5/64G，段间残留 +2G/段，第 3-4 段必撞顶被**整个容器**杀掉（断连+记录消失）。"
           + "开启后每次 cond 编码完就把 25.9GB 的 TE 驻留丢掉，采样/解码全程不背它 —— 单段峰值降到 ~35G，代价是每段首次编码多 ~45s（TE 回载）。"
           + "auto = Linux 开 / Windows 关（Windows 有 pagefile 不会 OOM）。改动立即生效" },
     { key: "index_mode", label: "素材库索引失效口径", kind: "sel", group: "通用与机器 · 素材库",
@@ -7587,12 +7587,13 @@ function openDesk() {
         + "不会取消正在跑的生成 —— 要取消请用页脚「✕ 终止」。";
     refreshBtn.onclick = () => { refreshAll(); };
     /* 全局重置：紧挨「刷新」——两个都是"界面/参数不对劲了先点它"的兜底动作。
-     * 链参数（画布控件）+ 语义桥 + 二采一次拉回默认；版本更新导致控件值
-     * 错位/出现怪值时用它兜底（按控件名落值，不依赖位置，天然修错位）。 */
+     * 链参数（画布控件）+ 语义桥 + 二采 + 性能优化一次拉回默认；版本更新导致
+     * 控件值错位/出现怪值时用它兜底（按控件名落值，不依赖位置，天然修错位）。 */
     const resetAllBtn = el("button", "h3d-btn", "↺ 全局重置");
-    resetAllBtn.title = "全部生成参数一键恢复默认：链参数（画布控件）+ 语义桥 + 二采放大。"
+    resetAllBtn.title = "全部生成参数一键恢复默认：链参数（画布控件）+ 语义桥 + 二采放大"
+        + " + 性能优化（块交换 / 分块 / 编码器 / 显存守卫等）。"
         + "版本更新导致参数错位 / 改乱了想回头时用。\n"
-        + "不含性能优化（机器级，在 ⚡ 性能优化弹窗里）、AI 优化设置、每段提示词与锚定。";
+        + "不含 AI 优化设置、每段提示词与锚定。";
     resetAllBtn.onclick = () => resetAllParams(findNode());
     /* AI 优化设置也是**全链共用**的一套（服务商 / 模型 / 提示词规则），
      * 跟性能优化同级。以前它挂在每段卡里 —— 每段都长一个按钮，看着像"本段设置"，
@@ -7886,7 +7887,7 @@ function renderLeftColumn(sec, data) {
     } else if (!projects.length) {
         list.append(el("div", "h3d-empty",
             "暂无项目存档：点下方「＋ 新建项目」立即在 output/h3_projects/ 建好文件夹；"
-            + "开自动保存/审片跑一次也会自动生成项目。"));
+            + "跑一次（每段默认自动落盘）或开审片也会自动生成项目。"));
     }
     for (const p of projects) {
         const active = state?.dir && p.dir === state.dir;
@@ -9576,24 +9577,27 @@ function labeledAssetCard(node, ds, idx) {
 /* assetCard / labeledAssetCard / syncMirrors（画布镜像）保留复用。 */
 
 /* ---- 链参数（面板直写画布控件）：基础设置 + 视频延续（关键帧设置/检测重摇） ----
- * 基础设置 = 原生工作流画幅/时长/采样类 + 链路存档策略（审片/自动保存/自动成片）
+ * 基础设置 = 原生工作流画幅/时长/采样类 + 链路存档策略（审片/自动成片）
  * + 参考图像尺寸；视频延续 = 段间引导相关（大折叠套两子折叠）。
  * 「存档目录」「重跑起始段」不再在导演台露出（项目与续跑由导演台自己管）——
  * 节点控件与后端逻辑照旧保留，只是不占界面。
+ * 「自动保存」2026-10-12 起同样撤出界面：出厂默认「分段」即每段自动落盘，
+ * 这一项没有可选项（另一档「关闭」只会关掉落盘、不是用户想要的），
+ * 节点控件保留以兼容旧工作流，改由默认值恒定生效。
  * ADVANCED_DEFS 保持全量（paramsSig/旧逻辑兼容口径），新增控件都要登记进去，
  * 否则改它不会触发面板重建。 */
 /* 「宽度/高度」不进面板（2026-09-27）：它们是旧版兼容位（原「自定义」画幅入口，
  * 该档位已删），画布始终由 宽高比×百万像素 换算——露出只会引来"改了没生效"。
  * ADVANCED_DEFS 同步摘除（paramsSig 不再盯着两个死值）。 */
 const BASIC_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数", "CFG", "采样器", "调度器",
-    "审片模式", "自动保存", "自动成片", "参考图像尺寸"];
+    "审片模式", "自动成片", "参考图像尺寸"];
 const KEYFRAME_DEFS = ["引导帧数", "锚定加噪", "递减锚定", "响度对齐强度"];
 const SEAM_DEFS = ["桥帧门控", "清晰度阈值", "回退上限",
     "接缝重摇", "重摇阈值", "重摇上限"];
 const PRIMARY_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数"];
 const ADVANCED_DEFS = [
     "引导帧数", "CFG", "采样器", "调度器",
-    "审片模式", "自动保存", "自动成片", "参考图像尺寸", "响度对齐强度",
+    "审片模式", "自动成片", "参考图像尺寸", "响度对齐强度",
     "桥帧门控", "清晰度阈值", "回退上限", "锚定加噪",
     "接缝重摇", "重摇阈值", "重摇上限", "递减锚定",
 ];
@@ -9667,13 +9671,13 @@ function renderWidgetField(node, name, labelOverride) {
 /* ---- 右栏「恢复默认」（2026-09-30 用户要求：性能优化 / 右栏 / AI优化三处各一个） ----
  * 链参数默认值 = nodes.py INPUT_TYPES 的 default（前端镜像一份；改后端默认值时
  * 必须同步这里）。2026-10-01 起与新版默认工作流同源：1.0MP / 8s / 8 步 /
- * 参考图像尺寸 max / 桥帧门控 关 / 接缝重摇 关（用户导出口径）。
- * 语义桥 / 二采的默认值直接用 defaultBridge / defaultUpscale（2026-10-01 起同样
- * 与默认工作流同源：桥开 · BUNNY V2；二采 关闭 · 1.4×，rev 3.3），不另抄一份。 */
+ * 参考图像尺寸 match（2026-10-12 由 max 改 match）/ 桥帧门控 关 / 接缝重摇 关。
+ * 语义桥 / 二采的默认值直接用 defaultBridge / defaultUpscale（2026-10-12 起
+ * 桥默认关闭 · BUNNY V2 · alpha 0.1；二采 关闭 · 1.4×，rev 3.3），不另抄一份。 */
 const CHAIN_DEFAULTS = {
     [W_AR]: "16:9", [W_MP]: 1.0, [W_DUR]: 8.0, [W_SEED]: 0,
     "步数": 8, "CFG": 1.0, "采样器": "res_multistep", "调度器": "simple",
-    "审片模式": "关闭", "自动保存": "分段", "自动成片": "开启", "参考图像尺寸": "max",
+    "审片模式": "关闭", "自动保存": "分段", "自动成片": "开启", "参考图像尺寸": "match",
     "引导帧数": "22", "锚定加噪": 0, "递减锚定": "关闭", "响度对齐强度": 1.0,
     "桥帧门控": "关闭", "清晰度阈值": 30.0, "回退上限": 34,
     "接缝重摇": "关闭", "重摇阈值": 0.06, "重摇上限": 1,
@@ -9730,7 +9734,7 @@ function resetContinuityParams(node) {
 function resetBridgeDefaults(node) {
     if (!node) return;
     if (!window.confirm("把语义桥恢复为默认设置？\n\n"
-        + "开启开关 · BUNNY V2 权重 · 强度 0.15 · 全量过桥。")) return;
+        + "关闭开关 · BUNNY V2 权重 · 强度 0.1 · 全量过桥。")) return;
     applyBridgeDefaults(node);
 }
 
@@ -9742,25 +9746,34 @@ function resetUpscaleDefaults(node) {
     applyUpscaleDefaults(node);
 }
 
-function resetAllParams(node) {
-    /* 顶栏「全局重置」：链参数（画布控件）+ 语义桥 + 二采一次拉回默认。
+async function resetAllParams(node) {
+    /* 顶栏「全局重置」：链参数（画布控件）+ 语义桥 + 二采 + 性能优化一次拉回默认。
      * 版本更新后控件值错位/出现怪值时，用它兜底回到已知状态。
-     * 不含：性能优化（机器级，在 ⚡ 性能优化弹窗里有自己的恢复默认）、
-     * AI 优化设置（里面有 API Key，误重置会丢配置）、每段提示词/锚定。 */
+     * 不含：AI 优化设置（里面有 API Key，误重置会丢配置）、每段提示词/锚定。 */
     if (!node) {
         alert("画布上没找到 H3 链节点，全局重置不可用。");
         return;
     }
     if (!window.confirm("把全部生成参数恢复为默认值？\n\n"
         + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 检测重摇）\n"
-        + "· 语义桥（开启 / BUNNY V2 / 0.15 / 全量过桥）\n"
-        + "· 二采放大（关闭 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n\n"
+        + "· 语义桥（关闭 / BUNNY V2 / 0.1 / 全量过桥）\n"
+        + "· 二采放大（关闭 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n"
+        + "· 性能优化（机器级：块交换 / 分块 / 编码器 / 显存守卫等）\n\n"
         + "以上默认值与新版默认工作流同源。\n"
-        + "不含：性能优化（机器级）、AI 优化设置、每段提示词与锚定。\n"
+        + "不含：AI 优化设置、每段提示词与锚定。\n"
         + "版本更新导致参数错位时，重置即回到节点当前定义的默认值。")) return;
     applyChainDefaults(node, Object.keys(CHAIN_DEFAULTS));
     applyBridgeDefaults(node);
     applyUpscaleDefaults(node);
+    /* 性能优化（机器级、全局）也一并回默认：POST 空对象 → 后端 parse_state 以
+     * DEFAULT_PERF 起底（与 ⚡ 性能优化弹窗里的「恢复默认」同一入口）。
+     * 失败不阻断其余重置 —— 画布参数已经落好了。 */
+    try {
+        const A = window.H3Api;
+        if (A && A.perfSet) await A.perfSet({ perf: {} });
+    } catch (e) {
+        console.warn("[h3-director] 全局重置：性能优化恢复默认失败（画布参数已重置）", e);
+    }
     repaintParams();
     scheduleRefresh(120);
 }
@@ -9909,7 +9922,7 @@ function renderBridgeZone(sec, data) {
     const models = data.bridgeModels || [];
     sec.replaceChildren();
     sec.append(resetRow("↺ 恢复默认",
-        "语义桥（本栏）恢复为默认：开启 / BUNNY V2 / 0.15 / 全量过桥",
+        "语义桥（本栏）恢复为默认：关闭 / BUNNY V2 / 0.1 / 全量过桥",
         () => resetBridgeDefaults(node)));
     const det = foldSection("bridge-top", false,
         "<summary>🌉 语义桥（条件增强）"

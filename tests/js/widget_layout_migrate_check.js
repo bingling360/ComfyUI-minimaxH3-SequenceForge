@@ -27,6 +27,7 @@
  *   同步为 1.0MP / 每段时长 8s / 步数 8（turbo 少步配套）/ 审片 关 / 参考图像尺寸
  *   max / 桥帧门控 关 / 接缝重摇 关；旧版兼容位「宽度/高度」对齐真实画布 1376×768。
  *   同批：nodes.py INPUT_TYPES 与 h3_director.js CHAIN_DEFAULTS 同步（三处同源）。
+ * 2026-10-12：出厂口径 参考图像尺寸 max → match（用户拍板）；三处同源同步。
  *
  * 用法：node tests/js/widget_layout_migrate_check.js
  *      （pytest 侧由 tests/test_js_checks.py 统一收集）
@@ -96,7 +97,7 @@ t("迁移后关键位语义仍对齐（任何一位串位都会红）", () => {
     assert.strictEqual(wv[24], "关闭", "递减锚定");
     assert.strictEqual(wv[25], "文生视频", "生成模式");
     assert.strictEqual(wv[26], "开启", "自动成片");
-    assert.strictEqual(wv[28], "max", "参考图像尺寸");
+    assert.strictEqual(wv[28], "match", "参考图像尺寸");
     assert.strictEqual(wv[29], 1, "响度对齐强度");
 });
 

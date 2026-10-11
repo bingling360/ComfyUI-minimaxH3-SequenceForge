@@ -318,7 +318,7 @@ All controls are on the node (labels are Chinese in the UI).
 - **`清晰度阈值` (sharpness threshold)** default 30.0, **`回退上限` (rollback cap)** default 34 (multiples of 17).
 - **`锚定加噪` (anchor noise)** default 0.0, **`递减锚定` (decaying anchor)** default 关闭. Both are *next-stage infrastructure*, off by default because measurement showed a net quality cost; kept as technical reserves.
 - **`审片模式` (review mode).** Default 关闭; `逐段确认` = one new segment per run.
-- **`自动保存` (auto-save).** Default `分段`; **`自动成片` (auto finalize)** default `开启`.
+- **`自动保存` (auto-save).** Fixed to `分段` — every segment is archived. The option was removed from the console on 2026-10-12 (the node widget is kept only for old-workflow compatibility); **`自动成片` (auto finalize)** default `开启`.
 - **`重跑起始段` (rerun from segment).** 0 = auto (follow archive progress, re-do changed prompts); N = discard the archive from segment N and regenerate.
 - **`接缝重摇` (seam reroll).** Default **关闭**. `自动` = re-sample a segment when its seam difference exceeds the threshold, keeping the smallest-difference attempt.
 - **`重摇阈值` (reroll threshold)** default 0.06 (good seams ~0.02–0.03, bad 0.08+), **`重摇上限` (reroll cap)** default 1.
@@ -326,7 +326,7 @@ All controls are on the node (labels are Chinese in the UI).
 - **`导演台状态` (director state).** JSON written by the console; takes precedence over canvas wiring when present. Stores only relative input filenames — no media, keys, or absolute paths.
 - **`起始视频` / `起始视频音轨`.** Prologue input (§15).
 - **`二采模型` (second-pass model).** Optional dedicated UNET for the high-res second pass (§19).
-- **`参考图像尺寸` (reference image size).** `match` (scale each reference to the generation canvas area, shrink-only) or `max` (2048 short side via the reference pipeline; best identity fidelity, potentially several times slower). Default `max`.
+- **`参考图像尺寸` (reference image size).** `match` (scale each reference to the generation canvas area, shrink-only) or `max` (2048 short side via the reference pipeline; best identity fidelity, potentially several times slower). Default `match` (changed from `max` on 2026-10-12).
 - **`响度对齐强度` (loudness alignment strength)** default 1.0.
 - **`自定义Sigmas` (custom sigmas).** Optional sigma table for distilled LoRAs (§26).
 
@@ -546,7 +546,7 @@ The `对比图` output is a per-seam `before | after | residual false-color (×4
 out = t + alpha * (mlp(rms(t)) - t)
 ```
 
-It helps H3 hold relationships like "who is doing what / prop ownership / attacker vs target / identity and state after occlusion". It is **not** a motion-repair tool and does not rewrite prompts. The author's own note: roughly 60% of cases improve, 20% are neutral, 10% introduce new errors — more strength is not better; compare at the same seed.
+It helps H3 hold relationships like "who is doing what / prop ownership / attacker vs target / identity and state after occlusion". It is **not** a motion-repair tool and does not rewrite prompts. The author's own note: roughly 60% of cases improve, 20% are neutral, 10% introduce new errors — more strength is not better; compare at the same seed. Default is **off** with `alpha = 0.1` (2026-10-12); turning it on puts the bridge into the whole-chain fingerprint, so any change re-renders the chain from segment 1.
 
 The weight ships in `models/BUNNY_H3_Semantic_Bridge_V2_seed22345.safetensors` (≈22 MB, committed). The console's semantic-bridge panel scans `models/` for the dropdown. The scope switch exists because the cond tensor mixes text and vision tokens (H3 does not use a chat template; reference / first-frame images are spliced into the sequence as vision blocks) — scope lets you apply the bridge to text tokens only, vision tokens only, or all.
 

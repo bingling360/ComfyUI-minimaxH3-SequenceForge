@@ -138,3 +138,38 @@ def test_hints_are_printed_to_log():
     """提示要同时进导演台（report）与日志（print [H3链]）。"""
     src = _src("nodes.py")
     assert src.count('print(f"[H3链] ') >= 4
+
+
+# ------------------------------------------------- 边界：重摇锚点 / 首末段
+
+def test_slot_res_prefers_measured_value():
+    """同一次运行里前一段可能刚被重摇（或因缺文件重生成）→ 它的真实分辨率是
+    当前画布；拿 `_archived_res` 的旧档值判「跨分辨率」会误杀该保留的接缝锚
+    （相邻两段一起重摇时最明显）。"""
+    src = _src("nodes.py")
+    assert "if g in _seg_res_map:" in src
+    assert "_slot_res(prev_g)" in src      # 重摇上锚用实测值
+    assert "_slot_res(nxt_g)" in src       # 重摇下锚同理
+
+
+def test_redo_anchor_edges_are_reported():
+    """链首无上段 / 链尾无下段：锚天然缺省，要说清（不是故障、也不是 bug）。"""
+    src = _src("nodes.py")
+    assert "本段是链首（前面没有段）" in src
+    assert "本段是链尾（后面没有段）" in src
+    # 两侧锚是**独立**判据：一侧不匹配不该连带掐掉另一侧
+    assert "_pv_res != (width, height)" in src
+    assert "_nx_res != (width, height)" in src
+
+
+def test_bridge_break_is_scoped_to_one_boundary():
+    """只断这一处接缝，其后各段仍照常引用上段（用户明确要求，不是永久断链）。"""
+    src = _src("nodes.py")
+    assert src.count("其后各段仍照常引用上段") >= 2      # 序章 + 段间两条路径
+
+
+def test_next_bridge_gating_respects_resolution():
+    """桥本就不会生成时，不必再为本段做桥帧门控（不为不存在的桥牺牲帧数）。"""
+    src = _src("nodes.py")
+    assert "不必再为它牺牲本段帧数做桥帧门控" in src
+    assert "next_wants_bridge = False" in src

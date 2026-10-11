@@ -2981,7 +2981,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
             return _arch_res
 
         def _slot_res(g):
-            """槽 g 本次实际用的分辨率：走存档回放的段=存档分辨率，新生成=当前画布。"""
+            """槽 g 本次实际用的分辨率。
+
+            已处理过的槽用**实测值**（`_seg_res_map`）——这一条很关键：同一次运行里
+            前一段可能刚被重摇（或在链中间因缺文件重生成），此刻它的真实分辨率是
+            **当前画布**，而 `_archived_res` 还停在旧档的值；用旧值判「跨分辨率」
+            会把本该保留的接缝锚误判掉（重摇相邻两段时最明显）。
+            未处理的槽按「存档回放 / 本次生成」推。
+            """
+            if g in _seg_res_map:
+                return _seg_res_map[g]
             if use_ckpt and root is not None and g < done and redo_map.get(g) is None \
                     and os.path.exists(checkpoint.seg_path(root, g)):
                 return _archived_res(g)
@@ -3294,11 +3303,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
             """
             prev_g = g - 1
             if prev_g < 0 or root is None:
+                # 链首没有上段：上锚天然缺省（不是故障）。说清楚，别让用户以为
+                # 设了「双锚」却没生效是 bug。
+                report.append(f"段{g + 1} 重摇：本段是链首（前面没有段），"
+                              "上锚缺省——按「无上锚」重做")
                 return None
             if prev_g >= off and prev_g - off >= len(exec_items):
                 return None
-            # 跨分辨率不接桥（本段重摇按当前画布重采样，上段存档是旧分辨率时拼不上）
-            _pv_res = _archived_res(prev_g)
+            # 跨分辨率不接桥（本段重摇按当前画布重采样，上段实际分辨率不同就拼不上）。
+            # ⚠ 用 `_slot_res`（实测值优先）而不是 `_archived_res`：上段也在本次重摇
+            # 列表里时它已按当前画布重新落盘，拿旧档值判会误杀该保留的锚。
+            _pv_res = _slot_res(prev_g)
             if _pv_res != (width, height):
                 _rmsg = (f"段{g + 1} 重摇：上段分辨率 {_fmt_res(_pv_res)} ≠ 本段 "
                          f"{_fmt_res((width, height))}，跳过自动引用上段尾帧")
@@ -3321,14 +3336,20 @@ class H3SeamlessChainSampler(io.ComfyNode):
             下段不存在/unlink 段/禁用段/未完成/也在重摇列表 → None（该侧
             锚自动缺省——转场本就硬切、禁用段不进成片、或由下次重摇自己衔接）。"""
             nxt_g, ni = g + 1, g + 1 - off
-            if root is None or ni < 0 or ni >= len(exec_items):
+            if root is None or ni < 0:
+                return None
+            if ni >= len(exec_items):
+                # 链尾没有下段：下锚天然缺省（不是故障）
+                report.append(f"段{g + 1} 重摇：本段是链尾（后面没有段），"
+                              "下锚缺省——按「无下锚」重做")
                 return None
             if nxt_g >= done or nxt_g in redo_map:
                 return None
-            # 跨分辨率不接下锚：本段按当前画布重采样，下段存档是旧分辨率时拼不上。
+            # 跨分辨率不接下锚：本段按当前画布重采样，下段实际分辨率不同就拼不上。
             # 只提示不报错——重摇本身照跑，只是尾锚缺省。
-            if _archived_res(nxt_g) != (width, height):
-                _rmsg = (f"段{g + 1} 重摇：下段分辨率 {_fmt_res(_archived_res(nxt_g))} ≠ 本段 "
+            _nx_res = _slot_res(nxt_g)
+            if _nx_res != (width, height):
+                _rmsg = (f"段{g + 1} 重摇：下段分辨率 {_fmt_res(_nx_res)} ≠ 本段 "
                          f"{_fmt_res((width, height))}，跳过接下段首帧尾锚")
                 report.append(_rmsg)
                 print(f"[H3链] {_rmsg}", flush=True)
@@ -3645,10 +3666,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _pro_nxt_res = _slot_res(off) if _profpi >= 0 else None
             if _pro_nxt_res is not None and _pro_nxt_res != _pro_res:
                 guide = None
-                report.append(f"序章 → 段{off + 1}：分辨率不同（{_fmt_res(_pro_res)} ≠ "
-                              f"{_fmt_res(_pro_nxt_res)}），跳过自动引用上段尾帧")
-                print(f"[H3链] 序章 → 段{off + 1}：分辨率不同（{_fmt_res(_pro_res)} ≠ "
-                      f"{_fmt_res(_pro_nxt_res)}），跳过自动引用上段尾帧", flush=True)
+                _pmsg = (f"序章 → 段{off + 1}：分辨率不同（{_fmt_res(_pro_res)} ≠ "
+                         f"{_fmt_res(_pro_nxt_res)}），跳过自动引用上段尾帧"
+                         f"（只有段{off + 1} 这一处断开，其后各段仍照常引用上段）")
+                report.append(_pmsg)
+                print(f"[H3链] {_pmsg}", flush=True)
             else:
                 guide = _inject_guide(pv, pa, _profpi)
             report.append(f"段1/{total}：{prologue_origin} 序章 留{pframes.shape[0]}帧 · 种子 — | guide=无（序章）")
@@ -3783,6 +3805,14 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _seg_res_map[g] = _cur_res
             _res_same_prev = (_prev_exec_res is None) or (_prev_exec_res == _cur_res)
             next_wants_bridge = _next_wants_bridge(item_i)
+            # 下一个会上链的段分辨率不同 → 尾帧桥本就不会生成（与交棒端同一判据），
+            # 不必再为它牺牲本段帧数做桥帧门控（门控是为下段桥服务的）。
+            if next_wants_bridge:
+                _nxt0 = _next_consumer(item_i)
+                _nxt0_g = next((_k + off for _k, _it in enumerate(exec_items)
+                                if _it[0] == "prompt" and _it[1] == _nxt0), -1)
+                if _nxt0_g >= 0 and _slot_res(_nxt0_g) != _cur_res:
+                    next_wants_bridge = False
             # 本段是否接收上段桥：事实首段没有上源；_eff_inject 已内含 unlink（返回 0）。
             _eff_fr, _has_v, _has_a = _eff_inject(i)
             _has_src = not _is_fact_first(item_i) and _eff_fr > 0 and (_has_v or _has_a)
@@ -4273,10 +4303,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if _nxt_res != _cur_res:
                     # 跨分辨率不生成尾帧桥：latent 桥按行预留，C/H/W 不同拼不上。
                     # 只提示不报错——链参数不再强制整链一致（2026-10-12）。
+                    # ⚠ 断的只是**这一处接缝**：段 N+1 之后的段彼此分辨率相同，
+                    # 照常互相引用上段；全链只有这一个（或几个）边界没有尾帧桥。
                     guide = None
                     _bmsg = (f"段{g + 1} → 段{_nxt_g + 1}：分辨率不同"
                              f"（{_fmt_res(_cur_res)} ≠ {_fmt_res(_nxt_res)}），"
-                             "跳过自动引用上段尾帧")
+                             f"跳过自动引用上段尾帧（只有段{_nxt_g + 1} 这一处断开，"
+                             "其后各段仍照常引用上段）")
                     report.append(_bmsg)
                     print(f"[H3链] {_bmsg}", flush=True)
                 else:

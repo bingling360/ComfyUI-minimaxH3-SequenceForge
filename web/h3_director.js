@@ -287,6 +287,15 @@ function canvasBadgeText(node) {
     return c ? `${ar} · ${mp}MP → ${c[0]}×${c[1]}` : null;
 }
 
+/** 当前画布换算结果 [w, h]（宽高比 × 百万像素）；控件不可用/档位非法时 null。
+ *  与后端 `_resolve_canvas` 同一张表——用来判「本段与已存档段分辨率是否一致」。 */
+function currentCanvasWH(node) {
+    const ar = String(getWidgetValue(node, W_AR) ?? "");
+    if (!AR_RATIO[ar]) return null;
+    const c = resolveCanvas(ar, String(getWidgetValue(node, W_MP) ?? "0.5"));
+    return c ? [c[0], c[1]] : null;
+}
+
 /** 反推：宽高完全命中某 AR×MP 组合则返回 [ar, mp]，否则 null（旧工作流迁移用）。
  *  mp 返回数值（「百万像素」已改浮点控件，写字符串会留下类型混杂） */
 function matchCanvasCombo(w, h) {
@@ -6170,6 +6179,26 @@ function openRerollModal(idx, data) {
         optrow.append(lab);
     });
     const err = el("div", "h3d-err", "");
+    /* 边界说明（2026-10-12）：链首/链尾的锚天然缺省；与旧分辨率相邻时那一侧的锚
+     * 会自动跳过——都只提示、不阻断重做。提前说清，免得用户以为「设了双锚没生效」。 */
+    const noteLines = [];
+    if (slot === 0) {
+        noteLines.push("本段是链首（前面没有段）：上锚天然缺省，实际按「仅锚下段 / 无锚」重做");
+    }
+    const lastPromptIdx = plan.reduce((acc, it, k) => (it.kind === "prompt" ? k : acc), -1);
+    if (idx === lastPromptIdx) {
+        noteLines.push("本段是链尾（后面没有段）：下锚天然缺省，实际按「仅锚上段 / 无锚」重做");
+    }
+    const _curWH = currentCanvasWH(node);
+    const _archP = mf?.params;
+    if (_curWH && _archP && Number(_archP.width) > 0
+        && (_curWH[0] !== Number(_archP.width) || _curWH[1] !== Number(_archP.height))) {
+        noteLines.push(`当前画布 ${_curWH[0]}×${_curWH[1]} 与已存档段的 `
+            + `${Number(_archP.width)}×${Number(_archP.height)} 不同：`
+            + "与旧分辨率相邻的那一侧锚会自动跳过（只提示，重做照常进行）");
+    }
+    const note = el("div", "h3d-sub h3d-redo-note", "");
+    noteLines.forEach((t) => note.append(el("div", "", "· " + t)));
     const row = el("div", "h3d-dialog-row");
     const cancel = el("button", "h3d-btn", "取消");
     const unmark = el("button", "h3d-btn h3d-btn-danger", "取消重摇标记");
@@ -6177,6 +6206,7 @@ function openRerollModal(idx, data) {
     if (cur) row.append(unmark);
     row.append(cancel, ok);
     dialog.append(optrow, err, row);
+    if (noteLines.length) dialog.insertBefore(note, optrow);
     overlay.append(dialog);
     overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
     document.body.append(overlay);
@@ -6273,15 +6303,33 @@ async function doRunOnly(segNo, done) {
 /** 从段 idx+1 之后继续生成到底（游戏读档语义）：
  *  保留第 1..n 段（n=idx+1，plan 口径），n 之后有旧存档时先截断（弹确认），
  *  然后连续生成到链尾。「重跑起始段」= 全局 1-based（序章占 1），提交后立即还原——
- *  残留旧值会让下一次普通运行再次截断（本次修复的隐患）。 */
-async function continueFromSegment(idx, done, off) {
+ *  残留旧值会让下一次普通运行再次截断（本次修复的隐患）。
+ *
+ *  ⚠ `off` 必须由调用方传 `planOff(mf)`：`重跑起始段` 是**全局 1-based 段号**
+ *  （序章占 1 号）。少了 off，有上传序章的项目会连序章一起截断＝整链重做。
+ *
+ *  ⚠ 分辨率边界（2026-10-12）：已保留段是旧分辨率、当前画布是新分辨率时，
+ *  续拍的**第一段**（段 n+1）不会参考段 n —— **只有这一处断开**，其后各段
+ *  照常互相引用上段；全链分辨率不一致 → 本次不自动成片（只提示，不阻断）。 */
+async function continueFromSegment(idx, done, off, mf) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
+    const offN = Number(off) || 0;
     const n = idx + 1;
-    if (n < done
-        && !confirm(`从段 ${n + 1} 继续生成？\n段 ${n + 1} 之后的旧存档会被丢弃，从段 ${n + 1} 起逐段重新生成到链尾。`)) return;
+    let resNote = "";
+    const _curWH = currentCanvasWH(node);
+    const _pw = Number(mf?.params?.width), _ph = Number(mf?.params?.height);
+    if (_curWH && _pw > 0 && _ph > 0 && (_curWH[0] !== _pw || _curWH[1] !== _ph)) {
+        resNote = `\n\n⚠ 当前画布 ${_curWH[0]}×${_curWH[1]} 与已保留段的 ${_pw}×${_ph} 不同：\n`
+            + `· 段 ${n + 1}（续拍的第一段）不会参考段 ${n} —— 只有这一处断开，`
+            + "其后各段仍照常引用上段；\n"
+            + "· 全链分辨率不一致时最终不会自动成片（分段 mp4 与合并导出都正常）。";
+    }
+    if ((n < done || resNote)
+        && !confirm(`从段 ${n + 1} 继续生成？\n段 ${n + 1} 之后的旧存档会被丢弃，`
+            + `从段 ${n + 1} 起逐段重新生成到链尾。` + resNote)) return;
     const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
-    setWidgetValue(node, W_REROLL, n < done ? n + (off || 0) + 1 : 0);
+    setWidgetValue(node, W_REROLL, n < done ? n + offN + 1 : 0);
     setLed("running", `从段 ${Math.min(n + 1, done + 1)} 续拍已提交`);
     await queuePrompt();
     setWidgetValue(node, W_REROLL, prevReroll);
@@ -6922,6 +6970,9 @@ function injectStyles() {
     .h3d-kicker{color:var(--h3d-copper);font:700 11px/1 ui-monospace,Consolas;letter-spacing:.18em;white-space:nowrap}
     .h3d-title{font-size:17px;font-weight:700;white-space:nowrap}
     .h3d-sub{min-width:0;color:var(--h3d-muted);font-family:ui-monospace,Consolas;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    /* 重摇弹窗的边界说明（链首/链尾锚缺省、跨分辨率锚跳过）：覆盖 .h3d-sub 的
+     * nowrap+ellipsis，否则多行说明会被裁成一行。 */
+    .h3d-redo-note{white-space:normal;overflow:visible;text-overflow:clip;font-family:inherit;line-height:1.6;margin:4px 0 2px}
     .h3d-top-right{display:flex;gap:14px;align-items:center;justify-self:end}
     .h3d-close{width:36px;height:36px;border:1px solid var(--h3d-line);border-radius:7px;background:#2d333b;color:var(--h3d-bone);cursor:pointer;font-size:15px}
     .h3d-close:hover{filter:brightness(1.2)}
@@ -9418,8 +9469,10 @@ function buildCards(data) {
                    可标记多段后由页脚统一提交（间隔选择重做，互不级联） */
                 const cont = el("button", "h3d-btn h3d-btn-cta", "▶ 从这段继续");
                 cont.title = `保留段 1–${idx + 1}，从段 ${idx + 2} 起连续生成到链尾`
-                    + (idx + 1 < done ? `（段 ${idx + 2} 之后的旧存档会被丢弃）` : "");
-                cont.onclick = () => continueFromSegment(idx, done);
+                    + (idx + 1 < done ? `（段 ${idx + 2} 之后的旧存档会被丢弃）` : "")
+                    + "；若当前画布与已保留段分辨率不同，段 "
+                    + `${idx + 2} 不参考段 ${idx + 1}（只有这一处断开），且不会自动成片`;
+                cont.onclick = () => continueFromSegment(idx, done, off, mf);
                 actions.append(cont);
                 const rerollBtn = el("button", "h3d-btn", redoMode ? "🎲 重摇·改标记" : "🎲 重摇此段");
                 rerollBtn.title = `只重做段 ${idx + 1}（换种子重新采样，按锚定模式接缝），其余段保留不动；`
@@ -10659,6 +10712,7 @@ function renderFooter(z, data) {
 
     const run = z.run;
     run.onclick = queuePrompt;
+    run.title = "";   // 各分支按需重设（防止上一轮分支的提示残留）
     /* 终止按钮只在"认为正在跑"时露出来：没在跑却摆一个醒目的红叉，只会让人
      * 以为哪里坏了。判定跟顶栏那盏灯同源（提交那一刻置 running）。 */
     if (z.stop) z.stop.style.display = ledPhase === "running" ? "" : "none";
@@ -10687,9 +10741,22 @@ function renderFooter(z, data) {
         run.textContent = `✓ 本链已完成（${total} 段）`;
     } else {
         run.disabled = false;
-        run.textContent = done > 0
-            ? `▶ 继续下一段（段 ${done + 1}）`
+        /* 段号按**提示词段**计：序章占全局槽位 0 但不计段号，而这里的 done 含序章槽
+         * ——少减 off 会把「要跑的段 1」报成「段 2」（有上传序章时）。 */
+        const doneP = Math.max(0, done - planOff(mf));
+        run.textContent = doneP > 0
+            ? `▶ 继续下一段（段 ${Math.min(doneP + 1, total)}）`
             : `▶ 开始生成（共 ${total} 段）`;
+        /* 分辨率边界（2026-10-12）：下一段若与上一段分辨率不同，它不会参考上一段
+         * ——只有这一处断开，其后各段照常引用上段；全链不一致则不自动成片。 */
+        const _curWH = currentCanvasWH(node);
+        const _pw = Number(mf?.params?.width), _ph = Number(mf?.params?.height);
+        run.title = (_curWH && _pw > 0 && _ph > 0
+            && (_curWH[0] !== _pw || _curWH[1] !== _ph))
+            ? `下一段（段 ${Math.min(doneP + 1, total)}）不会参考上一段：当前画布 `
+                + `${_curWH[0]}×${_curWH[1]} 与已存档段的 ${_pw}×${_ph} 不同。`
+                + "只有这一处断开，其后各段仍照常引用上段；全链分辨率不一致时不会自动成片。"
+            : "生成下一段（已有段落沿用存档，不重做）";
     }
 }
 

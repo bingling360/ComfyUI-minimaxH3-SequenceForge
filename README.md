@@ -83,7 +83,7 @@ The tail is also snapped to the H3 token grid before chaining, so the guide anch
 - **Game-style project archiving.** One project = one folder under `output/h3_projects/`. Per-segment latent archives (~5 MB each) let an interrupted run resume with **frame-identical** results, skipping already-completed segments.
 - **Prologue continuation.** Feed a `LoadVideo` into *start video* and it becomes segment 0: the final cut starts with it and generation continues seamlessly from its tail.
 - **Standalone shots.** Mark a segment `🔗 standalone` to hard-cut it from the previous one — no bridge injection, no head trim, no post-processing.
-- **Manual anchors.** Pin an external clip / image / previous tail / finished segment / latent-library entry to any segment's head / mid / tail as a guide anchor. Five sources, 17k+5 window widths, image+audio / image-only / audio-only modes. The only hard constraint is resolution.
+- **Manual anchors.** Pin an external clip / image / previous tail / finished segment / latent-library entry to any segment's head / mid / tail as a guide anchor. Five sources, 17k+5 window widths, image+audio / image-only / audio-only modes. The only structural constraint is the canvas shape (C/H/W) — window width, landing point and source are all free (external sources are cropped/re-encoded to fit).
 - **Merge export.** Re-concatenate existing segments, finals, and external videos in click order into `finals/merged_*.mp4` — no re-run.
 - **Latent-upscale second pass.** After each segment is finalized (and before decode) the latent is **neurally upscaled → lightly re-sampled** to recover high-frequency detail. The saved segment video and final cut are the high-res result directly. Audio is carried over untouched.
 - **Bridge-frame gating.** Score the tail frames that will become the bridge (Laplacian sharpness + exposure); on a bad tail, roll back 17/34 frames to a good one.
@@ -313,7 +313,7 @@ All controls are on the node (labels are Chinese in the UI).
 - **`种子` (seed).** Segment *i* uses `seed + i`.
 - **`步数` (steps).** Default **8** (distilled models). `CFG` default 1.0; sampler `res_multistep`; scheduler `simple`.
 - **`自动存档` (auto archive).** Legacy compatibility switch, folded into *auto-save*; old workflows with `自动存档=自动存档` map to `自动保存=分段`.
-- **`存档目录` (archive directory).** Project name: one folder per project under `output/h3_projects/`. Empty = auto-name from a parameter fingerprint; a fixed name pins all runs to that folder.
+- **`存档目录` (archive directory).** Project name: one folder per project under `output/h3_projects/`. Empty = a fixed automatic project folder (`h3chain`), independent of parameters (changed 2026-10-12); a fixed name pins all runs to that folder.
 - **`桥帧门控` (bridge-frame gating).** Default **关闭**. `标注` = score and report only; `自动回退` = on a below-threshold tail, roll back 17/34 frames to a good one.
 - **`清晰度阈值` (sharpness threshold)** default 30.0, **`回退上限` (rollback cap)** default 34 (multiples of 17).
 - **`锚定加噪` (anchor noise)** default 0.0, **`递减锚定` (decaying anchor)** default 关闭. Both are *next-stage infrastructure*, off by default because measurement showed a net quality cost; kept as technical reserves.
@@ -362,7 +362,7 @@ output/h3_projects/
 ```
 
 - With `自动存档=自动存档` (or auto-save = segments), each finished segment writes its AV latent and the manifest atomically (per-segment seed / prompt hash / trim amount / title / `updated_at` / finals). After a crash at segment *k*, re-running with the same parameters loads segments 1…k from the archive (seconds) and resumes from *k+1*.
-- The project name is auto-derived from the **shared parameter** fingerprint (resolution / duration / guide frames / sampling params — prompts excluded). **Changing a shared parameter refuses to resume** (start a new chain). Changing one segment's prompt re-does just that segment.
+- The automatic project folder is **fixed** (`h3chain`) and no longer derived from the shared-parameter fingerprint, so **changing a shared parameter no longer refuses to resume or silently starts a new project** (changed 2026-10-12). Changing one segment's prompt re-does just that segment.
 - The seed sequence is authoritative in the manifest; a multi-run resume is frame-identical to a single run.
 - **The console is the archive manager** — list, load, delete, and create projects against the live disk.
 
@@ -389,7 +389,7 @@ Review mode auto-enables archiving (otherwise cross-run continuation is impossib
 
 ## 12. Re-running and rerolling segments
 
-- **Prompt-change auto re-run** (`重跑起始段=0`): per-segment prompt hashing. Changing segment *N* rebuilds **only segment *N*** — double-anchored against segment *N-1*'s archived tail and segment *N+1*'s archived head, then slotted back. No cascade. Changing sampling params (steps / CFG / sampler / scheduler / model) triggers **no** redo; it only affects newly generated segments. Changing resolution is the one hard constraint → whole-chain redo or a new chain.
+- **Prompt-change auto re-run** (`重跑起始段=0`): per-segment prompt hashing. Changing segment *N* rebuilds **only segment *N*** — double-anchored against segment *N-1*'s archived tail and segment *N+1*'s archived head, then slotted back. No cascade. Changing sampling params (steps / CFG / sampler / scheduler / model) triggers **no** redo; it only affects newly generated segments. **Resolution is no longer a hard constraint either** (2026-10-12): archived segments keep their own resolution and only newly generated ones use the current canvas; where neighbours differ, the automatic "reference previous tail" bridge and seam metrics are skipped, and a mixed-resolution chain is not auto-composed — all advisory, never blocking.
 - **Targeted reroll** (`重跑起始段=N`): discard the archive from segment *N*, regenerate *N* and onward with `seed + segment number`. Without changing the seed it equals a plain redo; change the seed for new randomness.
 
 ---
@@ -451,7 +451,7 @@ Usage (the console's dual-track timeline):
 
 Key semantics:
 
-- **The only hard constraint is resolution** (C/H/W must match, else the bridge cannot be assembled). With a source, the window is decoded and center-covered to the project canvas before VAE encoding; with **no usable source it errors out** (no silent fallback).
+- **Resolution is not a chain-level hard constraint** (changed 2026-10-12). The latent bridge is row-allocated, so C/H/W must match *at that particular seam* — the runner simply skips the bridge and the seam metrics where neighbours differ, and skips auto final composition for a mixed-resolution chain (advisory only). With a source, the window is decoded and center-covered to the project canvas before VAE encoding; with **no usable source it errors out** (no silent fallback).
 - **Triggers redo:** changing the anchor / prompt / material / segment duration rebuilds that segment only (double-anchored; no cascade).
 - **Does not trigger redo:** sampling params (steps / CFG / sampler / scheduler / model / fade_ratio / gate) affect only newly generated segments.
 - **Old archives** whose manifest has a non-empty `inserts` (used the old "insert video" feature) error out and ask for a new project — no migration, no silent degradation.

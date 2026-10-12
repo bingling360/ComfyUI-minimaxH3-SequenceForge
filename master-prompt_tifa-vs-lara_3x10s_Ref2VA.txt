@@ -1,0 +1,175 @@
+[Segment 1]
+Duration: 10
+Standalone: no
+
+Prompt:
+subject_definitions:
+<Subject 1> is the female fighter in @蒂法.png, the reference image "蒂法.png". Her appearance is fixed: long straight dark-brown hair worn loose down to her hips, a fair complexion, dark almond eyes, long side-swept bangs and a small silver drop earring on her left ear; a white cropped tank top with black shoulder harness straps and a bare midriff, a long black glove covering her left arm, a black armoured bracer with red accents on her right forearm, a black leather mini-skirt with a buckled belt and hanging straps, black opaque thigh-high stockings and black lace-up combat boots.
+<Subject 2> is the female fighter in @劳拉.png, the reference image "劳拉.png". Her appearance is fixed: dark-brown hair pulled back into a low messy ponytail with a side-parted fringe, a fair complexion, hazel eyes and a thin brown cord necklace with a round pendant; a charcoal long-sleeve henley top with a brown leather strap crossing her chest, a brown leather belt with a rust-red strap hanging at her left hip, fitted tan trousers, a brown leather pouch strapped to her right thigh and brown lace-up combat boots.
+
+summary:
+[reference generation] The target video is a ten-second stretch of an underground octagon-cage MMA fight. <Subject 1> and <Subject 2> trade standing strikes inside one continuous handheld take: <Subject 2> opens with a straight punch and a low sweep, <Subject 1> answers with a spinning liver shot that bursts the belt buckle at <Subject 2>'s side waist, and <Subject 2> closes with a Muay Thai clinch that drives <Subject 1> backwards into the chain-link fence.
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - loose dark-brown hair, white cropped tank top, black harness straps, left long glove, red-accented right bracer, black leather mini-skirt, thigh-high stockings and combat boots are all retained unchanged.
+<Subject 2> (appears in [Shot 1]): fully_preserved - low messy ponytail, charcoal henley, chest strap, belt with the rust-red hip strap, tan trousers, thigh pouch and combat boots are all retained unchanged.
+
+detailed_description:
+Photorealistic cinematic game CG, ultra-realistic 3D anime rendering, UE5.4 path tracing, physical PBR materials, subsurface-scattered skin, running sweat and oiled muscle sheen, tactical fabric and worn leather surface detail, ACES filmic grading with natural highlight roll-off and fully retained shadow detail, a single overhead yellow spotlight pouring a hard volumetric cone through airborne magnesium dust and heavy atmospheric haze. The entire segment is one uninterrupted 35mm handheld take that never cuts, breathing at 1.0-1.5 Hz with minimal inertia lag, every move of it driven by the fighters' impacts.
+[Shot 1] An underground octagon cage, chain-link fencing closing off the left of frame, a rubber-matted floor, the air thick with sweat vapour and drifting magnesium powder. <Subject 1>, the female fighter with long dark-brown hair worn loose to her hips, a white cropped tank top with black harness straps, a long black glove on her left arm and a red-accented black bracer on her right forearm, stands at the centre of frame in profile to the lens, weight sunk into a low fighting crouch, both fists raised to guard her face, her hair and tank top soaked dark with sweat. Three paces ahead of her, also in profile to the lens, <Subject 2> holds a military combat-ready stance in her charcoal henley, chest strap and tan trousers. Neither woman ever speaks and no other figure enters the cage.
+The camera pushes in low along their side with small amplitude at slow speed. Within the first half second <Subject 2> fires first: a heavy right straight punch followed by a low left sweep kick. <Subject 1> answers in the same instant, turning her head aside and taking the punch on a raised forearm while lifting her knee to absorb the sweep; knuckles and boot sole scrape hard across the guard and bone meets bone with a dull crack that shakes a wide sheet of sweat off both bodies. The camera whips to the side as the punch arrives and shakes slightly, sweat and dust striking the lens.
+By the third second <Subject 1> rides the rebound of her own block, drops under the follow-up high kick and unloads a heavy spinning liver shot that lands dead on the belt buckle at <Subject 2>'s side waist. The buckle bursts with a sharp crack and breaks off as a visible chunk; fragments and sweat spray outward as <Subject 2> lets out a stifled grunt and rolls her hips to shed the force. The two pass each other and trade positions, <Subject 1> still in profile to the lens. The camera arcs half a circle around the crossing bodies with small amplitude at slow speed, racking focus onto the shattered buckle and <Subject 2>'s twisted expression, and shakes slightly as debris sprays past.
+From the sixth second <Subject 2> comes back hard, clamping a Muay Thai clinch onto the back of <Subject 1>'s neck and driving rapid heavy knees into her abdominal guard, walking her backwards until her back slams into the chain-link wall. The fence rocks hard and shakes loose a heavy curtain of magnesium dust. <Subject 2> adds a heavy downward axe kick; <Subject 1> cross-blocks with both forearms and is driven down onto one knee, still in profile to the lens, sweat running from the corner of her mouth, her brows knitting, her eyes narrowing and going hard. The camera retreats fast behind <Subject 1> along the path of her slam into the fence, then tilts down from above onto her one-knee side profile, the frame shaken hard by the impact while magnesium dust and sweat burst across the whole image. The take ends here, uncut and unfrozen.
+
+overall_soundscape:
+Low female panting and exertion breathing runs under the whole segment. Dull heavy impacts of knuckles and shins against muscle and guard, one bone-on-bone crack at the block, the sharp snap of the belt buckle bursting, rubber matting squeaking under boots, chain-link fence rattling and ringing as she is driven back into it, magnesium dust pattering down, and a short stifled grunt from each fighter at the moment of contact. No spoken words at any point.
+
+non_diegetic_music:
+N/A
+
+[Segment 2]
+Duration: 10
+Standalone: no
+
+Prompt:
+subject_definitions:
+<Subject 1> is the female fighter in @蒂法.png, the reference image "蒂法.png". Her appearance is fixed: long straight dark-brown hair worn loose down to her hips, a fair complexion, dark almond eyes, long side-swept bangs and a small silver drop earring on her left ear; a white cropped tank top with black shoulder harness straps and a bare midriff, a long black glove covering her left arm, a black armoured bracer with red accents on her right forearm, a black leather mini-skirt with a buckled belt and hanging straps, black opaque thigh-high stockings and black lace-up combat boots.
+<Subject 2> is the female fighter in @劳拉.png, the reference image "劳拉.png". Her appearance is fixed: dark-brown hair pulled back into a low messy ponytail with a side-parted fringe, a fair complexion, hazel eyes and a thin brown cord necklace with a round pendant; a charcoal long-sleeve henley top with a brown leather strap crossing her chest, a brown leather belt with a rust-red strap hanging at her left hip, fitted tan trousers, a brown leather pouch strapped to her right thigh and brown lace-up combat boots.
+
+summary:
+[reference generation] Continuing directly from the previous segment, <Subject 1> drives up off the single knee and forces <Subject 2> onto the back foot with a high-frequency combination, then adds a heavy front push-kick that throws her several metres across the mat. The segment closes with the two fighters at opposite ends of the cage, glaring white steam rising off <Subject 1> and military afterimages distorting the air around <Subject 2>'s arms.
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - loose dark-brown hair, white cropped tank top, black harness straps, left long glove, red-accented right bracer, black leather mini-skirt, thigh-high stockings and combat boots are all retained unchanged.
+<Subject 2> (appears in [Shot 1]): fully_preserved - low messy ponytail, charcoal henley, chest strap, belt with the rust-red hip strap, tan trousers, thigh pouch and combat boots are all retained unchanged.
+
+detailed_description:
+Picking up on the same photorealistic cinematic game CG, the same UE5.4 path-traced rendering, the same single overhead yellow spotlight through airborne magnesium dust and the same heavy atmospheric haze; the segment is again one uninterrupted 35mm handheld take that never cuts, breathing at 1.0-1.5 Hz with minimal inertia lag.
+[Shot 1] The shot opens on exactly the final frame of the previous segment: <Subject 1>, the female fighter with loose dark-brown hair, white cropped tank top and black leather mini-skirt, still down on one knee against the chain-link wall, and <Subject 2>, the fighter in the charcoal henley and tan trousers, standing over her. Within the first half second <Subject 1> drives up off the single knee, both forearms sweeping <Subject 2>'s pressing guard aside, and explodes into a storm of high-frequency combination punches, fist-wind tearing the air. <Subject 2> folds, both arms clamped tight around her head, retreating across the mat with the rubber screeching under her boots. The camera pushes in with large amplitude at fast speed on <Subject 1>'s advance, the frame trembling in a fine continuous rhythm with each punch, sweat flung off in arcs.
+By the fourth second <Subject 1> rolls her hips through the last punch and adds a heavy front push-kick, the sole of her boot landing dead centre on <Subject 2>'s crossed guard. The impact booms like thunder and throws <Subject 2> and her guard backwards, her boots skidding several metres across the mat, and the two are fully separated. The camera trucks sideways between them with small amplitude at slow speed and snaps back as the kick lands, the frame shaking clearly.
+From the seventh second the two stand at opposite ends of the cage, both in profile to the lens. <Subject 1>'s fists clench hard and fresh cracks split open in the rubber matting under her feet as every trace of sweat on her skin vaporises into glaring white steam, the air bending around her body. <Subject 2> sinks her centre of gravity, military combat afterimages distorting the air in a tight band around both arms. The camera pulls out with large amplitude at fast speed and pedestals up into a wide two-shot. The instant the cracks break open and the light and pressure wave are about to burst, the take ends, uncut and unfrozen.
+
+overall_soundscape:
+Heavy female panting and low exertion breathing throughout. The dense rapid impacts of bare fists on raised forearms, boots scraping and squeaking across rubber matting, one deep thunderous boom from the push-kick, the rising hiss of sweat flashing into steam, a low swelling air-pressure rumble under the final three seconds, and short sharp exertion shouts from both women. No spoken words at any point.
+
+non_diegetic_music:
+N/A
+
+[Segment 3]
+Duration: 10
+Standalone: no
+
+Prompt:
+subject_definitions:
+<Subject 1> is the female fighter in @蒂法.png, the reference image "蒂法.png". Her appearance is fixed: long straight dark-brown hair worn loose down to her hips, a fair complexion, dark almond eyes, long side-swept bangs and a small silver drop earring on her left ear; a white cropped tank top with black shoulder harness straps and a bare midriff, a long black glove covering her left arm, a black armoured bracer with red accents on her right forearm, a black leather mini-skirt with a buckled belt and hanging straps, black opaque thigh-high stockings and black lace-up combat boots.
+<Subject 2> is the female fighter in @劳拉.png, the reference image "劳拉.png". Her appearance is fixed: dark-brown hair pulled back into a low messy ponytail with a side-parted fringe, a fair complexion, hazel eyes and a thin brown cord necklace with a round pendant; a charcoal long-sleeve henley top with a brown leather strap crossing her chest, a brown leather belt with a rust-red strap hanging at her left hip, fitted tan trousers, a brown leather pouch strapped to her right thigh and brown lace-up combat boots.
+
+summary:
+[reference generation] The final ten seconds of the underground octagon-cage fight. <Subject 1> and <Subject 2> collide in the centre of the cage with their charged strikes already formed, <Subject 2> lands a spinning elbow that severs one of the black harness straps of <Subject 1>'s tank top, and <Subject 1> answers with a white-hot flying knee that lands on the already-broken buckle gap at <Subject 2>'s side waist and freezes the film on its only held frame.
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - loose dark-brown hair, white cropped tank top, left long glove, red-accented right bracer, black leather mini-skirt, thigh-high stockings and combat boots are retained; only one black harness strap is severed by the elbow strike.
+<Subject 2> (appears in [Shot 1]): fully_preserved - low messy ponytail, charcoal henley, chest strap, tan trousers, thigh pouch and combat boots are retained; the belt stays on with its side buckle gap still broken open.
+
+detailed_description:
+Continuing the same photorealistic cinematic game CG, the same UE5.4 path-traced rendering, the same overhead yellow spotlight through drifting magnesium dust and the same heavy atmospheric haze; the segment is again one uninterrupted 35mm handheld take that never cuts, breathing at 1.0-1.5 Hz with minimal inertia lag.
+[Shot 1] The shot opens on exactly the final frame of the previous segment: <Subject 1>, the female fighter with loose dark-brown hair, white cropped tank top and black leather mini-skirt, at one end of the cage with white-hot steam gathered around her body, and <Subject 2>, the fighter in the charcoal henley and tan trousers, at the other with military afterimages banding both arms. Within the first half second both women launch toward the centre like shells, white-hot fist-wind and military heavy afterimages colliding head-on, fists and shins meeting in continuous rolling thunder. <Subject 2> finds the seam in the exchange and lands a spinning heavy elbow that grazes <Subject 1>'s left shoulder and cuts one black harness strap of her tank top clean through; <Subject 1> bites down, dropping the left shoulder fast to shed the force. The camera trucks sideways between the colliding bodies with small amplitude at fast speed and snaps back as the elbow lands, the frame shaking clearly while sweat and pressure waves churn.
+By the fourth second <Subject 1> twists her hips to the limit off the dropped shoulder, pouring all the white-hot steam and kinetic energy down into her right leg, drives off the floor and rises into a super-heavy white-hot flying knee that tears the air. <Subject 2> has no room to evade and crosses both arms tight over her chest to take it. The camera pushes in with large amplitude at fast speed along <Subject 1>'s rising path, focus locked on the knee wrapped in white-hot steam, the frame trembling continuously under the wind pressure.
+From the seventh second the knee smashes straight through <Subject 2>'s crossed guard and lands dead on the already-broken buckle gap at the side waist of her belt. On the passing frame the image flashes pure white for a single frame and all sound is sucked out. When it returns, <Subject 1> has landed with her back to <Subject 2> and her front to the lens, and half a beat later <Subject 2> is blown backwards, slams into the chain-link wall and slides down to one knee, panting hard. <Subject 1> turns half of her face toward the lens, and in the final half second the image freezes exactly as it is - the severed black harness strap, the lifted loose dark hair and the whole spray of sweat in the air all motionless. This is the only freeze in the entire film. The camera pulls out with small amplitude at slow speed in front of <Subject 1>, shakes strongly as the pressure wave arrives, the frame whiting out three times and swimming, then settles into a medium shot in front of her; the last half second is completely still, with one small shake in the frame just before it freezes.
+
+overall_soundscape:
+Continuous low female panting under the whole segment, breaking into hard panting after the impact. Rapid dense impacts of fists and shins, the sharp tearing of a fabric strap, a deep concussive boom at the knee strike, one beat of total silence on the white flash, then the ringing rattle of the chain-link wall taking the body of the thrown fighter, sliding metal, and a long shuddering exhale from each woman. No spoken words at any point.
+
+non_diegetic_music:
+N/A
+
+[END]
+
+———————— 中文对照版（仅供阅读，不要粘进提示词框）————————
+
+[Segment 1]
+Duration: 10
+Standalone: no
+
+Prompt:
+subject_definitions:
+<Subject 1> 是 @蒂法.png 中的女性格斗手，参考图 "蒂法.png"。她的外貌固定为：深棕色长直发披散垂至腰际，肤色白皙，深色杏眼，侧分长刘海，左耳一枚小银坠；白色露腰背心配黑色肩部绑带、露出腰腹，左臂一副黑色长手套，右前臂黑色护臂带红色配色，黑色皮质短裙配扣环腰带与垂挂皮带，黑色不透明过膝袜，黑色系带作战靴。
+<Subject 2> 是 @劳拉.png 中的女性格斗手，参考图 "劳拉.png"。她的外貌固定为：深棕色头发向后束成低位松散马尾、侧分刘海，肤色白皙，浅褐色眼睛，细棕色绳编项链配圆形吊坠；深灰色长袖亨利衫，胸前斜跨一条棕色皮带，棕色皮质腰带在左胯垂着一根锈红色带子，卡其色修身长裤，右腿绑一只棕色皮质腿袋，棕色系带作战靴。
+
+summary:
+[reference generation] 目标视频是地下八角笼 MMA 格斗的十秒片段。<Subject 1> 与 <Subject 2> 在一镜到底的手持长镜头中站立互殴：<Subject 2> 先手直拳接低位扫腿，<Subject 1> 以转身爆肝拳回应、打崩 <Subject 2> 侧腰的腰带扣，<Subject 2> 最后以泰式箍颈把 <Subject 1> 一路顶进铁丝网。
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - 深棕披散长发、白色露腰背心、黑色肩部绑带、左手长手套、带红配色的右护臂、黑色皮质短裙、过膝袜与作战靴全部原样保留。
+<Subject 2> (appears in [Shot 1]): fully_preserved - 低位松散马尾、深灰亨利衫、胸前斜跨皮带、腰带与锈红胯带、卡其长裤、腿袋与作战靴全部原样保留。
+
+detailed_description:
+高端写实 3D Anime Cinematic、Photorealistic Game CG，UE5.4 Path Tracing，PBR 物理材质，真实皮肤次表面散射，汗水流淌与油亮肌肉肌理，战术织物与磨损皮革的表面细节，电影级 ACES 高动态范围、自然高光滚降、暗部层次完整保留，头顶单盏黄色聚光灯打出一道硬边体积光锥，穿过悬浮的镁粉尘埃与浓重的空气透视。整段是一镜到底的 35mm 手持长镜头，全程不切，以 1.0-1.5Hz 高频呼吸微抖，惯性延迟极低，它的每一次运动都由两人的肌肉冲击牵引。
+[Shot 1] 地下八角笼擂台，铁丝网笼壁立在画面左侧，地面铺设橡胶垫，空气中弥漫汗水蒸气与飘浮的镁粉。<Subject 1>——深棕色长发披散垂至腰际、白色露腰背心配黑色肩部绑带、左臂黑色长手套、右前臂带红配色的黑色护臂——站在画面中央，侧对镜头，重心压低成低位格斗架势，双拳护住面部，长发与背心被汗水浸成深色。她前方三步处，同样侧对镜头，<Subject 2> 穿着深灰亨利衫、胸前斜跨皮带与卡其长裤，保持军用格斗准备姿态。两人全程不说话，笼内不出现第三个身影。
+镜头贴着侧面低角度推近，幅度小、速度慢。开场半秒内 <Subject 2> 先手：一记沉重的右直拳接一记低位左扫腿。<Subject 1> 在同一瞬作出应对，侧头、抬臂用手臂架住重拳，同时提膝硬抗扫腿；拳锋与靴底狠狠擦过防守，骨骼相撞发出一声沉闷的爆响，震飞两人身上一大片汗水。重拳打来时镜头朝侧面猛地一甩并轻轻一震，汗滴与尘埃扑向镜头。
+到第三秒，<Subject 1> 借自己格挡的反弹力顺势下潜，躲过随后的高扫腿，打出一记重型转身爆肝拳，精准落在 <Subject 2> 侧腰的腰带扣上。锁扣"啪"地一声脆响崩开，作为一块可见的碎片整块脱落；碎屑与汗水向四周飞溅，<Subject 2> 发出一声压抑的闷哼，转腰卸力。两人擦身而过交换位置，<Subject 1> 仍侧对镜头。镜头绕着交错的两具身体转了半圈，幅度小、速度慢，焦点切到被击碎的锁扣与 <Subject 2> 扭曲的表情上，碎屑掠过时画面轻轻一震。
+从第六秒起 <Subject 2> 狠狠反扑，以泰式箍颈死死扣住 <Subject 1> 后颈，连续极速的重型膝撞轰击她的腹部防守，推着她一路倒退，直到后背重重撞在铁丝网笼壁上。铁丝网剧烈晃动，震落一整片镁粉尘埃。<Subject 2> 再补上一记重型下劈腿；<Subject 1> 交叉双臂硬接，被砸得单膝贴地，仍侧对镜头，汗水从嘴角滑落，眉头拧紧，眼睛收窄并转为狠厉。镜头在 <Subject 1> 身后沿着她撞笼的轨迹迅速后退，再从上往下俯拍她单膝贴地的侧影，画面被冲击震得明显晃动，镁粉与汗水炸满整幅画面。镜头到此结束，不切、不定格。
+
+overall_soundscape:
+全段垫着女性低沉的喘息与发力呼吸。拳头与小腿砸在肌肉与防守上的沉闷重击，格挡处一声骨骼相撞的脆响，腰带扣崩开的一声脆响，靴子在橡胶垫上摩擦发出的吱嘎声，被顶进铁丝网时笼壁的震颤与金属回响，镁粉簌簌落下，以及两人每次接触时短促压抑的闷哼。全程没有任何说话声。
+
+non_diegetic_music:
+N/A
+
+[Segment 2]
+Duration: 10
+Standalone: no
+
+Prompt:
+subject_definitions:
+<Subject 1> 是 @蒂法.png 中的女性格斗手，参考图 "蒂法.png"。她的外貌固定为：深棕色长直发披散垂至腰际，肤色白皙，深色杏眼，侧分长刘海，左耳一枚小银坠；白色露腰背心配黑色肩部绑带、露出腰腹，左臂一副黑色长手套，右前臂黑色护臂带红色配色，黑色皮质短裙配扣环腰带与垂挂皮带，黑色不透明过膝袜，黑色系带作战靴。
+<Subject 2> 是 @劳拉.png 中的女性格斗手，参考图 "劳拉.png"。她的外貌固定为：深棕色头发向后束成低位松散马尾、侧分刘海，肤色白皙，浅褐色眼睛，细棕色绳编项链配圆形吊坠；深灰色长袖亨利衫，胸前斜跨一条棕色皮带，棕色皮质腰带在左胯垂着一根锈红色带子，卡其色修身长裤，右腿绑一只棕色皮质腿袋，棕色系带作战靴。
+
+summary:
+[reference generation] 严格承接上一段，<Subject 1> 从单膝状态爆发站起，以高频组合拳把 <Subject 2> 逼到后脚，再接一记重型正蹬把她踹出数米。本段收在两人分站八角笼两端：<Subject 1> 周身腾起刺目白气，<Subject 2> 双臂周围军用残影扭曲空气。
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - 深棕披散长发、白色露腰背心、黑色肩部绑带、左手长手套、带红配色的右护臂、黑色皮质短裙、过膝袜与作战靴全部原样保留。
+<Subject 2> (appears in [Shot 1]): fully_preserved - 低位松散马尾、深灰亨利衫、胸前斜跨皮带、腰带与锈红胯带、卡其长裤、腿袋与作战靴全部原样保留。
+
+detailed_description:
+延续同样的高端写实 3D Anime Cinematic、Photorealistic Game CG，同样的 UE5.4 Path Tracing，同样的头顶黄色聚光灯穿过悬浮镁粉与浓重空气透视；本段同样是一镜到底的 35mm 手持长镜头、全程不切，以 1.0-1.5Hz 高频呼吸微抖，惯性延迟极低。
+[Shot 1] 镜头开场就是上一段的最后一帧：<Subject 1>——深棕披散长发、白色露腰背心与黑色皮质短裙——仍单膝贴地靠着铁丝网，<Subject 2>——深灰亨利衫与卡其长裤——站在她身前。开场半秒内 <Subject 1> 单膝爆发站起，双手护臂强行荡开 <Subject 2> 压制的防守，爆出一串高频组合拳，拳风撕裂空气。<Subject 2> 被迫收缩，双臂紧紧护头，踩着橡胶垫连续后退，橡胶发出刺耳的摩擦声。镜头跟着 <Subject 1> 反扑的步伐向前推进，幅度大、速度快，画面伴随每一拳持续细密震颤，汗水成弧线飞出。
+到第四秒，<Subject 1> 在最后一拳上拧腰送胯，接上一记重型正蹬，靴底正正踹在 <Subject 2> 交叉防守的正中心。冲击像闷雷一样炸开，把 <Subject 2> 连人带防守向后掀飞，靴子在垫子上滑行出数米，两人彻底拉开距离。镜头在两者之间横移，幅度小、速度慢，正蹬踹出时向后猛地一仰，画面明显晃动。
+从第七秒起，两人站在八角笼两端，均侧对镜头。<Subject 1> 双拳猛然紧握，脚下橡胶垫裂开新的裂纹，皮肤上所有汗水瞬间汽化成刺目的白气，空气在她身体四周弯曲；<Subject 2> 压低重心，军用格斗残影在双臂周围扭曲出一圈紧绷的空气带。镜头向后急拉，幅度大、速度快，再升高成一个双人全景。就在裂纹刚崩开、光芒与气浪即将涌出的一瞬，镜头到此结束，不切、不定格。
+
+overall_soundscape:
+全段是沉重的女性喘息与低沉的发力呼吸。赤裸拳头砸在抬起手臂上的密集重击，靴子在橡胶垫上拖擦与吱嘎，正蹬那一记深沉的闷雷般巨响，汗水汽化成白气的嘶嘶声，最后三秒垫着一层逐渐升高的低频气压轰鸣，以及两名女性短促尖锐的发力爆喝。全程没有任何说话声。
+
+non_diegetic_music:
+N/A
+
+[Segment 3]
+Duration: 10
+Standalone: no
+
+Prompt:
+subject_definitions:
+<Subject 1> 是 @蒂法.png 中的女性格斗手，参考图 "蒂法.png"。她的外貌固定为：深棕色长直发披散垂至腰际，肤色白皙，深色杏眼，侧分长刘海，左耳一枚小银坠；白色露腰背心配黑色肩部绑带、露出腰腹，左臂一副黑色长手套，右前臂黑色护臂带红色配色，黑色皮质短裙配扣环腰带与垂挂皮带，黑色不透明过膝袜，黑色系带作战靴。
+<Subject 2> 是 @劳拉.png 中的女性格斗手，参考图 "劳拉.png"。她的外貌固定为：深棕色头发向后束成低位松散马尾、侧分刘海，肤色白皙，浅褐色眼睛，细棕色绳编项链配圆形吊坠；深灰色长袖亨利衫，胸前斜跨一条棕色皮带，棕色皮质腰带在左胯垂着一根锈红色带子，卡其色修身长裤，右腿绑一只棕色皮质腿袋，棕色系带作战靴。
+
+summary:
+[reference generation] 地下八角笼格斗的最后十秒。<Subject 1> 与 <Subject 2> 带着已成形的蓄势在笼中央对撞，<Subject 2> 一记转身砸肘切断 <Subject 1> 背心上的一条黑色肩带，<Subject 1> 以一记白热飞膝回应，正正落在 <Subject 2> 侧腰那个已经崩开的锁扣缺口上，全片在唯一一次定格中收尾。
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - 深棕披散长发、白色露腰背心、左手长手套、带红配色的右护臂、黑色皮质短裙、过膝袜与作战靴全部保留；仅一条黑色肩带被砸肘切断。
+<Subject 2> (appears in [Shot 1]): fully_preserved - 低位松散马尾、深灰亨利衫、胸前斜跨皮带、卡其长裤、腿袋与作战靴全部保留；腰带仍在身上，侧腰锁扣缺口保持崩开状态。
+
+detailed_description:
+延续同样的高端写实 3D Anime Cinematic、Photorealistic Game CG，同样的 UE5.4 Path Tracing，同样的头顶黄色聚光灯穿过飘浮镁粉与浓重空气透视；本段同样是一镜到底的 35mm 手持长镜头、全程不切，以 1.0-1.5Hz 高频呼吸微抖，惯性延迟极低。
+[Shot 1] 镜头开场就是上一段的最后一帧：<Subject 1>——深棕披散长发、白色露腰背心与黑色皮质短裙——站在笼子一端，周身聚着白热气浪；<Subject 2>——深灰亨利衫与卡其长裤——站在另一端，双臂环绕军用残影。开场半秒内两人同时如出膛炮弹般冲向中央，白热拳风与军用重型残影迎面对撞，拳脚相交发出一连串滚动的闷雷。<Subject 2> 在极速乱战中抓准破绽，一记转身重型砸肘擦过 <Subject 1> 左肩，将她背心上的一条黑色肩带齐根切断；<Subject 1> 咬牙忍住，左肩急速下沉卸力。镜头在相撞的两具身体之间横移，幅度小、速度快，重肘命中时向后一仰，画面明显晃动，汗水与气浪疯狂翻涌。
+到第四秒，<Subject 1> 借着左肩下沉的姿态把腰拧到极限，将全身的白热气浪与动能全部灌入右腿，猛蹬地面拔地而起，打出一记撕裂空气的超重型白热飞膝。<Subject 2> 已无处闪避，只能交叉双臂死死护在胸前硬接。镜头跟着 <Subject 1> 起跳的轨迹向前推进，幅度大、速度快，焦点锁紧包裹着白热气浪的膝盖，画面在风压下持续发抖。
+从第七秒起，膝盖直接暴力撞开 <Subject 2> 的交叉双臂，正正落在她腰带侧腰那个已经崩开的锁扣缺口上。擦身交错的一瞬，画面闪过一帧纯白，所有声音被抽空。再出现时，<Subject 1> 已经背对 <Subject 2>、正面朝向镜头落地，半拍之后 <Subject 2> 被弹飞，重重撞在铁丝网笼壁上滑落，单膝跪地剧烈喘息。<Subject 1> 侧过半张脸朝向镜头，最后半秒画面就那样精准定格——断裂的黑色肩带、扬起的披散长发与漫天飞溅的汗滴全部静止不动。这是全片唯一一次定格。镜头在 <Subject 1> 身前向后缓拉，幅度小、速度慢，冲击波到达时剧烈晃动，画面被白光闪白三次并发晕，随后稳在她身前的中景；最后半秒完全静止，定格前一刻画面轻轻一震。
+
+overall_soundscape:
+全段垫着持续的女性低沉喘息，命中后转为剧烈喘气。拳头与小腿的密集快击，织物肩带被切断的清脆撕裂声，飞膝命中时一记深沉的震荡巨响，白光闪过的那一拍全场静音，随后是铁丝网笼壁承受被弹飞者身体时的震颤嗡鸣、金属滑落声，以及两名女性各一次长长的颤抖吐气。全程没有任何说话声。
+
+non_diegetic_music:
+N/A
+
+[END]

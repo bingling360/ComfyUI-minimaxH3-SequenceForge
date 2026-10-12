@@ -19,7 +19,7 @@ import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(ROOT, "web", "h3_default_workflow.js")
-EXAMPLE = os.path.join(ROOT, "example_workflows", "备用初始化导演台工作流.json")
+EXAMPLE = os.path.join(ROOT, "example_workflows", "初始化导演台工作流.json")
 
 # 已下线的画布节点类（资产库时代残留）
 REMOVED_NODES = ["H3AssetBundle", "H3AssetHub", "H3MediaToLatent",
@@ -104,13 +104,18 @@ def _assert_frozen(wf):
     assert len(_up) == 1
     assert _up[0].get("type") == "MODEL"
     assert _up[0].get("link") is not None
-    # 两个 sigmas 槽：纯连线槽（无 widget，不占 widgets_values），默认空置。
+    # 两个 sigmas 槽：纯连线槽（无 widget，不占 widgets_values）。
     # 「一采」槽在 rev3.1 的位次上与旧「自定义Sigmas」**同一位**（改名不改位次，
     # 旧工作流接在这儿的线载入后仍落回本槽）；「二采」槽是它后面新加的一位。
+    # rev3.5（2026-10-12）：「一采自定义Sigmas」出厂接一张 10 步手工 sigma 表
+    # （ManualSigmas，11 个点，与主链步数 10 配套）；「二采自定义Sigmas」仍默认空置。
     for _nm in ("一采自定义Sigmas", "二采自定义Sigmas"):
         _sig = [i for i in sampler.get("inputs", []) if i.get("name") == _nm]
         assert len(_sig) == 1 and _sig[0].get("type") == "SIGMAS", _nm
-        assert _sig[0].get("link") is None, _nm
+    _one = [i for i in sampler.get("inputs", []) if i.get("name") == "一采自定义Sigmas"][0]
+    assert _one.get("link") is not None, "一采自定义Sigmas 出厂应接手工 sigma 表"
+    _two = [i for i in sampler.get("inputs", []) if i.get("name") == "二采自定义Sigmas"][0]
+    assert _two.get("link") is None, "二采自定义Sigmas 出厂应空置"
     _names = [i.get("name") for i in sampler.get("inputs", [])]
     assert _names.index("一采自定义Sigmas") + 1 == _names.index("二采自定义Sigmas"), _names
     for i in sampler.get("inputs", []):
@@ -155,8 +160,8 @@ def test_upscale_chain_ignored_by_default():
 
     忽略态不进执行图：二采不用时内存零占用（同款 int8 权重不会被第二个
     UNETLoader 再读一份 ~13GB 进 RAM）。链上含二采专用 Motion Repair 0.25；
-    一采 Motion Repair 保持 0.6。要二采：框选 ④ 组「取消忽略」
-    + 右栏把二采拨回「跟随生成」。
+    一采 Motion Repair rev3.5（2026-10-12）起降为 0.3。要二采：框选 ④ 组
+    「取消忽略」+ 右栏把二采拨回「跟随生成」。
     """
     for path in (TEMPLATE, EXAMPLE):
         wf = _load_wf(path)
@@ -170,7 +175,81 @@ def test_upscale_chain_ignored_by_default():
         first = next(n for n in wf["nodes"] if n["type"] == "LoraLoaderModelOnly"
                      and n["widgets_values"][0] == "Motion_Repair_V2.safetensors"
                      and n["id"] != chain[1]["id"])
-        assert first["widgets_values"][1] == 0.6, f"{path}: 一采 Motion Repair 必须保持 0.6"
+        assert first["widgets_values"][1] == 0.3, f"{path}: 一采 Motion Repair 应为 0.3"
+
+
+def _base_chain(wf):
+    """从主节点「模型」输入向上游遍历 MODEL 链（下游→上游），反转成执行顺序。"""
+    nodes = {n["id"]: n for n in wf["nodes"]}
+    links = {L[0]: L for L in wf["links"]}
+    sampler = next(n for n in wf["nodes"] if n["type"] == "H3SeamlessChainSampler")
+    cur = links[next(i for i in sampler["inputs"] if i["name"] == "模型")["link"]]
+    chain = []
+    while True:
+        n = nodes[cur[1]]
+        chain.append(n)
+        ins = n.get("inputs") or []
+        if not ins or ins[0].get("link") is None:
+            return list(reversed(chain))
+        cur = links[ins[0]["link"]]
+
+
+def test_base_chain_topology():
+    """rev3.5（2026-10-12）：一采链新增 H3_Combat_V2，turbo 换 ref2v 8step 版，Motion Repair 降 0.3。"""
+    for path in (TEMPLATE, EXAMPLE):
+        wf = _load_wf(path)
+        chain = _base_chain(wf)
+        assert [n["type"] for n in chain] == [
+            "UNETLoader", "LoraLoaderModelOnly", "LoraLoaderModelOnly",
+            "LoraLoaderModelOnly", "ModelAttentionBackend", "BlockSparseAttention"], (path, chain)
+        loras = [n["widgets_values"] for n in chain if n["type"] == "LoraLoaderModelOnly"]
+        assert loras[0] == ["minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors", 0.75], (path, loras[0])
+        assert loras[1] == ["H3_Combat_V2.safetensors", 0.6], (path, loras[1])
+        assert loras[2] == ["Motion_Repair_V2.safetensors", 0.3], (path, loras[2])
+
+
+def test_base_pass_sparse_ignored_by_default():
+    """rev3.6（2026-10-12）：一采 Sol-Attn 块稀疏出厂**忽略**（mode=4，旁路）。
+
+    一采只走 comfy kitchen 注意力；要启用右键该节点「取消忽略」。
+    """
+    for path in (TEMPLATE, EXAMPLE):
+        wf = _load_wf(path)
+        chain = _base_chain(wf)
+        assert chain[-2]["type"] == "ModelAttentionBackend" and chain[-2]["mode"] == 0, path
+        assert chain[-1]["type"] == "BlockSparseAttention", (path, chain[-1]["type"])
+        assert chain[-1]["mode"] == 4, f"{path}: 一采 Sol-Attn 应为 mode=4 忽略"
+        assert chain[-1]["widgets_values"][0] == "sol-attn", path
+
+
+def test_one_pass_sigmas_table_wired():
+    """rev3.5：出厂「一采自定义Sigmas」接 10 步手工 sigma 表（ManualSigmas，11 个点）。"""
+    for path in (TEMPLATE, EXAMPLE):
+        wf = _load_wf(path)
+        nodes = {n["id"]: n for n in wf["nodes"]}
+        links = {L[0]: L for L in wf["links"]}
+        sampler = next(n for n in wf["nodes"] if n["type"] == "H3SeamlessChainSampler")
+        slot = next(i for i in sampler["inputs"] if i["name"] == "一采自定义Sigmas")
+        assert slot.get("link") is not None, path
+        src = nodes[links[slot["link"]][1]]
+        assert src["type"] == "ManualSigmas", (path, src["type"])
+        pts = [p.strip() for p in str(src["widgets_values"][0]).split(",") if p.strip()]
+        assert len(pts) == 11, (path, pts)      # 11 个 sigma 点 = 10 步
+
+
+def test_default_steps_and_sampler():
+    """rev3.5：出厂「步数 10 / 采样器 er_sde」（三处同源：nodes.py / CHAIN_DEFAULTS / 本模板）。"""
+    src = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
+    assert 'io.Int.Input("步数", default=10' in src
+    assert 'default="er_sde"' in src
+    js = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
+    assert '"步数": 10' in js and '"采样器": "er_sde"' in js
+    for path in (TEMPLATE, EXAMPLE):
+        wf = _load_wf(path)
+        wv = next(n for n in wf["nodes"]
+                  if n["type"] == "H3SeamlessChainSampler")["widgets_values"]
+        assert wv[_widget_slots().index(("步数", "Int"))] == 10, path
+        assert wv[_widget_slots().index(("采样器", "Combo"))] == "er_sde", path
 
 
 def test_no_mirror_text():

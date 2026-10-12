@@ -318,8 +318,9 @@ const MODERN_LIVE = [{ id: 10, ports: [
         const { intents, repair, outIntents, repairOut } = mkWin();
         const list = intents(tpl);
         const names = Array.from(list, (x) => x.name).sort();   // Array.from 收进主 realm
-        /* rev3（2026-10-01）起出厂模板默认接独立二采链 → 意图含「二采模型」 */
-        assert.deepStrictEqual(names, ["二采模型", "文本编码器", "模型", "视频VAE", "音频VAE"],
+        /* rev3（2026-10-01）起出厂模板默认接独立二采链 → 意图含「二采模型」；
+         * rev3.5（2026-10-12）起「一采自定义Sigmas」出厂接手工 sigma 表 → 意图再加一条。 */
+        assert.deepStrictEqual(names, ["一采自定义Sigmas", "二采模型", "文本编码器", "模型", "视频VAE", "音频VAE"],
             "默认工作流的接线端口漂了：" + JSON.stringify(names));
         const sampler = tpl.nodes.find((n) => n.type === "H3SeamlessChainSampler");
         for (const it of list) {

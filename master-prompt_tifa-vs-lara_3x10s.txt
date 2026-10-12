@@ -1,0 +1,111 @@
+[Segment 1]
+Duration: 10
+Standalone: no
+
+Prompt:
+integrated_multimodal_description: [Shot 1] Photorealistic cinematic game CG, ultra-realistic 3D anime rendering, UE5.4 path tracing, physical PBR materials, subsurface-scattered skin, running sweat and oiled muscle sheen, tactical fabric and worn leather surface detail, ACES filmic grading with natural highlight roll-off and fully retained shadow detail, a single overhead yellow spotlight pouring a hard volumetric cone through airborne magnesium dust and heavy atmospheric haze. The entire segment is one uninterrupted 35mm handheld take that never cuts; the camera breathes at 1.0-1.5 Hz with minimal inertia lag, and every move of it is driven by the fighters' impacts.
+
+An underground octagon cage, chain-link fencing closing off the left of frame, a rubber-matted floor, the air thick with sweat vapour and drifting magnesium powder. A female mixed-martial fighter (Tifa) - long black hair in a high ponytail, white tank top with black shoulder straps, black fingerless fighting gloves, black pleated mini-skirt, black leather boots - stands at the centre of frame in profile to the lens, weight sunk into a low fighting crouch, both fists raised to guard her face, her ponytail and tank top soaked dark with sweat. Three paces ahead of her, also in profile to the lens, her opponent (Lara) - braided ponytail, brown tactical vest with a chest rig, dark cargo trousers, high combat boots - holds a military combat-ready stance. Neither woman ever speaks, and no other figure enters the cage.
+
+The camera pushes in low along their side with small amplitude at slow speed. Within the first half second Lara fires first: a heavy right straight punch followed by a low left sweep kick. Tifa answers in the same instant, turning her head aside and taking the punch on a raised forearm while lifting her knee to absorb the sweep; Lara's knuckles and boot sole scrape hard across the guard and bone meets bone with a dull crack that shakes a wide sheet of sweat off both bodies. The camera whips to the side as the punch arrives and shakes slightly, sweat and dust striking the lens.
+
+By the third second Tifa rides the rebound of her own block, drops under Lara's follow-up high kick and unloads a heavy spinning liver shot that lands dead on the side-waist buckle of Lara's tactical vest. The buckle bursts with a sharp crack and breaks off as a visible chunk; fragments and sweat spray outward as Lara lets out a stifled grunt and rolls her hips to shed the force. The two pass each other and trade positions, Tifa still in profile to the lens. The camera arcs half a circle around the crossing bodies with small amplitude at slow speed, racking focus onto the shattered buckle and Lara's twisted expression, and shakes slightly as debris sprays past.
+
+From the sixth second Lara comes back hard, clamping a Muay Thai clinch onto the back of Tifa's neck and driving rapid heavy knees into Tifa's abdominal guard, walking her backwards until her back slams into the chain-link wall. The fence rocks hard and shakes loose a heavy curtain of magnesium dust. Lara adds a heavy downward axe kick; Tifa cross-blocks with both forearms and is driven down onto one knee, still in profile to the lens, sweat running from the corner of her mouth, her brows knitting, her eyes narrowing and going hard. The camera retreats fast behind Tifa along the path of her slam into the fence, then tilts down from above onto her one-knee side profile, the frame shaken hard by the impact while magnesium dust and sweat burst across the whole image. The take ends here, uncut and unfrozen.
+
+overall_soundscape: Low female panting and exertion breathing runs under the whole segment. Dull heavy impacts of knuckles and shins against muscle and guard, one bone-on-bone crack at the block, the sharp snap of the vest buckle bursting, rubber matting squeaking under boots, chain-link fence rattling and ringing as Tifa's back hits it, magnesium dust pattering down, and a short stifled grunt from each fighter at the moment of contact. No spoken words at any point.
+
+non_diegetic_music: N/A
+
+[Segment 2]
+Duration: 10
+Standalone: no
+
+Prompt:
+integrated_multimodal_description: [Shot 1] Picking up exactly on the previous segment's final frame - Tifa down on one knee against the chain-link wall, Lara standing over her - the same photorealistic cinematic game CG, the same UE5.4 path-traced rendering, the same single overhead yellow spotlight through magnesium dust, the same one uninterrupted 35mm handheld take that never cuts, the camera still breathing at 1.0-1.5 Hz with minimal inertia lag.
+
+Within the first half second Tifa drives up off the single knee, both forearms sweeping Lara's pressing guard aside, and explodes into a storm of high-frequency combination punches, fist-wind tearing the air. Lara folds, both arms clamped tight around her head, retreating across the mat with the rubber screeching under her boots. The camera pushes in with large amplitude at fast speed on Tifa's advance, the frame trembling in a fine continuous rhythm with each punch, sweat flung off in arcs.
+
+By the fourth second Tifa rolls her hips through the last punch and adds a heavy front push-kick, the sole of her boot landing dead centre on Lara's crossed guard. The impact booms like thunder and throws Lara and her guard backwards, her boots skidding several metres across the mat, and the two are fully separated. The camera trucks sideways between them with small amplitude at slow speed and snaps back as the kick lands, the frame shaking clearly.
+
+From the seventh second the two stand at opposite ends of the cage, both in profile to the lens. Tifa's fists clench hard and fresh cracks split open in the rubber matting under her feet as every trace of sweat on her skin vaporises into glaring white steam, the air bending around her body. Lara sinks her centre of gravity, military combat afterimages distorting the air in a tight band around both arms. The camera pulls out with large amplitude at fast speed and pedestals up into a wide two-shot. The instant the cracks break open and the light and pressure wave are about to burst, the take ends, uncut and unfrozen.
+
+overall_soundscape: Heavy female panting and low exertion breathing throughout. The dense rapid impacts of bare fists on raised forearms, boots scraping and squeaking across rubber matting, one deep thunderous boom from the push-kick, the rising hiss of sweat flashing into steam, a low swelling air-pressure rumble under the final three seconds, and short sharp exertion shouts from both women. No spoken words at any point.
+
+non_diegetic_music: N/A
+
+[Segment 3]
+Duration: 10
+Standalone: no
+
+Prompt:
+integrated_multimodal_description: [Shot 1] Picking up exactly on the previous segment's final frame - the two fighters at opposite ends of the octagon, white-hot steam gathered around Tifa, military afterimages banding Lara's arms - the same photorealistic cinematic game CG, the same UE5.4 path-traced rendering, the same overhead yellow spotlight through drifting magnesium dust, the same one uninterrupted 35mm handheld take that never cuts.
+
+Within the first half second both women launch toward the centre like shells, white-hot fist-wind and military heavy afterimages colliding head-on, fists and shins meeting in continuous rolling thunder. Lara finds the seam in the exchange and lands a spinning heavy elbow that grazes Tifa's left shoulder and cuts one black shoulder strap clean through; Tifa bites down, dropping the left shoulder fast to shed the force. The camera trucks sideways between the colliding bodies with small amplitude at fast speed and snaps back as the elbow lands, the frame shaking clearly while sweat and pressure waves churn.
+
+By the fourth second Tifa twists her hips to the limit off the dropped shoulder, pouring all the white-hot steam and kinetic energy down into her right leg, drives off the floor and rises into a super-heavy white-hot flying knee that tears the air. Lara has no room to evade and crosses both arms tight over her chest to take it. The camera pushes in with large amplitude at fast speed along Tifa's rising path, focus locked on the knee wrapped in white-hot steam, the frame trembling continuously under the wind pressure.
+
+From the seventh second the knee smashes straight through Lara's crossed guard and lands dead on the already-broken buckle gap at the side waist of her tactical vest. On the passing frame the image flashes pure white for a single frame and all sound is sucked out. When it returns, Tifa has landed with her back to Lara and her front to the lens, and half a beat later Lara is blown backwards, slams into the chain-link wall and slides down to one knee, panting hard. Tifa turns half of her face toward the lens, and in the final half second the image freezes exactly as it is - the severed strap, the lifted ponytail and the whole spray of sweat in the air all motionless. This is the only freeze in the entire film. The camera pulls out with small amplitude at slow speed in front of Tifa, shakes strongly as the pressure wave arrives, the frame whiting out three times and swimming, then settles into a medium shot in front of her; the last half second is completely still, with one small shake in the frame just before it freezes.
+
+overall_soundscape: Continuous low female panting under the whole segment, breaking into hard panting after the impact. Rapid dense impacts of fists and shins, the sharp tearing of a fabric strap, a deep concussive boom at the knee strike, one beat of total silence on the white flash, then the ringing rattle of the chain-link wall taking Lara's body, sliding metal, and a long shuddering exhale from each woman. No spoken words at any point.
+
+non_diegetic_music: N/A
+
+[END]
+
+———————— 中文对照版（仅供阅读，不要粘进提示词框）————————
+
+[Segment 1]
+Duration: 10
+Standalone: no
+
+Prompt:
+integrated_multimodal_description: [Shot 1] 高端写实 3D Anime Cinematic、Photorealistic Game CG，UE5.4 Path Tracing，PBR 物理材质，真实皮肤次表面散射，汗水流淌与油亮肌肉肌理，战术织物与磨损皮革的表面细节，电影级 ACES 高动态范围、自然高光滚降、暗部层次完整保留，头顶单盏黄色聚光灯打出一道硬边体积光锥，穿过悬浮的镁粉尘埃与浓重的空气透视。整段是一镜到底的 35mm 手持长镜头，全程不切；摄影机以 1.0-1.5Hz 高频呼吸微抖，惯性延迟极低，它的每一次运动都由两人的肌肉冲击牵引。
+
+地下八角笼擂台，铁丝网笼壁立在画面左侧，地面铺设橡胶垫，空气中弥漫汗水蒸气与飘浮的镁粉。一名女性综合格斗手（蒂法）——黑色长发扎成高马尾、白色背心配黑色肩带、黑色露指格斗手套、黑色百褶短裙、黑色皮靴——站在画面中央，侧对镜头，重心压低成低位格斗架势，双拳护住面部，马尾与背心被汗水浸成深色。她前方三步处，同样侧对镜头，她的对手（劳拉）——编织马尾、褐色战术背心配战术胸挂、深色工装裤、高帮作战靴——保持军用格斗准备姿态。两人全程不说话，笼内不出现第三个身影。
+
+镜头贴着侧面低角度推近，幅度小、速度慢。开场半秒内劳拉先手：一记沉重的右直拳接一记低位左扫腿。蒂法在同一瞬作出应对，侧头、抬臂用手臂架住重拳，同时提膝硬抗扫腿；劳拉的拳锋与靴底狠狠擦过防守，骨骼相撞发出一声沉闷的爆响，震飞两人身上一大片汗水。重拳打来时镜头朝侧面猛地一甩并轻轻一震，汗滴与尘埃扑向镜头。
+
+到第三秒，蒂法借自己格挡的反弹力顺势下潜，躲过劳拉随后的高扫腿，打出一记重型转身爆肝拳，精准落在劳拉战术背心的侧腰锁扣上。锁扣"啪"地一声脆响崩开，作为一块可见的碎片整块脱落；碎屑与汗水向四周飞溅，劳拉发出一声压抑的闷哼，转腰卸力。两人擦身而过交换位置，蒂法仍侧对镜头。镜头绕着交错的两具身体转了半圈，幅度小、速度慢，焦点切到被击碎的锁扣与劳拉扭曲的表情上，碎屑掠过时画面轻轻一震。
+
+从第六秒起劳拉狠狠反扑，以泰式箍颈死死扣住蒂法后颈，连续极速的重型膝撞轰击蒂法的腹部防守，推着她一路倒退，直到后背重重撞在铁丝网笼壁上。铁丝网剧烈晃动，震落一整片镁粉尘埃。劳拉再补上一记重型下劈腿；蒂法交叉双臂硬接，被砸得单膝贴地，仍侧对镜头，汗水从嘴角滑落，眉头拧紧，眼睛收窄并转为狠厉。镜头在蒂法身后沿着她撞笼的轨迹迅速后退，再从上往下俯拍她单膝贴地的侧影，画面被冲击震得明显晃动，镁粉与汗水炸满整幅画面。镜头到此结束，不切、不定格。
+
+overall_soundscape: 全段垫着女性低沉的喘息与发力呼吸。拳头与小腿砸在肌肉与防守上的沉闷重击，格挡处一声骨骼相撞的脆响，背心锁扣崩开的一声脆响，靴子在橡胶垫上摩擦发出的吱嘎声，蒂法后背撞上铁丝网时笼壁的震颤与金属回响，镁粉簌簌落下，以及两人每次接触时短促压抑的闷哼。全程没有任何说话声。
+
+non_diegetic_music: N/A
+
+[Segment 2]
+Duration: 10
+Standalone: no
+
+Prompt:
+integrated_multimodal_description: [Shot 1] 严格承接上一段的最后一帧——蒂法单膝贴地靠着铁丝网，劳拉站在她身前——同样的高端写实 3D Anime Cinematic、Photorealistic Game CG，同样的 UE5.4 Path Tracing，同样的头顶黄色聚光灯穿过镁粉尘埃，同样的 35mm 手持一镜到底、全程不切，摄影机依旧以 1.0-1.5Hz 高频呼吸微抖，惯性延迟极低。
+
+开场半秒内蒂法单膝爆发站起，双手护臂强行荡开劳拉压制的防守，爆出一串高频组合拳，拳风撕裂空气。劳拉被迫收缩，双臂紧紧护头，踩着橡胶垫连续后退，橡胶发出刺耳的摩擦声。镜头跟着蒂法反扑的步伐向前推进，幅度大、速度快，画面伴随每一拳持续细密震颤，汗水成弧线飞出。
+
+到第四秒，蒂法在最后一拳上拧腰送胯，接上一记重型正蹬，靴底正正踹在劳拉交叉防守的正中心。冲击像闷雷一样炸开，把劳拉连人带防守向后掀飞，靴子在垫子上滑行出数米，两人彻底拉开距离。镜头在两者之间横移，幅度小、速度慢，正蹬踹出时向后猛地一仰，画面明显晃动。
+
+从第七秒起，两人站在八角笼两端，均侧对镜头。蒂法双拳猛然紧握，脚下橡胶垫裂开新的裂纹，皮肤上所有汗水瞬间汽化成刺目的白气，空气在她身体四周弯曲；劳拉压低重心，军用格斗残影在双臂周围扭曲出一圈紧绷的空气带。镜头向后急拉，幅度大、速度快，再升高成一个双人全景。就在裂纹刚崩开、光芒与气浪即将涌出的一瞬，镜头到此结束，不切、不定格。
+
+overall_soundscape: 全段是沉重的女性喘息与低沉的发力呼吸。赤裸拳头砸在抬起手臂上的密集重击，靴子在橡胶垫上拖擦与吱嘎，正蹬那一记深沉的闷雷般巨响，汗水汽化成白气的嘶嘶声，最后三秒垫着一层逐渐升高的低频气压轰鸣，以及两名女性短促尖锐的发力爆喝。全程没有任何说话声。
+
+non_diegetic_music: N/A
+
+[Segment 3]
+Duration: 10
+Standalone: no
+
+Prompt:
+integrated_multimodal_description: [Shot 1] 严格承接上一段的最后一帧——两人分站八角笼两端，蒂法周身聚着白热蒸气，劳拉双臂环绕军用残影——同样的高端写实 3D Anime Cinematic、Photorealistic Game CG，同样的 UE5.4 Path Tracing，同样的头顶黄色聚光灯穿过飘浮的镁粉尘埃，同样的 35mm 手持一镜到底、全程不切。
+
+开场半秒内两人同时如出膛炮弹般冲向中央，白热拳风与军用重型残影迎面对撞，拳脚相交发出一连串滚动的闷雷。劳拉在极速乱战中抓准破绽，一记转身重型砸肘擦过蒂法左肩，将一条黑色肩带齐根切断；蒂法咬牙忍住，左肩急速下沉卸力。镜头在相撞的两具身体之间横移，幅度小、速度快，重肘命中时向后一仰，画面明显晃动，汗水与气浪疯狂翻涌。
+
+到第四秒，蒂法借着左肩下沉的姿态把腰拧到极限，将全身的白热气浪与动能全部灌入右腿，猛蹬地面拔地而起，打出一记撕裂空气的超重型白热飞膝。劳拉已无处闪避，只能交叉双臂死死护在胸前硬接。镜头跟着蒂法起跳的轨迹向前推进，幅度大、速度快，焦点锁紧包裹着白热气浪的膝盖，画面在风压下持续发抖。
+
+从第七秒起，膝盖直接暴力撞开劳拉的交叉双臂，正正落在她战术背心侧腰那个已经碎裂的锁扣缺口上。擦身交错的一瞬，画面闪过一帧纯白，所有声音被抽空。再出现时，蒂法已经背对劳拉、正面朝向镜头落地，半拍之后劳拉被弹飞，重重撞在铁丝网笼壁上滑落，单膝跪地剧烈喘息。蒂法侧过半张脸朝向镜头，最后半秒画面就那样精准定格——断裂的肩带、扬起的马尾与漫天飞溅的汗滴全部静止不动。这是全片唯一一次定格。镜头在蒂法身前向后缓拉，幅度小、速度慢，冲击波到达时剧烈晃动，画面被白光闪白三次并发晕，随后稳在她身前的中景；最后半秒完全静止，定格前一刻画面轻轻一震。
+
+overall_soundscape: 全段垫着持续的女性低沉喘息，命中后转为剧烈喘气。拳头与小腿的密集快击，织物肩带被切断的清脆撕裂声，飞膝命中时一记深沉的震荡巨响，白光闪过的那一拍全场静音，随后是铁丝网笼壁承受劳拉身体时的震颤嗡鸣、金属滑落声，以及两名女性各一次长长的颤抖吐气。全程没有任何说话声。
+
+non_diegetic_music: N/A
+
+[END]

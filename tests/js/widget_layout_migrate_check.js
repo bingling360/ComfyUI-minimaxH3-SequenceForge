@@ -24,10 +24,12 @@
  *   所以以后**每次改默认工作流参数，这里对应的那几行必须同步改**，不许删。
  *
  * 2026-10-01（rev 3）：默认工作流按用户「新版默认工作流.json」重制，链参数出厂值
- *   同步为 1.0MP / 每段时长 8s / 步数 8（turbo 少步配套）/ 审片 关 / 参考图像尺寸
- *   max / 桥帧门控 关 / 接缝重摇 关；旧版兼容位「宽度/高度」对齐真实画布 1376×768。
+ *   同步为 1.0MP / 每段时长 8s / 审片 关 / 参考图像尺寸 max / 桥帧门控 关 / 接缝重摇 关；
+ *   旧版兼容位「宽度/高度」对齐真实画布 1376×768。
  *   同批：nodes.py INPUT_TYPES 与 h3_director.js CHAIN_DEFAULTS 同步（三处同源）。
  * 2026-10-12：出厂口径 参考图像尺寸 max → match（用户拍板）；三处同源同步。
+ * 2026-10-12（rev 3.5）：默认工作流按用户「初始化导演台工作流.json」重制 ——
+ *   步数 8 → 10、采样器 res_multistep → er_sde；一采链加 H3_Combat_V2 / 一采 sigma 表。
  *
  * 用法：node tests/js/widget_layout_migrate_check.js
  *      （pytest 侧由 tests/test_js_checks.py 统一收集）
@@ -85,9 +87,9 @@ t("迁移后关键位语义仍对齐（任何一位串位都会红）", () => {
     assert.strictEqual(wv[1], 1, "百万像素");
     assert.strictEqual(wv[2], 1376, "宽度（旧版兼容位，对齐 1MP 16:9 画布）");
     assert.strictEqual(wv[4], 8, "每段时长");
-    assert.strictEqual(wv[8], 8, "步数");
+    assert.strictEqual(wv[8], 10, "步数");
     assert.strictEqual(wv[9], 1, "CFG");
-    assert.strictEqual(wv[10], "res_multistep", "采样器");
+    assert.strictEqual(wv[10], "er_sde", "采样器");
     assert.strictEqual(wv[16], 34, "回退上限");
     assert.strictEqual(wv[17], 0, "锚定加噪");
     assert.strictEqual(wv[18], "关闭", "审片模式");

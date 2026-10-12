@@ -1191,9 +1191,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "响度对齐仍生效；各段锚定里的显式段首锚不受影响"),
                 io.Int.Input("种子", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
                              tooltip="第 i 段实际使用 种子+i"),
-                io.Int.Input("步数", default=8, min=1, max=100),
+                io.Int.Input("步数", default=10, min=1, max=100),
                 io.Float.Input("CFG", default=1.0, min=0.0, max=100.0, step=0.1),
-                io.Combo.Input("采样器", options=comfy.samplers.KSampler.SAMPLERS, default="res_multistep"),
+                io.Combo.Input("采样器", options=comfy.samplers.KSampler.SAMPLERS, default="er_sde"),
                 io.Combo.Input("调度器", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
                 io.Combo.Input("自动存档", options=["关闭", "自动存档"], default="关闭", advanced=True,
                                tooltip="已并入「自动保存」的「分段」档（功能等价）。本开关仅兼容旧工作流："

@@ -104,7 +104,7 @@ Saganaki README 原话：**"Use Euler for the released recipe; other samplers ar
 
 而且只有 8 步，**步数越少采样器差异越被放大**（每步都关键，高阶项的偏差也更大）。
 
-- 本插件默认采样器是 `res_multistep`（对基础模型合适），**挂 HyperFlow 时记得手动改成 euler**，
+- 本插件出厂默认采样器是 `er_sde`（2026-10-12 起；此前为 `res_multistep`，两者对基础模型都合适），**挂 HyperFlow 时记得手动改成 euler**，
   报告会提示你。
 - 调度器无所谓——接了 sigma 表之后它已经失效了。
 
@@ -113,7 +113,7 @@ Saganaki README 原话：**"Use Euler for the released recipe; other samplers ar
 **结论：二采不需要改 euler，也不需要配 beta。** 那套是给 **一采的 HyperFlow 蒸馏**用的。
 
 - euler 之所以必须，是因为 flow-map 每步吃 `(t, r)` 区间端点。二采若按推荐**接了独立基础权重**，
-  它跑的是基础模型的低强度精化，与蒸馏无关——**反而插件默认的 `res_multistep` 更合适**
+  它跑的是基础模型的低强度精化，与蒸馏无关——**反而 `res_multistep` 这类多步高阶采样器更合适**
   （少步短区间里高阶方法通常更精确）。
 - drbaph 的 "euler + beta" 是给 **Turbo LoRA 完整生成 6–8 步**的推荐，不是二采精化。
 - 二采默认 `σ₀=0.35`、`steps=6`，`sampler/scheduler` 留空 = 沿用主链值。

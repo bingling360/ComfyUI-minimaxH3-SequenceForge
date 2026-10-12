@@ -150,12 +150,13 @@ HF_ENDPOINT=https://hf-mirror.com hf download LBH-123-AI/Minimax_h3_latent_Upsca
 
 ### 5.3 Models and LoRAs for the bundled workflow
 
-The plugin itself needs no weights, but the bundled `example_workflows/备用初始化导演台工作流.json` is wired for a specific, known-good stack. Download the three files below (plus the official CLIP and VAEs) or the loaders will report a missing file.
+The plugin itself needs no weights, but the bundled `example_workflows/初始化导演台工作流.json` is wired for a specific, known-good stack. Download the files below (plus the official CLIP and VAEs) or the loaders will report a missing file.
 
 | Role | File | Source | Size | Destination |
 |---|---|---|---|---|
 | Base-pass UNET **and** second-pass UNET | `minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors` | [`smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models`](https://huggingface.co/smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models) | ~21 GB | `ComfyUI/models/diffusion_models/` |
-| Turbo (few-step) LoRA | `minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors` | [`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI) | 620 MB | `ComfyUI/models/loras/` |
+| Turbo (few-step) LoRA — Ref2V 8-step | `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` | [`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI) | ~600 MB | `ComfyUI/models/loras/` |
+| Combat LoRA (V2) | `H3_Combat_V2.safetensors` | community release — check the LoRA's own model card | — | `ComfyUI/models/loras/` |
 | Motion Repair LoRA (V2) | `Motion_Repair_V2.safetensors` | [`JOKER141/MiniMax-H3-General-Motion-Continuity-Repair`](https://huggingface.co/JOKER141/MiniMax-H3-General-Motion-Continuity-Repair) | 155 MB | `ComfyUI/models/loras/` |
 
 ```bash
@@ -166,12 +167,15 @@ hf download smhfacct/Minimax-H3-fl2va-ref2va-hybrid-models \
   --local-dir ComfyUI/models/diffusion_models
 
 hf download drbaph/MiniMax-H3-Turbo-Lora-ComfyUI \
-  minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors \
+  minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors \
   --local-dir ComfyUI/models/loras
 
 hf download JOKER141/MiniMax-H3-General-Motion-Continuity-Repair \
   Motion_Repair_V2.safetensors \
   --local-dir ComfyUI/models/loras
+
+# H3_Combat_V2.safetensors has no fixed public mirror — drop it into ComfyUI/models/loras/
+# yourself (or point the node at any combat LoRA you have).
 
 # mainland China: prepend HF_ENDPOINT=https://hf-mirror.com to any command above
 ```
@@ -198,9 +202,9 @@ All variants are built from the pruned **int8-convrot** base models. If your wor
 
 #### Turbo LoRA — few-step acceleration
 
-[`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI) (**Apache-2.0**) hosts MiniMax-H3 Turbo and few-step LoRAs converted and optimized for ComfyUI. They accelerate the joint video + synchronized-audio generation by cutting the number of sampling steps — the bundled workflow pairs the Turbo LoRA at strength **1.0** with **8 steps**, which is why the factory `steps` default is 8 rather than 25. The same repo also ships HyperFlow 8-step conversions; see [§26 Custom sigmas](#26-custom-sigmas-distilled-loras) for the matching sigma table.
+[`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI) (**Apache-2.0**) hosts MiniMax-H3 Turbo and few-step LoRAs converted and optimized for ComfyUI. They accelerate the joint video + synchronized-audio generation by cutting the number of sampling steps — the bundled workflow pairs the **Ref2V 8-step** Turbo LoRA at strength **0.75** with a **10-step** manual sigma table, which is why the factory `steps` default is 10 rather than 25. The same repo also ships HyperFlow 8-step conversions; see [§26 Custom sigmas](#26-custom-sigmas-distilled-loras) for the matching sigma table.
 
-> The repo carries 4-step and 8-step, FL2V and Ref2V, full and pruned variants. The file the bundled workflow expects is `minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors`; if you pick a different variant, update the LoRA node's file name and check its recommended step count.
+> The repo carries 4-step and 8-step, FL2V and Ref2V, full and pruned variants. The file the bundled workflow expects is `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors`; if you pick a different variant, update the LoRA node's file name and check its recommended step count.
 
 #### Motion Repair LoRA — motion continuity repair (V2)
 
@@ -212,7 +216,7 @@ The author's recommended weights:
 - **alongside a Combat LoRA, stage-1 ~0.5–0.7** — Combat already supplies motion speed and impact, so this LoRA only needs a medium weight to correct continuity / coordination / action logic;
 - very high weights can begin to reshape the whole motion logic, or affect visual style and audio characteristics.
 
-The bundled workflow uses `Motion_Repair_V2.safetensors` at **0.6** on the base pass and **0.25** on the second pass. The V1 file (`Motion_Repair.safetensors`) is in the same repo.
+The bundled workflow uses `Motion_Repair_V2.safetensors` at **0.3** on the base pass and **0.25** on the second pass (the base-pass weight was lowered from 0.6 to 0.3 on 2026-10-12, since the Combat LoRA now sits ahead of it). The V1 file (`Motion_Repair.safetensors`) is in the same repo.
 
 #### Also required — official MiniMax H3 files
 
@@ -224,7 +228,7 @@ The bundled workflow's CLIP and VAE loaders point at the official [`Comfy-Org/Mi
 
 1. After restart, the node menu should find `H3SeamlessChainSampler`, `H3SeamDoctor`, `H3RunReport`, and the two EAV/FETA nodes.
 2. Visit `http://127.0.0.1:8188/h3chain/ping` (adjust the port). A JSON response means the project-archive routes are mounted (the Director Console depends on them; if they are missing, the console shows a diagnostic banner).
-3. Load `example_workflows/备用初始化导演台工作流.json`, adjust the model paths to your environment, and run.
+3. Load `example_workflows/初始化导演台工作流.json`, adjust the model paths to your environment, and run.
 
 ---
 
@@ -237,7 +241,7 @@ The bundled workflow's CLIP and VAE loaders point at the official [`Comfy-Org/Mi
 
 How the bundled workflow is wired (all official ComfyUI nodes; weights in [§5.3](#53-models-and-loras-for-the-bundled-workflow)):
 
-- **Base pass (top row):** `UNETLoader` (hybrid int8) → `LoraLoaderModelOnly` (Turbo, 1.0) → `LoraLoaderModelOnly` (Motion Repair, 0.6) → `ModelAttentionBackend` → `BlockSparseAttention` → the node's *model* input.
+- **Base pass (top row):** `UNETLoader` (hybrid int8) → `LoraLoaderModelOnly` (Ref2V Turbo, 0.75) → `LoraLoaderModelOnly` (H3_Combat_V2, 0.6) → `LoraLoaderModelOnly` (Motion Repair, 0.3) → `ModelAttentionBackend` → `BlockSparseAttention` → the node's *model* input. A `ManualSigmas` node (11 sigmas = 10 steps) is wired to the node's *一采自定义Sigmas* input. The base-pass `BlockSparseAttention` (Sol-Attn) ships **bypassed** (`mode=4`) — the base pass runs comfy-kitchen attention only; right-click it and un-bypass to turn it on.
 - **Second pass (bottom row, shipped bypassed):** `UNETLoader` (same hybrid) → `LoraLoaderModelOnly` (Motion Repair, 0.25) → `ModelAttentionBackend` → `BlockSparseAttention` → the node's *second-pass model* input.
 - **CLIP** — `CLIPLoader` with `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`, type **`minimax`** (Qwen3-VL).
 - **VAEs** — video `minimax_h3_video_vae_int8_convrot.safetensors`, audio `minimax_h3_audio_vae_fp32.safetensors`.
@@ -311,7 +315,7 @@ All controls are on the node (labels are Chinese in the UI).
 - **`每段时长` (segment duration).** Visible seconds per segment @24 fps (0.5–15.0, default 8.0), auto-snapped to the 17k+5 frame grid (8.0 s → 192 frames, 5.0 s → 124 frames). Per-segment overrides live in the console.
 - **`引导帧数` (guide frames).** The overlap bridge: how many of the previous tail's frames are pinned to the next head. Options 关闭 / 1 / 5 / 22 / 39 / 56 (grid points; default 22). `1` = single-frame anchor (official style, cheap); `关闭` = no automatic reference to the previous segment (hard cut, independent sampling), loudness alignment still applies.
 - **`种子` (seed).** Segment *i* uses `seed + i`.
-- **`步数` (steps).** Default **8** (distilled models). `CFG` default 1.0; sampler `res_multistep`; scheduler `simple`.
+- **`步数` (steps).** Default **10** (distilled models). `CFG` default 1.0; sampler `er_sde`; scheduler `simple`. A 10-step manual sigma table ships wired to `一采自定义Sigmas` (see §26), which overrides the base pass's steps/scheduler; unplug that link to fall back to the node's `步数` / `采样器`.
 - **`自动存档` (auto archive).** Legacy compatibility switch, folded into *auto-save*; old workflows with `自动存档=自动存档` map to `自动保存=分段`.
 - **`存档目录` (archive directory).** Project name: one folder per project under `output/h3_projects/`. Empty = a fixed automatic project folder (`h3chain`), independent of parameters (changed 2026-10-12); a fixed name pins all runs to that folder.
 - **`桥帧门控` (bridge-frame gating).** Default **关闭**. `标注` = score and report only; `自动回退` = on a below-threshold tail, roll back 17/34 frames to a good one.
@@ -328,7 +332,7 @@ All controls are on the node (labels are Chinese in the UI).
 - **`二采模型` (second-pass model).** Optional dedicated UNET for the high-res second pass (§19).
 - **`参考图像尺寸` (reference image size).** `match` (scale each reference to the generation canvas area, shrink-only) or `max` (2048 short side via the reference pipeline; best identity fidelity, potentially several times slower). Default `match` (changed from `max` on 2026-10-12).
 - **`响度对齐强度` (loudness alignment strength)** default 1.0.
-- **`一采自定义Sigmas` / `二采自定义Sigmas` (custom sigmas).** Optional sigma tables for distilled LoRAs, one per pass (§26).
+- **`一采自定义Sigmas` / `二采自定义Sigmas` (custom sigmas).** Optional sigma tables for distilled LoRAs, one per pass (§26). The bundled workflow ships `一采自定义Sigmas` **wired** to a 10-step `ManualSigmas` table; `二采自定义Sigmas` is left empty.
 
 **Outputs (order matters — see §22):** `图像 / 音频 / 报告 / 帧率`.
 
@@ -581,7 +585,7 @@ Two details worth knowing:
 
 Distilled LoRAs (HyperFlow 8-step, H3 Turbo, …) are trained with their own sigma table; recomputing one from "steps + scheduler" does not match the distillation trajectory. Two optional sockets take an external sigma table (e.g. from `ApplyHyperFlow` / `ManualSigmas` / `BasicScheduler`):
 
-- **`一采自定义Sigmas`** — drives the **base pass**; overrides `steps` and `scheduler` (actual steps = number of sigma points − 1). Unwired, behavior is byte-identical to before. The HyperFlow official 8-step table is `1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0`.
+- **`一采自定义Sigmas`** — drives the **base pass**; overrides `steps` and `scheduler` (actual steps = number of sigma points − 1). The bundled workflow ships it **wired** to a 10-step `ManualSigmas` table; unplug that link and behavior is byte-identical to before. The HyperFlow official 8-step table is `1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0`.
 - **`二采自定义Sigmas`** — drives the **high-res second pass** (added 2026-10-12; the first socket was renamed from `自定义Sigmas` to `一采自定义Sigmas`). Overrides the second pass's `denoise`, refine `steps` and `scheduler`; the cascade (`passes`/`decay`) and the gain retry step aside since the table *is* the whole refine schedule. The `sampler` still applies. ⚠ A second-pass table is a **tail-refinement** schedule: its first value is the refine start σ (e.g. `0.35, 0.28, 0.19, 0.09, 0.0`) and its last value must be 0 — don't reuse the 1.0→0 base-pass table. Changing the table redoes every recorded high-res segment (its fingerprint enters `upscale.params_hash`).
 
 See [`docs/HyperFlow适配与自定义Sigmas.md`](docs/HyperFlow适配与自定义Sigmas.md).
@@ -675,7 +679,7 @@ ComfyUI-minimaxH3-SequenceForge/
 │   └─ h3d_anchor.js         # Manual-anchor dual-track timeline
 │
 ├─ example_workflows/
-│   └─ 备用初始化导演台工作流.json   # Director-Console init workflow (models + main node + 3 prompts pre-wired)
+│   └─ 初始化导演台工作流.json   # Director-Console init workflow (models + main node + 3 prompts pre-wired)
 │
 ├─ skills/                   # Agent skills shipped with the plugin
 │   ├─ README.md

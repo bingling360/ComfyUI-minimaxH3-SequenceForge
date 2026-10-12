@@ -241,7 +241,7 @@ DEFAULT_PERF = {
     #   改 crf」—— 它本来就不该带着改）。
     #   真源：`upscale._ENCODE_SETTINGS` / `resolve_encode_quad`。
     "encoder": "libx264",          # libx264 / h264_nvenc / hevc_nvenc（不再有假 auto）
-    "x264_crf": 20,                # x264 恒定质量（越小越清晰，常用 13–23）
+    "x264_crf": 19,                # x264 恒定质量（越小越清晰，常用 13–23；2026-10-12 出厂默认 20→19）
     "nvenc_cq": 20,                # NVENC 恒定质量（对应 x264 的 crf）
     "encode_hq": True,             # 高清编码档：medium preset + 暗部 aq + 抖动（2026-10-02 起默认开）
 
@@ -1550,7 +1550,7 @@ def apply_runtime(table):
                                            t.get("nvenc_cq", 20))
         # x264 的质量档另走一条通道：media 的进程级 ENCODER_CRF（NVENC 不看它）
         try:
-            media.set_crf(t.get("x264_crf", 20))
+            media.set_crf(t.get("x264_crf", 19))
         except AttributeError:
             pass
     except Exception:

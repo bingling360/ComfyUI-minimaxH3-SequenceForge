@@ -129,12 +129,17 @@ def test_no_drop_when_disabled():
     assert clip.encodes == 1 and len(calls) == 0
 
 
-# ── 4) 丢的动作 = unload_model_and_clips(clip.patcher) ──
+# ── 4) 丢的动作 = unload_model_and_clones(clip.patcher) ──
+# ⚠ 2026-10-13：老测试 mock 的是 `unload_model_and_clips` —— ComfyUI 里**从未
+# 存在**这个名字（真名 `unload_model_and_clones`）。mock 掉被测依赖的后果是：
+# 测试只证明了「我们调了这个名字」，没证明「这个名字存在」，于是源码静默失效
+# 了很久而测试一直绿。**这里改成真名**，并由下面 test_source_never_names_a_phantom_api
+# 守住「不许再写不存在的名字」。
 
-def test_drop_calls_unload_model_and_clips(monkeypatch):
+def test_drop_calls_unload_model_and_clones(monkeypatch):
     calls = []
     fake_mm = types.ModuleType("comfy.model_management")
-    fake_mm.unload_model_and_clips = lambda patcher, **kw: calls.append(patcher)
+    fake_mm.unload_model_and_clones = lambda patcher, **kw: calls.append(patcher)
     fake_comfy = types.ModuleType("comfy")
     fake_comfy.model_management = fake_mm
     monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
@@ -144,6 +149,42 @@ def test_drop_calls_unload_model_and_clips(monkeypatch):
     _enc(p, "你好")
     assert calls == [clip.patcher]
     assert p.drops == 1
+
+
+# ── 4b) 反回归：源码里不许出现 ComfyUI 不存在的 comfy API 名 ──
+# 为什么值得单开一条：这次的事故是「函数名写错 + except 吞异常」，单测形态下
+# （mock 一切）永远发现不了。**只能靠静态扫源码**。
+
+def test_source_never_names_a_phantom_api():
+    """用 AST 查**真实调用点**（注释/文档里提这个名字不算，反而应该被允许）。"""
+    import ast
+
+    path = os.path.join(ROOT, "cond_cache.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    bad = [n for n in ast.walk(tree)
+           if isinstance(n, ast.Attribute) and n.attr == "unload_model_and_clips"]
+    assert not bad, (
+        f"cond_cache.py 第 {[n.lineno for n in bad]} 行调用了 "
+        "unload_model_and_clips —— ComfyUI 里不存在这个名字（真名 "
+        "unload_model_and_clones）。老实现这么写 → AttributeError 被 "
+        "except 吞 → te_drop_after_cond 静默失效")
+
+
+def test_drop_warns_once_when_api_missing(monkeypatch, capsys):
+    """comfy 有、但 API 不在（比如 ComfyUI 改版改名）→ 必须出声，不能静默。"""
+    fake_mm = types.ModuleType("comfy.model_management")   # 故意不挂任何 unload_*
+    fake_comfy = types.ModuleType("comfy")
+    fake_comfy.model_management = fake_mm
+    monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake_mm)
+    CC._DROP_WARNED.clear()
+
+    clip, p = _proxy(True)
+    _enc(p, "你好")
+    _enc(p, "再一段")
+    out = capsys.readouterr().out
+    assert p.drops == 0                       # 失败就是失败，不伪装成功
+    assert out.count("[H3性能] te_drop_after_cond 未生效") == 1   # 但只报一次，不刷屏
 
 
 # ── 5) 无 comfy 环境：静默吞，不炸编码链 ──

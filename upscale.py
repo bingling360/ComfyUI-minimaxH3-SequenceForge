@@ -37,6 +37,7 @@ from . import checkpoint
 from . import grid
 from . import perf
 from . import sigmas_adapter
+from . import vae_chunk
 
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
@@ -989,6 +990,33 @@ def _vram_probe_reset():
             torch.cuda.reset_peak_memory_stats()
     except Exception:
         pass
+
+
+def _plan_vae_chunk(vae, latent, cfg, tag=""):
+    """时间分块解码的「要不要分」判定（与 nodes._vae_chunk_plan 同口径，只是参数
+    来源是本文件的 `cfg` 而不是 perf.current_settings()）。
+
+    三道闸：开关（默认关）→ 段太短 → **账目校验**（各段帧数之和必须等于整段帧数）。
+    任一不过 → None，调用方原路走整段解码（见 vae_chunk.py 文件头的安全契约）。
+    """
+    if not cfg.get("vae_decode_chunk_on"):
+        return None
+    try:
+        z_len = int(tuple(latent.shape)[2])
+        want = int(cfg.get("vae_decode_chunk_tokens") or 0)
+        max_tokens = want if want > 0 else perf.auto_chunk_tokens(vae, latent)
+        pl = vae_chunk.plan(vae, z_len, max_tokens)
+        if not pl.get("ok"):
+            print(f"[H3性能] {tag}时间分块解码跳过：{pl.get('why') or '未知原因'}",
+                  flush=True)
+            return None
+        print(f"[H3性能] {tag}时间分块解码：{pl.get('why')}"
+              f"（每块的像素缓冲降为 1/{len(pl['pieces'])}）", flush=True)
+        return pl
+    except Exception as _pe:
+        print(f"[H3性能] {tag}时间分块解码规划失败（{type(_pe).__name__}: {_pe}）"
+              f"—— 退回整段解码", flush=True)
+        return None
 
 
 def _rss_probe():
@@ -3006,9 +3034,32 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 解码高清 latent -> 高清帧。注意：H3 视频 VAE 声明 handles_tiling=True
     # （comfy/sd.py:1020），**它本来就内部分块解码**（256px 空间 tile + 17 帧时序块），
     # 不存在「OOM 才降级到 tiled」这个动作——这里无需也不该做显存干预。
+    # ★ 解码前的**内存**预算体检（2026-10-13）：高清解码同样逃不掉「整段像素缓冲
+    #   预分配到内存」（comfy/sd.py:1270）——且高清段还在 dec Arenas**之上**再叠一层，
+    #   所以它比基础解码更容易撞。够用则几乎零开销，只在预测真会撞时才收堆。
+    try:
+        perf.decode_ram_check(video_vae, up_v,
+                              mode=(cfg.get("decode_ram_guard") or "auto"),
+                              tag=f"二采段{g + 1} ")
+    except Exception:
+        pass
+    # 时间分块解码（perf.vae_decode_chunk_on，默认关）。高清解码比基础解码更容易撞
+    # 内存（在基础解码的开销之上再叠一层），所以这里是它最该发挥作用的地方。
+    # 分不了 / 账对不上 → 原路走整段解码（见 vae_chunk.py 文件头的安全契约）。
+    _up_pl = _plan_vae_chunk(video_vae, up_v, cfg, tag=f"二采段{g + 1} ")
     _vram_probe_reset()
     _t = time.perf_counter()
-    frames = video_vae.decode(up_v)
+    if _up_pl is not None:
+        try:
+            frames = vae_chunk.decode_chunked(
+                video_vae, up_v, _up_pl,
+                blend=int(cfg.get("vae_decode_blend") or 0))
+        except Exception as _ce:
+            print(f"[H3二采] 段{g + 1}：分块解码失败（{type(_ce).__name__}: {_ce}）"
+                  f"—— 退回整段解码", flush=True)
+            frames = video_vae.decode(up_v)
+    else:
+        frames = video_vae.decode(up_v)
     del up_v
     torch.cuda.empty_cache()
     if len(frames.shape) == 5:

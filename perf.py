@@ -223,6 +223,34 @@ DEFAULT_PERF = {
     # 仍保留三态：「auto」= Linux 开 / Windows 关，可手动拨回（见
     # te_drop_after_cond_enabled 的 docstring）。消费端：cond_cache.CachedClipProxy。
     "te_drop_after_cond": True,
+    # ★ 解码前的**内存**预算体检（2026-10-13）——本轮唯一的「是对症药」的机制。
+    #
+    # 为什么必须单独做一条：现有全部机制（段末清理 / 无主显存回收 / oom_retry /
+    # offload_guard）**治的都是显存**。而 H3 视频 VAE 会在**开始解码之前**把整段
+    # 视频的完整像素缓冲一次性分配在主机内存里（comfy/sd.py:1270-1277 +
+    # comfy/ldm/minimax/vae.py:708-711）——那是一张与帧数线性相关的固定开口支票。
+    # 显存侧再干净也救不了它；而 Linux 无 swap / cgroup 下内存不够是 **SIGKILL**，
+    # 连异常都不抛 → `oom_retry` 那种「抛了再救」的路径完全失效（表现为无声断连）。
+    #
+    # 分工：
+    #   "auto" 够用就**什么都不做**（只多一次 meminfo 读，微秒级）；只在预测会撞
+    #         时才做最便宜的救助（gc.collect + malloc_trim），然后复测并如实报告。
+    #   "warn" 永不改行为，只在吃紧时打一行 `[H3内存]`。
+    #   "off"  完全不体检。
+    "decode_ram_guard": "auto",
+    # ★ 时间分块解码（2026-10-13）—— 把那张「一次性开口支票」拆成分期付款。
+    #
+    # 默认**关**：拼接处有 VAE 结构性的 3 帧内容跳跃（见 vae_chunk.py 文件头
+    # 「接缝问题的真相」），虽然帧数有账目校验兜底（对不上就不分块），
+    # 但画质副作用必须由用户自己确认，所以按项目惯例做成显式开关、默认不动。
+    #
+    # 开关关掉时 `vae_decode_chunk_tokens` / `vae_decode_blend` 仍保留数值、只是
+    # 不生效（与其它分块两件套同口径：免得来回开关要重填）。
+    #   tokens = 0 表示「自动」：按可用内存反推每块 token 上限。
+    #   blend   = 0 表示硬拼接；>0 则在接缝处做这么多帧的交叉溶解（柔化，非消除）。
+    "vae_decode_chunk_on": False,
+    "vae_decode_chunk_tokens": 0,
+    "vae_decode_blend": 0,
 
     # 编码。**一个「质量数值」跟着编码器换含义**（面板上按 encoder 值显隐）：
     #   encoder=libx264     -> 读 `x264_crf`（恒定质量，越小越清晰）
@@ -342,6 +370,10 @@ PERF_TYPES = {
     # 磁盘 / swap 守卫
     "offload_guard_ratio": (int, float),
     "guard_action": (str,),
+    "decode_ram_guard": (str,),
+    "vae_decode_chunk_on": (bool,),
+    "vae_decode_chunk_tokens": (int,),
+    "vae_decode_blend": (int,),
     "te_drop_after_cond": (bool, "auto"),
     # 编码（两个维度：实现 / 质量档；质量档随 encoder 换含义，crf 与 cq 分开存）
     "encoder": (str,),
@@ -1913,6 +1945,185 @@ def rss_gb():
         return None
     except Exception:
         return None
+
+
+def malloc_trim(level=0):
+    """把 glibc 空闲堆还给操作系统（**RSS 真下降的唯一手段**）。(Linux 独有)
+
+    为什么要这一刀：torch / glibc 释放了内存**不会主动还给内核**，进程 RSS 停在
+    历史最高点。下一次峰值要在「上次的最高点」上再叠——这就是实测到的
+    「段间残留 +2G/段」的大头（另一部分是模型本体，那部分本来就不该降）。
+    在 Linux 上 `malloc_trim(0)` 会把空闲堆区（`heap trim`/`madvise`）交回内核，
+    RSS 立刻降下来。成本是一次 madvise 扫描，**毫秒级、且不动任何张量**。
+
+    ⚠ Windows 没有这回事：那里由 pagefile 兜底，直接返回 None 跳过。
+    """
+    if os.name == "nt":
+        return None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.malloc_trim.argtypes = [ctypes.c_int]
+        libc.malloc_trim.restype = ctypes.c_int
+        return int(libc.malloc_trim(int(level)))
+    except Exception:
+        return None
+
+
+def decode_pixels_need_gb(vae, latent, factor=1.15):
+    """H3 视频 VAE 本次解码要在**内存**里开的那张支票（GB）；量不到 → None。
+
+    ═══ 为什么它是「固定开口支票」，而不是可以慢慢挤的普通峰值 ═══
+
+    ComfyUI 对声明了 `comfy_has_chunked_io` 的 VAE（H3 的 VideoVAE 有，
+    `comfy/ldm/minimax/vae.py:408`）会**在解码开始之前**先把整块输出预分配到
+    `output_device`（`comfy/sd.py:1270-1277`）：
+
+        pixel_samples = torch.empty(
+            first_stage_model.decode_output_shape(samples_in.shape),
+            device=self.output_device, dtype=self.vae_output_dtype())
+
+    而 H3 VAE 自己的兜底路径也一样（`vae.py:708-711`，注释写得很直白：
+    *"finalized chunks stream out of VRAM so the full video never sits on the GPU"*）
+    —— 官方就是故意把整段视频从显存挪到**内存**的。
+
+    后果：**这笔钱与你的显存干不干净无关，也不受任何卸载开关影响**，
+    它等于 `帧数 × 高 × 宽 × 3 × 4字节`。1080p 10 秒 @24fps ≈ 6GB，
+    二采的高清分辨率还要再乘一个系数。它一上来就要，且中途不可能收回。
+
+    `factor`：解码过程中还会有临时的 dtype 转换 / permute 副本，留 15% 余量。
+    """
+    try:
+        shape = vae.first_stage_model.decode_output_shape(tuple(latent.shape))
+    except Exception:
+        shape = None
+    if shape is None:
+        try:
+            shape = tuple(vae.decode_output_shape(tuple(latent.shape)))
+        except Exception:
+            return None
+    try:
+        shape = tuple(int(x) for x in shape)
+        if len(shape) != 5:
+            return None
+        _, _, frames, height, width = shape
+        planes = 3
+        return float(frames * height * width * planes * 4) * float(factor) / GB
+    except Exception:
+        return None
+
+
+def auto_chunk_tokens(vae, latent, target_frac=0.5, min_tokens=1):
+    """「自动」档：按可用内存反推每块 token 上限；量不到 → 0（= 不自动分块）。
+
+    原理：那张开口支票 `need` 与 latent 的 token 数**严格成正比**（帧数 = token ×
+    ratio_t），所以要把单块的开销压到 `可用 × target_frac` 以内，每块最多能装
+    `z_len × (可用 × target_frac) / need` 个 token —— 一次除法，不需要迭代。
+
+    `target_frac` 取 0.5：留出一半给「模型常驻之外的其它波动 + 拼接时的临时副本」。
+    压得太狠块数会变多，而块数一多接缝就多，不值得。
+    """
+    need = decode_pixels_need_gb(vae, latent)
+    ram, _swap = probe_ram_swap()
+    avail = None if ram is None else ram.get("avail_gb")
+    try:
+        z_len = int(tuple(latent.shape)[2])
+    except Exception:
+        return 0
+    if need is None or avail is None or z_len <= 0 or need <= 0:
+        return 0
+    budget = float(avail) * float(target_frac)
+    if budget <= 0:
+        return 0
+    n = int(z_len * budget / need)
+    return max(int(min_tokens), min(n, z_len))
+
+
+def decode_ram_check(vae, latent, mode="auto", tag="", margin_gb=1.0, verbose=False):
+    """解码前的内存预算体检 + **只在真的要撞时**做最便宜的救助。
+
+    设计前提（用户 2026-10-13 明确要求）：**不要在没必要的时候白付代价**。
+    于是判据是「预测需求」而不是「历史残留」——够用就一个 if 都不多走。
+
+    返回 dict（任何一环量不到都降级为「跳过」，绝不拦路）：
+        need_gb     本次解码要的内存
+        avail_gb    系统可用（MemAvailable）
+        rss_gb      本进程 RSS
+        level       "ok" | "tight" | "short"
+        action      "none" | "returned" | "skipped"
+        freed_gb    救助真降下来的 RSS（None = 没做/没效果）
+        message     一行中文结论
+    """
+    out = {"need_gb": None, "avail_gb": None, "rss_gb": None, "level": "ok",
+           "action": "none", "freed_gb": None, "message": ""}
+    mode = str(mode or "off").lower()
+    if mode == "off":
+        return out
+    need = decode_pixels_need_gb(vae, latent)
+    ram, _swap = probe_ram_swap()
+    avail = None if ram is None else ram.get("avail_gb")
+    rss0 = rss_gb()
+    out.update({"need_gb": need, "avail_gb": avail, "rss_gb": rss0})
+    if need is None or avail is None:
+        out["level"] = "ok"
+        out["action"] = "skipped"
+        return out
+
+    if avail - need >= margin_gb:
+        out["level"] = "ok"
+    elif avail - need >= 0:
+        out["level"] = "tight"          # 理论够，但没有任何余量：正是这种会炸
+    else:
+        out["level"] = "short"
+
+    if out["level"] == "ok":
+        return out
+
+    _n = f"{need:.1f}"
+    _a = f"{avail:.1f}"
+    if mode == "auto" and out["level"] == "short":
+        # 只在**真的不够**时才动手，且只做最便宜的两件事：
+        # ① gc：回收「没人引用的中间张量」；② malloc_trim：把空闲堆还给内核。
+        # 两者都不碰任何在用张量，毫秒级；如果本就没有可收的，代价接近零。
+        try:
+            import gc as _gc
+
+            _gc.collect()
+            malloc_trim()
+        except Exception:
+            pass
+        rss1 = rss_gb()
+        out["action"] = "returned"
+        if rss0 is not None and rss1 is not None:
+            out["freed_gb"] = round(rss0 - rss1, 2)
+        _ram2, _ = probe_ram_swap()
+        avail2 = None if _ram2 is None else _ram2.get("avail_gb")
+        out["avail_gb"] = avail2 if avail2 is not None else avail
+        _f = out["freed_gb"]
+        _f_txt = "无明显变化" if _f is None or abs(_f) < 0.05 else f"RSS {rss0:.1f}→{rss1:.1f}GB（-{_f:.2f}GB）"
+        out["message"] = (
+            f"[H3内存] {tag}解码预算不足：需要 {_n}GB / 可用 {_a}GB ——"
+            f"已做 gc+堆回收（{_f_txt}），复测可用 {out['avail_gb']:.1f}GB。"
+            f"仍不足的话建议：缩短段时长（峰值 ∝ 帧数）或关闭二采。")
+    elif out["level"] == "short":
+        out["message"] = (
+            f"[H3内存] {tag}解码预算不足：需要 {_n}GB / 可用 {_a}GB "
+            f"—— H3 视频 VAE 会在解码前一次性预分配整段像素缓冲到内存"
+            f"（comfy/sd.py:1270），Linux 无 swap 时直接 OOM kill、不会抛异常，"
+            f"所以 oom_retry 那类「抛了再救」救不到。建议：缩短段时长（峰值 ∝ 帧数）"
+            f"或关闭二采，也可把 decode_ram_guard 设为 auto 让它在撞之前先收堆。")
+    else:
+        out["message"] = (
+            f"[H3内存] {tag}解码余量仅 {avail - need:.1f}GB（需要 {_n}GB / 可用 {_a}GB）"
+            f"—— 没有任何缓冲余地，建议缩短段时长或关闭二采。")
+
+    if verbose or out["level"] == "short":
+        try:
+            print(out["message"], flush=True)
+        except Exception:
+            pass
+    return out
 
 
 def probe_disk_free(path=None):

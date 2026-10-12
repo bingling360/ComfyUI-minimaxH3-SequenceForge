@@ -50,6 +50,7 @@ from . import metrics
 from . import guides
 from . import grid
 from . import perf
+from . import vae_chunk
 from . import semantic_bridge
 from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
                    audio_tokens_for_frames, align_frame_count_down)
@@ -638,6 +639,42 @@ def _log_reclaim(rec, prefix):
               f"（无主 {rec['orphan_gb']:.2f}GB · 释放 {freed:.2f}GB）", flush=True)
     except Exception:
         pass
+
+
+def _vae_chunk_plan(vae, latent, on, tag=""):
+    """时间分块解码的「要不要分」判定；不该分 / 分不了 → None（调用方走整段解码）。
+
+    三道闸，任何一道不过都退回原路：
+      ① 开关（默认关）；
+      ② 段太短（整段本来就不超过每块上限）→ 没意义；
+      ③ **账目校验**：各段帧数之和必须等于整段帧数（见 vae_chunk.py 文件头的安全
+         契约）。帧数错了会导致音画不同步、段长漂移，是这类改动唯一真正致命的
+         失败模式，所以宁可不省内存。
+    """
+    if not on:
+        return None
+    try:
+        from . import vae_chunk
+
+        z_len = int(tuple(latent.shape)[2])
+        want = perf.current_settings().get("vae_decode_chunk_tokens")
+        try:
+            want = int(want or 0)
+        except (TypeError, ValueError):
+            want = 0
+        max_tokens = want if want > 0 else perf.auto_chunk_tokens(vae, latent)
+        pl = vae_chunk.plan(vae, z_len, max_tokens)
+        if not pl.get("ok"):
+            print(f"[H3性能] {tag}时间分块解码跳过：{pl.get('why') or '未知原因'}",
+                  flush=True)
+            return None
+        print(f"[H3性能] {tag}时间分块解码：{pl.get('why')}"
+              f"（每块的像素缓冲降为 1/{len(pl['pieces'])}）", flush=True)
+        return pl
+    except Exception as _pe:
+        print(f"[H3性能] {tag}时间分块解码规划失败（{type(_pe).__name__}: {_pe}）"
+              f"—— 退回整段解码", flush=True)
+        return None
 
 
 def _frames_to_uint8(frames_f):
@@ -3650,6 +3687,31 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _comfy_exec_cleanup()
             _log_reclaim(_reclaim_orphan_vram(tag=f"{label} 解码前"),
                          f"{label} 解码前")
+            # ★ 解码前的**内存**预算体检（2026-10-13）。上面那套 + 下面的 oom_retry
+            #   治的都是**显存**；而 H3 视频 VAE 会在解码前把整段像素缓冲一次性
+            #   预分配到内存（comfy/sd.py:1270），且在 Linux 无 swap 下不够就是
+            #   SIGKILL（不抛异常 → oom_retry 那类「抛了再救」完全失效）。
+            #   够用则这里只是多读一次 meminfo；只有预测真会撞时才做 gc+堆回收。
+            try:
+                perf.decode_ram_check(video_vae, vt,
+                                      mode=perf.current_settings().get("decode_ram_guard"),
+                                      tag=f"{label} ")
+            except Exception:
+                pass
+            # ── 时间分块解码（perf.vae_decode_chunk_on，默认关）──
+            # 只在这里做一次「能分就分」的尝试：分不了（账对不上 / 参数读不到 /
+            # 段太短）一律原路走整段解码，行为与没装它时逐字相同。
+            _chunk_pl = _vae_chunk_plan(video_vae, vt,
+                                        perf.current_settings().get("vae_decode_chunk_on"))
+            if _chunk_pl is not None:
+                try:
+                    _blend = int(perf.current_settings().get("vae_decode_blend") or 0)
+                    _f = vae_chunk.decode_chunked(video_vae, vt, _chunk_pl,
+                                                  blend=_blend)
+                    return _f, 0
+                except Exception as _ce:
+                    print(f"[H3性能] {label} 分块解码失败（{type(_ce).__name__}: {_ce}）"
+                          f"—— 退回整段解码，本次不省内存", flush=True)
             if not _oom_autoretry:
                 return video_vae.decode(vt), 0
 

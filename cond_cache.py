@@ -118,6 +118,10 @@ def _misc_key(args, kwargs):
     return _norm((tuple(args), dict(kwargs)))
 
 
+# 一次性告警去重。为什么要有：`_drop_te` 每段 miss 都会走到，失败不设闸会刷屏。
+_DROP_WARNED = set()
+
+
 class CachedClipProxy:
     """clip 透明代理：tokenize 记账 + encode_from_tokens(_scheduled) 结果缓存。
 
@@ -148,17 +152,40 @@ class CachedClipProxy:
         解码结束，段间残留 +2G/段，3-4 段必撞 cgroup 上限被整容器杀掉（2026-09-30
         实测）。编码完它就闲了（下一段的 cond 才用，权重躺在 577MB/s 共享盘，
         回载 ~45s）——编码一结束就丢，采样/解码全程不背它。
-        用 unload_model_and_clips 而不是 unload_all_models：只动 TE 自己，
-        不碰主模型的暖驻留（那是「Staged 11956MB」半热加载的来源）。
+
+        ═══ 2026-10-13 修：这里原来是**静默失效**的 ═══
+
+        原实现调 `comfy.model_management.unload_model_and_clips` —— ComfyUI 里
+        **从未存在过**这个名字（真名是 `unload_model_and_clones`，
+        `comfy/model_management.py:2118`；全仓 grep + `git log --all -S` 均无 `_clips`
+        版本）。而调用包在 `except Exception: pass` 里 → AttributeError 被吞 →
+        `te_drop_after_cond` 这个开关**什么都没干**，连 `drops` 计数都不会加，
+        所以任何报告都发现不了。加这个开关的人以为自己在省内存，实际是空转。
+
+        现在三条防线：① 只调真实存在的 API；② API 不在就**报错出声**（一次性），
+        不再静默；③ 仍然保证缓存层自己永不成为崩溃源（失败只是不丢，编码照常）。
         """
         try:
-            import gc as _gc
             import comfy.model_management as _mm
-            _mm.unload_model_and_clips(self._clip.patcher)
+        except Exception:
+            return          # 没有 comfy（单测形态就是它）：缓存层不做噪音源
+        try:
+            import gc as _gc
+            _fn = getattr(_mm, "unload_model_and_clones", None)
+            if _fn is None:
+                raise AttributeError(
+                    "comfy.model_management 里没有 unload_model_and_clones"
+                    "（老实现写的 unload_model_and_clips 从未存在）")
+            # 用 unload_model_and_clones 而不是 unload_all_models：只动 TE 自己，
+            # 不碰主模型的暖驻留（那是「Staged 11956MB」半热加载的来源）。
+            _fn(self._clip.patcher)
             _gc.collect()
             self.drops += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            if "drop_fail" not in _DROP_WARNED:
+                _DROP_WARNED.add("drop_fail")
+                print(f"[H3性能] te_drop_after_cond 未生效：{type(exc).__name__}: {exc}；"
+                      f"TE 不会被提前请出显卡（cond 缓存本身不受影响）", flush=True)
 
     def tokenize(self, text, *args, **kwargs):
         tokens = self._clip.tokenize(text, *args, **kwargs)

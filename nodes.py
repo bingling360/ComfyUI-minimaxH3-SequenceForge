@@ -526,7 +526,7 @@ def _reclaim_orphan_vram(threshold_gb=2.5, tag=""):
           设备 6.00/6.00GB 已用 · CUDA 报空闲 0.00GB · torch allocated 0.31GB
           #0 MiniMaxH3VideoVAE loaded=0.00GB · vbar resident=0
           #1 MiniMaxH3         loaded=0.00GB · vbar resident=0
-          free_memory 要求释放 5.07GB → 卸了 0 个 · 实释放 0.00GB
+          free_memory 需要 5.07GB 可用 → 卸了 0 个 · 实释放 0.00GB
 
       —— **约 5.7GB 不在任何账本上**。`free_memory` 找不到可卸对象，解码就在
       这个状态下反复尝试，表现为「卡住不动」（实测多段链第 1 段解码入口

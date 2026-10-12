@@ -93,13 +93,49 @@ def test_size_txt_renders_sentinel_as_all():
     assert mod._size_txt(2 * 1024 ** 3) == "2.00GB"
 
 
-def test_notable_free_flags_the_responsibility_vacuum(monkeypatch):
-    """默认模式下：「要了内存却一点没释放」必须出声 —— 这正是责任真空的签名。"""
+def test_need_txt_says_need_not_release():
+    """`需要 X 可用` —— X 是上游 memory_required，不能读成「要腾出 X」。"""
+    mod = _load()
+    assert mod._need_txt(1e30) == "全部显存"
+    assert mod._need_txt(2 * 1024 ** 3) == "2.00GB 可用"
+
+
+def test_num_never_pretends_nan_is_zero():
+    """读数失败必须显示 `?` —— 冒充 0 会被读成「什么都没释放」。"""
+    mod = _load()
+    assert mod._num(float("nan")) == "?"
+    assert mod._num(None) == "?"
+    assert mod._num(1.5) == "1.50"
+
+
+def test_notable_free_keeps_the_real_signals(monkeypatch):
+    """真卸了模型 / 非动态路径的老判据 / 动态路径真还回了 —— 一定要出声。"""
     mod = _load(monkeypatch)
-    assert mod._notable_free(0.1 * 1024 ** 3, 0.0, 0, False) is True
-    assert mod._notable_free(0.1 * 1024 ** 3, 0.1 * 1024 ** 3, 0, False) is False
-    # for_dynamic 一律出声
-    assert mod._notable_free(1, 0.0, 0, True) is True
+    gb = 1024 ** 3
+    assert mod._notable_free(0.1 * gb, 0.0, 0, False) is True        # 责任真空（非动态）
+    assert mod._notable_free(0.1 * gb, 0.1 * gb, 0, False) is False  # 非动态且真释放、额度也小
+    assert mod._notable_free(0.1 * gb, 0.0, 2, True) is True         # 真卸了 2 个
+    assert mod._notable_free(0.1 * gb, 0.5 * gb, 0, True) is True    # 动态路径真还回了
+    # unload_all_models 那条关键行：哨兵额度 + for_dynamic=False，绝不能被压掉
+    assert mod._notable_free(1e30, 15.77 * gb, 4, False) is True
+
+
+def test_notable_free_pressure_gate(monkeypatch):
+    """动态路径 + 没还回：只在设备吃紧时出声，例行问价必须压掉。"""
+    mod = _load(monkeypatch)
+    gb = 1024 ** 3
+    total = 24 * gb
+    # 设备空着、要 29GB、卸 0 个、释放 0 —— 例行问价，压掉
+    assert mod._notable_free(29 * gb, 0.0, 0, True,
+                             used_gb=0.3 * gb, total_gb=total) is False
+    # 设备 90% —— 这才是「腾不出来」的现场
+    assert mod._notable_free(11 * gb, 0.0, 0, True,
+                             used_gb=21.6 * gb, total_gb=total) is True
+    # 读数缺失 → 不猜、不出声（否则退化成旧版的刷屏）
+    assert mod._notable_free(11 * gb, 0.0, 0, True) is False
+    # 全量模式下不再过滤
+    verbose = _load(monkeypatch, mode="1")
+    assert verbose._notable_free(11 * gb, 0.0, 0, True) is True
 
 
 def test_plugin_entry_wires_the_probe():

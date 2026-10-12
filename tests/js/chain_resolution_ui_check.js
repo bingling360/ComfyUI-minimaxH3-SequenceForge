@@ -100,6 +100,18 @@ function boot(node, mf) {
             "画布与存档不同 → 提示两个分辨率", txt2);
         ok(/自动跳过/.test(txt2), "并说明那一侧的锚会自动跳过", txt2);
         ok(!/链首/.test(txt2) && !/链尾/.test(txt2), "中间段不该报链首/链尾", txt2);
+
+        /* 2d) 两侧邻居都已被标重摇 → 那两处接缝会按当前画布重做，不该再报「会跳过」
+              （与后端 ResolutionLedger 把 redo 槽排除在"存档值"之外同一口径） */
+        const node3 = mkNode("16:9", 0.5);
+        const mfMarked = Object.assign({}, MANIFEST, {
+            redo_queue: [[0, "双锚"], [2, "双锚"]],
+        });
+        const b3 = boot(node3, mfMarked);
+        b3.w.openRerollModal(1, { node: node3, mf: mfMarked, plan: planOf(3),
+                                  ds: b3.w.getDs(node3), state: { dir: "PROJ" } });
+        const txt3 = (b3.w.document.querySelector(".h3d-redo-note") || {}).textContent || "";
+        ok(!/当前画布/.test(txt3), "邻居已标重摇 → 不再报分辨率边界", txt3);
     }
 
     /* ---------- 3) 「从这段继续」：重跑起始段必须带 off ---------- */
@@ -130,6 +142,58 @@ function boot(node, mf) {
         await b2.w.continueFromSegment(0, 3, 1, mfP);
         const hit2 = seen2.filter(([name]) => name === "重跑起始段").map(([, v]) => v);
         ok(hit2[0] === 3, "有序章：从段 1 继续 → 重跑起始段 3（不得连序章一起截断）", hit2, 3);
+    }
+
+    /* ---------- 4) archivedRes：按槽位读 seg_res（与后端 _archived_res 同口径） ---------- */
+    {
+        const { w } = boot(mkNode("16:9", 1.0), MANIFEST);
+
+        /* 4a) 有逐段记录 → 按槽位取值（混分辨率链里 params 指不了具体段） */
+        const mfSeg = Object.assign({}, MANIFEST, {
+            seg_res: [[1376, 768], [960, 544], [960, 544]],
+        });
+        ok(JSON.stringify(w.archivedRes(mfSeg, 0)) === "[1376,768]",
+            "seg_res[0] → 1376×768", w.archivedRes(mfSeg, 0), [1376, 768]);
+        ok(JSON.stringify(w.archivedRes(mfSeg, 1)) === "[960,544]",
+            "seg_res[1] → 960×544", w.archivedRes(mfSeg, 1), [960, 544]);
+
+        /* 4b) 旧档无 seg_res → 整链回落 params */
+        ok(JSON.stringify(w.archivedRes(MANIFEST, 1)) === "[1376,768]",
+            "旧档（无 seg_res）→ 回落 params", w.archivedRes(MANIFEST, 1), [1376, 768]);
+
+        /* 4c) 不是已存档槽位（g >= done）→ null，不许拿 params 顶替 */
+        ok(w.archivedRes(MANIFEST, 3) === null,
+            "g >= done（还没生成的段）→ null", w.archivedRes(MANIFEST, 3), null);
+        ok(w.archivedRes(MANIFEST, -1) === null, "负槽位 → null", w.archivedRes(MANIFEST, -1), null);
+
+        /* 4d) seg_res 行写坏（长度不对）→ 回落 params，不抛 */
+        const mfBad = Object.assign({}, MANIFEST, { seg_res: [[1, 2, 3], null, [0, 0]] });
+        ok(JSON.stringify(w.archivedRes(mfBad, 0)) === "[1376,768]",
+            "坏行 → 回落 params", w.archivedRes(mfBad, 0), [1376, 768]);
+        ok(JSON.stringify(w.archivedRes(mfBad, 2)) === "[1376,768]",
+            "全零行 → 回落 params", w.archivedRes(mfBad, 2), [1376, 768]);
+    }
+
+    /* ---------- 5) upRecValid：越界口径必须与后端 base_hash 逐字一致 ---------- */
+    {
+        const { w } = boot(mkNode("16:9", 1.0), MANIFEST);
+        const mk = (baseHash) => ({
+            done: 3, total: 3, has_prologue: false,
+            params: { width: 1376, height: 768 },
+            prompt_hashes: ["h0"],            // 故意短于 done：槽 1、2 越界
+            seeds: [7],
+            upscale: { segs: [null, { done: true, base_hash: baseHash }] },
+        });
+        /* 5a) 数组短于槽位 → 空串占位（后端口径），不是"判为有效" */
+        ok(w.upRecValid(mk("|"), 1) !== null,
+            "越界槽：base_hash 恰为 \"|\"（空串占位）→ 有效", null, "非 null");
+        ok(w.upRecValid(mk("h0|7"), 1) === null,
+            "越界槽：base_hash 用了真实值 → 无效（后端也这么判）", null, null);
+
+        /* 5b) 键整个不存在（极老存档）→ 退回只看 done，行为与从前一致 */
+        const mfOld = { done: 1, upscale: { segs: [{ done: true, base_hash: "whatever" }] } };
+        ok(w.upRecValid(mfOld, 0) !== null,
+            "极老存档（两条数组都缺）→ 退回只看 done", null, "非 null");
     }
 
     console.log(bad ? `\n${bad} 个用例不符` : "\n全部通过");

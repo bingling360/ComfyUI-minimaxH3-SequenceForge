@@ -18,7 +18,10 @@ anchor 结构（§3）：
      "branches": {"av": "both|video|audio"},
      "on": True}
 
-唯一硬约束是分辨率（C/H/W）；窗宽受 17k+5 约定约束，落点完全自由。
+锚自身唯一受限的字段是分辨率（C/H/W）：`PackedLayout` 按行预留，形状不合就拼不上。
+⚠ 这是**锚/桥这一层**的约束，不是「整链必须同一分辨率」——2026-10-12 起链参数不再强制
+整链一致，相邻段分辨率不同时由 nodes.py 跳过该处桥接（见 checkpoint.py 模块 docstring v6）。
+窗宽受 17k+5 约定约束，落点完全自由。
 """
 
 from . import grid
@@ -143,8 +146,9 @@ _REENCODE_HINT = {
 def resolve_anchor_source(anchor, chain_chw, source_meta):
     """决定这条 anchor 的源怎么取：**直接切窗 / 先裁后编 / 硬报错**。
 
-    `chain_chw` = 本链的 (C, H, W)：唯一硬约束。`PackedLayout` 按行预留，
+    `chain_chw` = 本链的 (C, H, W)：在**桥接层面**唯一受限的量。`PackedLayout` 按行预留，
     不匹配则桥根本拼不上——所以这里要么把源改成链的尺寸，要么报错，没有第三条路。
+    （链级一致性不在此列：2026-10-12 起相邻段分辨率不同只是跳过该处桥接，不报错。）
 
     `source_meta` 由调用方探测后传入（形状/帧数/帧率/能否重编）：
         {"shape": (C, T, H, W) | None,   # None = 源不可用
@@ -201,6 +205,42 @@ def resolve_anchor_source(anchor, chain_chw, source_meta):
     return {"action": "encode", "window": win, "start_f": start_f, "end_f": end_f,
             "note": (f"{label}：源 {src_chw[2]}×{src_chw[1]} → 本链 {want[2]}×{want[1]}"
                      f"，先裁后编（帧窗 [{start_f},{end_f})）")}
+
+
+# ---- 段首桥：来源判定与帧数（跨分辨率语义的纯逻辑） ----
+
+def bridge_from_prev_tail(anchor):
+    """这条段首锚的源是否**取自上一段尾帧**（而不是库/段/视频/图片等外源）。
+
+    `anchor` 为 None（该段没有显式 head 锚）→ True：那是自动桥，取的就是上一段尾帧。
+
+    为什么需要这个判据：分辨率只约束「取上一段尾帧」这一条通路——latent 桥按行预留，
+    C/H/W 不同就拼不上；而外源锚经 `resolve_anchor_source` 归一（形状不匹配走
+    「先裁后编」），跨分辨率照样接得上。所以「相邻段分辨率不同 → 跳过引用上段尾帧」
+    只对前者成立，对后者套用等于把一条本来能用的显式锚废掉。
+    `src.kind` 缺省即 `prev_tail`（见 SRC_KINDS / normalize_anchor）。
+    """
+    if anchor is None:
+        return True
+    return str(((anchor.get("src") or {}).get("kind") or "prev_tail")) == "prev_tail"
+
+
+def bridge_extra_frames(window, skip_bridge=False):
+    """段首桥的采样额外帧数（同时就是**裁头帧数**）。
+
+    `window` 来自 `anchor.window`（已吸附 17k+5，就是视频 latent 实际能切出的帧数）；
+    有桥时整段 `window` 帧烧进引导桥、可见帧从第 window 帧起算。
+
+    ⚠ `skip_bridge=True` 必须返回 0（不预留、不裁头）。桥不会生成时仍预留 window 帧
+    会白生成再裁掉头部 window 帧——没有桥帧可裁，裁掉的是**本段真实内容的前 window 帧**
+    （默认 22 帧≈0.9s），画面整体前移、开头缺失。这是 nodes.py「跨分辨率跳过引用
+    上段尾帧」的配套半边：那边把 guide 置 None，这边把帧数归零，缺一半就是 bug。
+    ⚠ 回放段**不能**传 True：它解的是盘上那份 latent，头部 window 帧是当年真烘进去的
+    桥帧，必须照裁。
+    """
+    if skip_bridge:
+        return 0
+    return int(window or 0)
 
 
 # ---- 旧字段迁移 ----

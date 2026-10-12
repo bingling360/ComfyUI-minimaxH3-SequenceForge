@@ -9,7 +9,7 @@ v2：指纹只覆盖共享参数（不含提示词、不含种子），改某段
 v4（2026-09-16 修正旧注释）：**重做不需要级联。** 段 N 可用双锚对齐邻居——
 上锚取段 N-1 存档 latent 的尾部，下锚取段 N+1 存档 latent 的头部（`_redo_next_anchor`）。
 所以下游段已经生成好的前提下，改某段只重建该段即可，不必连带其后的段。
-真·唯一硬约束只有分辨率（C/H/W 不同则桥拼不上）。
+（旧注释此处写「真·唯一硬约束只有分辨率」——2026-10-12 起已作废，见下方 v6。）
 
 v5（2026-09-16）：变更检测改**区间模型**（重做最小单位 = 单段，离散区间各自双锚）：
 - 区间计算迁到 `anchors.change_intervals`，本模块的 `reroll_start`（返回单一 start、
@@ -152,8 +152,12 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
         out["redo_queue"] = _kept
     # 注意：manifest 里没有 "anchors" 键——anchor 是**请求侧**字段（ds.segments[i].anchors），
     # 只按段并进 prompt_hashes，不落盘成 manifest 列表（旧实现这里留了个永不命中的键，已删）。
+    # ⚠ `base_videos`（一采另存，checkpoint.base_seg_files）与 `seg_res`（逐段分辨率）
+    # 必须一起截断：漏掉前者会让被弃段的一采入口留在段卡上指向已删文件；漏掉后者会让
+    # 「跨分辨率跳过桥接」的判定读到被弃段的旧值。两者都是**槽位对齐**列表，短了不报错、
+    # 但错位会静默走错分支。
     for key in ("seeds", "trims", "prompt_hashes", "thumbs", "videos", "prompts",
-                "seams", "bridge_scores", "seam_metrics"):
+                "seams", "bridge_scores", "seam_metrics", "base_videos", "seg_res"):
         if key in out:
             out[key] = list(out[key])[:start]
     up = out.get("upscale")
@@ -162,8 +166,10 @@ def truncate(root: str, manifest: dict, start: int) -> dict:
         up2["segs"] = list(up.get("segs"))[:start]
         out["upscale"] = up2
     save_manifest(root, out)
-    pat = re.compile(r"seg_(\d{3,})\.(?:pt|mp4)$")
-    thumb_pat = re.compile(r"thumb_(\d{3,})\.png$")
+    # 段文件清理：`(?:base_)?` 前缀让一采另存件（base_seg_NNN.mp4 / base_thumb_NNN.png）
+    # 与本体同口径一起清。`re.match` 从头锚定，所以旧版只会漏掉带前缀的那些，不会误伤。
+    pat = re.compile(r"(?:base_)?seg_(\d{3,})\.(?:pt|mp4)$")
+    thumb_pat = re.compile(r"(?:base_)?thumb_(\d{3,})\.png$")
     up_pat = re.compile(r"upseg_(\d{3,})\.(?:pt|mp4)$")
     up_thumb_pat = re.compile(r"up(?:thumb|last)_(\d{3,})\.png$")
     for sub in ("", "finals"):
@@ -187,6 +193,10 @@ def _adopt_legacy_auto_project(proot: str) -> str:
     旧版自动目录（必须是已有 manifest.json 的目录）——否则老用户升级后自动项目
     会凭空多出一个空壳，看着像进度丢了。目录名保持原样，不搬家。
     没有可用旧目录时返回空串（调用方回落到固定名）。
+
+    「最近更新」的判据按优先级：`manifest.updated_at`（每次运行都会刷，语义最准）
+    → 目录 mtime（**只是近似**：目录 mtime 只在增删文件时变，改 manifest 或改段
+    文件都不变）→ 0。拿不到 manifest 内容的目录不因此被排除，只是排序靠后。
     """
     best, best_mt = "", -1.0
     try:
@@ -199,10 +209,19 @@ def _adopt_legacy_auto_project(proot: str) -> str:
         d = os.path.join(proot, n)
         if not os.path.isdir(d) or not os.path.isfile(os.path.join(d, "manifest.json")):
             continue
+        mt = 0.0
         try:
-            mt = os.path.getmtime(d)
-        except OSError:
-            continue
+            with open(os.path.join(d, "manifest.json"), "r", encoding="utf-8") as f:
+                _u = json.load(f).get("updated_at")
+            if isinstance(_u, (int, float)) and not isinstance(_u, bool):
+                mt = float(_u)
+        except Exception:
+            pass          # 读不动/没这个键 → 退回目录 mtime
+        if mt <= 0.0:
+            try:
+                mt = os.path.getmtime(d)
+            except OSError:
+                continue
         if mt > best_mt:
             best, best_mt = d, mt
     return best
@@ -342,6 +361,95 @@ def assert_match(old: dict, new: dict, hint: str = ""):
         if old.get(k, new[k]) != new[k]:
             notes.append(f"{k}: 存档={old.get(k)!r} 当前={new[k]!r}")
     return notes
+
+
+# ---- 逐段分辨率账（链参数不再强制整链一致，2026-10-12） ----
+
+class ResolutionLedger:
+    """谁在什么分辨率下生成的：逐槽位的分辨率台账（跨次运行续跑用）。
+
+    **纯逻辑，不 import torch / folder_paths**，所以能在无 ComfyUI 环境下直接单测
+    （nodes.py 的 `_archived_res` / `_slot_res` / `_res_list` 就是它的薄封装，
+    逻辑只此一份，别在那边抄第二份判据）。
+
+    为什么需要它：链参数不再强制整链一致后，一次运行里同时存在「存档时旧分辨率的段」
+    与「本次当前画布新生成的段」，而 `manifest.params.width/height` 每次运行都被当前
+    画布覆盖、只代表「上次运行用的画布」，指不了任何具体段。要判某处的分辨率边界
+    （跳过尾帧桥 / 跳过接缝测量 / 成片闸门）必须**按槽位**问这里。
+
+    真源优先级（高→低）：
+      1. `record(g, wh)` 记下的本次实测值（本段已处理过，可能是重摇出来的新分辨率）；
+      2. `archived_seg_res[g]`（`manifest.seg_res` 逐段记录）；
+      3. `archived_wh`（旧档没有逐段记录时，整链按 manifest.params 的宽高算）；
+      4. `current_wh`（当前画布）——只有「本次会新生成」的槽才落在这里。
+
+    ⚠ 判定「本次是否回放」的三个条件与主循环的 `replay` 完全同源：槽位已存档
+    （`g < done`）、没被标重摇、段文件在盘（`replayable(g)`）。三者任一不满足 →
+    该槽本次会重新生成 → 用当前画布。
+    """
+
+    def __init__(self, current_wh, archived_wh=None, archived_seg_res=None,
+                 done=0, redo_slots=(), replayable=None):
+        self.current = (int(current_wh[0]), int(current_wh[1]))
+        self.archived = (int(archived_wh[0]), int(archived_wh[1])) \
+            if archived_wh else self.current
+        self._seg_res = list(archived_seg_res or [])
+        self.done = int(done or 0)
+        self._redo = {int(x) for x in (redo_slots or [])}
+        self._replayable = replayable or (lambda g: False)
+        self._map = {}
+
+    def archived_of(self, g):
+        """槽 g **存档时**的分辨率（旧档无逐段记录 → 整链一个值）。"""
+        if 0 <= g < len(self._seg_res):
+            r = self._seg_res[g]
+            if isinstance(r, (list, tuple)) and len(r) == 2:
+                try:
+                    return (int(r[0]), int(r[1]))
+                except (TypeError, ValueError):
+                    pass
+        return self.archived
+
+    def is_replay(self, g):
+        """槽 g 本次是否走「存档回放」（已存档、未标重摇、段文件在盘）。"""
+        return (g < self.done and g not in self._redo and bool(self._replayable(g)))
+
+    def slot(self, g):
+        """槽 g **本次实际**用的分辨率。
+
+        已处理过的槽用实测值（`record`）——这一条很关键：同一次运行里前一段可能刚被
+        重摇（或因缺文件重生成），此刻它的真实分辨率是**当前画布**，而存档记录还停在
+        旧值；用旧值判「跨分辨率」会把本该保留的接缝锚误判掉（相邻两段一起重摇时最明显）。
+        """
+        if g in self._map:
+            return self._map[g]
+        if self.is_replay(g):
+            return self.archived_of(g)
+        return self.current
+
+    def record(self, g, wh):
+        """记下槽 g 本次实际用的分辨率（`slot` 从此以它为准）。"""
+        self._map[g] = (int(wh[0]), int(wh[1]))
+
+    def snapshot(self, upto):
+        """`manifest.seg_res`：逐段 `[w, h]`（槽位对齐，跨次运行续跑的真源）。
+
+        ⚠ 必须**逐槽问 `slot()`**，不许写成 `self._map.get(x, self.current)`：
+        `_map` 只装本次循环**真正走过**的槽位，而 `upto`（= done）是存档里的整链完成数，
+        两者不等（审片/重摇中段 break 时 done 仍是 10、循环只走到第 3 段）。用当前画布
+        兜底会把没走到的槽位写成"新分辨率"——它们盘上其实是旧分辨率，下次运行据此判
+        「相邻段同分辨率」→ 真去拼 latent 桥 → C/H/W 不一致崩掉，正是本机制要根除的失败。
+        """
+        return [list(self.slot(x)) for x in range(upto)]
+
+    def distinct(self, skip=()):
+        """本次实际用到的分辨率集合（成片闸门：>1 = 全链不一致，不自动合成）。
+
+        只看 `_map`（本次真正生成/回放过的槽）——没走到的不参与判断，
+        与 `nodes.py` 里「成片只覆盖已确认部分」的既有语义一致。
+        """
+        skip = {int(x) for x in (skip or [])}
+        return {tuple(self._map[g]) for g in self._map if g not in skip}
 
 
 def seg_path(root: str, idx: int) -> str:

@@ -296,6 +296,28 @@ function currentCanvasWH(node) {
     return c ? [c[0], c[1]] : null;
 }
 
+/** 槽位 g **存档时**的分辨率 [w, h]；不是已存档槽位（或查不到）→ null。
+ *  与后端 nodes.py `_archived_res` 同一口径：优先读 `manifest.seg_res[g]`（逐段记录），
+ *  旧档没这个键才整链回落到 `manifest.params`（= 上次运行画布）。
+ *
+ *  ⚠ 别只读 `params`：链参数不再强制整链一致后，`params` 每次运行都被当前画布覆盖，
+ *  于是它只代表「上次运行用的画布」，混分辨率链里指的不是某一具体段。要判某一处的
+ *  分辨率边界必须按槽位问 `seg_res`，否则提示会指错段（甚至该报不报）。
+ *  ⚠ `g >= done` 一律返回 null：那不是已存档段，拿 `params` 顶替会把"还没生成的段"
+ *  说成"存档分辨率是上次画布"。 */
+function archivedRes(mf, g) {
+    const done = Number(mf?.done ?? 0);
+    if (!Number.isInteger(g) || g < 0 || g >= done) return null;
+    const sr = mf?.seg_res;
+    if (Array.isArray(sr) && g < sr.length) {
+        const r = sr[g];
+        if (Array.isArray(r) && r.length === 2
+            && Number(r[0]) > 0 && Number(r[1]) > 0) return [Number(r[0]), Number(r[1])];
+    }
+    const w = Number(mf?.params?.width), h = Number(mf?.params?.height);
+    return (w > 0 && h > 0) ? [w, h] : null;
+}
+
 /** 反推：宽高完全命中某 AR×MP 组合则返回 [ar, mp]，否则 null（旧工作流迁移用）。
  *  mp 返回数值（「百万像素」已改浮点控件，写字符串会留下类型混杂） */
 function matchCanvasCombo(w, h) {
@@ -4820,7 +4842,7 @@ async function openPerfSettings() {
         reset.disabled = true;
         reset.textContent = "恢复中…";
         try {
-            const b = (await A.perfSet({ perf: {} })).body;
+            const b = (await A.perfSet({})).body;
             if (!b || !b.ok) throw new Error("后端未接受（详见 ComfyUI 控制台）");
             close();
             openPerfSettings();
@@ -6194,13 +6216,21 @@ function openRerollModal(idx, data) {
     if (idx === lastPromptIdx) {
         noteLines.push("本段是链尾（后面没有段）：下锚天然缺省，实际按「仅锚上段 / 无锚」重做");
     }
+    /* 分辨率边界（2026-10-12）：只比**紧邻的两段**（上邻 slot-1 / 下邻 slot+1）——
+     * 「相邻的那一侧锚会跳过」说的就是它们；拿整链的 params 比会指错段。
+     * ⚠ 已被标重摇的邻居不算：它本次会按当前画布重新生成，那一处接缝照样有桥
+     * （与后端 `ResolutionLedger` 把 redo 槽排除在"存档值"之外同一口径）。 */
     const _curWH = currentCanvasWH(node);
-    const _archP = mf?.params;
-    if (_curWH && _archP && Number(_archP.width) > 0
-        && (_curWH[0] !== Number(_archP.width) || _curWH[1] !== Number(_archP.height))) {
-        noteLines.push(`当前画布 ${_curWH[0]}×${_curWH[1]} 与已存档段的 `
-            + `${Number(_archP.width)}×${Number(_archP.height)} 不同：`
-            + "与旧分辨率相邻的那一侧锚会自动跳过（只提示，重做照常进行）");
+    if (_curWH) {
+        const _marked = new Set((mf?.redo_queue || []).map((x) => Number(x && x[0])));
+        const _nb = [[slot - 1, "上段"], [slot + 1, "下段"]]
+            .map(([gs, who]) => [who, _marked.has(gs) ? null : archivedRes(mf, gs)])
+            .filter(([, r]) => r && (r[0] !== _curWH[0] || r[1] !== _curWH[1]));
+        if (_nb.length) {
+            noteLines.push(`当前画布 ${_curWH[0]}×${_curWH[1]} 与相邻段`
+                + `（${_nb.map(([who, r]) => `${who} ${r[0]}×${r[1]}`).join(" / ")}）不同：`
+                + "与旧分辨率相邻的那一侧锚会自动跳过（只提示，重做照常进行）");
+        }
     }
     const note = el("div", "h3d-sub h3d-redo-note", "");
     noteLines.forEach((t) => note.append(el("div", "", "· " + t)));
@@ -6323,9 +6353,13 @@ async function continueFromSegment(idx, done, off, mf) {
     const n = idx + 1;
     let resNote = "";
     const _curWH = currentCanvasWH(node);
-    const _pw = Number(mf?.params?.width), _ph = Number(mf?.params?.height);
-    if (_curWH && _pw > 0 && _ph > 0 && (_curWH[0] !== _pw || _curWH[1] !== _ph)) {
-        resNote = `\n\n⚠ 当前画布 ${_curWH[0]}×${_curWH[1]} 与已保留段的 ${_pw}×${_ph} 不同：\n`
+    /* 保留段的**最后一段**（全局槽位 = offN + n - 1；序章占 0 号）的分辨率。
+     * 按槽位读 seg_res，不拿 params 顶替——params 只代表"上次运行画布"，
+     * 重摇过靠后段时它与段 n 无关。 */
+    const _prevWH = archivedRes(mf, offN + n - 1);
+    if (_curWH && _prevWH && (_curWH[0] !== _prevWH[0] || _curWH[1] !== _prevWH[1])) {
+        resNote = `\n\n⚠ 当前画布 ${_curWH[0]}×${_curWH[1]} 与已保留段的 `
+            + `${_prevWH[0]}×${_prevWH[1]} 不同：\n`
             + `· 段 ${n + 1}（续拍的第一段）不会参考段 ${n} —— 只有这一处断开，`
             + "其后各段仍照常引用上段；\n"
             + "· 全链分辨率不一致时最终不会自动成片（分段 mp4 与合并导出都正常）。";
@@ -6885,13 +6919,21 @@ function segMediaHtml(state, mf, idx) {
  * `seg_NNN.mp4` 写回基础版，但旧的高清记录**不会被自动清掉**（后端只在二采
  * 开着时才走 `record_stale` 重做）。此时 `seg_NNN.mp4` 其实是基础分辨率，却仍被
  * 判成"高清" —— 一采入口被错误置灰、二采入口指向一段基础分辨率视频。
- * `prompt_hashes` 缺失（极老存档）时退回只看 `done`，行为与从前一致。 */
+ *
+ * 口径必须与后端 `upscale.base_hash` **逐字一致**，否则同一个存档前后端给出两种
+ * 结论（前端说"有效"、后端认为失效）。后端的越界口径是**空串占位**：
+ *     f"{hashes[g] if g < len(hashes) else ''}|{seeds[g] if g < len(seeds) else ''}"
+ * 所以这里也照抄——数组短于槽位时用 "" 而不是 undefined（旧实现 `undefined` 就
+ * `return rec` 判有效，正是两边不一致的来源）。只有**整个键都不存在**（极老存档，
+ * 两条数组都空）才退回只看 `done`，行为与从前一致。 */
 function upRecValid(mf, g) {
     const rec = (mf?.upscale?.segs || [])[g];
     if (!rec || !rec.done) return null;
-    const ph = (mf.prompt_hashes || [])[g];
-    const sd = (mf.seeds || [])[g];
-    if (ph === undefined || sd === undefined) return rec;
+    const hashes = mf.prompt_hashes || [];
+    const seeds = mf.seeds || [];
+    if (!hashes.length && !seeds.length) return rec;
+    const ph = g < hashes.length && hashes[g] != null ? String(hashes[g]) : "";
+    const sd = g < seeds.length && seeds[g] != null ? String(seeds[g]) : "";
     return rec.base_hash === `${ph}|${sd}` ? rec : null;
 }
 
@@ -9905,10 +9947,13 @@ async function resetAllParams(node) {
     applyUpscaleDefaults(node);
     /* 性能优化（机器级、全局）也一并回默认：POST 空对象 → 后端 parse_state 以
      * DEFAULT_PERF 起底（与 ⚡ 性能优化弹窗里的「恢复默认」同一入口）。
+     * ⚠ 传**空对象**、不是 `{perf:{}}` —— `H3Api.perfSet` 自己会包一层 `{perf:…}`
+     * （h3_api.js），再包一层就发成 `{perf:{perf:{}}}`；结果虽因后端丢弃未知键而
+     * 碰巧正确，但语义是错的，别照抄。
      * 失败不阻断其余重置 —— 画布参数已经落好了。 */
     try {
         const A = window.H3Api;
-        if (A && A.perfSet) await A.perfSet({ perf: {} });
+        if (A && A.perfSet) await A.perfSet({});
     } catch (e) {
         console.warn("[h3-director] 全局重置：性能优化恢复默认失败（画布参数已重置）", e);
     }
@@ -10868,13 +10913,14 @@ function renderFooter(z, data) {
             ? `▶ 继续下一段（段 ${Math.min(doneP + 1, total)}）`
             : `▶ 开始生成（共 ${total} 段）`;
         /* 分辨率边界（2026-10-12）：下一段若与上一段分辨率不同，它不会参考上一段
-         * ——只有这一处断开，其后各段照常引用上段；全链不一致则不自动成片。 */
+         * ——只有这一处断开，其后各段照常引用上段；全链不一致则不自动成片。
+         * 上一段 = 最后一个已存档槽位（done-1），按槽位读 seg_res，不拿 params 顶替。 */
         const _curWH = currentCanvasWH(node);
-        const _pw = Number(mf?.params?.width), _ph = Number(mf?.params?.height);
-        run.title = (_curWH && _pw > 0 && _ph > 0
-            && (_curWH[0] !== _pw || _curWH[1] !== _ph))
+        const _prevWH = archivedRes(mf, done - 1);
+        run.title = (_curWH && _prevWH
+            && (_curWH[0] !== _prevWH[0] || _curWH[1] !== _prevWH[1]))
             ? `下一段（段 ${Math.min(doneP + 1, total)}）不会参考上一段：当前画布 `
-                + `${_curWH[0]}×${_curWH[1]} 与已存档段的 ${_pw}×${_ph} 不同。`
+                + `${_curWH[0]}×${_curWH[1]} 与上一段的 ${_prevWH[0]}×${_prevWH[1]} 不同。`
                 + "只有这一处断开，其后各段仍照常引用上段；全链分辨率不一致时不会自动成片。"
             : "生成下一段（已有段落沿用存档，不重做）";
     }

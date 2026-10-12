@@ -1,6 +1,7 @@
 # HyperFlow / 少步蒸馏 LoRA 适配（自定义 Sigmas 通道）
 
 > 2026-09-21 · 主节点新增「自定义Sigmas」输入槽（`sigmas_adapter.py`）
+> 2026-10-12 · 该槽改名「**一采自定义Sigmas**」，并新增「**二采自定义Sigmas**」
 
 ## 为什么必须有这个口子
 
@@ -20,7 +21,7 @@
 Load Diffusion Model (MiniMax-H3)
   └─> ApplyHyperFlow                  Saganaki22/ComfyUI-Hyperflow
         ├─ MODEL  ──> H3 Seamless Chain「模型」
-        └─ SIGMAS ──> H3 Seamless Chain「自定义Sigmas」   ← 新增的槽
+        └─ SIGMAS ──> H3 Seamless Chain「一采自定义Sigmas」   ← 2026-09-21 起的槽
 ```
 
 > ⚠️ **最容易踩的坑：drbaph 有两个仓库，文件名长得像但完全不是一回事。**
@@ -36,10 +37,10 @@ Load Diffusion Model (MiniMax-H3)
 > 反过来也一样——节点版给 Load LoRA 会缺 `.alpha` 之外的结构，同样挂不上。
 >
 > 走 standalone 那条路时没有 SIGMAS 输出，需要用 core 的 **`ManualSigmas`** 节点手工填那 9 个点，
-> 再接进本节点的「自定义Sigmas」槽（见下）。
+> 再接进本节点的「一采自定义Sigmas」槽（见下）。
 
 - 「模型」槽接 ApplyHyperFlow 的 **MODEL** 输出（LoRA 与双时间条件已装在里面）。
-- 「自定义Sigmas」槽接它的 **SIGMAS** 输出（9 点表 = 8 步）。
+- 「一采自定义Sigmas」槽接它的 **SIGMAS** 输出（9 点表 = 8 步）。
 - 采样器选 **euler**（HyperFlow 官方配方；其它采样器属 ablation）。
 - 「步数」「调度器」不用动——接了表之后它们被忽略，报告里会写明。
 - **不需要**再挂 `ModelSamplingMiniMaxH3`：H3 默认就是 video shift 12 / audio shift 3，
@@ -56,7 +57,7 @@ Load Diffusion Model (MiniMax-H3)
 | CFG | 1.0 | 本插件默认即 1.0，蒸馏 LoRA 也要求低 CFG |
 | 步数 | 任意 | 接了表即失效；报告显示实际步数 = 点数-1 |
 | 调度器 | 任意 | 同上 |
-| 二采 | 建议关，或另接基础权重 | 见下 |
+| 二采 | 关，或另接基础权重；蒸馏权重就接「二采自定义Sigmas」 | 见下 |
 
 ## 主模型精度：INT8 ConvRot 的差距其实不大
 
@@ -157,9 +158,10 @@ denoise 是步数比例，不是 σ 比例，别按字面理解它。
 
 4. **二采（潜空间放大高清）的 sigma 不受影响，但"模型"会——这是最容易漏的一条。**
 
-   - **sigma 表**：二采走自己的 `common_ksampler(steps=n, denoise=σ₀)` 低强度精化路径，
-     「自定义Sigmas」只作用于一采，不会渗过去（也不该——二采是从 σ₀ 起的尾段精化，
-     HyperFlow 那张 1.0→0 的完整表和它的语义完全不同）。
+   - **sigma 表**：一采表只作用于一采，**不会渗到二采**。二采走自己的路径：默认是
+     `common_ksampler(steps=n, denoise=σ₀)` 低强度精化；要给二采也换表，必须走**另一个槽**
+     「二采自定义Sigmas」（见下一节）。两个槽互不干扰是刻意的——一采那张 1.0→0 的完整表
+     和二采「从 σ₀ 起的尾段精化」语义完全不同，自动串过去只会整段重画。
    - **模型**：`_up_model = 模型 if 二采模型 is None else 二采模型`。
      **「二采模型」槽空着 = 二采沿用一采模型 = 带着 HyperFlow LoRA 跑**，
      只不过用的是二采自己的步数/调度器（不是蒸馏表），轨迹对不上。
@@ -169,9 +171,95 @@ denoise 是步数比例，不是 σ 比例，别按字面理解它。
      要区分就在二采面板显式填，别留空。报告会提示。
      二采接了独立基础模型时，采样器沿用主链值即可，不必特意换。
 
-5. **换表 = 重做。** sigma 表已进存档指纹（`ckpt_params["sigmas"]`）。
-   未接时**不加键**——`fingerprint()` 是 `json.dumps(sort_keys=True)`，
-   多一个空串键也是新指纹，会让既有项目全部续不上。
+5. **一采换表不会让已存档的段重做 —— 必须手动「重跑起始段」。**
+   （⚠ 2026-10-12 复核更正：本节旧文写「换表 = 重做」，那是 `fingerprint()` 还拿
+   参数命名项目目录时的行为。同日起自动项目目录固定为 `h3chain`、`fingerprint()`
+   退化为诊断用（见 `checkpoint.ckpt_dir` / `checkpoint.fingerprint` 的注释），
+   于是**整条基础链的参数**（步数/采样器/调度器/一采表…）都只进 `manifest.params`，
+   由 `checkpoint.assert_match` **只报告不重做**：报告里会出现
+   「参数已变更（sigmas: …）——仅影响此后新生成的段；已有段是盘上张量、与采样参数
+   无耦合，不会因此重做」。
+   一采表仍写进 `ckpt_params["sigmas"]`（未接时**不加键**，否则 `json.dumps(sort_keys)`
+   下多一个键就是新指纹、既有项目续不上）——留着做**诊断/复现比对**，也是「哪些段
+   是这份参数下生成的」的存档证据。
+   👉 想让换了表之后的基础段重跑：设「重跑起始段」。想让**二采**高清段跟着重做：
+   二采表走的是另一条路（`upscale.params_hash`，见下节），二采面板的参数一改就会
+   自动重做高清段。
+
+## 二采自定义Sigmas（2026-10-12 新增）
+
+**它解决什么问题**：一采挂蒸馏 LoRA、二采又另接了一份**带自己 sigma 表的蒸馏权重**时，
+二采的「去噪 + 精化步数 + 调度器」现算出来的表同样对不上蒸馏轨迹。
+这个槽就是把「外部 sigma 表」这条通道接到二采上。
+
+```
+ApplyHyperFlow（二采那份权重）
+  ├─ MODEL  ──> H3 Seamless Chain「二采模型」
+  └─ SIGMAS ──> H3 Seamless Chain「二采自定义Sigmas」   ← 本槽
+```
+
+### 接了之后，哪些控件失效 / 哪些仍然生效
+
+| 二采面板项 | 接表后 | 说明 |
+|---|---|---|
+| 去噪（σ₀） | ❌ 失效 | 精化起点改由**表首值**决定 |
+| 精化步数 | ❌ 失效 | 实际步数 = **表点数 − 1** |
+| 调度器 | ❌ 失效 | 表即调度（`comfy.samplers.KSampler.sample` 里 `if sigmas is None` 才用现算的） |
+| 多轮递降（passes/decay） | ❌ 让位 | 表本身就是整条精化轨迹，再叠轮次没有语义 |
+| 增益重试（retry） | ❌ 让位 | 它要从 σ₀+0.1 现推一张表，而表是外部给的，推不出来 |
+| 段自适应σ（adaptive） | ❌ 失效 | σ 起点由表首值定，不再按段运动量偏移 |
+| **采样器** | ✅ 生效 | 与一采同口径：`sampler_name` 仍传给采样器 |
+| shift / STG | ✅ 生效 | 激活窗口按**表首值**（本表实际 σ 起点）算 |
+| 时序分块 / 空间 tile | ✅ 生效 | 每块各自跑整张表（表首值即每块的加噪起点） |
+
+报告里会把失效项逐条写出来；接表时控制台也会打一行 `[H3二采] 段N：使用二采自定义 sigma 表`。
+
+### ⚠ 表是「尾段精化」语义，别照搬一采那张
+
+一采那张 HyperFlow 表是 `1.0 → 0`（从纯噪声起步）；二采精化是从**放大后的 latent** 起步，
+首值就是**精化起点 σ**、末值应为 0。典型二采表长这样：
+
+```
+0.35, 0.28, 0.19, 0.09, 0.0        # σ₀=0.35 的 4 步精化（对应面板「去噪 0.35 / 精化 4 步」）
+```
+
+首值不在 (0,1) 开区间时报告会提示一次（多半是拿错了表）。
+
+### 指纹口径
+
+表指纹（`sigmas_adapter.fingerprint_tag`）由 `nodes.py` 写进 `up_cfg["sigmas"]` →
+进 `upscale.params_hash` → **换表 = 既有高清分段全部重做**（`record_stale` 判得出）。
+未接时**不加键**（与一采同一条铁律）。接了之后 `passes/decay`、`retry`、`scheduler`
+在采样侧已失效，故**一并退出指纹** —— 拨这些不生效的旋钮不该触发整链高清重做。
+
+⚠ 写键的判据是 `sigmas_adapter.sigmas_usable`（点数 ≥ 2），**与采样分支同源**。
+空表/坏表按「未接」处理：既不加键、也不改采样。若两处用两套判据，空表就会落到
+「指纹变了、采样没变」的白做——既有高清段全被判失效重做，画面一个像素没动。
+
+### 两个边界（2026-10-12 复核，各有守卫测试）
+
+| 情形 | 二采受影响吗 | 一采受影响吗 | 依据 |
+|---|---|---|---|
+| **只接一采表**，二采不接 | **零影响** | 按表走 | 一采表的张量只在一采采样点用；`upscale.py` 里根本不出现「一采自定义Sigmas」这个名字（守卫：`test_first_pass_table_never_leaks_into_second_pass`）。二采指纹只认 `up_cfg["sigmas"]`，那是由**二采**槽写入的 |
+| **只接二采表**，二采没开 | 零影响（本来就没跑） | 零影响 | `up_cfg = upscale.parse_state(ds)` 二采关着就是 `None` → 写键那句在 `if up_cfg:` 块内、执行不到；`render_segment` 也受 `if not (up_cfg and use_ckpt)` 守卫不会被调用（守卫：`test_second_pass_table_is_inert_when_upscale_off`） |
+| 只接二采表，二采开着但该段不在「手动选择」范围 | 该段不重做 | 零影响 | `in_scope()` 逐段判定 |
+
+两个边界都有报告行兜底：坏表（点数 < 2）→「接了表但读不出有效步数…已按未接处理」；
+二采没开 →「已接线但本次二采未启用…该表未生效」。
+
+**唯一的非零成本**：接线本身让上游那张表节点进了执行图（比如 `ManualSigmas` 会照跑）。
+不需要时把它 bypass（Ctrl+B）即可——纯连线槽不参与执行，bypass 不影响本节点。
+
+### 与一采表的「重做口径」不对称（刻意如此）
+
+| | 改参数后已存档段会重做吗 | 机制 |
+|---|---|---|
+| **一采表 / 一采步数 / 一采采样器** | ❌ 不会（要手动「重跑起始段」） | 基础链只进 `manifest.params`，`assert_match` 只报告 |
+| **二采表 / 二采去噪 / 二采步数 / 二采采样器** | ✅ 会（高清段自动重渲染，基础 latent 不动） | `upscale.params_hash` → `record_stale` |
+
+不对称是两边既有设计各自成立：基础段是**贵**产物、且参数与盘上张量无耦合，
+所以「改参数不重做」；二采是**便宜**的再渲染一遍，所以「参数变即重做」。
+二采表跟着二采那一侧走。
 
 ## 已知限制（来自上游，非本插件）
 
@@ -272,6 +360,10 @@ denoise 是步数比例，不是 σ 比例，别按字面理解它。
 ## 验证
 
 ```
-python -m pytest tests/test_sigmas_adapter.py -q     # 9 条：指纹兼容 / 换表重做 / 两分支参数
-python -m pytest tests/ -q                            # 全量（含 widgets_values 仍为 31）
+python -m pytest tests/test_sigmas_adapter.py -q     # 12 条：指纹兼容 / 换表重做 / 两分支参数
+                                                     #   + 二采通道四段接线 / 两个槽的位次
+python -m pytest tests/ -q                            # 全量（含 widgets_values 仍为 30）
+node tests/js/desk_node_skin_check.js                 # 端口免打扰名单（两个 sigmas 槽必须露头）
+node tests/js/desk_slot_geometry_check.js             # 端口行号（新增一位后按钮位置随之下移）
+node tests/js/link_repair_check.js                    # 按名搬线（旧存档接在「自定义Sigmas」上的线）
 ```

@@ -8,6 +8,11 @@
 2. 接了 sigmas 后换表 = 换指纹（否则换 sigma 表会静默复用旧段）；
 3. ksampler_with_sigmas 的 sigmas=None 分支与官方 common_ksampler 同参，
    非 None 分支把表传下去、且进度步数按 sigma 点数算。
+
+另钉二采通道（2026-10-12 新增「二采自定义Sigmas」槽）：
+4. 两个 sigmas 槽都在末尾、都是纯连线槽（不进 widgets_values）；
+5. nodes.py → render_segment → render_latent → 精化采样 四段接线一个不漏；
+6. 二采表指纹「接了才进」params_hash，且让位项（passes/retry/scheduler）退出指纹。
 """
 
 import ast
@@ -32,7 +37,7 @@ def _load(name, fname):
 
 
 class FakeSigmas:
-    """够用的 tensor 桩：detach/flatten/tolist/shape。"""
+    """够用的 tensor 桩：detach/flatten/tolist/shape/下标。"""
 
     def __init__(self, vals):
         self._v = list(vals)
@@ -46,6 +51,9 @@ class FakeSigmas:
 
     def tolist(self):
         return list(self._v)
+
+    def __getitem__(self, i):
+        return self._v[i]
 
 
 # ---- fingerprint_tag ----
@@ -73,6 +81,26 @@ def test_sigmas_steps():
     sa = _load("h3_sigmas_adapter", "sigmas_adapter.py")
     assert sa.sigmas_steps(None) is None
     assert sa.sigmas_steps(FakeSigmas(HF_SIGMAS)) == 8
+
+
+def test_sigmas_start():
+    """表首值 = 本表的实际 σ 起点（二采的 STG 激活窗口与报告回显都取它）。"""
+    sa = _load("h3_sigmas_adapter_start", "sigmas_adapter.py")
+    assert sa.sigmas_start(None) is None
+    assert sa.sigmas_start(FakeSigmas([0.35, 0.2, 0.0])) == 0.35
+    # 坏表（取不出首值）返回 None —— 调用方据此回落到面板 σ₀，而不是崩掉
+    assert sa.sigmas_start(object()) is None
+
+
+def test_sigmas_usable():
+    """「表真能用吗」的唯一判据（点数 ≥ 2）。写指纹与按表采样必须同用它。"""
+    sa = _load("h3_sigmas_adapter_usable", "sigmas_adapter.py")
+    assert sa.sigmas_usable(None) is False
+    assert sa.sigmas_usable(FakeSigmas([])) is False        # 空表
+    assert sa.sigmas_usable(FakeSigmas([0.5])) is False     # 1 点 = 0 步
+    assert sa.sigmas_usable(FakeSigmas([0.35, 0.0])) is True
+    assert sa.sigmas_usable(FakeSigmas(HF_SIGMAS)) is True
+    assert sa.sigmas_usable(object()) is False              # 坏表（取不出 shape）
 
 
 # ---- 存档指纹兼容性（最关键的一条） ----
@@ -200,9 +228,9 @@ def test_ksampler_custom_sigmas_overrides():
         restore()
 
 
-# ---- schema：新槽必须是最后一个 input，且不产生 widget ----
+# ---- schema：两个 sigmas 槽都必须是末尾的纯连线槽，且不产生 widget ----
 
-def test_sigmas_input_is_last_and_link_only():
+def test_sigmas_inputs_are_last_and_link_only():
     src = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
     tree = ast.parse(src)
     names = []
@@ -219,12 +247,102 @@ def test_sigmas_input_is_last_and_link_only():
         # optional=True 必须是字面量 True（写成 True 以外的值就不是可选槽）
         kw = {k.arg: k.value for k in node.keywords}
         assert isinstance(kw.get("optional"), ast.Constant) and kw["optional"].value is True
-    assert names == ["自定义Sigmas"], names
+    assert names == ["一采自定义Sigmas", "二采自定义Sigmas"], names
 
-    # 位置：必须在最后一个 widget 型控件「响度对齐强度」之后
+    # 位置：两个槽都必须在最后一个 widget 型控件「响度对齐强度」之后，且二采槽
+    # 紧跟一采槽 —— 位次是输入连线的坐标（前端按位次重建），旧工作流里接在
+    # 「自定义Sigmas」上的线要靠「一采槽仍占原来那个位次」才不会落空。
     i_last_widget = src.rindex('io.Float.Input("响度对齐强度"')
-    i_sigmas = src.index('io.Sigmas.Input("自定义Sigmas"')
-    assert i_sigmas > i_last_widget
+    i_1 = src.index('io.Sigmas.Input("一采自定义Sigmas"')
+    i_2 = src.index('io.Sigmas.Input("二采自定义Sigmas"')
+    assert i_1 > i_last_widget
+    assert i_2 > i_1
+
+
+def test_second_pass_channel_is_wired_end_to_end():
+    """二采通道的四个接线点，少任何一个这张表都白接（静默失效）。
+
+    历史同类 bug：render_segment 声明了形参却没往下传（埋点 `_vram` 就这么漏过），
+    或 nodes.py 没把张量传下去（开关恒为默认值）。
+    """
+    up = open(os.path.join(ROOT, "upscale.py"), encoding="utf-8").read()
+    nd = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
+
+    # ① 两个入口都声明 sigmas 形参
+    for fn in ("render_latent", "render_segment"):
+        sig = up.split("def %s(" % fn, 1)[1].split("):", 1)[0]
+        assert "sigmas=None" in sig, "%s 必须接收 sigmas（默认 None = 旧调用行为不变）" % fn
+    # ② render_segment 透传给 render_latent
+    body = up.split("def render_segment(", 1)[1]
+    call = body[body.index("render_latent("):][:900]
+    assert "sigmas=sigmas" in call, "必须把 sigmas 透传给 render_latent"
+    # ③ 精化真的走 sigmas_adapter（而不是仍用 common_ksampler）
+    assert "sigmas_adapter.ksampler_with_sigmas(" in up
+    assert "sigmas=_ref_sigmas, denoise=ks_denoise" in up
+    # ④ nodes.py 把表传下去，并把表指纹写进 cfg（否则 record_stale 判不出「换表=重做」）
+    assert "sigmas=二采自定义Sigmas," in nd, "nodes.py 必须把二采表传给 render_segment"
+    assert 'up_cfg["sigmas"] = _sigmas_adapter.fingerprint_tag(二采自定义Sigmas)' in nd, \
+        "二采表指纹必须写进 up_cfg（否则换表不会触发高清段重做）"
+
+
+def test_second_pass_fingerprint_only_when_wired():
+    """未接表时不加键（既有项目高清记录续不上就是事故）；接了才加。
+
+    顺带钉住「让位项退出指纹」：接了表之后 passes/decay、retry、scheduler 在采样侧
+    已失效，拨它们不该触发整链高清重做。
+    """
+    src = open(os.path.join(ROOT, "upscale.py"), encoding="utf-8").read()
+    i = src.index('keys["sigmas"] = cfg["sigmas"]')
+    assert "if _has_sig:" in src[max(0, i - 300):i], "sigmas 键必须包在「接了才加」的条件里"
+    assert "_has_sig = bool(cfg.get(\"sigmas\"))" in src
+    assert src.count("and not _has_sig") >= 3, \
+        "passes/decay、retry、scheduler 三项都要在接表时退出指纹"
+
+
+# ---- 两个边界：只接一采表 / 只接二采表但二采没开（2026-10-12 复核） ----
+
+def test_first_pass_table_never_leaks_into_second_pass():
+    """边界①：只接「一采自定义Sigmas」时，二采必须**零影响**。
+
+    一采表的张量只在 nodes.py 的一采采样点用（`sigmas=一采自定义Sigmas`），
+    绝不进 upscale 的二采通道；二采指纹也只认 `up_cfg["sigmas"]`（由**二采**槽写入）。
+    最强的钉法：upscale.py 里根本不该出现「一采自定义Sigmas」这个名字 ——
+    它一旦出现，就说明一采表渗进了二采。
+    """
+    nd = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
+    up = open(os.path.join(ROOT, "upscale.py"), encoding="utf-8").read()
+    assert "一采自定义Sigmas" not in up, \
+        "一采表不得渗进二采通道（upscale.py 只该认 sigmas 形参与 cfg['sigmas']）"
+    # 写进 cfg["sigmas"] 的只能来自二采槽
+    i = nd.index('up_cfg["sigmas"] =')
+    assert "二采自定义Sigmas" in nd[i:i + 120]
+    assert "一采自定义Sigmas" not in nd[i:i + 120]
+    # 一采采样点仍只吃一采表（二采表不得反向渗进一采）
+    i2 = nd.index("sigmas=一采自定义Sigmas")
+    assert "二采自定义Sigmas" not in nd[i2:i2 + 80]
+
+
+def test_second_pass_table_is_inert_when_upscale_off():
+    """边界②：只接「二采自定义Sigmas」但二采没开时，必须**零影响**。
+
+    `up_cfg` 由 `upscale.parse_state(ds)` 给，二采关着就是 None → 写键那句在
+    `if up_cfg:` 块内、根本执行不到；张量也没人传（render_segment 不会被调用）。
+    另外要有一条报告说清「接了但没生效」，否则用户会以为它生效了。
+    """
+    nd = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
+    # 写键在 `if up_cfg:` 之内（缩进 12 空格 = 该块内；`if up_cfg:` 本身在 8）
+    assert '\n            if _up_sig_usable:\n                up_cfg["sigmas"] =' in nd, \
+        "写键必须嵌在 `if up_cfg:` 块里（二采关着时 up_cfg=None，键就不该存在）"
+    # 「能不能用」的判据算在块外 —— 报告/提示在 up_cfg 为 None 时也要能用它
+    assert '\n        _up_sig_usable = _sigmas_adapter.sigmas_usable(二采自定义Sigmas)' in nd
+    # 未生效必须有两句明确提示（坏表 / 二采没开）
+    assert "接了表但读不出有效步数" in nd
+    assert "已接线但本次二采未启用" in nd
+    # 二采通道的唯一入口受 up_cfg 守卫（None 时不会调用 render_segment）
+    up = open(os.path.join(ROOT, "upscale.py"), encoding="utf-8").read()
+    assert "if not (up_cfg and use_ckpt):" in nd, "二采入口必须受 up_cfg 守卫"
+    # 二采槽没接时，二采采样仍是原路径（sigmas=None → common_ksampler 分支）
+    assert "_ref_sigmas = sigmas if sigmas_adapter.sigmas_usable(sigmas) else None" in up
 
 
 def test_no_widget_count_change_for_sigmas_slot():

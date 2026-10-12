@@ -143,7 +143,7 @@ const MODERN_LIVE = [{ id: 10, ports: [
     ["视频VAE", "VAE", 11], ["音频VAE", "VAE", 12], ["模型", "MODEL", 13], ["文本编码器", "CLIP", 14],
     ["宽高比", "COMBO", 15], ["百万像素", "FLOAT", null], ["宽度", "INT", null], ["高度", "INT", null],
     ["起始视频", "IMAGE", null], ["起始视频音轨", "AUDIO", null], ["二采模型", "MODEL", null],
-    ["自定义Sigmas", "SIGMAS", null],
+    ["一采自定义Sigmas", "SIGMAS", null], ["二采自定义Sigmas", "SIGMAS", null],
 ] }];
 
 (async () => {

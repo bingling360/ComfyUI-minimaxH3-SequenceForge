@@ -31,7 +31,8 @@ function ok(cond, msg) { if (!cond) fails.push(msg); }
 
 /* ---------- 夹具：H3 主节点真实的端口清单（顺序 = nodes.py schema 里非控件输入的先后） ---------- */
 const INPUT_NAMES = ["模型", "文本编码器", "视频VAE", "音频VAE",
-                     "起始视频", "起始视频音轨", "二采模型", "自定义Sigmas"];
+                     "起始视频", "起始视频音轨", "二采模型",
+                     "一采自定义Sigmas", "二采自定义Sigmas"];
 // rev3.4（2026-10-04）：schema 把停机场槽「帧率」排到「报告」之后 → 「报告」钉在第 2 位
 const OUTPUT_NAMES = ["图像", "音频", "报告", "帧率", "分段图像", "分段音频"];
 // 用户当前的工作流：一采/二采模型都在用，「报告」有下游；被藏的 5 个都没接线
@@ -110,7 +111,8 @@ const orowOf = (i) => Math.round(((node.getOutputPos(i)[1] - node.pos[1]) / SLOT
 const byName = (arr, name) => arr.findIndex((s) => s.name === name);
 
 /* ---------- ① 露头的端口各占一行，行号从 0 连续排 ---------- */
-const shownInputs = ["模型", "文本编码器", "视频VAE", "音频VAE", "二采模型", "自定义Sigmas"];
+const shownInputs = ["模型", "文本编码器", "视频VAE", "音频VAE", "二采模型",
+                     "一采自定义Sigmas", "二采自定义Sigmas"];
 shownInputs.forEach((name, row) => {
     const i = byName(node.inputs, name);
     ok(rowOf(i) === row, `「${name}」应在第 ${row} 行，实际第 ${rowOf(i)} 行`);
@@ -157,13 +159,13 @@ const bottoms = [];
 for (let i = 0; i < node.inputs.length; i += 1) bottoms.push(node.getInputPos(i)[1] + SLOT_H);
 for (let i = 0; i < node.outputs.length; i += 1) bottoms.push(node.getOutputPos(i)[1] + SLOT_H);
 const bodyBottom = Math.max(...bottoms) - node.pos[1];       // arrange() 用它定位按钮
-const shownBottom = node.getInputPos(byName(node.inputs, "自定义Sigmas"))[1] + SLOT_H - node.pos[1];
-// 第 5 行（0-based）的底边 = (5 + 0.7) * 20 + 20 = 134
-ok(bodyBottom === (5 + 0.7) * SLOT_H + SLOT_H,
-   `按钮位置应贴着最后一个露头端口（${(5 + 0.7) * SLOT_H + SLOT_H}），实际 ${bodyBottom}`);
+const shownBottom = node.getInputPos(byName(node.inputs, "二采自定义Sigmas"))[1] + SLOT_H - node.pos[1];
+// 第 6 行（0-based）的底边 = (6 + 0.7) * 20 + 20 = 154
+ok(bodyBottom === (6 + 0.7) * SLOT_H + SLOT_H,
+   `按钮位置应贴着最后一个露头端口（${(6 + 0.7) * SLOT_H + SLOT_H}），实际 ${bodyBottom}`);
 ok(shownBottom === bodyBottom, "机身底边应只由露头端口决定（停机场不能把它撑开）");
 node.computeSize();
-ok(String(node.__seen) === "6,3", `computeSize 应只看到露头的端口，实际 ${node.__seen}`);
+ok(String(node.__seen) === "7,3", `computeSize 应只看到露头的端口，实际 ${node.__seen}`);
 ok(node.inputs.length === INPUT_NAMES.length && node.outputs.length === OUTPUT_NAMES.length,
    "computeSize 之后必须把完整端口表还原（否则存档会缺端口）");
 

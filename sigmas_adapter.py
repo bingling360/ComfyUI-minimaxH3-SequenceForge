@@ -9,36 +9,81 @@
 所以要接这类 LoRA，采样必须能**直接吃外部 sigmas**（等价于官方
 `SamplerCustomAdvanced` 的 sigmas 输入），而 `nodes.common_ksampler` 没有这个口子。
 
-本模块提供两件事：
+本模块提供四件事：
 
 * `ksampler_with_sigmas()` —— `nodes.common_ksampler` 的逐行等价实现 + 可选 sigmas 覆盖。
   sigmas 为 None 时与官方实现**逐字节一致**（旧工作流结果不变），
   非 None 时走 `comfy.sample.sample(sigmas=...)` 覆盖掉「步数」与「调度器」。
 * `fingerprint_tag()` —— sigma 表进存档指纹的短标签。
+* `sigmas_start()` / `sigmas_steps()` —— 表首值（实际 σ 起点）与表长（实际步数），
+  报告回显与 STG 激活窗口共用。
+* `sigmas_usable()` —— 「这张表真能用吗」的**唯一判据**（点数 ≥ 2）。「写不写指纹」
+  与「按不按表采样」必须同用它，否则空表/坏表会落到「指纹变了、采样没变」的白做。
 
-为什么单独成模块：这两个函数只依赖 torch 与 comfy 的延迟导入，可以脱离
+两个入口共用本模块（2026-10-12）：
+* **一采**（基础链，`H3 Seamless Chain` 的「一采自定义Sigmas」槽）——原路径；
+* **二采**（潜空间放大高清精化，同节点的「二采自定义Sigmas」槽）——见
+  `upscale.render_latent` 的 `sigmas` 形参：二采换了带自己 sigma 表的蒸馏权重时，
+  「去噪 + 精化步数 + 调度器」现算的表同样对不上蒸馏轨迹。
+  二采是**尾段精化**语义，所以那张表应从目标 σ 起步（首值即精化起点）、末值为 0；
+  照搬一采那张 1.0→0 的完整表等于整段重画。
+
+为什么单独成模块：这些函数只依赖 torch 与 comfy 的延迟导入，可以脱离
 ComfyUI 在 pytest 里单测（nodes.py 顶层就要 import comfy_api，测不了）。
 
 接法（HyperFlow 官方链路）
 -------------------------
     Load Diffusion Model (MiniMax-H3)
       -> ApplyHyperFlow                (Saganaki22/ComfyUI-Hyperflow；MODEL -> MODEL + SIGMAS)
-      -> H3 Seamless Chain「自定义Sigmas」槽      ← 本模块负责的那一环
+      -> H3 Seamless Chain「一采自定义Sigmas」槽      ← 本模块负责的那一环
       -> 采样器选 euler（其余控件在接了 sigmas 后自动失效）
 
 「步数/调度器」失效是 `comfy.samplers.KSampler.sample` 的行为：`if sigmas is None:
 sigmas = self.sigmas` —— 传了就用传的，没传才用调度器算的。
 """
 
-__all__ = ["ksampler_with_sigmas", "fingerprint_tag", "sigmas_steps"]
+__all__ = ["ksampler_with_sigmas", "fingerprint_tag", "sigmas_steps", "sigmas_start",
+           "sigmas_usable"]
+
+
+def sigmas_usable(sigmas):
+    """这张表**真的能用**吗（点数 ≥ 2，即至少 1 步）？
+
+    唯一判据，三个调用点共用，不许各写一份：
+    * `nodes.py` —— 决定要不要把表指纹写进 `up_cfg["sigmas"]`（进二采指纹）；
+    * `upscale.render_latent` —— 决定精化采样走表还是走原路径；
+    * `upscale.render_segment` —— 决定段末报告行按表回显还是按面板回显。
+
+    **为什么必须共用**：如果「写指纹」与「按表采样」用两套判据，空表/坏表就会落到
+    「指纹变了、采样没变」的错位状态 —— 既有高清段被判失效全部重做，画面却一个像素
+    没动。宁可统一按「未接」处理（走原路径、不加键），代价为零。
+    """
+    return bool(sigmas_steps(sigmas))
 
 
 def sigmas_steps(sigmas):
-    """sigma 表 -> 实际去噪步数（表点数 - 1）；sigmas 为 None 返回 None。"""
+    """sigma 表 -> 实际去噪步数（表点数 - 1）；sigmas 为 None/坏表返回 None。"""
     if sigmas is None:
         return None
     try:
         return max(int(sigmas.shape[-1]) - 1, 0)
+    except Exception:
+        return None
+
+
+def sigmas_start(sigmas):
+    """sigma 表 -> 首值（= 本表的实际 σ 起点）；sigmas 为 None/坏表返回 None。
+
+    用途有二：
+    * 报告行回显「这张表从哪个 σ 起步」（表是外部给的，控件上的「去噪/起始 σ」
+      对采样已失效，只有表首值能说明实际强度）；
+    * 二采的 STG 激活窗口按「本段精化的 σ 起点」算（见 upscale._stg_model），
+      接表时那个起点就是表首值，不是面板上的「去噪」。
+    """
+    if sigmas is None:
+        return None
+    try:
+        return float(sigmas.detach().flatten()[0])
     except Exception:
         return None
 

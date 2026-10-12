@@ -81,7 +81,8 @@ for (const out of ['io.Int.Output("帧率")', 'io.String.Output("报告")']) {
     ok(nodesPy.includes(out), `nodes.py 误删输出：${out}`);
 }
 for (const inp of ['io.Image.Input("起始视频"', 'io.Audio.Input("起始视频音轨"',
-                   'io.Model.Input("二采模型"', 'io.Sigmas.Input("自定义Sigmas"']) {
+                   'io.Model.Input("二采模型"', 'io.Sigmas.Input("一采自定义Sigmas"',
+                   'io.Sigmas.Input("二采自定义Sigmas"']) {
     ok(nodesPy.includes(inp), `nodes.py 误删输入：${inp}`);
 }
 /* 模板输出 = schema 4 槽制（1.53.6 实测：运行时输出槽永远按 schema 建，序列化里的

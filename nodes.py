@@ -67,6 +67,8 @@ _full_bridge_cache = None
 
 # 自定义 sigma 表（少步蒸馏 LoRA：HyperFlow 8 步 / H3 Turbo）走 sigmas_adapter：
 # 单独成模块一是可脱离 ComfyUI 单测，二是这部分逻辑与续拍/接缝无关。
+# 两个入口共用它：「一采自定义Sigmas」（基础链）与「二采自定义Sigmas」（潜空间放大
+# 高清精化，2026-10-12 加；二采那侧的精化采样在 upscale.render_latent 里）。
 try:
     from . import sigmas_adapter as _sigmas_adapter
 except ImportError:      # 兜底：作为顶层脚本被直接 import 时
@@ -1296,13 +1298,31 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "0.2-0.4 常用于只兜内容本身的残留响度差。"
                                        "段间隔链（勾了「跳过自动引用上段」）本就不做对齐。"),
                 # 纯连线槽：没有 widget，不进 widgets_values（不影响控件值布局）。
-                io.Sigmas.Input("自定义Sigmas", optional=True,
-                                tooltip="可选：接自定义 sigma 表（少步蒸馏 LoRA 用），接了就覆盖「步数」与「调度器」，"
-                                        "实际步数 = sigma 点数 - 1。典型用法：ApplyHyperFlow / ManualSigmas / "
+                # ⚠ 名字由「自定义Sigmas」改为「一采自定义Sigmas」（2026-10-12）：加了二采
+                # 同款槽之后旧名字指代不清。改名的安全性：输入连线的坐标是**位次**
+                # （工作流序列化 inputs 的数组序 / 前端按位次重建），位次一个没动 ——
+                # 旧工作流载入后那根线仍落回本槽（见 tests/js/link_repair_check.js）。
+                io.Sigmas.Input("一采自定义Sigmas", optional=True,
+                                tooltip="可选：**一采**（基础链）的自定义 sigma 表（少步蒸馏 LoRA 用），"
+                                        "接了就覆盖「步数」与「调度器」，实际步数 = sigma 点数 - 1。"
+                                        "典型用法：ApplyHyperFlow / ManualSigmas / "
                                         "BasicScheduler 的输出接进来（HyperFlow 官方 8 步表 = "
                                         "1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0）。"
                                         "不接则完全沿用「步数 + 采样器 + 调度器」，与旧行为逐字节一致。"
-                                        "注意：只作用于本节点的一采（基础链），二采（潜空间放大高清）仍用自己的参数。"),
+                                        "只作用于一采；二采走自己的参数（要覆盖用「二采自定义Sigmas」）。"),
+                io.Sigmas.Input("二采自定义Sigmas", optional=True,
+                                tooltip="可选：**二采**（潜空间放大高清精化）的自定义 sigma 表——"
+                                        "二采另接了带自己 sigma 表的少步蒸馏权重时用："
+                                        "「去噪 + 精化步数 + 调度器」现算的表对不上蒸馏轨迹。"
+                                        "接了就用这张表直接驱动二采精化，覆盖「去噪」「精化步数」「调度器」，"
+                                        "实际步数 = sigma 点数 - 1；**多轮递降（passes）与增益重试自动让位**"
+                                        "（表本身就是整条精化轨迹，再叠轮次/重试没有语义）。"
+                                        "「采样器」仍然生效（与一采同口径）；二采面板的 shift / STG 照常叠加，"
+                                        "它们的激活窗口按**表首值**（本表实际 σ 起点）算。"
+                                        "⚠ 表是**尾段精化**语义：首值即精化起点 σ、末值应为 0；"
+                                        "别照搬一采那张 1.0→0 的完整表（那是从纯噪声起步，会整段重画）。"
+                                        "不接则完全沿用「去噪 + 精化步数 + 调度器」，与旧行为逐字节一致。"
+                                        "换表 = 既有高清分段全部重做（表指纹进二采存档指纹）。"),
             ],
             # ⚠ 输出**位次**是连线的坐标（工作流 JSON 的 links 存 origin_slot），不是随便排的：
             # 1.53.6 前端运行时**永远按 schema 建输出槽**（序列化的 outputs 数组对布局无效，
@@ -1332,7 +1352,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 审片模式="关闭", 自动保存="分段", 自动成片="开启", 重跑起始段=0,
                 接缝重摇="自动", 重摇阈值=0.06, 重摇上限=1,
                 递减锚定="关闭", 生成模式="文生视频", 导演台状态="",
-                二采模型=None, 参考图像尺寸="match", 响度对齐强度=1.0, 自定义Sigmas=None):
+                二采模型=None, 参考图像尺寸="match", 响度对齐强度=1.0,
+                一采自定义Sigmas=None, 二采自定义Sigmas=None):
         # P4d：画布媒体/提示词/参考入口已从 schema 删除，对应形参一并移除；
         # 起始视频（序章）是唯一的画布媒体入口，保留。
         # 运行期路由兜底：导入期注册因时序失败时，首次执行后前端删除/列表即可用
@@ -1763,6 +1784,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 分辨率整链运行（报告注明），不让每段反复撞同一个错。关闭时 up_cfg=None
         from . import upscale
         up_cfg = upscale.parse_state(ds)
+        # 二采 sigma 表「真能用吗」（点数 ≥ 2）——只算一次，指纹注入 / 报告 / 提示三处共用。
+        # 判据与 upscale 的采样分支同一条（sigmas_usable），别各写一份。
+        _up_sig_usable = _sigmas_adapter.sigmas_usable(二采自定义Sigmas)
         if up_cfg:
             # 性能设置 -> 二采 cfg（**只加不进指纹的键**：_hash_params 只认
             # _PARAM_KEYS + 条件项，新增键不会让既有高清记录失效重做）。
@@ -1794,6 +1818,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
             up_cfg["refine_tile"] = str(_pf.get("refine_tile") or "off")
             up_cfg["refine_tile_overlap"] = int(_pf.get("refine_tile_overlap") or 32)
             up_cfg["refine_tile_feather"] = int(_pf.get("refine_tile_feather") or 16)
+            # 二采自定义 sigma 表（「二采自定义Sigmas」槽，少步蒸馏 LoRA）：表指纹写进
+            # cfg 才进得了 params_hash / manifest.params → 换表即既有高清分段全部重做；
+            # 张量本身另走 render_segment 的 sigmas= 形参（cfg 必须保持可 JSON 序列化）。
+            # 未接时不加键 —— 与一采 ckpt_params["sigmas"] 同一条铁律：
+            # json.dumps(sort_keys) 下「多一个键」就是新指纹，会让既有项目的高清记录
+            # 全部判失效重做。
+            # ⚠ 判据用 sigmas_usable（点数 ≥ 2），与 upscale 那边的采样分支**同一条**：
+            #   空表/坏表若只挡采样不挡指纹，就会落到「指纹变了、采样没变」的白做
+            #   —— 既有高清段全被判失效重做，画面一个像素没动。
+            if _up_sig_usable:
+                up_cfg["sigmas"] = _sigmas_adapter.fingerprint_tag(二采自定义Sigmas)
         up_net = None
         _up_err = None
         if up_cfg:
@@ -2627,6 +2662,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _stg = float(up_cfg.get("stg") or 0.0)
             _stgb = int(up_cfg.get("stg_block") if up_cfg.get("stg_block") is not None else 25)
             _passes = int(up_cfg.get("passes") or 1)
+            # 二采自定义 sigma 表：表即整条精化轨迹 —— 步数/去噪/调度器对它失效，
+            # 多轮递降与增益重试一并让位（见 upscale.render_latent 的那段注释）。
+            # 判据统一走 _up_sig_usable（= 表真能用），别在这里再判一次。
+            _up_sig_steps = (_sigmas_adapter.sigmas_steps(二采自定义Sigmas)
+                             if _up_sig_usable else None)
             _sig_list = upscale.cascade_sigmas(float(up_cfg["denoise"]), _passes,
                                                float(up_cfg.get("decay") or 0.5))
             _shp = float(up_cfg.get("sharpen") or 0.0)
@@ -2635,9 +2675,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _sam = str(up_cfg.get("sampler") or "").strip()
             _sch = str(up_cfg.get("scheduler") or "").strip()
             report.append(f"潜空间放大二采：{up_cfg['mode']} · {up_cfg['arch']} {up_cfg['scale']:g}× · "
-                          f"精化 {up_cfg['steps']} 步"
-                          + (f"×{_passes}轮" if _passes > 1 else "")
-                          + " @ σ≈" + "/".join(f"{s:g}" for s in _sig_list)
+                          + (f"精化 {_up_sig_steps} 步（自定义σ表）" if _up_sig_usable
+                             else f"精化 {up_cfg['steps']} 步")
+                          + (f"×{_passes}轮" if (_passes > 1 and not _up_sig_usable) else "")
+                          + (" @ σ≈" + "/".join(f"{s:g}" for s in _sig_list)
+                             if not _up_sig_usable else "")
                           + (f" · 细节混合 {_mix:g}" if _mix > 0 else "")
                           + (" · 段自适应σ" if up_cfg.get("adaptive") is True else "")
                           + (f" · 二采shift {_sh:g}" if _sh > 0 else "")
@@ -2647,8 +2689,22 @@ class H3SeamlessChainSampler(io.ComfyNode):
                           + (" · 高清编码档" if _ehq else "")
                           + (f" · 独立采样 {_sam}/{_sch}".rstrip("/")
                              if (_sam or _sch) else "")
-                          + (" · 增益重试" if up_cfg.get("retry") is True else "")
+                          + (" · 增益重试" if (up_cfg.get("retry") is True
+                                              and not _up_sig_usable) else "")
                           + "——每段采样定稿后立即渲染高清，分段视频与成片直接保存二采结果")
+            if _up_sig_usable:
+                report.append("二采自定义 Sigmas：" + f"{_up_sig_steps} 步 @ σ≈"
+                              + "/".join(str(up_cfg["sigmas"]).split(","))
+                              + f"（「去噪 {up_cfg['denoise']:g}」「精化步数 {up_cfg['steps']}」"
+                                "「调度器」已忽略；采样器仍生效）"
+                              + ("；多轮递降已让位（表即完整调度）" if _passes > 1 else "")
+                              + ("；增益重试已让位" if up_cfg.get("retry") is True else ""))
+                if _stg > 0 or _sh > 0:
+                    report.append("提示：二采 shift/STG 照常叠加，激活窗口按表首值（本表实际 σ 起点）算")
+                if _sch:
+                    report.append(f"提示：二采面板的调度器「{_sch}」对本次二采无效（sigma 表已接管调度）")
+                if up_cfg.get("adaptive") is True:
+                    report.append("提示：「段自适应σ」对本次二采无效（σ 起点由表首值定，不再按段运动量偏移）")
         elif _up_err:
             report.append(f"潜空间放大二采：面板已开启但本次跳过——{_up_err}")
         if _bhq:
@@ -2702,25 +2758,35 @@ class H3SeamlessChainSampler(io.ComfyNode):
             aug_start = 1.0 - aug if aug > 0 else 0.999
             report.append(f"递减锚定：前 {fade_ratio*100:.0f}% 步数内锚定 {aug_start:.2f} → 0 递减消失"
                           + (f"（起点=锚定加噪 {aug:.2f}）" if aug > 0 else "（硬锚定起点）"))
-        # 自定义 sigma 表（少步蒸馏 LoRA 用：HyperFlow 8 步 / Turbo 等）
-        _sig_tag = _sigmas_adapter.fingerprint_tag(自定义Sigmas)
+        # 一采自定义 sigma 表（少步蒸馏 LoRA 用：HyperFlow 8 步 / Turbo 等）
+        _sig_tag = _sigmas_adapter.fingerprint_tag(一采自定义Sigmas)
         if _sig_tag is not None:
-            _sig_steps = _sigmas_adapter.sigmas_steps(自定义Sigmas) or 0
-            report.append(f"自定义 Sigmas：{_sig_steps} 步"
+            _sig_steps = _sigmas_adapter.sigmas_steps(一采自定义Sigmas) or 0
+            report.append(f"一采自定义 Sigmas：{_sig_steps} 步"
                           + f"（「步数 {int(步数)}」与「调度器 {调度器}」已忽略，采样器仍为「{采样器}」）"
-                          + "；只作用于一采，二采沿用自身参数")
+                          + ("；二采另走「二采自定义Sigmas」表" if (_up_sig_usable and up_cfg)
+                             else ("；二采本次未启用（二采表已接但未生效）"
+                                   if _up_sig_usable
+                                   else "；只作用于一采，二采沿用自身参数")))
             if fade_ratio > 0:
                 report.append(f"注意：递减锚定按 sigma 进度计算，{_sig_steps} 步下曲线只有 {_sig_steps} 个采样点（阶梯化）")
             if 采样器 != "euler":
                 report.append(f"提示：少步蒸馏配方一般用 euler，当前是「{采样器}」——"
                               "每步吃 (t,r) 区间端点的蒸馏假设与多步高阶采样器不一致，属未验证组合")
             if 二采模型 is None and up_cfg:
-                report.append("提示：二采未接独立模型，仍沿用一采模型——即二采会带着这份少步蒸馏权重跑，"
-                              "但用的是二采自己的步数/调度器（不是蒸馏表），轨迹对不上；"
-                              "不想让二采用这个 LoRA，请在「二采模型」另接一份基础（非蒸馏）权重")
+                if _up_sig_usable:
+                    # 二采自己也有表：那句「不是蒸馏表」就不成立了，别照旧说
+                    report.append("提示：二采未接独立模型，仍沿用一采模型（= 带着这份少步蒸馏权重跑）；"
+                                  "二采已接自己的 sigma 表，轨迹按表走——但与权重是否配套要看该表是不是"
+                                  "这份蒸馏权重发布时配套的那张")
+                else:
+                    report.append("提示：二采未接独立模型，仍沿用一采模型——即二采会带着这份少步蒸馏权重跑，"
+                                  "但用的是二采自己的步数/调度器（不是蒸馏表），轨迹对不上；"
+                                  "不想让二采用这个 LoRA，请在「二采模型」另接一份基础（非蒸馏）权重")
             if up_cfg:
                 _miss = [k for k in ("sampler", "scheduler") if not str(up_cfg.get(k) or "").strip()]
-                if _miss:
+                if _miss and not _up_sig_usable:
+                    # 二采自己接了表时「调度器」已失效，这条提示只对没接表的情形成立
                     report.append("提示：二采未指定" + "、".join(_miss)
                                   + f"，会沿用主链「{采样器}/{调度器}」——该组值对一采已被 sigma 表覆盖、"
                                     "对二采**仍然生效**；要区分请在二采面板显式填写")
@@ -2753,6 +2819,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 二采产物落项目文件夹（manifest 记录 + seg mp4 覆盖），无存档就没有挂载点
             report.append("潜空间放大二采：需开启自动保存（或审片/自动存档）建立项目存档，本次跳过")
             up_cfg = None
+        # 二采 sigma 表接了却没跑成二采：明确说一句，别让人以为它生效了。
+        # 两种情形分开说 —— 它们的处置完全不同（一个是接线问题，一个是开关问题）。
+        if 二采自定义Sigmas is not None and not _up_sig_usable:
+            report.append("二采自定义 Sigmas：接了表但读不出有效步数（空表 / 坏表，点数 < 2）——"
+                          "已按「未接」处理：本次二采走「去噪 + 精化步数 + 调度器」，且不进指纹")
+        elif 二采自定义Sigmas is not None and not up_cfg:
+            report.append("二采自定义 Sigmas：已接线但本次二采未启用（面板关闭 / 被跳过）——该表未生效")
         if review and not (resume or autosave):
             report.append("审片模式：存档自动启用（每段落盘 latent，跨次运行续接）")
         if autosave and not (resume or review):
@@ -3448,6 +3521,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         guide_kf, tail_kf, head_kf, cur_seed,
                         skip_f, vis_len,
                         wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag,
+                        sigmas=二采自定义Sigmas,
                         bridge=_bridge_cfg, _up_swap=_up_swap)
                 if not _reload_logged[0]:
                     _reload_logged[0] = True
@@ -4067,7 +4141,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         return _sigmas_adapter.ksampler_with_sigmas(
                             模型, cur_seed, 步数, CFG,
                             采样器, 调度器, cond, negative, _sampling_latent,
-                            sigmas=自定义Sigmas, denoise=1.0)[0]
+                            sigmas=一采自定义Sigmas, denoise=1.0)[0]
 
                     def _sample_rescue():
                         """主干采样 + OOM 自救。返回 (结果, 自救次数)。

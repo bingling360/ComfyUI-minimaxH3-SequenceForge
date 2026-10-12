@@ -328,7 +328,7 @@ All controls are on the node (labels are Chinese in the UI).
 - **`二采模型` (second-pass model).** Optional dedicated UNET for the high-res second pass (§19).
 - **`参考图像尺寸` (reference image size).** `match` (scale each reference to the generation canvas area, shrink-only) or `max` (2048 short side via the reference pipeline; best identity fidelity, potentially several times slower). Default `match` (changed from `max` on 2026-10-12).
 - **`响度对齐强度` (loudness alignment strength)** default 1.0.
-- **`自定义Sigmas` (custom sigmas).** Optional sigma table for distilled LoRAs (§26).
+- **`一采自定义Sigmas` / `二采自定义Sigmas` (custom sigmas).** Optional sigma tables for distilled LoRAs, one per pass (§26).
 
 **Outputs (order matters — see §22):** `图像 / 音频 / 报告 / 帧率`.
 
@@ -579,7 +579,12 @@ Two details worth knowing:
 
 ## 26. Custom sigmas (distilled LoRAs)
 
-Distilled LoRAs (HyperFlow 8-step, H3 Turbo, …) are trained with their own sigma table; recomputing one from "steps + scheduler" does not match the distillation trajectory. The optional `自定义Sigmas` socket takes an external sigma table (e.g. from `ApplyHyperFlow` / `ManualSigmas` / `BasicScheduler`) and overrides `steps` and `scheduler` for the base pass (actual steps = number of sigma points − 1). Unwired, behavior is byte-identical to before. The HyperFlow official 8-step table is `1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0`. See [`docs/HyperFlow适配与自定义Sigmas.md`](docs/HyperFlow适配与自定义Sigmas.md).
+Distilled LoRAs (HyperFlow 8-step, H3 Turbo, …) are trained with their own sigma table; recomputing one from "steps + scheduler" does not match the distillation trajectory. Two optional sockets take an external sigma table (e.g. from `ApplyHyperFlow` / `ManualSigmas` / `BasicScheduler`):
+
+- **`一采自定义Sigmas`** — drives the **base pass**; overrides `steps` and `scheduler` (actual steps = number of sigma points − 1). Unwired, behavior is byte-identical to before. The HyperFlow official 8-step table is `1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0`.
+- **`二采自定义Sigmas`** — drives the **high-res second pass** (added 2026-10-12; the first socket was renamed from `自定义Sigmas` to `一采自定义Sigmas`). Overrides the second pass's `denoise`, refine `steps` and `scheduler`; the cascade (`passes`/`decay`) and the gain retry step aside since the table *is* the whole refine schedule. The `sampler` still applies. ⚠ A second-pass table is a **tail-refinement** schedule: its first value is the refine start σ (e.g. `0.35, 0.28, 0.19, 0.09, 0.0`) and its last value must be 0 — don't reuse the 1.0→0 base-pass table. Changing the table redoes every recorded high-res segment (its fingerprint enters `upscale.params_hash`).
+
+See [`docs/HyperFlow适配与自定义Sigmas.md`](docs/HyperFlow适配与自定义Sigmas.md).
 
 ---
 

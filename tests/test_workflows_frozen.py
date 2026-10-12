@@ -80,9 +80,10 @@ def _assert_frozen(wf):
     # P4b 全冻结：无任何画布外联（提示词/素材全走导演台状态）
     assert not any(n["type"] == "PrimitiveStringMultiline" for n in wf["nodes"])
     # P4g：画布只剩模型链（「资产包」输入已删）；rev3.1 起模板按 1.53.6 序列化口径：
-    # 停机场槽（起始视频/起始视频音轨）不落盘，含「自定义Sigmas」纯连线槽
+    # 停机场槽（起始视频/起始视频音轨）不落盘，含两个 sigmas 纯连线槽
     assert sorted(i.get("name") for i in sampler.get("inputs", [])) == sorted([
-        "模型", "文本编码器", "视频VAE", "音频VAE", "二采模型", "自定义Sigmas",
+        "模型", "文本编码器", "视频VAE", "音频VAE", "二采模型",
+        "一采自定义Sigmas", "二采自定义Sigmas",
     ])
     # 模板输出 = schema 4 槽制（1.53.6 实测：运行时输出槽永远按 schema 建，序列化
     # 的 outputs 数组对布局无效）；「报告」必须带连线，且**钉在第 2 位**（连线表
@@ -103,10 +104,15 @@ def _assert_frozen(wf):
     assert len(_up) == 1
     assert _up[0].get("type") == "MODEL"
     assert _up[0].get("link") is not None
-    # 「自定义Sigmas」：纯连线槽（无 widget，不占 widgets_values），默认空置
-    _sig = [i for i in sampler.get("inputs", []) if i.get("name") == "自定义Sigmas"]
-    assert len(_sig) == 1 and _sig[0].get("type") == "SIGMAS"
-    assert _sig[0].get("link") is None
+    # 两个 sigmas 槽：纯连线槽（无 widget，不占 widgets_values），默认空置。
+    # 「一采」槽在 rev3.1 的位次上与旧「自定义Sigmas」**同一位**（改名不改位次，
+    # 旧工作流接在这儿的线载入后仍落回本槽）；「二采」槽是它后面新加的一位。
+    for _nm in ("一采自定义Sigmas", "二采自定义Sigmas"):
+        _sig = [i for i in sampler.get("inputs", []) if i.get("name") == _nm]
+        assert len(_sig) == 1 and _sig[0].get("type") == "SIGMAS", _nm
+        assert _sig[0].get("link") is None, _nm
+    _names = [i.get("name") for i in sampler.get("inputs", [])]
+    assert _names.index("一采自定义Sigmas") + 1 == _names.index("二采自定义Sigmas"), _names
     for i in sampler.get("inputs", []):
         name = i.get("name") or ""
         if name in ("起始视频", "起始视频音轨"):

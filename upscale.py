@@ -36,6 +36,7 @@ import torch
 from . import checkpoint
 from . import grid
 from . import perf
+from . import sigmas_adapter
 
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
@@ -493,8 +494,16 @@ def _hash_params(cfg):
     生效 σ 由该段基础 latent（经 base_hash 指纹）决定论派生，无需逐段进
     指纹也不会串档。size_mode 始终进指纹（切换模式改变目标尺寸）；目标
     尺寸/百万像素模式不进 scale（该值此时无效，避免无谓重做）。
+    sigmas（二采自定义 sigma 表）同样只在接了才进指纹；接了之后 passes/decay、
+    retry、scheduler 在采样侧已让位，故一并退出指纹（拨它们不该触发重做）。
     """
     keys = {k: cfg[k] for k in _PARAM_KEYS}
+    # 二采自定义 sigma 表（「二采自定义Sigmas」槽）：表指纹由 nodes.py 写进
+    # cfg["sigmas"]（**且只在 sigmas_usable 为真时写** —— 空表/坏表不写键，
+    # 否则会「指纹变了、采样没变」白做）。接了表之后「多轮递降」「增益重试」
+    # 「调度器」在采样侧全部让位（表即完整调度，见 render_latent），所以它们
+    # **不进指纹**——否则拨一个不生效的旋钮会把既有高清分段整链判失效重做，纯白干。
+    _has_sig = bool(cfg.get("sigmas"))
     # 目标尺寸模式：仅非倍率模式进指纹（target_w/h、megapixels 两组键与
     # scale 键天然互斥，模式切换必然变 hash）；倍率模式指纹与旧版逐位一致
     # ——既有二采记录不因新增 size_mode 字段而失效重做（项目铁律）。
@@ -516,7 +525,7 @@ def _hash_params(cfg):
     if cfg.get("stg"):
         keys["stg"] = cfg["stg"]
         keys["stg_block"] = cfg["stg_block"]
-    if int(cfg.get("passes") or 1) > 1:
+    if int(cfg.get("passes") or 1) > 1 and not _has_sig:
         keys["passes"] = cfg["passes"]
         keys["decay"] = cfg["decay"]
     if cfg.get("sharpen"):
@@ -537,10 +546,15 @@ def _hash_params(cfg):
         keys["device"] = dev
     if cfg.get("sampler"):
         keys["sampler"] = cfg["sampler"]
-    if cfg.get("scheduler"):
+    if cfg.get("scheduler") and not _has_sig:
         keys["scheduler"] = cfg["scheduler"]
-    if cfg.get("retry"):
+    if cfg.get("retry") and not _has_sig:
         keys["retry"] = cfg["retry_target"]
+    # 二采自定义 sigma 表：只在接了才加键（与一采 ckpt_params["sigmas"] 同一条
+    # 铁律 —— json.dumps(sort_keys) 下「多一个键」就是新指纹，会让既有项目的
+    # 高清记录全部续不上）。
+    if _has_sig:
+        keys["sigmas"] = cfg["sigmas"]
     # ⛔ `keep_base_seg`（保存一采分段成片）**故意不进指纹**：它只多存一份一采产物，
     # 二采输出本身一个像素都不变。进指纹等于「拨一下开关 = 全链高清段重做」。
     return keys
@@ -1442,12 +1456,20 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent,
                   cur_seed,
                   采样器, 调度器, report=None, _timing=None, seg_no=None,
-                  bridge=None, _vram=None, _rss=None):
+                  sigmas=None, bridge=None, _vram=None, _rss=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
 
     bridge：语义桥配置（semantic_bridge.config 的返回值，由 render_segment 透传）。
     二采的 cond 是在**本函数里**重建的，所以语义桥也必须在这里过 —— 只在 render_segment
     收尾处调会造成「基础链带桥、高清链不带桥」的一采/二采语义漂移。
+
+    sigmas：二采自定义 sigma 表（「二采自定义Sigmas」槽，少步蒸馏 LoRA 用，由
+    render_segment 透传）。接了就用它**直接驱动精化采样**——与一采同一条路
+    （sigmas 直给 comfy.sample.sample，「去噪 / 精化步数 / 调度器」三个控件自动
+    失效，实际步数 = 点数-1）。表本身已是完整调度，故**多轮递降（passes）与
+    增益重试（retry）一并让位**（再叠轮次没有语义；重试要从 σ₀+0.1 现推一张表，
+    而表是外部给的，推不出来）。采样器仍生效；shift/STG 照常叠加，激活窗口按
+    表首值（= 本表实际 σ 起点）算。None = 逐字节沿用原路径。
 
     _vram / _rss：阶段 0 诊断埋点的**出参容器**（dict，由 render_segment 建好后
     传进来，函数内只往里写）。默认 None = 零开销不采样。
@@ -1827,6 +1849,30 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     ks_sampler = ks_sampler or 采样器
     ks_scheduler = ks_scheduler or 调度器
 
+    # ── 二采自定义 sigma 表（少步蒸馏 LoRA 通道）─────────────────────────────
+    # 与一采同口径：表直接当调度用（ks_steps = 点数-1、ks_denoise 只作 STG 的
+    # 激活窗口起点——comfy 在 sigmas 非 None 时忽略 denoise，见 sigmas_adapter）。
+    # 空表/坏表（sigmas_usable=False，点数 < 2）当作没接：宁可走回原路径，也不拿
+    # 一张读不出来的表把整条链打停。⚠ 判据必须与 nodes.py「写不写 cfg["sigmas"]」
+    # 那条**同源**（都走 sigmas_usable）——两套判据会让空表落到「指纹变了、采样没变」
+    # 的白做：既有高清段全被判失效重做，画面一个像素没动。
+    _ref_sigmas = sigmas if sigmas_adapter.sigmas_usable(sigmas) else None
+    _ref_sig_steps = None
+    _ref_sig_start = float(sigma0)
+    if _ref_sigmas is not None:
+        _ref_sig_steps = sigmas_adapter.sigmas_steps(_ref_sigmas)
+        _start = sigmas_adapter.sigmas_start(_ref_sigmas)
+        _ref_sig_start = float(sigma0) if _start is None else _start
+        _ref_sig_start = min(max(_ref_sig_start, 0.0), 1.0)
+        print(f"[H3二采] 段{seg_no}：使用二采自定义 sigma 表（{_ref_sig_steps} 步 · "
+              f"σ≈{_ref_sig_start:g}→0）——「去噪/精化步数/调度器」已忽略"
+              f"{'，多轮递降与增益重试让位' if (passes > 1 or retry_on) else ''}",
+              flush=True)
+        if report is not None and not 0.0 < _ref_sig_start < 0.99:
+            report.append(f"⚠ 段{seg_no} 二采自定义 Sigmas 首值 σ={_ref_sig_start:g} 异常偏高/偏低"
+                          "（二采是**尾段精化**：首值即精化起点 σ，通常 0.2-0.6）——"
+                          "若接的是一采那张 1.0 起步的完整表，二采会从纯噪声整段重画")
+
     def _is_dev_err(e):
         return "to be on the same device" in str(e)
 
@@ -1863,7 +1909,12 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
         # 引用 + 归还空闲缓存块，次轮起点与首轮对齐。round_desc 进报错定位轮次
         gc.collect()
         torch.cuda.empty_cache()
-        ks_steps, ks_denoise = tail_refine_args(sigma_start, cfg["steps"])
+        if _ref_sigmas is None:
+            ks_steps, ks_denoise = tail_refine_args(sigma_start, cfg["steps"])
+        else:
+            # 自定义 sigma 表：步数 = 点数-1、σ 起点 = 表首值（不再从本轮
+            # sigma_start 现算）；ks_denoise 只喂 STG 的激活窗口。
+            ks_steps, ks_denoise = _ref_sig_steps, _ref_sig_start
 
         def _attempt(plain):
             ks_model = 模型
@@ -1879,10 +1930,19 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                 # 也是判断「精化前那次全卸该不该做」的依据（详见 1629 行待办）。
                 # torch 的 max_memory_allocated 量不到权重池，必须走采样线程。
                 with perf.watch_vram_peak() as _w:
-                    _out = comfy_nodes.common_ksampler(
-                        ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
-                        ks_scheduler, cond, negative, cur_latent,
-                        denoise=ks_denoise)[0]
+                    if _ref_sigmas is None:
+                        _out = comfy_nodes.common_ksampler(
+                            ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
+                            ks_scheduler, cond, negative, cur_latent,
+                            denoise=ks_denoise)[0]
+                    else:
+                        # 二采自定义 sigma 表：与一采同一条路（表直给
+                        # comfy.sample.sample → 「步数/调度器」失效）。sigmas=None
+                        # 时该函数与 common_ksampler 逐字节一致，这里只走非 None 分支。
+                        _out = sigmas_adapter.ksampler_with_sigmas(
+                            ks_model, cur_seed, ks_steps, cfg["cfg"], ks_sampler,
+                            ks_scheduler, cond, negative, cur_latent,
+                            sigmas=_ref_sigmas, denoise=ks_denoise)[0]
                 if _w["peak"] is not None:
                     _refine_peak[0] = _w["peak"] if _refine_peak[0] is None \
                         else max(_refine_peak[0], _w["peak"])
@@ -2166,28 +2226,33 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
 
     # 多轮递降精化（cascade，抗糊 N2）：passes=1 即现状单轮；σ 序列由
     # cascade_sigmas 决定论派生（同参数同序列，重放一致）；种子逐轮 +1。
+    # 接了二采自定义 sigma 表 → 单轮（表已含完整调度，再叠轮次没有语义）。
     # restore_rows 的 finally 覆盖整条精化链（任一轮异常都恢复守卫再上抛）
-    sigmas = cascade_sigmas(sigma0, passes, decay)
+    # ⚠ 局部变量名是 _rounds 不是 sigmas —— sigmas 现在是**形参**（自定义表）。
+    _rounds = [sigma0] if _ref_sigmas is not None \
+        else cascade_sigmas(sigma0, passes, decay)
+    # 增益重试要从 σ₀+0.1 现推一张 cascade 表，而外部表推不出来 → 接表时自动让位
+    _retry_on = retry_on and _ref_sigmas is None
     up_out_v, hf_gain, retried = None, 0.0, False
     _t = time.perf_counter()
     try:
         cur = latent
-        for k, sk in enumerate(sigmas):
+        for k, sk in enumerate(_rounds):
             cur = _refine(sk, cur, (seed + k) % 0xffffffffffffffff,
-                          f"（第{k + 1}轮/共{len(sigmas)}轮）")
+                          f"（第{k + 1}轮/共{len(_rounds)}轮）")
 
         up_out_v, hf_gain = _deliver(cur)
         cur = None
-        if retry_on and should_retry(hf_gain, retry_target, sigma0):
+        if _retry_on and should_retry(hf_gain, retry_target, sigma0):
             # 增益自适应重试（抗糊 N7）：同一起始放大 latent、σ₀+0.1 重跑整条
             # 精化链一次，按细节增益取优——「一轮抠不动就再深一轮」的自动档
             sigma_r = min(sigma0 + 0.1, 0.90)
-            sigmas_r = cascade_sigmas(sigma_r, passes, decay)
+            _rounds_r = cascade_sigmas(sigma_r, passes, decay)
             cur2 = latent
-            for k, sk in enumerate(sigmas_r):
+            for k, sk in enumerate(_rounds_r):
                 cur2 = _refine(sk, cur2,
-                               (seed + len(sigmas) + k) % 0xffffffffffffffff,
-                               f"（增益重试链第{k + 1}轮/共{len(sigmas_r)}轮）")
+                               (seed + len(_rounds) + k) % 0xffffffffffffffff,
+                               f"（增益重试链第{k + 1}轮/共{len(_rounds_r)}轮）")
             v2, g2 = _deliver(cur2)
             cur2 = None
             if g2 > hf_gain:
@@ -2839,7 +2904,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
                    skip_f, vis_len,
                    wav, sample_rate, bh, report, 采样器, 调度器, model_tag=None,
-                   bridge=None, _up_swap=False):
+                   sigmas=None, bridge=None, _up_swap=False):
     """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪）。
 
     model_tag：二采模型结构签名（model_tag()），仅用于报告标注与写进
@@ -2849,6 +2914,12 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     bridge：语义桥配置（semantic_bridge.config 的返回值）。二采的 cond 是在
     render_latent 里重新编码出来的（高清画幅），所以必须**透传下去**在那里过桥；
     只在收尾处调会造成「基础链带桥、高清链不带桥」的一采/二采语义漂移。
+
+    sigmas：二采自定义 sigma 表（「二采自定义Sigmas」槽，少步蒸馏 LoRA 用）。
+    同样必须透传到 render_latent —— 它改的是精化采样本身，在收尾处接没有意义。
+    表指纹（cfg["sigmas"]）由 nodes.py 写进 up_cfg，故本次二采是否「待做」在
+    调用本函数**之前**就已由 record_stale 判完（换表 = 既有高清段重做）。
+    None = 完全沿用「去噪 + 精化步数 + 调度器」，与旧行为逐字节一致。
 
     _up_swap：本次二采用的 `模型` 是否与一采模型是**两份不同权重**
     （`upscale.models_distinct` 判定，nodes.py 传入）。为真时解码前会先卸掉
@@ -2909,7 +2980,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
             video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
             pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
             采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1,
-            bridge=bridge, _vram=_vram, _rss=_rss)
+            sigmas=sigmas, bridge=bridge, _vram=_vram, _rss=_rss)
     except BaseException:
         _dump_partial("二采渲染中断")
         raise
@@ -2991,14 +3062,26 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     up_state = write_record(root, g, cfg, up_seed, (tw, th), bh,
                             hf_gain=hf_gain, motion=_mo, sharp=sharp,
                             model_tag=model_tag)
-    _n, _d = tail_refine_args(_sig, cfg["steps"])   # _n=执行步数，_d=σ 起点
+    # 二采自定义 sigma 表：回显**表自己的**步数与 σ 序列（面板上的「去噪/精化步数/
+    # 调度器」对本次采样已失效，照它们回显会误导），多轮递降同样让位。
+    # 判据走 sigmas_usable（与采样分支、与 nodes.py 写不写 cfg["sigmas"] 同源），
+    # 不直接读 cfg["sigmas"] —— 两者理论上可能不同步，而「表能不能用」是唯一真源。
+    _sig_tbl = sigmas_adapter.sigmas_usable(sigmas)
+    if _sig_tbl:
+        _n = sigmas_adapter.sigmas_steps(sigmas) or int(cfg["steps"])
+        _d = sigmas_adapter.sigmas_start(sigmas)
+        _d = float(_sig) if _d is None else _d
+        _passes = 1
+        _sig_str = "/".join(str(cfg["sigmas"]).split(","))
+    else:
+        _n, _d = tail_refine_args(_sig, cfg["steps"])   # _n=执行步数，_d=σ 起点
+        _passes = int(cfg.get("passes") or 1)
+        _sigmas = cascade_sigmas(_sig, _passes, float(cfg.get("decay") or 0.5))
+        _sig_str = "/".join(f"{s:g}" for s in _sigmas)
     _mix = float(cfg.get("mix") or 0.0)
     _sh = float(cfg.get("shift") or 0.0)
     _stg = float(cfg.get("stg") or 0.0)
     _stgb = int(cfg.get("stg_block") if cfg.get("stg_block") is not None else 25)
-    _passes = int(cfg.get("passes") or 1)
-    _sigmas = cascade_sigmas(_sig, _passes, float(cfg.get("decay") or 0.5))
-    _sig_str = "/".join(f"{s:g}" for s in _sigmas)
     _shp = float(cfg.get("sharpen") or 0.0)
     _ehq = bool(cfg.get("encode_hq"))
     _sam = str(cfg.get("sampler") or "").strip()
@@ -3010,7 +3093,8 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _sm_lbl = str(cfg.get("size_mode") or "倍率")
     _mode_bit = "" if _sm_lbl == "倍率" else f"（{_sm_lbl}）"
     report.append(f"段{g + 1} 二采：{tw}×{th} · {_kind} ×{_eff:g}{_mode_bit} · "
-                  f"精化 {('×'.join([str(_n)] * _passes))} 步 @ σ≈{_sig_str} · "
+                  f"精化 {('×'.join([str(_n)] * _passes))} 步 @ σ≈{_sig_str}"
+                  + ("（自定义σ表）" if _sig_tbl else "") + " · "
                   f"细节 {hf_gain:+.0%} · 清晰 {sharp:.1f} · "
                   f"{time.perf_counter() - t0:.0f}s"
                   + (" · 桥锚" if bridged else "")
@@ -3021,7 +3105,8 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   + (f" · 锐化{_shp:g}" if _shp > 0 else "")
                   + (f" · 像素锐{_psp:g}" if _psp > 0 else "")
                   + (" · 高清编码档" if _ehq else "")
-                  + ((f" · {(_sam + '/' + _sch).rstrip('/')}")
+                  + ((f" · 二采采样器 {_sam}" if _sig_tbl
+                      else f" · {(_sam + '/' + _sch).rstrip('/')}")
                      if (_sam or _sch) else "")
                   + (" · 重试取优" if retried else "")
                   + (f" · 二采模型{model_tag}" if model_tag else ""))

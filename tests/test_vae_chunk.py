@@ -18,6 +18,12 @@ token_overlap=2、frame_overlap=5。
   frame_plan(z=32, n=6, pad=2): 每块 17 帧 ×6 = 102，末尾重叠 5 → 107，
   减去 _pad_frames(32,2)=5（k=0 命中 intra_tail=1、k=1 是 4）→ **102**
   交叉验证：30×4 − 3×6 = 120 − 18 = 102 ✓
+
+⚠ 2026-10-13 补（真机实测教训，见下面 5b 组）：
+  **`vae.decode()` 返回 [B, T, H, W, C]，时间在 dim=1**（`comfy/sd.py` 末尾
+  `movedim(1,-1)`）。本文件原先用 [B, C, T, H, W] 的假 VAE，把错误布局当成了契约，
+  而真正危险的 `decode_chunked` 又**没有任何用例** —— 于是"沿高度维拼接"这个 bug
+  一路绿灯，功能上线即失效。**假 VAE 的布局必须照抄真实包装函数的输出。**
 """
 
 import os
@@ -194,33 +200,131 @@ def test_auto_chunk_tokens_unknown_is_zero(monkeypatch):
 
 def test_blend_zero_is_identity():
     torch = pytest.importorskip("torch")
-    prev = torch.zeros(1, 3, 10, 2, 2)
-    nxt = torch.ones(1, 3, 10, 2, 2)
-    p2, n2 = VC._blend_join(prev, nxt, 0)
+    # 真实布局是 [B, T, H, W, C]，时间在 dim=1（见下面 5b 组）
+    prev = torch.zeros(1, 10, 2, 2, 3)
+    nxt = torch.ones(1, 10, 2, 2, 3)
+    p2, n2 = VC._blend_join(prev, nxt, 0, 1)
     assert p2 is prev and n2 is nxt            # blend=0 → 什么都不动
 
 
 def test_blend_join_keeps_frame_count():
     """溶解只能改变像素，**不能**改变帧数 —— 否则整段时长会漂、音画会不同步。"""
     torch = pytest.importorskip("torch")
-    prev = torch.zeros(1, 3, 10, 2, 2)
-    nxt = torch.ones(1, 3, 10, 2, 2)
-    p2, n2 = VC._blend_join(prev, nxt, 3)
-    assert int(p2.shape[2]) == 10
-    assert int(n2.shape[2]) == 10
-    assert int(p2.shape[2]) + int(n2.shape[2]) == 20
+    prev = torch.zeros(1, 10, 2, 2, 3)
+    nxt = torch.ones(1, 10, 2, 2, 3)
+    p2, n2 = VC._blend_join(prev, nxt, 3, 1)
+    assert int(p2.shape[1]) == 10
+    assert int(n2.shape[1]) == 10
+    assert int(p2.shape[1]) + int(n2.shape[1]) == 20
 
 
 def test_blend_join_really_ramps():
     """尾部应被改成「从 prev 值爬到 nxt 值」的斜坡，而不是原样或全量替换。"""
     torch = pytest.importorskip("torch")
-    prev = torch.zeros(1, 3, 10, 1, 1)
-    nxt = torch.ones(1, 3, 10, 1, 1)
-    p2, _ = VC._blend_join(prev, nxt, 4)
-    tail = p2[0, 0, -4:, 0, 0].tolist()
+    prev = torch.zeros(1, 10, 1, 1, 3)
+    nxt = torch.ones(1, 10, 1, 1, 3)
+    p2, _ = VC._blend_join(prev, nxt, 4, 1)
+    tail = p2[0, -4:, 0, 0, 0].tolist()
     assert tail[0] < tail[1] < tail[2] < tail[3]
     assert tail[3] < 1.0            # 开区间：末帧不是纯 nxt，否则会出现半帧突跳
     assert p2[0, 0, 0, 0, 0].item() == 0.0   # 头部不受影响
+
+
+# ── 5b) decode_chunked：**真实输出布局** [B,T,H,W,C] ──
+#
+# ⛔ 为什么必须补这一组（2026-10-13 用真机真 VAE 跑出来的教训）：
+#   `decode_chunked` 原先**一个测试都没有**，而它按 dim=2 拼接 —— 那是**高度**维。
+#   真实 `vae.decode()` 返回 **[B, T, H, W, C]**（时间在 dim=1），依据是
+#   `comfy/sd.py` 的 `VAE.decode` 末尾 `pixel_samples.movedim(1,-1)`（v0.38.2 在 1354 行）；
+#   `decode_output_shape` 给的 `(b, 3, frames, h, w)` 只是**内部**缓冲的布局。
+#   后果：拼接后帧数永远对不上 → 每次都被账目闸挡回去退整段解码 →
+#   **这个功能从上线起就没真正生效过**，而且"安静回退"在日志之外看不出来。
+#   本组用真实布局的假 VAE 把这条钉死；下面 `test_time_dim_*` 再钉住"不许写死维号"。
+
+
+class FakeVideoVAE:
+    """输出**真实布局** [B, T, H, W, C] 的假 VAE（照 comfy/sd.py 的 movedim(1,-1)）。"""
+
+    def __init__(self):
+        self.first_stage_model = FakeFirstStage()
+
+    def decode(self, z):
+        import torch
+
+        b, _c, t, h, w = z.shape
+        n = VC.frames_for(VC.vae_params(self), t)
+        return torch.zeros(b, n, h * self.first_stage_model.vae_ratio,
+                           w * self.first_stage_model.vae_ratio, 3)
+
+
+class FakeInnerLayoutVAE(FakeVideoVAE):
+    """反例：万一将来变回内部布局 [B, C, T, H, W]，也得能拼对（不许写死 dim=1）。"""
+
+    def decode(self, z):
+        import torch
+
+        b, _c, t, h, w = z.shape
+        n = VC.frames_for(VC.vae_params(self), t)
+        return torch.zeros(b, 3, n, h * self.first_stage_model.vae_ratio,
+                           w * self.first_stage_model.vae_ratio)
+
+
+def test_decode_chunked_frame_count_matches_whole():
+    """分块拼出的帧数必须等于整段应得帧数（真实布局下）。"""
+    torch = pytest.importorskip("torch")
+    vae = FakeVideoVAE()
+    pl = VC.plan(vae, 30, 15)
+    assert pl["ok"] and pl["frames_total"] == 102
+    out = VC.decode_chunked(vae, torch.zeros(1, 24, 30, 8, 8), pl)
+    assert int(out.shape[1]) == 102, "时间维该在 dim=1，实际 %s" % (tuple(out.shape),)
+    assert out.dim() == 5
+
+
+def test_decode_chunked_blend_keeps_frame_count():
+    torch = pytest.importorskip("torch")
+    vae = FakeVideoVAE()
+    pl = VC.plan(vae, 30, 15)
+    out = VC.decode_chunked(vae, torch.zeros(1, 24, 30, 8, 8), pl, blend=2)
+    assert int(out.shape[1]) == 102
+
+
+def test_time_dim_is_detected_not_hardcoded():
+    """两种布局都要能拼对 —— 写死维号是这次 bug 的根源。"""
+    torch = pytest.importorskip("torch")
+    z = torch.zeros(1, 24, 30, 8, 8)
+    for cls in (FakeVideoVAE, FakeInnerLayoutVAE):
+        vae = cls()
+        pl = VC.plan(vae, 30, 15)
+        out = VC.decode_chunked(vae, z, pl)
+        assert VC._time_dim(out, 102) in (1, 2)
+        assert int(out.shape[VC._time_dim(out, 102)]) == 102
+
+
+def test_time_dim_raises_when_unidentifiable():
+    """找不到时间维时必须**抛**（调用方退回整段解码），不许悄悄返回错的东西。"""
+
+    class BadVAE(FakeVideoVAE):
+        def decode(self, z):
+            import torch
+
+            return torch.zeros(1, 7, 7, 7, 7)      # 没有任何一维等于应得帧数
+
+    torch = pytest.importorskip("torch")
+    vae = FakeVideoVAE()
+    pl = VC.plan(vae, 30, 15)
+    with pytest.raises(RuntimeError):
+        VC.decode_chunked(BadVAE(), torch.zeros(1, 24, 30, 8, 8), pl)
+
+
+def test_decode_chunked_rejects_wrong_frame_total():
+    """账目闸的最后一道：拼出来帧数不对就必须抛，绝不能把错帧数的张量交出去。"""
+    torch = pytest.importorskip("torch")
+    vae = FakeVideoVAE()
+    pl = VC.plan(vae, 30, 15)
+    bad = dict(pl)
+    bad["frames_total"] = 999                       # 故意把期望值改错
+    with pytest.raises(RuntimeError):
+        VC.decode_chunked(vae, torch.zeros(1, 24, 30, 8, 8), bad)
 
 
 # ── 6) perf 键声明（守 DEFAULT_PERF / PERF_TYPES 两处同步）──

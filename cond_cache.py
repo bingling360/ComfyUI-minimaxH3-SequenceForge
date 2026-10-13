@@ -157,7 +157,8 @@ class CachedClipProxy:
 
         原实现调 `comfy.model_management.unload_model_and_clips` —— ComfyUI 里
         **从未存在过**这个名字（真名是 `unload_model_and_clones`，
-        `comfy/model_management.py:2118`；全仓 grep + `git log --all -S` 均无 `_clips`
+        `comfy/model_management.py:2144`（v0.38.2；旧文记的 2118 是更早版本的行号）；
+        全仓 grep + `git log --all -S` 均无 `_clips`
         版本）。而调用包在 `except Exception: pass` 里 → AttributeError 被吞 →
         `te_drop_after_cond` 这个开关**什么都没干**，连 `drops` 计数都不会加，
         所以任何报告都发现不了。加这个开关的人以为自己在省内存，实际是空转。

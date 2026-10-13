@@ -5,16 +5,32 @@
 
 背景（2026-09-30）：64GB 无 swap 云端实测，1MP 单段一采 cgroup 峰值 59.5/64G，
 段间残留 +2G/段，第 3-4 段必撞顶被**整个容器**杀掉（断连 + 运行记录消失）。
-修复 = cond 编码完就把 TE 权重副本丢掉（unload_model_and_clips，只动 TE 不碰
-主模型暖驻留），采样/解码全程不背 25.9GB。挂接点 = CachedClipProxy（全链 TE
-encode 唯一入口），只在 **miss** 时丢 —— hit 没碰 TE 权重，丢了白付回载。
+当初的设计意图 = cond 编码完就把 TE 请出去（`unload_model_and_clones`，只动 TE
+不碰主模型暖驻留）。挂接点 = CachedClipProxy（全链 TE encode 唯一入口），
+只在 **miss** 时丢 —— hit 没碰 TE 权重，丢了白付回载。
+
+⚠ 2026-10-13 修复：这个开关**直到 10-13 之前一直是空转的** —— 原实现调的是
+ComfyUI 里从未存在的 `unload_model_and_clips`，异常又被 `except` 吞掉，
+所以它什么都没干、连 `drops` 都不会加。现已改调真名并出声告警。
+
+⛔ 2026-10-13 实测结论：**它不省内存 —— 内存占用无变化。**
+`unload_model_and_clones` 走的是 `free_memory(..., for_dynamic=False)` →
+`LoadedModel.model_unload()` → `ModelPatcher.detach(unpatch_weights=True)`：
+把权重 `model_patches_to(offload_device)` **从显存搬回主机**、从
+`current_loaded_models` 摘掉、再 `soft_empty_cache()`。
+**ComfyUI 的「卸载」= 从显存搬回内存，不是从内存删掉** → 那 25.9GB 权重副本
+该在还在，内存地板一点不动。所以它的真实收益是**腾显存窗口**（小显存卡有意义），
+代价是每段首次编码多一次回载 + 重 patch（约 45s）。
+当初「默认强制开」是为了救云端内存，该理由已被这条实测推翻。
 
 钉住：
-  1) perf 键存在、默认 "auto"、类型表收 bool 与字面量 "auto"；
+  1) perf 键存在、**默认 True（2026-10-12 起强制开，不再随 OS 分档）**、
+     类型表收 bool 与字面量 "auto"；
   2) te_drop_after_cond_enabled 的解析矩阵（显式值 / auto 按 OS / 乱串回落 auto）；
   3) 代理只在 miss 丢、hit 不丢；
-  4) 丢的动作真调 unload_model_and_clips 且传的是 clip.patcher；
-  5) comfy 环境缺失时静默吞（缓存层任何情况下不该成为崩溃源）。
+  4) 丢的动作真调 `unload_model_and_clones` 且传的是 clip.patcher；
+  5) comfy 环境缺失时静默吞（缓存层任何情况下不该成为崩溃源）；
+  6) 源码里不许再出现 ComfyUI 不存在的 API 名（AST 守卫）。
 """
 
 import os
@@ -40,7 +56,7 @@ class FakeClip:
 
     def __init__(self):
         self.encodes = 0
-        self.patcher = object()   # 真实路径里会传给 unload_model_and_clips
+        self.patcher = object()   # 真实路径里会传给 unload_model_and_clones
 
     def tokenize(self, text, *a, **kw):
         return {"text": text}

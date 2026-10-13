@@ -2439,8 +2439,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _ctx_txt = f"上下文 {ctx} 帧" if ctx > 0 else "引导桥 关闭（段间硬切，响度对齐仍生效）"
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}（按实际引用自动推导），{_ctx_txt}"]
         if _te_drop:
-            report.append("内存瘦身：cond 编码后即释放文本编码器驻留"
-                          "（te_drop_after_cond，代价=每段首次编码多一次回载）")
+            report.append("显存瘦身：cond 编码后即把文本编码器请出显存"
+                          "（te_drop_after_cond；⚠ 它**不省内存**，只腾显存，"
+                          "代价=每段首次编码多一次回载）")
 
         # ---- 手动锚定（Anchor Studio）：唯一入口 ----
         # 所有「把某段 latent / 素材钉到本段某位置」的诉求统一走 seg.anchors[]（规划 §2/§3）。
@@ -3689,7 +3690,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                          f"{label} 解码前")
             # ★ 解码前的**内存**预算体检（2026-10-13）。上面那套 + 下面的 oom_retry
             #   治的都是**显存**；而 H3 视频 VAE 会在解码前把整段像素缓冲一次性
-            #   预分配到内存（comfy/sd.py:1270），且在 Linux 无 swap 下不够就是
+            #   预分配到内存（comfy/sd.py:1281，v0.38.2），且在 Linux 无 swap 下不够就是
             #   SIGKILL（不抛异常 → oom_retry 那类「抛了再救」完全失效）。
             #   够用则这里只是多读一次 meminfo；只有预测真会撞时才做 gc+堆回收。
             try:

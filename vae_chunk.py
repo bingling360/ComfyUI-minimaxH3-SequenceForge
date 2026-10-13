@@ -4,9 +4,11 @@
 ═══ 为什么必须有这个文件 ═══
 
 H3 的视频 VAE 会在**开始解码之前**把整段视频的完整像素缓冲一次性预分配到
-主机内存（ComfyUI `comfy/sd.py:1270-1277` 预先 `torch.empty(decode_output_shape…)`；
-VAE 自己的兜底路径 `comfy/ldm/minimax/vae.py:708-711`，注释写着 *"finalized chunks
+主机内存（ComfyUI `comfy/sd.py:1281-1286` 预先 `torch.empty(decode_output_shape…)`；
+VAE 自己的兜底路径 `comfy/ldm/minimax/vae.py:713`，注释写着 *"finalized chunks
 stream out of VRAM so the full video never sits on the GPU"*）。
+（行号按 ComfyUI v0.38.2 复核；旧文记的 `sd.py:1270-1277` / `vae.py:708-711`
+是更早版本的行号 —— 行号会随版本漂移，引用时按符号名核对。）
 
 于是内存峰值 = **帧数 × 高 × 宽 × 3 × 4 字节**，与帧数线性相关，且与显存是否干净、
 卸载开关是否开启**完全无关**。ComfyUI 自带的 VAE 分块（256px 空间 tile + 17 帧
@@ -191,7 +193,32 @@ def plan(vae, z_len, max_tokens):
     return out
 
 
-def _blend_join(prev, nxt, blend):
+def _time_dim(t, expected):
+    """定位「时间维」。
+
+    ⛔ **2026-10-13 实测纠错（本模块原先在这里是错的）**：
+    `vae.decode()` 返回的是 **[B, T, H, W, C]** —— 时间在 **dim=1**，不是 dim=2。
+    依据：`comfy/sd.py` 的 `VAE.decode` 最后一行
+    `pixel_samples = pixel_samples.to(...).movedim(1,-1)`（v0.38.2 在 1354 行）。
+    `decode_output_shape` 给的 `(b, 3, frames, h, w)` 是**内部**缓冲的布局
+    （`first_stage_model.decode` 往里写的那块），跟这个包装函数吐出来的**不是**同一个。
+
+    原先本模块统一按 dim=2 拼，于是沿**高度**维拼接 →
+    `sum(每段帧数) == 整段帧数` 这道闸必然失败 → 每次都被挡回去退整段解码，
+    **功能等于从来没接上**（而且因为失败是"安静回退"，日志之外看不出来）。
+
+    这里不硬编码：按「哪一维等于本段应得帧数」定维，拿不到就抛（调用方兜底）。
+    优先 dim=1（实测的真实布局），再试 dim=2（万一将来变回内部布局）。
+    """
+    for d in (1, 2):
+        if d < t.dim() and int(t.shape[d]) == int(expected):
+            return d
+    raise RuntimeError(
+        f"分块解码：输出 {tuple(t.shape)} 里没有等于 {expected} 帧的时间维"
+        f"（期望 [B,T,H,W,C]、时间在 dim=1，见 _time_dim 的说明）")
+
+
+def _blend_join(prev, nxt, blend, dim=1):
     """把 prev 的**尾 n 帧原地替换**成「prev 尾 → nxt 头」的线性斜坡（帧数不变）。
 
     为什么要它：见文件头「接缝问题的真相」—— 每段会各自丢掉开头
@@ -210,7 +237,7 @@ def _blend_join(prev, nxt, blend):
     if blend <= 0 or prev is None or nxt is None:
         return prev, nxt
     try:
-        n = int(min(blend, prev.shape[2], nxt.shape[2]))
+        n = int(min(blend, prev.shape[dim], nxt.shape[dim]))
     except Exception:
         return prev, nxt
     if n <= 0:
@@ -218,14 +245,21 @@ def _blend_join(prev, nxt, blend):
     try:
         import torch
 
-        # ramp 取 (0,1) 开区间：首尾帧保持原样，中间渐变，避免出现半帧黑边
+        # ramp 取 (0,1) 开区间：首尾帧保持原样，中间渐变，避免出现半帧黑边。
+        # 广播形状按 dim 展开（不能写死 (1,1,n,1,1)：时间维是 dim=1，见 _time_dim）。
         ramp = torch.linspace(0.0, 1.0, n + 2, dtype=prev.dtype,
                               device=prev.device)[1:-1]
-        ramp = ramp.reshape((1, 1, n) + (1,) * (prev.dim() - 3))
-        tail = prev[:, :, -n:, :, :]
-        head = nxt[:, :, :n, :, :].to(dtype=prev.dtype)
+        shape = [1] * prev.dim()
+        shape[dim] = n
+        ramp = ramp.reshape(shape)
+        sl = [slice(None)] * prev.dim()
+        sl[dim] = slice(-n, None)
+        tail = prev[tuple(sl)]
+        sl[dim] = slice(0, n)
+        head = nxt[tuple(sl)].to(dtype=prev.dtype)
         mixed = tail * (1.0 - ramp) + head * ramp
-        prev = torch.cat([prev[:, :, :-n, :, :], mixed], dim=2)
+        sl[dim] = slice(None, -n)
+        prev = torch.cat([prev[tuple(sl)], mixed], dim=dim)
     except Exception:
         pass                      # 溶解失败不影响拼接本身：退回硬切，帧数仍然正确
     return prev, nxt
@@ -234,38 +268,44 @@ def _blend_join(prev, nxt, blend):
 def decode_chunked(vae, z, pl, blend=0, log=None):
     """按 `plan` 的切法分块解码并拼回去。**任一步异常都向上抛，由调用方兜底**。
 
-    返回拼接后的帧张量。时间维取 `dim=2`（ComfyUI 视频 VAE 的输出是
-    [B, C, T, H, W]；`comfy/sd.py` 的 `process_output` 之后才是 [B, T, H, W, C]，
-    两种形态的时间维都在 dim=2，所以这里统一按 dim=2 拼）。
+    ⚠ **两个方向的布局不是同一个，别搞混**（2026-10-13 实测纠错）：
+      · **输入 latent** `z` 是 `[B, C, T, H, W]` —— 切时间就是切 **dim=2**；
+      · **`vae.decode()` 的返回值**是 `[B, T, H, W, C]` —— 时间在 **dim=1**
+        （`comfy/sd.py` 的 `VAE.decode` 末尾 `movedim(1,-1)`，v0.38.2 在 1354 行）。
+    本模块原先两边都写 dim=2，于是输出按**高度**拼 → 帧数校验必然失败 →
+    每次都被挡回去退整段解码，功能从未真正生效。现在输出维由 `_time_dim` 实测定位。
     """
+    import torch
+
     parts = []
     prev = None
+    dim = None
     for i, (a, b) in enumerate(pl["pieces"]):
+        # 输入侧：latent 的时间维确实是 dim=2（[B, C, T, H, W]）
         piece = vae.decode(z[:, :, a:b, :, :])
+        if dim is None:
+            # 输出侧：按「这一维是不是本段应得帧数」定时间维
+            dim = _time_dim(piece, pl["frames_each"][i])
         if prev is not None:
-            prev, piece = _blend_join(prev, piece, blend)
+            prev, piece = _blend_join(prev, piece, blend, dim)
             parts.append(prev)
             prev = None
         prev = piece
         if log is not None:
             try:
                 log(f"  分块解码 {i + 1}/{len(pl['pieces'])}："
-                    f"token {a}..{b} → {int(piece.shape[2])} 帧")
+                    f"token {a}..{b} → {int(piece.shape[dim])} 帧")
             except Exception:
                 pass
     if prev is not None:
         parts.append(prev)
     try:
-        import torch
-
-        out = torch.cat(parts, dim=2)
-    except Exception:
-        raise
+        out = torch.cat(parts, dim=dim)
     finally:
         del parts
     # 最后一道闸：帧数必须等于整段应得的帧数，否则整段结果作废（调用方会退回整解）
-    if int(out.shape[2]) != int(pl["frames_total"]):
+    if int(out.shape[dim]) != int(pl["frames_total"]):
         raise RuntimeError(
-            f"分块解码帧数不符：拼出 {int(out.shape[2])} 帧，"
+            f"分块解码帧数不符：拼出 {int(out.shape[dim])} 帧，"
             f"整段应为 {int(pl['frames_total'])} 帧")
     return out

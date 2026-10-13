@@ -6,9 +6,9 @@
 背景（2026-10-13 用户追问「为什么第二段解码时内存爆」）：
 
   ★ 根因：H3 视频 VAE 会在**开始解码之前**把整段视频的完整像素缓冲一次性
-    预分配到**主机内存**（ComfyUI `comfy/sd.py:1270-1277` 预先
+    预分配到**主机内存**（ComfyUI `comfy/sd.py:1281-1286` 预先
     `torch.empty(first_stage_model.decode_output_shape(...))`；VAE 自己的兜底路径
-    `comfy/ldm/minimax/vae.py:708-711` 注释写着 "stream out of VRAM so the full
+    `comfy/ldm/minimax/vae.py:713` 注释写着 "stream out of VRAM so the full
     video never sits on the GPU"）。这是一张**与帧数线性相关的固定开口支票**：
     显存再干净也救不了，任何卸载开关都影响不到它。
 

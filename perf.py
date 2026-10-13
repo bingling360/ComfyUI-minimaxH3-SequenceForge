@@ -214,21 +214,39 @@ DEFAULT_PERF = {
     # 收 ratio 入参，以前 nodes 没传 → 键改了不生效；现在按它传。
     "offload_guard_ratio": DEFAULT_GUARD_RATIO,
     "guard_action": "warn",        # warn=只报 / block=critical 时禁止全卸
-    # cond 出口释放 TE 驻留（2026-09-30）：64GB 无 swap 云端实测，1MP 单段一采
-    # 峰值 59.5G/64G，段间残留 +2G/段 → 第 3-4 段必撞顶被 cgroup 整容器杀掉
-    # （断连 + 运行记录消失）。编码完就把 TE 的权重副本丢掉，采样/解码全程
-    # 不背 25.9GB —— 单段峰值降到 ~35G。
-    # 2026-10-12 起出厂默认改**强制开**（用户拍板）：不再随 OS 分档，Linux/Windows
-    # 一律在 cond 编码完就丢 TE 驻留，把峰值压到最低（代价是每段首次编码多 ~45s）。
-    # 仍保留三态：「auto」= Linux 开 / Windows 关，可手动拨回（见
-    # te_drop_after_cond_enabled 的 docstring）。消费端：cond_cache.CachedClipProxy。
+    # cond 出口释放 TE 驻留（2026-09-30 立项）：当初的理由是 64GB 无 swap 云端实测
+    # 1MP 单段一采峰值 59.5G/64G、段间残留 +2G/段 → 第 3-4 段必撞顶被 cgroup 整容器
+    # 杀掉（断连 + 运行记录消失），希望"编码完就把 TE 丢掉"能把峰值压到 ~35G。
+    #
+    # ⛔ 2026-10-13 实测结论：**它不省内存，内存占用无变化。**
+    #   两个原因，缺一不可：
+    #   ① 该开关在 10-13 之前一直是**静默空转**的（原实现调的是 ComfyUI 里不存在的
+    #      `unload_model_and_clips`，异常又被 `except` 吞掉，见 cond_cache.py::_drop_te）
+    #      —— 空转期间开与不开行为逐字相同，所以当初那个「→ ~35G」根本无从测出
+    #      （且 59.5 − 25.9 = 33.6 ≈ 35，形似减法而非实测）。
+    #   ② 修好之后它做的事仍然**只在显存侧**：`unload_model_and_clones` →
+    #      `free_memory(1e30, device, keep_loaded, for_dynamic=False)` → 因为
+    #      `for_dynamic=False`，那条"动态模型跳过卸载"的分支不生效 → TE 真的走
+    #      `LoadedModel.model_unload(1e30)` → `ModelPatcher.detach(unpatch_weights=True)`：
+    #        · `model_patches_to(offload_device)` 把权重**从显存搬回主机内存**；
+    #        · 从 `current_loaded_models` **摘掉**（下次用要重新 load + 重新 patch）；
+    #        · `soft_empty_cache()` 把 CUDA 缓存块还给驱动。
+    #      ComfyUI 语境下「卸载」= 从显存搬回内存，**不是从内存删掉** → 那 25.9GB
+    #      权重副本该在还在（原本驻显存的话，搬回内存后 RSS 反而涨）。
+    #   所以它的真实收益是**给采样/解码腾显存窗口**（小显存卡有意义），
+    #   代价是每段首次编码多一次回载 + 重 patch（约 45s）。
+    #   ⚠ 当初"默认强制开"是为了救云端内存，该理由已被实测推翻 —— 默认值留待用户重定。
+    # 2026-10-12 起出厂默认 True（用户拍板，不再随 OS 分档）；仍保留三态：
+    # 「auto」= Linux 开 / Windows 关，可手动拨回（见 te_drop_after_cond_enabled）。
+    # 消费端：cond_cache.CachedClipProxy。
     "te_drop_after_cond": True,
     # ★ 解码前的**内存**预算体检（2026-10-13）——本轮唯一的「是对症药」的机制。
     #
     # 为什么必须单独做一条：现有全部机制（段末清理 / 无主显存回收 / oom_retry /
     # offload_guard）**治的都是显存**。而 H3 视频 VAE 会在**开始解码之前**把整段
-    # 视频的完整像素缓冲一次性分配在主机内存里（comfy/sd.py:1270-1277 +
-    # comfy/ldm/minimax/vae.py:708-711）——那是一张与帧数线性相关的固定开口支票。
+    # 视频的完整像素缓冲一次性分配在主机内存里（comfy/sd.py:1281-1286 +
+    # comfy/ldm/minimax/vae.py:713；行号按 v0.38.2 复核，旧文记的 1270-1277 /
+    # 708-711 是更早版本的行号）——那是一张与帧数线性相关的固定开口支票。
     # 显存侧再干净也救不了它；而 Linux 无 swap / cgroup 下内存不够是 **SIGKILL**，
     # 连异常都不抛 → `oom_retry` 那种「抛了再救」的路径完全失效（表现为无声断连）。
     #
@@ -946,10 +964,14 @@ def guard_allows_unload(hw, action="warn", ratio=DEFAULT_GUARD_RATIO):
 def te_drop_after_cond_enabled(value, profile=None):
     """解析 `te_drop_after_cond`：显式 bool 直用；"auto" = Linux 开 / Windows 关。
 
-    为什么 auto 按 OS 判而不按 profile：这个开关救的是「无 swap 的 Linux 被
-    cgroup OOM killer 整容器杀掉」（2026-09-30 实测：1MP 单段一采 cgroup 峰值
-    59.5G/64G，段间残留 +2G/段，第 3-4 段必死）。Windows 有 pagefile，内存压力
-    的表现是变慢不是被杀，丢了 TE 反而每段多付一次重载，故 auto 下不开。
+    为什么 auto 按 OS 判而不按 profile：这个开关**只动显存、不动内存**
+    （2026-10-13 实测：内存占用无变化，机制见 DEFAULT_PERF 里 te_drop_after_cond
+    上方的注释）。当初立项想救的是「无 swap 的 Linux 被 cgroup OOM killer 整容器
+    杀掉」（2026-09-30 实测：1MP 单段一采 cgroup 峰值 59.5G/64G，段间残留 +2G/段，
+    第 3-4 段必死）—— 但那条理由**已被实测推翻**，因为卸载不等于删内存。
+    「auto」的分档理由因此只剩一条较弱的：Windows 有 pagefile，内存压力的表现是
+    变慢不是被杀，丢了 TE 反而每段多付一次回载，故 auto 下不开。
+    ⚠ 这个三态的存在本身值得重新评估（默认值现已强制 True，见 DEFAULT_PERF）。
     profile 在设置里可能是 "auto"（还没跑过渲染就没解析），不可靠；
     运行时 OS 是当下事实。
     """
@@ -1977,14 +1999,14 @@ def decode_pixels_need_gb(vae, latent, factor=1.15):
     ═══ 为什么它是「固定开口支票」，而不是可以慢慢挤的普通峰值 ═══
 
     ComfyUI 对声明了 `comfy_has_chunked_io` 的 VAE（H3 的 VideoVAE 有，
-    `comfy/ldm/minimax/vae.py:408`）会**在解码开始之前**先把整块输出预分配到
-    `output_device`（`comfy/sd.py:1270-1277`）：
+    `comfy/ldm/minimax/vae.py:410`）会**在解码开始之前**先把整块输出预分配到
+    `output_device`（`comfy/sd.py:1281-1286`）：
 
         pixel_samples = torch.empty(
             first_stage_model.decode_output_shape(samples_in.shape),
             device=self.output_device, dtype=self.vae_output_dtype())
 
-    而 H3 VAE 自己的兜底路径也一样（`vae.py:708-711`，注释写得很直白：
+    而 H3 VAE 自己的兜底路径也一样（`vae.py:713`，注释写得很直白：
     *"finalized chunks stream out of VRAM so the full video never sits on the GPU"*）
     —— 官方就是故意把整段视频从显存挪到**内存**的。
 
@@ -2110,7 +2132,7 @@ def decode_ram_check(vae, latent, mode="auto", tag="", margin_gb=1.0, verbose=Fa
         out["message"] = (
             f"[H3内存] {tag}解码预算不足：需要 {_n}GB / 可用 {_a}GB "
             f"—— H3 视频 VAE 会在解码前一次性预分配整段像素缓冲到内存"
-            f"（comfy/sd.py:1270），Linux 无 swap 时直接 OOM kill、不会抛异常，"
+            f"（comfy/sd.py:1281），Linux 无 swap 时直接 OOM kill、不会抛异常，"
             f"所以 oom_retry 那类「抛了再救」救不到。建议：缩短段时长（峰值 ∝ 帧数）"
             f"或关闭二采，也可把 decode_ram_guard 设为 auto 让它在撞之前先收堆。")
     else:

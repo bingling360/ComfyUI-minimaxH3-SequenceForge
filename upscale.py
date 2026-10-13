@@ -3032,10 +3032,10 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
         except Exception:
             pass
     # 解码高清 latent -> 高清帧。注意：H3 视频 VAE 声明 handles_tiling=True
-    # （comfy/sd.py:1020），**它本来就内部分块解码**（256px 空间 tile + 17 帧时序块），
+    # （comfy/sd.py:1043-1044），**它本来就内部分块解码**（256px 空间 tile + 17 帧时序块），
     # 不存在「OOM 才降级到 tiled」这个动作——这里无需也不该做显存干预。
     # ★ 解码前的**内存**预算体检（2026-10-13）：高清解码同样逃不掉「整段像素缓冲
-    #   预分配到内存」（comfy/sd.py:1270）——且高清段还在 dec Arenas**之上**再叠一层，
+    #   预分配到内存」（comfy/sd.py:1281）——且高清段还在 dec Arenas**之上**再叠一层，
     #   所以它比基础解码更容易撞。够用则几乎零开销，只在预测真会撞时才收堆。
     try:
         perf.decode_ram_check(video_vae, up_v,

@@ -50,6 +50,12 @@ function mkDs(extra) {
                 },
                 async refvidSet(p) { calls.push(["set", p]); return { body: { ok: true, data: p.refvid } }; },
                 async refvidPlan(p) { calls.push(["plan", p]); return { body: { ok: true, rows: [] } }; },
+                async vpackGet() {
+                    return { body: { ok: true, data: { on: false, ratio: "2/5" },
+                                     ratios: ["0/5", "1/5", "2/5", "3/5"],
+                                     default_ratio: "2/5" } };
+                },
+                async vpackSet(p) { calls.push(["vpset", p]); return { body: { ok: true, data: p.vpack } }; },
             },
         });
         ok(!errors.length, "装载期无异常（" + errors.join(" | ") + "）");
@@ -71,6 +77,7 @@ function mkDs(extra) {
     /* ================= ② 弹窗结构 + 保存契约 ================= */
     {
         const calls = [];
+        const vpCalls = [];
         const node = mkNode(mkDs());
         const { w } = load({
             node,
@@ -90,6 +97,12 @@ function mkDs(extra) {
                 async refvidPlan(p) { return { body: { ok: true, rows: [
                     { label: "片头", ok: true,
                       report: ["参考视频「片头」1920×1080 @30fps 5.00s（150 帧） → 1344×768"] }] } }; },
+                async vpackGet() {
+                    return { body: { ok: true, data: { on: false, ratio: "2/5" },
+                                     ratios: ["0/5", "1/5", "2/5", "3/5"],
+                                     default_ratio: "2/5" } };
+                },
+                async vpackSet(draft) { vpCalls.push(draft); return { body: { ok: true, data: draft } }; },
             },
         });
         await w.openRefVideoSettings(node);
@@ -105,6 +118,21 @@ function mkDs(extra) {
             ok(!!rowOf(t), "弹窗有「" + t + "」行");
         }
         ok(rows.every((r) => r.querySelector(".h3d-perf-hint")), "每行都带说明（两行式，不被吞掉）");
+
+        /* 🗜 参考视频压缩（Spark-VPack）：入口在缩放面板里，但**存储分开**（vpack.json）——
+         * 档位表由后端下发（每 5 个 latent token 一块的分块口径只许有一份）。 */
+        const vpRow = rowOf("参考视频压缩");
+        ok(!!vpRow, "弹窗有「参考视频压缩（Spark-VPack）」行");
+        const vpSel = vpRow.querySelector("select");
+        ok(!!vpSel && vpSel.options.length === 4, "档位下拉是后端下发的 4 档，实际 "
+            + (vpSel ? vpSel.options.length : "无下拉"));
+        ok(!!vpSel && vpSel.value === "2/5", "档位默认 2/5（后端 default_ratio），实际 "
+            + (vpSel ? vpSel.value : "-"));
+        ok(!!vpRow.querySelector("input[type=checkbox]"), "有总开关（checkbox）");
+        ok(vpRow.textContent.indexOf("vpack.json") >= 0, "说明里点名存储位置 vpack.json（与 refvid 分开）");
+        ok(vpRow.textContent.indexOf("RoPE") >= 0,
+            "说明里讲清「抽剩帧的时间坐标会被还原」——不然用户会以为参考视频被缩短了");
+        ok(vpRow.textContent.indexOf("指纹") >= 0, "说明里讲清会进逐段指纹（改档位→引用视频的段重做）");
 
         /* 目标画布行：宽高比 + 百万像素 + 跟随链画布 + 即时换算显示 */
         const cv = rowOf("目标画布");
@@ -130,6 +158,8 @@ function mkDs(extra) {
         await new Promise((r) => setTimeout(r, 30));
         ok(calls.length === 1 && calls[0].audio === false,
             "点「保存并应用」才 POST，且带上 audio:false，实际：" + JSON.stringify(calls[0]));
+        ok(vpCalls.length === 1 && vpCalls[0].on === false,
+            "压缩设置同一次保存一并 POST（两个文件各写一份），实际：" + JSON.stringify(vpCalls[0]));
     }
 
     /* ================= ③ 音轨开关改变映射条编号 ================= */
@@ -170,6 +200,7 @@ function mkDs(extra) {
     /* ================= ④ 恢复默认 ================= */
     {
         const calls = [];
+        const vpCalls = [];
         const node = mkNode(mkDs());
         const { w } = load({
             node,
@@ -180,6 +211,10 @@ function mkDs(extra) {
                                                      grids: ["向下"], limits: ["不限"] } }; },
                 async refvidSet(draft) { calls.push(draft); return { body: { ok: true, data: draft } }; },
                 async refvidPlan() { return { body: { ok: true, rows: [] } }; },
+                async vpackGet() { return { body: { ok: true, data: { on: true, ratio: "3/5" },
+                                                    ratios: ["0/5", "1/5", "2/5", "3/5"],
+                                                    default_ratio: "2/5" } }; },
+                async vpackSet(draft) { vpCalls.push(draft); return { body: { ok: true, data: draft } }; },
             },
         });
         await w.openRefVideoSettings(node);
@@ -190,6 +225,8 @@ function mkDs(extra) {
         await new Promise((r) => setTimeout(r, 30));
         ok(calls.length >= 1 && JSON.stringify(calls[0]) === "{}",
             "恢复默认 = POST 空对象（后端以 DEFAULT_REFVID 起底），实际：" + JSON.stringify(calls[0]));
+        ok(vpCalls.length >= 1 && JSON.stringify(vpCalls[0]) === "{}",
+            "压缩设置也一并恢复默认（POST 空对象 → DEFAULT_VPACK），实际：" + JSON.stringify(vpCalls[0]));
     }
 
     console.log(bad ? `\n${bad} 项失败` : "\nALL OK");

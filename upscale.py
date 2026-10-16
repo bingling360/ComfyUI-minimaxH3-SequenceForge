@@ -38,6 +38,7 @@ from . import grid
 from . import perf
 from . import sigmas_adapter
 from . import vae_chunk
+from . import vpack
 
 MODES = ("跟随生成", "手动选择")
 PRECISIONS = ("fp32", "fp16", "bf16")
@@ -1484,12 +1485,17 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                   pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent,
                   cur_seed,
                   采样器, 调度器, report=None, _timing=None, seg_no=None,
-                  sigmas=None, bridge=None, _vram=None, _rss=None):
+                  sigmas=None, bridge=None, vpack_cfg=None, _vram=None, _rss=None):
     """基础段 AV latent -> 高清视频 latent（放大 + 低强度重采样）。
 
     bridge：语义桥配置（semantic_bridge.config 的返回值，由 render_segment 透传）。
     二采的 cond 是在**本函数里**重建的，所以语义桥也必须在这里过 —— 只在 render_segment
     收尾处调会造成「基础链带桥、高清链不带桥」的一采/二采语义漂移。
+
+    vpack_cfg：参考视频压缩配置（vpack.current 的返回值，由 render_segment 透传）。
+    与 bridge 同理且更硬：压缩改的是参考视频 latent 的**形状**（时间维抽帧），
+    一采二采不同源就不是「漂移」而是直接对不上。所以这里既要把同一档位再压一次，
+    也要给精化采样用的模型装同一份 RoPE 时间坐标修正补丁。
 
     sigmas：二采自定义 sigma 表（「二采自定义Sigmas」槽，少步蒸馏 LoRA 用，由
     render_segment 透传）。接了就用它**直接驱动精化采样**——与一采同一条路
@@ -1690,6 +1696,13 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 一采/二采语义漂移，正是本项目最忌的「一条数据两个真相」。
     if bridge is not None:
         cond = semantic_bridge.apply(cond, bridge)
+
+    # 参考视频压缩（Spark-VPack 内联）：与语义桥**同一位置、同一理由**，而且更硬 ——
+    # 它改的是参考视频 latent 的时间维长度（抽帧），一采压了二采不压就是两份不同
+    # 形状的条件，接缝与身份都会漂。未生效 / 本段无参考视频时原样返回。
+    # 模型侧的 RoPE 时间坐标还原在下面精化采样处装（见 _attempt 里的 vpack.install）。
+    if vpack_cfg is not None:
+        cond = vpack.apply(cond, vpack_cfg)
 
     # 桥锚 CondSync：上段尾帧桥/尾帧锚/首帧图头锚的 latent 同步神经放大后注入
     # 重采样 cond——锚住段首与上段高清尾的连续性（只依赖上段基础 latent + scale，
@@ -1952,6 +1965,10 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
                 if stg > 0.0:
                     # STG 挂在 shift 克隆之上（两次 clone 共享权重，近零成本）
                     ks_model = _stg_model(ks_model, ks_denoise, stg, stg_block)
+            # 参考视频压缩的 RoPE 时间坐标修正：装在上面所有克隆**之后**
+            # （clone 会 deepcopy model_options，先装虽也能被继承，但放最后语义最直白：
+            # 它是最外层的一层前向包装）。未生效 / 非原生 H3 时原样返回，零改动。
+            ks_model = vpack.install(ks_model, vpack_cfg)
 
             def _ksample():
                 # 采设备级显存峰值：这是「精化到底需要多少显存」的唯一硬数，
@@ -2932,7 +2949,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
                    first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
                    skip_f, vis_len,
                    wav, sample_rate, bh, report, 采样器, 调度器, model_tag=None,
-                   sigmas=None, bridge=None, _up_swap=False):
+                   sigmas=None, bridge=None, vpack_cfg=None, _up_swap=False):
     """基础段 AV latent -> 高清分段直接落盘（放大→重采样→解码→裁剪）。
 
     model_tag：二采模型结构签名（model_tag()），仅用于报告标注与写进
@@ -2942,6 +2959,11 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     bridge：语义桥配置（semantic_bridge.config 的返回值）。二采的 cond 是在
     render_latent 里重新编码出来的（高清画幅），所以必须**透传下去**在那里过桥；
     只在收尾处调会造成「基础链带桥、高清链不带桥」的一采/二采语义漂移。
+
+    vpack_cfg：参考视频压缩配置（vpack.current 的返回值）。理由与 bridge **完全
+    相同**：二采的 cond 是重建的，参考视频 latent 必须按同一档位再压一次，否则
+    「基础链压了、高清链没压」——同一个毛病。二采用的模型对象也要装同一份 RoPE
+    修正补丁（在 render_latent 里装，见那里的注释）。
 
     sigmas：二采自定义 sigma 表（「二采自定义Sigmas」槽，少步蒸馏 LoRA 用）。
     同样必须透传到 render_latent —— 它改的是精化采样本身，在收尾处接没有意义。
@@ -3008,7 +3030,7 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
             video_t, audio_t, kind, idx, seg_prompts, seg_label_orders,
             pool_tensors, refs, first_frame, guide, tail_kf_latent, head_kf_latent, cur_seed,
             采样器, 调度器, report=report, _timing=_timing, seg_no=g + 1,
-            sigmas=sigmas, bridge=bridge, _vram=_vram, _rss=_rss)
+            sigmas=sigmas, bridge=bridge, vpack_cfg=vpack_cfg, _vram=_vram, _rss=_rss)
     except BaseException:
         _dump_partial("二采渲染中断")
         raise

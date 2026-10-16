@@ -51,6 +51,7 @@ from . import guides
 from . import grid
 from . import perf
 from . import refvideo
+from . import vpack
 from . import vae_chunk
 from . import semantic_bridge
 from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
@@ -1432,6 +1433,31 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _rv_cfg = refvideo.current()
         _rv_audio = bool(_rv_cfg.get("audio", True))
         _rv_on = bool(_rv_cfg.get("on", False))
+        # ---- 参考视频压缩设置（**机器级、全局**，与 perf.json/refvid.json 同目录的
+        # vpack.json）----
+        # Spark-VPack 内联版：抽掉参考视频 latent 的一部分时间 token，再在模型侧
+        # 把抽剩帧的 RoPE 时间坐标还原（见 vpack.py 模块头）。
+        #   · on=False（出厂默认）= 完全透传，不进指纹；
+        #   · on=True 且档位非 0/5 = 抽帧 + 装 RoPE 修正补丁，并进逐段指纹
+        #     （改档位 → 引用视频的段重做，与 refvid 同口径）；
+        #   · 档位 0/5 = 不压缩，语义与关闭逐字节等价（vpack.enabled 统一判据）。
+        _vp_cfg = vpack.current()
+        _vp_on = vpack.enabled(_vp_cfg)
+        # 档位取一次（parse_state 归一化后的值）：报告行与存档指纹共用，
+        # 免得在段循环里反复查键 —— 那里查不到就是 KeyError，报错位置会很难看。
+        _vp_ratio = str(vpack.parse_state(_vp_cfg)["ratio"])
+        # 采样用模型对象（装了 VPack RoPE 时间坐标修正的 clone）。**惰性创建**：
+        # 必须在所有模型补丁（ff chunking / 低显存 attention / block prefetch，
+        # 见下方 install_* 段）都装完之后再 clone —— 那些补丁写的是原件的
+        # model_options，先 clone 就把它们丢了。首次调用发生在段循环里，
+        # 时机天然正确，且整个运行只 clone 一次。
+        _vp_model_box = [None]
+
+        def _vp_sample_model():
+            """一采/重摇的采样模型（未生效时就是原对象，零改动）。"""
+            if _vp_model_box[0] is None:
+                _vp_model_box[0] = vpack.install(模型, _vp_cfg)
+            return _vp_model_box[0]
         # 语义桥（ds.bridge）：逐项目的条件增强，与性能设置分开 —— 那个是机器相关、
         # 全局落盘；这个改的是画出来的东西，必须跟着作品走。
         _bridge_cfg = semantic_bridge.config(ds)
@@ -2921,6 +2947,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 "alpha": _bridge_cfg["alpha"],
                 "scope": _bridge_cfg["scope"],
             }
+        # 参考视频压缩（Spark-VPack 内联）进指纹：**只在生效时加键**（与 bridge/sigmas
+        # 同一条铁律）。它改的是进模型的参考 latent 与 RoPE 时间坐标 —— 不进指纹就会
+        # 出现「同一条链上两种压缩口径的段」。真正驱动重做的是逐段哈希里的 vp: 键，
+        # 这里让整链参数快照与报告能追溯「这条链当时压了多少」。
+        if _vp_on:
+            ckpt_params["vpack"] = {"ratio": _vp_ratio}
         # 衔接诊断参数（下阶段基建：重摇/锚定）只记录不进指纹（改值不触发重跑；报告回看用）
         seam_refine = {"reroll": 接缝重摇, "reroll_th": float(重摇阈值),
                        "reroll_max": int(重摇上限), "anchor_aug": aug}
@@ -2975,6 +3007,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     tag = f"rv:{refvideo.signature(_rv_cfg)}|{tag}"
                 if not _rv_audio:
                     tag = f"rva:0|{tag}"
+                # 参考视频压缩（Spark-VPack 内联）：同样**只对引用了视频的段**加键，
+                # 且只在真正生效（开 且 非 0/5）时加 —— 出厂默认下哈希逐字节不变。
+                # 它改的是进模型的参考 latent 与 RoPE 时间坐标，不进指纹就会出现
+                # 「同一条链上两种压缩口径的段」。
+                _vp_sig = vpack.signature(_vp_cfg)
+                if _vp_sig is not None:
+                    tag = f"vp:{_vp_sig}|{tag}"
             seg_hashes.append(checkpoint.prompt_hash(tag))
 
         exec_hashes = list(seg_hashes)   # 执行序列 = 提示词段按序，没有插入槽要单独指纹
@@ -3340,6 +3379,26 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(_line)
         if _rv_on and not _rv_report:
             report.append("参考视频缩放已开启，但本次没有任何视频素材被引用（无事可做）")
+        # 参考视频压缩（Spark-VPack 内联）报告：只在**真正生效**时出声（关 / 0/5 都不吭声）
+        _vp_line = vpack.report_line(_vp_cfg)
+        if _vp_line:
+            report.append(_vp_line)
+            if not any(_k == "video" for _order in seg_label_orders for _k, _ in _order):
+                report.append("⚠ 参考视频压缩已开启，但本次没有任何视频素材被引用（无事可做）")
+            else:
+                # 护栏：非原生 H3 时 vpack.install 会**原样返回**（不抛），于是
+                # 「压了 token 却没修 RoPE」会静默发生 —— 本仓最忌的就是静默变换，
+                # 所以在这里点名。一采与二采分别查（二采模型是独立槽位）。
+                _vp_targets = [("模型", 模型)]
+                if _up_model is not 模型:
+                    _vp_targets.append(("二采模型", _up_model))
+                _vp_bad = [nm for nm, m in _vp_targets
+                           if m is not None and not vpack.patchable(m, _vp_cfg)]
+                if _vp_bad:
+                    report.append(
+                        f"⚠ 参考视频压缩已开启，但 {'/'.join(_vp_bad)} 不是原生 MiniMax H3 —— "
+                        "RoPE 时间坐标无法还原，压缩后的参考视频时间轴会错位。"
+                        "请改用原生 H3 UNET，或关掉「参考视频压缩」。")
 
         def _ref_pool_view():
             """参考通路用的素材视图：视频取**归一后**的，图/音取原始池。
@@ -3727,7 +3786,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         skip_f, vis_len,
                         wav, rate, bh, report, 采样器, 调度器, model_tag=_up_tag,
                         sigmas=二采自定义Sigmas,
-                        bridge=_bridge_cfg, _up_swap=_up_swap)
+                        bridge=_bridge_cfg, vpack_cfg=_vp_cfg, _up_swap=_up_swap)
                 if not _reload_logged[0]:
                     _reload_logged[0] = True
                     # ⚠ 窗口包住的是整个 render_segment，n 里混着 TE（建高清 cond）
@@ -4245,6 +4304,21 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 _seg_t["cond"] += time.perf_counter() - _t
 
                 cond, latent = out[0], out[1]
+                # 参考视频压缩（Spark-VPack 内联版）：抽掉本段参考视频 latent 的一部分
+                # 时间 token，并把「抽剩帧的原下标」写进 ref 元数据（模型侧的 RoPE 还原
+                # 靠它，见 vpack.install）。只动 cond[i][1]["minimax_refs"][k]["latent"]，
+                # 与下面的语义桥（改 cond[i][0] 文本张量）、锚定（写 minimax_keyframes）
+                # **三者正交**，先后结果逐字节相同 —— 放这里只是离 cond 诞生点最近。
+                # 本段没有参考视频时静默原样返回（vpack.apply 的刻意分歧，见模块头）。
+                _vp_info = {}
+                cond = vpack.apply(cond, _vp_cfg, _vp_info)
+                if _vp_info:
+                    report.append(
+                        f"段{g + 1} 参考视频压缩（{_vp_ratio}）："
+                        f"{_vp_info['videos']} 个视频 {_vp_info['before']} → "
+                        f"{_vp_info['after']} latent token"
+                        f"（压掉 {_vp_info['before'] - _vp_info['after']}，"
+                        "RoPE 时间坐标已还原）")
                 # 语义桥（FourBunny BUNNY H3 Conditioning Bridge 内联版）：只改 cond 的
                 # 文本张量、不碰元数据 —— 与下面「锚定来源」那段注入正交，所以放在注入
                 # 之前还是之后结果逐字节相同（放这里只是读起来离 cond 诞生点最近）。
@@ -4368,9 +4442,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             模型.model.diffusion_model, aug_start, 0.0, fade_ratio)
                     def _sample_once():
                         # 初始 latent 是官方空 latent（段首内容由引导桥 cond 承载），
-                        # 与旧版逐字节一致
+                        # 与旧版逐字节一致。
+                        # 模型取 `_vp_sample_model()`：未开 VPack 时它就是 `模型` 本身
+                        # （逐字节同旧），开了则多一层 RoPE 修正 wrapper。
                         return _sigmas_adapter.ksampler_with_sigmas(
-                            模型, cur_seed, 步数, CFG,
+                            _vp_sample_model(), cur_seed, 步数, CFG,
                             采样器, 调度器, cond, negative, _sampling_latent,
                             sigmas=一采自定义Sigmas, denoise=1.0)[0]
 

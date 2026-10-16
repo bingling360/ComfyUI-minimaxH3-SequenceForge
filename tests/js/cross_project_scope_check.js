@@ -154,6 +154,13 @@ function ok(cond, msg) {
          * —— 所以按界面态登记，不做 dir 分桶。 */
         _refvidCache: { scope: "ui" },
         _refvidLoading: { scope: "ui" },
+        /* 🗜 参考视频压缩（2026-10-16）：同样是**机器级全局**设置（vpack.json），
+         * 面板入口挂在「🎬 参考视频缩放」里但存储分开 —— 与 _refvid* 同一口径。 */
+        _vpackCache: { scope: "ui" },
+        _vpackMeta: { scope: "ui" },
+        _vpackLoading: { scope: "ui" },
+        /* 一次性标记（自动补拉只做一次）：见 h3_director.js 里的注释。 */
+        _vpackTried: { scope: "ui" },
     };
 
     const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");

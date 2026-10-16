@@ -230,6 +230,12 @@
     refvidSet: (refvid) => _json("POST", "/h3chain/refvid", { refvid: refvid || {} }),
     /* 试算（只读）：素材 -> 探针 + 归一方案报告，跑之前就能看到「会变成什么」 */
     refvidPlan: (payload) => _json("POST", "/h3chain/refvid_plan", payload || {}),
+    /* ---- 参考视频压缩（Spark-VPack 内联版；全局，跨项目；与 refvid 分开存）----
+     * 真源在后端 vpack.py：DEFAULT_VPACK / parse_state / COMPRESSION_PROFILES。
+     * 档位表由 GET 下发（每 5 个 latent token 一块的抽帧口径只有一份），
+     * 前端不自己算「压完还剩多少 token」。 */
+    vpackGet: () => _call("/h3chain/vpack"),
+    vpackSet: (vpack) => _json("POST", "/h3chain/vpack", { vpack: vpack || {} }),
     /* 启动命令速查（📖 启动命令弹窗）。数据源在后端 launch_ref.py（单一真源），
      * 与 docs/ComfyUI启动命令速查.txt 同源。 */
     launchRef: () => _call("/h3chain/launch_ref"),

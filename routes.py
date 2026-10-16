@@ -43,6 +43,11 @@ try:
 except ImportError:
     import refvideo
 
+try:
+    from . import vpack
+except ImportError:
+    import vpack
+
 _registered = False
 _mounted = []  # [(目标对象, {(method, path)})]：按对象身份防重复挂载（持引用防 id 复用）
 
@@ -100,6 +105,8 @@ ROUTES = [
     ("GET", "/h3chain/refvid"),
     ("POST", "/h3chain/refvid"),
     ("POST", "/h3chain/refvid_plan"),
+    ("GET", "/h3chain/vpack"),
+    ("POST", "/h3chain/vpack"),
     ("GET", "/h3chain/launch_ref"),
     ("GET", "/h3chain/launch_ref.txt"),
     ("GET", "/h3chain/lib_list"),
@@ -2043,6 +2050,41 @@ def add_routes(routes):
             return _err("无法写入参考视频设置（用户目录不可用）", code="NO_DIR", status=500)
         return web.json_response({"ok": True, "data": table})
 
+    async def vpack_get(request):
+        """参考视频压缩设置（全局机器级）：面板的唯一数据来源。
+
+        与 `/h3chain/refvid` 同构：设置真源在后端 `vpack.py`
+        （DEFAULT_VPACK / parse_state），档位表也从后端下发 ——
+        「每 5 个 latent token 一块」的分块口径与档位映射只有一份（vpack.py），
+        前端不自己算。
+        """
+        table = vpack.load_settings()
+        return web.json_response({
+            "ok": True, "data": table,
+            "ratios": list(vpack.RATIOS),
+            "default_ratio": vpack.DEFAULT_RATIO,
+            "path": vpack.settings_path(),
+        })
+
+    async def vpack_set(request):
+        """参考视频压缩设置：写全局设置并立即生效（渲染期读的就是这个文件）。
+
+        写回时把「当前档位实际保留多少 token」一并回给前端 —— 面板上那行
+        「抽帧后参考序列长度」就是它，免得前端复刻一遍分块数学。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        raw = (data or {}).get("vpack")
+        if not isinstance(raw, dict):
+            return _err("缺少 vpack 对象", code="BAD_REQUEST", status=400)
+        table = vpack.save_settings(raw)
+        if table is None:
+            return _err("无法写入参考视频压缩设置（用户目录不可用）", code="NO_DIR", status=500)
+        return web.json_response({"ok": True, "data": table,
+                                  "effective": vpack.enabled(table)})
+
     async def refvid_plan(request):
         """参考视频**试算**（只读、不解码、不落盘）：素材 -> 探针 + 归一方案。
 
@@ -3115,6 +3157,8 @@ def add_routes(routes):
         ("GET", "/h3chain/refvid", refvid_get),
         ("POST", "/h3chain/refvid", refvid_set),
         ("POST", "/h3chain/refvid_plan", refvid_plan),
+        ("GET", "/h3chain/vpack", vpack_get),
+        ("POST", "/h3chain/vpack", vpack_set),
         ("GET", "/h3chain/launch_ref", launch_ref_get),
         ("GET", "/h3chain/launch_ref.txt", launch_ref_txt),
         ("GET", "/h3chain/lib_list", lib_list),

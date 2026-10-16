@@ -2389,6 +2389,63 @@ function refvidSummary() {
         + (c.audio ? " · 参考音轨" : " · 不参考音轨");
 }
 
+/* ---- 🗜 参考视频压缩（Spark-VPack 内联版；**全局机器级**，与 refvid 并列、分开存 vpack.json）----
+ *
+ * 真源在后端 vpack.py：DEFAULT_VPACK / parse_state / COMPRESSION_PROFILES / enabled。
+ * 前端只做两件事：① 渲染开关 + 档位（档位表由 GET /h3chain/vpack 下发 ——
+ * 「每 5 个 latent token 一块抽帧」的分块口径只许有一份）② 入口按钮的摘要小字。
+ *
+ * ⚠ 面板入口在「🎬 参考视频缩放」里（用户指定），但**存储分开**（vpack.json）：
+ * 那是「素材怎么处理」、这是「参考视频压多少」，混一个文件里重置一个会顺手清掉另一个
+ * （与 refvideo.py 自己的判断一致）。
+ *
+ * ⚠ 为什么不像上游 Spark-VPack 那样做成画布节点：本节点是「cond 构建 + 采样」的合体，
+ * 画布上既没有 CONDITIONING 端口、也没有 BasicGuider 节点，而 cond_i 依赖
+ * latent_{i-1} —— 上游那套「positive 往返接线」在这里无处可接，硬接还会成环
+ * （comfy_execution 直接抛 DependencyCycleError）。详见 vpack.py 模块头。
+ */
+function defaultVpack() {
+    /* 出厂默认 = **关闭**（完全透传，不进指纹）。档位默认跟后端一致；
+       注意「0/5」与关闭逐字节等价（后端 vpack.enabled 是唯一判据）。 */
+    return { on: false, ratio: "2/5" };
+}
+
+let _vpackCache = null;     // 后端 /h3chain/vpack 的 data（null = 还没取到）
+let _vpackMeta = null;      // 同一次 GET 的只读辅助（档位表等）
+let _vpackLoading = null;
+/* ⚠ 自动补拉**只做一次**（区别于 _refvid* 那两行）：
+ * `scheduleRefresh` 是 clearTimeout + setTimeout，不会自己停 —— 若接口取不到，
+ * `_vpackCache` 永远为 null，"本来就没值就刷一次" 的条件会**每次渲染都成立**，
+ * 于是 refresh → render → load → refresh 以 80ms 自转（接口 404 / 前端缓存旧版本时
+ * 就会踩到）。用一次性标记断开这个环；取到值之后面板与保存路径会各自刷新。 */
+let _vpackTried = false;
+
+function vpackCfg() { return _vpackCache || defaultVpack(); }
+
+/** 生效判据（与后端 vpack.enabled 同口径）：开 **且** 档位不是 0/5。 */
+function vpackOn() {
+    const c = _vpackCache;
+    return !!(c && c.on === true && String(c.ratio) !== "0/5");
+}
+
+function loadVpack() {
+    if (_vpackLoading) return _vpackLoading;
+    const A = window.H3Api;
+    if (!A || !A.vpackGet) return Promise.resolve(null);
+    _vpackLoading = A.vpackGet().then((r) => {
+        const b = r && r.body;
+        if (b && b.ok) { _vpackCache = b.data || null; _vpackMeta = b; }
+        return _vpackCache;
+    }).catch(() => null).then((v) => { _vpackLoading = null; return v; });
+    return _vpackLoading;
+}
+
+/** 入口按钮上那行小字（未生效返回空串 —— 不占位、不误导）。 */
+function vpackSummary() {
+    if (!vpackOn()) return "";
+    return `VPack 压参考视频 ${vpackCfg().ratio}`;
+}
+
 function defaultSegment() {
     // 双按钮（null=跟随全局默认开）：auto_ref=false≈旧unlink，auto_seq=false≈旧disabled；
     // latent_ref（null=跟随全局尾部N帧注入），latent_save（null=默认全存）。
@@ -5322,7 +5379,9 @@ async function openRefVideoSettings(node) {
         "上传的视频素材在执行生成前自动<b>缩放</b>到目标画布、<b>重定时到 24fps</b>、"
         + "对齐 H3 的 <b>17k+5 帧网格</b>，音轨与画面同一时间窗（也可不参考音轨）。"
         + "<b>机器级设置、全局生效、跨项目共用</b>，存 &lt;user&gt;/minimax_h3/refvid.json。"
-        + "只作用于「参考视频引用」，锚 / 序章 / 参考图不受影响。"));
+        + "只作用于「参考视频引用」，锚 / 序章 / 参考图不受影响。"
+        + "面板末尾还有 <b>🗜 参考视频压缩（Spark-VPack）</b>：抽掉参考视频 latent 的"
+        + "一部分时间 token 换更短的序列（更快更省显存），存 <b>vpack.json</b>，与缩放设置分开。"));
     const body = el("div", "h3d-perf-body");
     const foot = el("div", "h3d-perf-foot");
     dialog.append(body, foot);
@@ -5343,6 +5402,7 @@ async function openRefVideoSettings(node) {
 
     body.append(el("div", "h3d-perf-hint", "读取中…"));
     let meta = null;
+    let vmeta = null;
     try {
         const r = await A.refvidGet();
         const b = r && r.body;
@@ -5354,8 +5414,16 @@ async function openRefVideoSettings(node) {
             "读取失败：" + ((e && e.message) || e) + " —— 保存按钮已禁用（读不到就别写）"));
         return;
     }
+    /* 压缩设置**单独取**：它挂了不该把整个缩放面板带塌（反过来也一样）。
+       取不到就把那一块标成不可用，其余控件照常。 */
+    try {
+        const r2 = await A.vpackGet();
+        const b2 = r2 && r2.body;
+        if (b2 && b2.ok) { vmeta = b2; _vpackCache = b2.data || null; }
+    } catch (e) { vmeta = null; }
 
     const draft = Object.assign(defaultRefvid(), meta.data || {});
+    const vdraft = Object.assign(defaultVpack(), (vmeta && vmeta.data) || {});
     body.replaceChildren();
 
     const mkRow = (label, ctl, hint) => {
@@ -5495,7 +5563,53 @@ async function openRefVideoSettings(node) {
         + "取消 = **音轨不注入也不占号**，等价于「视频参考只接图像接口」——"
         + "注意它会改变正文里独立音频的 `<Audio j>` 编号，映射条会跟着变（后端三处同规则）。");
 
-    /* ⑩ 试算 */
+    /* ⑩ 参考视频压缩（Spark-VPack 内联版）
+     *
+     * 入口在这里（用户指定），但**存储分开**：vpack.json，与 refvid.json 同级。
+     * 档位值由后端下发（「每 5 个 latent token 一块抽帧」的分块口径只许有一份），
+     * 前端只解释「N/5 是什么意思」——与 refvideo 面板里其它 hint 同一个写法。 */
+    const vpRow = el("div", "h3d-perf-row");
+    const vpTop = el("div", "h3d-perf-top");
+    const vpOnC = document.createElement("input");
+    vpOnC.type = "checkbox";
+    vpOnC.checked = !!vdraft.on;
+    vpOnC.onchange = () => { vdraft.on = vpOnC.checked; };
+    const vpSel = document.createElement("select");
+    const vpRatios = (vmeta && vmeta.ratios) || ["0/5", "1/5", "2/5", "3/5"];
+    const vpDefault = String((vmeta && vmeta.default_ratio) || "2/5");
+    for (const r of vpRatios) {
+        const op = document.createElement("option");
+        op.value = String(r);
+        op.textContent = String(r) + (String(r) === vpDefault ? "（推荐）" : "");
+        vpSel.append(op);
+    }
+    if (!vpRatios.map(String).includes(String(vdraft.ratio))) vdraft.ratio = String(vpRatios[0]);
+    vpSel.value = String(vdraft.ratio);
+    vpSel.onchange = () => { vdraft.ratio = vpSel.value; };
+    vpTop.append(el("label", "", "参考视频压缩（Spark-VPack）"), vpOnC, vpSel);
+    vpRow.append(vpTop);
+    vpRow.append(el("div", "h3d-perf-hint",
+        "把参考视频的 latent 按<b>每 5 个 token 一块</b>抽帧（一块正好 = 17 个像素帧 = H3 "
+        + "17k+5 网格的一格），档位 <b>N/5 = 压掉 N/5</b>：<b>2/5</b> 压 40%（上游推荐默认）、"
+        + "3/5 压 60%（更省但参考信息更少）。实际比例随视频长度略有变化。"));
+    vpRow.append(el("div", "h3d-perf-hint",
+        "压完不是「把参考视频变短」—— 模型侧会把抽剩帧的 <b>RoPE 时间坐标还原成原始时间</b>，"
+        + "所以参考的动作节奏与时长不变，只是参与注意力的 token 更少（序列更短 → 更快、更省显存）。"
+        + "只作用于「参考视频引用」，锚 / 序章 / 参考图不受影响；一采二采吃同一档。"));
+    vpRow.append(el("div", "h3d-perf-hint",
+        "出厂<b>关闭</b>（完全透传，与今天的行为逐字节一致）；档位选 <b>0/5</b> 也等价于关闭。"
+        + "开启后进<b>逐段指纹</b>：改档位会让引用了视频的段重做（不会出现同一条链两种压缩口径的段）。"
+        + "存 &lt;user&gt;/minimax_h3/vpack.json，与缩放设置<b>分开存</b>。"));
+    body.append(vpRow);
+    if (!vmeta) {
+        vpOnC.disabled = true;
+        vpSel.disabled = true;
+        vpRow.append(el("div", "h3d-perf-hint h3d-lref-warn",
+            "⚠ 压缩设置接口不可用（后端 vpack.py 未加载或插件版本过旧）——"
+            + "这一块本次不可改，其余设置照常可保存。"));
+    }
+
+    /* ⑪ 试算 */
     const tryRow = el("div", "h3d-perf-row");
     const tryTop = el("div", "h3d-perf-top");
     const tryBtn = el("button", "h3d-btn h3d-btn-cyan", "🔎 试算（只探测，不解码）");
@@ -5551,8 +5665,14 @@ async function openRefVideoSettings(node) {
         saveBtn.disabled = true;
         saveBtn.textContent = "保存中…";
         try {
+            /* 两份设置落两个文件（vpack.json / refvid.json），**必须都成功** ——
+               否则会留下「压缩改了、缩放没改」的半套状态，而用户以为保存好了。 */
+            if (!A.vpackSet) throw new Error("前端接口过旧（缺 vpackSet）——请强制刷新页面");
+            const b2 = (await A.vpackSet(vdraft)).body;
+            if (!b2 || !b2.ok) throw new Error("参考视频压缩设置未被接受（详见 ComfyUI 控制台）");
+            _vpackCache = b2.data || null;
             const b = (await A.refvidSet(draft)).body;
-            if (!b || !b.ok) throw new Error("后端未接受（详见 ComfyUI 控制台）");
+            if (!b || !b.ok) throw new Error("参考视频缩放设置未被接受（详见 ComfyUI 控制台）");
             _refvidCache = b.data || null;
             status.textContent = "已保存并生效（下一次渲染生效）";
             close();
@@ -5564,12 +5684,17 @@ async function openRefVideoSettings(node) {
         }
     };
     resetBtn.onclick = async () => {
-        if (!window.confirm("把参考视频缩放恢复为默认？\n\n"
-            + "默认 = 总开关关闭（完全透传，与官方行为一致），设置写回 refvid.json。")) return;
+        if (!window.confirm("把「参考视频缩放」与「参考视频压缩」都恢复为默认？\n\n"
+            + "缩放默认 = 总开关关闭（完全透传，与官方行为一致）；压缩默认 = 关闭。\n"
+            + "分别写回 refvid.json 与 vpack.json。")) return;
         resetBtn.disabled = true;
         try {
+            if (!A.vpackSet) throw new Error("前端接口过旧（缺 vpackSet）——请强制刷新页面");
+            const b2 = (await A.vpackSet({})).body;
+            if (!b2 || !b2.ok) throw new Error("后端未接受（压缩设置）");
+            _vpackCache = b2.data || null;
             const b = (await A.refvidSet({})).body;
-            if (!b || !b.ok) throw new Error("后端未接受");
+            if (!b || !b.ok) throw new Error("后端未接受（缩放设置）");
             _refvidCache = b.data || null;
             close();
             openRefVideoSettings(node);
@@ -8555,18 +8680,29 @@ function renderV2Section(sec, data) {
 
         /* 🎬 参考视频缩放：**紧挨素材库下方**（用户指定的位置）。
          * 它管的是"素材进模型前怎么处理"，与素材库是同一件事的两半：
-         * 库管"有哪些素材"，这里管"素材被怎么喂给模型"。 */
+         * 库管"有哪些素材"，这里管"素材被怎么喂给模型"。
+         * 🗜 参考视频压缩（Spark-VPack）的入口也挂在这里（用户指定），
+         * 但设置**分开存** vpack.json —— 所以摘要是两段拼起来的。 */
+        const rvSum = [refvidSummary(), vpackSummary()].filter(Boolean).join(" · ");
         const rv = el("button", "h3d-hubbtn",
-            "🎬 参考视频缩放" + `<small>${escapeHtml(refvidSummary())}</small>`);
+            "🎬 参考视频缩放" + `<small>${escapeHtml(rvSum)}</small>`);
         rv.type = "button";
         rv.title = "上传的视频素材在执行生成前自动缩放 / 重定时到 24fps / 对齐 H3 的 17k+5 帧网格"
-            + "（可关音轨参考）。设置为**机器级全局**，跨项目共用；点开可先试算。";
+            + "（可关音轨参考），并可对参考视频 latent 做 Spark-VPack 抽帧压缩。"
+            + "设置为**机器级全局**，跨项目共用；点开可先试算。";
         rv.onclick = () => openRefVideoSettings(data?.node);
         sec.append(rv);
         if (_refvidCache === null) {
             /* 设置还没取到：取完刷一次让按钮上的摘要变准。只在"本来就没值"时刷一次，
              * 否则每次渲染都触发刷新 = 死循环。 */
             loadRefvid().then(() => scheduleRefresh(80)).catch(() => {});
+        }
+        if (!_vpackTried) {
+            /* 同上，压缩设置单独取（两个接口互不阻塞：一个挂了另一个照常）。
+             * ⚠ 只拉一次 —— 见 _vpackTried 的注释：接口取不到时这会变成自转的
+             * refresh 循环。取到值后这里自然不再触发。 */
+            _vpackTried = true;
+            loadVpack().then(() => scheduleRefresh(80)).catch(() => {});
         }
 
         sec.append(el("div", "h3d-foot",

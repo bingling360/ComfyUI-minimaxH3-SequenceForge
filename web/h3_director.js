@@ -275,6 +275,20 @@ function segmentFrames(node, seg) {
     return snapFrames(segmentSeconds(node, seg));
 }
 
+/** 本链最长一段的帧数（参考视频「时长上限=最长段」与试算提示用）。
+ *
+ *  为什么取 max 而不是当前段：素材长于**任何**一段都会被官方截掉，
+ *  按最长段裁既不损失信息（每段都够用），又省掉多余的 VAE 开销。
+ *  与 segmentFrames 同源（snapFrames），不另立公式。 */
+function maxSegmentFrames(node) {
+    const ds = getDs(node);
+    let m = 0;
+    for (const seg of (ds.segments || [])) {
+        m = Math.max(m, segmentFrames(node, seg));
+    }
+    return m || segmentFrames(node, {});
+}
+
 /** 宽高比+百万像素 -> 显示徽章文案；无法判断返回 null。
  *
  *  「自定义」画幅已删（2026-09-27）：画布唯一来源 = 宽高比 × 百万像素，
@@ -1327,10 +1341,15 @@ function buildRefBar(RB) {
                  * ref_video_audio_N 插一条 <Audio j>（排在 <Video k> 之前），而节点
                  * 对每个参考视频都塞了音轨槽 → 不预扣会让同段独立音频整体错位
                  * （1 个视频偏 1、2 个偏 2），正文里的 <Audio j> 会指向视频音轨。
-                 * 与后端 nodes._kind_tokens / asset_store.compile_refs 三处同规则。 */
-                for (const l of uniq) {
-                    const hit = hitOf(l);
-                    if (hit && (hit.kind || "image") === "video") ord.audio += 1;
+                 * 与后端 nodes._kind_tokens / asset_store.compile_refs 三处同规则。
+                 * ⚠ 参考视频设置里「参考视频音频」关掉时不预扣（音轨不注入、
+                 * 也就不占号）—— 这一项在弹窗里改完必须让本面板重绘一次，
+                 * 否则显示的编号会与实跑差 1。 */
+                if (refvidAudioOn()) {
+                    for (const l of uniq) {
+                        const hit = hitOf(l);
+                        if (hit && (hit.kind || "image") === "video") ord.audio += 1;
+                    }
                 }
                 for (const l of uniq) {
                     const hit = hitOf(l);
@@ -2314,6 +2333,60 @@ function defaultUpscale() {
                 不进二采指纹 —— 拨开关不会让既有高清段重做。 */
              keep_base_seg: false,
              include: [] };
+}
+
+/* ---- 🎬 参考视频缩放（**全局机器级**，与 ⚡ 性能优化并列、分开存 refvid.json）----
+ *
+ * 真源在后端 refvideo.py：DEFAULT_REFVID / parse_state / plan。前端只做三件事：
+ *   ① 渲染控件（档位表由 GET /h3chain/refvid 下发 —— 「宽高比 × 百万像素」的
+ *      档位表只许有一份，与链画布同一个 resolve_canvas，免得两边各算一遍算错）
+ *   ② 「跟随链画布」快捷按钮：一键把当前链的 宽高比/百万像素 填进来
+ *   ③ 「试算」：把池子里的视频素材发给后端算一遍，把「原始 fps/尺寸/时长 →
+ *      处理后的帧数/尺寸/时长」摆出来 —— 跑之前就能看到会变成什么
+ *
+ * ⚠ 「参考视频音频」这一项**不只影响本面板**：关掉后视频音轨不占 <Audio j> 号，
+ * 映射条（paintAll）显示的编号必须跟着变。后端 nodes._kind_tokens /
+ * asset_store.compile_refs / 前端 paintAll 三处同规则，改一处必须改三处。
+ */
+function defaultRefvid() {
+    /* 出厂默认 = **完全透传**（on:false）= 今天的官方行为，一个字节不变。
+       开起来后的默认口径 16:9 @ 0.98MP = 1344×768，恰好等于官方参考画布
+       （短边 768 / 面积上限 768×1344），也就是"把官方隐式行为显式化"。 */
+    return { on: false, ar: "16:9", mp: 0.98, no_upscale: true, fit: "裁切填满",
+             resample: "lanczos", fps_norm: true, grid: "向下",
+             limit: "最长段", limit_s: 0.0, audio: true };
+}
+
+let _refvidCache = null;    // 后端 /h3chain/refvid 的 data（null = 还没取到）
+let _refvidLoading = null;
+
+function refvidCfg() { return _refvidCache || defaultRefvid(); }
+
+/** 参考视频音频开关（映射条编号用）：取不到设置时按 true（= 今天的行为）。 */
+function refvidAudioOn() {
+    const c = _refvidCache;
+    return !(c && c.audio === false);
+}
+
+function loadRefvid() {
+    if (_refvidLoading) return _refvidLoading;
+    const A = window.H3Api;
+    if (!A || !A.refvidGet) return Promise.resolve(null);
+    _refvidLoading = A.refvidGet().then((r) => {
+        const b = r && r.body;
+        if (b && b.ok) _refvidCache = b.data || null;
+        return _refvidCache;
+    }).catch(() => null).then((v) => { _refvidLoading = null; return v; });
+    return _refvidLoading;
+}
+
+/** 入口按钮上那行小字：一眼看出开没开、口径是什么。 */
+function refvidSummary() {
+    const c = refvidCfg();
+    if (!c.on) return "关闭 · 透传（与官方行为一致）";
+    return `${c.ar} @ ${Number(c.mp).toFixed(2)}MP · ${c.fit} · ${c.resample}`
+        + (c.fps_norm ? " · 24fps 归一" : " · 不做帧率归一")
+        + (c.audio ? " · 参考音轨" : " · 不参考音轨");
 }
 
 function defaultSegment() {
@@ -5227,6 +5300,287 @@ async function openPerfSettings() {
     };
 }
 
+/* 🎬 参考视频缩放弹窗（入口在左栏「🗂 打开素材库」正下方）。
+ *
+ * 与 ⚡ 性能优化同一个壳（.h3d-opt-overlay / .h3d-perf-dialog / .h3d-perf-row
+ * 两行式：第一行 label+控件，第二行说明全文换行）—— 右栏那种窄折叠装不下
+ * 「控件 + 一句解释」，塞进去等于把说明吞掉。
+ *
+ * 保存语义与性能优化一致：改动先进 draft，点「保存并应用」一次性 POST
+ * （读不到配置时保存按钮直接禁用 —— 列一排勾选却存不下去比直说读不到更糟）。
+ *
+ * 「试算」是这块面板的价值所在：跑之前就能看到「我上传的素材会被变成什么」。
+ * 它只做 probe + plan（不解码、不落盘），所以点起来是毫秒级。 */
+async function openRefVideoSettings(node) {
+    if (document.querySelector(".h3d-refvid-overlay")) return;
+    const A = window.H3Api;
+    const overlay = el("div", "h3d-opt-overlay h3d-perf-overlay h3d-refvid-overlay");
+    const dialog = el("div", "h3d-opt-dialog h3d-perf-dialog");
+    overlay.append(dialog);
+    dialog.append(el("div", "h3d-opt-title", "🎬 参考视频缩放 · 素材归一"));
+    dialog.append(el("div", "h3d-opt-sub",
+        "上传的视频素材在执行生成前自动<b>缩放</b>到目标画布、<b>重定时到 24fps</b>、"
+        + "对齐 H3 的 <b>17k+5 帧网格</b>，音轨与画面同一时间窗（也可不参考音轨）。"
+        + "<b>机器级设置、全局生效、跨项目共用</b>，存 &lt;user&gt;/minimax_h3/refvid.json。"
+        + "只作用于「参考视频引用」，锚 / 序章 / 参考图不受影响。"));
+    const body = el("div", "h3d-perf-body");
+    const foot = el("div", "h3d-perf-foot");
+    dialog.append(body, foot);
+    const status = el("div", "h3d-perf-status", "");
+    const actions = el("div", "h3d-opt-actions");
+    const closeBtn = el("button", "h3d-btn", "关闭");
+    const resetBtn = el("button", "h3d-btn", "恢复默认");
+    resetBtn.title = "全部恢复为出厂默认（关闭总开关 = 完全透传，即官方行为），写回 refvid.json";
+    const saveBtn = el("button", "h3d-btn h3d-opt-save", "保存并应用");
+    saveBtn.disabled = true;
+    actions.append(closeBtn, resetBtn, saveBtn);
+    foot.append(status, actions);
+    const close = () => overlay.remove();
+    closeBtn.onclick = close;
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) close(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+    document.body.append(overlay);
+
+    body.append(el("div", "h3d-perf-hint", "读取中…"));
+    let meta = null;
+    try {
+        const r = await A.refvidGet();
+        const b = r && r.body;
+        if (!b || !b.ok) throw new Error("接口不可用（请更新插件）");
+        meta = b;
+        _refvidCache = b.data || null;
+    } catch (e) {
+        body.replaceChildren(el("div", "h3d-perf-hint",
+            "读取失败：" + ((e && e.message) || e) + " —— 保存按钮已禁用（读不到就别写）"));
+        return;
+    }
+
+    const draft = Object.assign(defaultRefvid(), meta.data || {});
+    body.replaceChildren();
+
+    const mkRow = (label, ctl, hint) => {
+        const row = el("div", "h3d-perf-row");
+        const top = el("div", "h3d-perf-top");
+        top.append(el("label", "", label), ctl);
+        row.append(top);
+        if (hint) row.append(el("div", "h3d-perf-hint", hint));
+        body.append(row);
+        return row;
+    };
+    const mkCheck = (key, onChange) => {
+        const c = document.createElement("input");
+        c.type = "checkbox";
+        c.checked = !!draft[key];
+        c.onchange = () => { draft[key] = c.checked; if (onChange) onChange(c.checked); };
+        return c;
+    };
+    const mkSelect = (key, options, coerce) => {
+        const s = document.createElement("select");
+        for (const o of options) {
+            const op = document.createElement("option");
+            op.value = String(o);
+            op.textContent = String(o);
+            s.append(op);
+        }
+        s.value = String(draft[key]);
+        if (s.value !== String(draft[key])) draft[key] = s.value;   // 旧值不在表里 → 落到首个
+        /* coerce 是必须的：`mp` 这类数值字段若存成字符串 "1.2"，后端 parse_state
+         * 按 REFVID_TYPES 判类型不符 → 静默回落默认值（用户改了像没改）。 */
+        s.onchange = () => { draft[key] = coerce ? coerce(s.value) : s.value; };
+        return s;
+    };
+
+    /* ① 总开关 */
+    mkRow("启用参考视频归一（总开关）", mkCheck("on"),
+        "关 = **完全透传**：素材原样交给官方节点（它自己会缩到 768 短边参考画布并向下砍"
+        + "到 17k+5），也就是今天的行为，一个字节不变。开启后才做归一，并进入逐段指纹"
+        + "（改设置会让引用了视频的段重做——不会出现同一条链两种口径的段）。");
+
+    /* ② 目标画布：宽高比 × 百万像素（与链画布同一个换算） */
+    const arSel = mkSelect("ar", meta.ar_ratio || ["16:9"]);
+    const mpSel = mkSelect("mp", meta.mp_options || [0.98], Number);
+    const whBox = el("div", "h3d-refvid-wh");
+    const canvasCtl = el("div", "h3d-refvid-pair");
+    canvasCtl.append(arSel, mpSel, whBox);
+    mkRow("目标画布（宽高比 × 百万像素）", canvasCtl,
+        "与链画布**同一个**官方 Resolution Selector 换算（32 对齐）。"
+        + "出厂 16:9 @ 0.98MP = 1344×768，恰好等于官方参考画布（短边 768 / 面积上限 "
+        + "768×1344）—— 也就是把官方隐式口径显式化。");
+    {
+        const follow = el("button", "h3d-btn", "跟随链画布");
+        follow.type = "button";
+        follow.title = "把当前链的「宽高比 / 百万像素」原样填进来（与画布口径一致）";
+        follow.onclick = () => {
+            const ar = String(getWidgetValue(node, W_AR) ?? "");
+            const mp = Number(getWidgetValue(node, W_MP));
+            if (meta.ar_ratio && meta.ar_ratio.includes(ar)) { draft.ar = ar; arSel.value = ar; }
+            if (isFinite(mp) && mp > 0) {
+                draft.mp = mp;
+                if (![...mpSel.options].some((o) => Number(o.value) === mp)) {
+                    const op = document.createElement("option");
+                    op.value = String(mp); op.textContent = String(mp);
+                    mpSel.append(op);
+                }
+                mpSel.value = String(mp);
+            }
+            paintWH();
+        };
+        canvasCtl.append(follow);
+    }
+    const paintWH = () => {
+        const w = resolveCanvas(draft.ar, draft.mp);
+        whBox.textContent = w ? `= ${w[0]}×${w[1]}` : "";
+    };
+    paintWH();
+    {
+        const _arOn = arSel.onchange, _mpOn = mpSel.onchange;
+        arSel.onchange = () => { _arOn(); paintWH(); };
+        mpSel.onchange = () => { _mpOn(); paintWH(); };
+    }
+
+    /* ③ 只缩不放 */
+    mkRow("只缩不放", mkCheck("no_upscale"),
+        "源像素面积小于目标时不放大（官方对参考视频本来就是这个口径，"
+        + "`nodes_minimax_h3.py` 的 `if vw * vh < cw * ch` 那条回退）。"
+        + "关掉它会把小素材放大到目标画布 —— 多花时间且不增加信息。");
+
+    /* ④ 适配方式 */
+    mkRow("宽高比对不上时的适配", mkSelect("fit", meta.fits || ["裁切填满"]),
+        "**裁切填满** = cover-crop（官方 `_resize(..., \"center\")` 同语义，会切掉多出来的边）；"
+        + "**补黑边** = letterbox（不丢画面，四周补黑）；**拉伸** = 直接把画面压到目标比例"
+        + "（官方对参考视频用的 `disabled`，比例不一致会变形）。");
+
+    /* ⑤ 重采样 */
+    mkRow("重采样方式", mkSelect("resample", meta.resamples || ["lanczos"]),
+        "lanczos（默认，官方 `_resize` 用的就是它）/ bicubic / bilinear / area / nearest-exact。"
+        + "缩小时 lanczos 与 area 最稳；nearest-exact 只适合像素画。");
+
+    /* ⑥ fps 归一 */
+    mkRow("帧率归一（重定时到 24fps）", mkCheck("fps_norm"),
+        "官方把帧序列**当 24fps 用**（Qwen 侧按 2fps 抽帧、时间戳写 i/2）。"
+        + "30fps 素材因此整体放慢 25%、再被截掉尾巴 —— 音画必然对不上。"
+        + "开启后按时间轴取 `round(i × 源fps ÷ 24)` 号源帧，**输出时长与源时长一致**。"
+        + "关掉 = 源帧原样按 24fps 解释（会变速），一般不该关。");
+
+    /* ⑦ 网格对齐 */
+    mkRow("17k+5 网格对齐方向", mkSelect("grid", meta.grids || ["向下"]),
+        "**向下** = 官方行为（`while n % 17 != 5: n -= 1`，最多砍 16 帧 = 0.67s，绝不补帧）；"
+        + "**就近** = 上下都行（可能补到 0.67s 的重复末帧）；**向上** = 一定补足。"
+        + "对齐结果与原始时长的差异会写在试算表里。");
+
+    /* ⑧ 时长上限 */
+    const limitNum = document.createElement("input");
+    limitNum.type = "number";
+    limitNum.min = "0"; limitNum.max = "60"; limitNum.step = "0.1";
+    limitNum.value = String(draft.limit_s || 0);
+    limitNum.disabled = draft.limit !== "自定义";
+    limitNum.oninput = () => { draft.limit_s = Number(limitNum.value) || 0; };
+    const limitSel = mkSelect("limit", meta.limits || ["不限"]);
+    limitSel.onchange = () => {
+        draft.limit = limitSel.value;
+        limitNum.disabled = draft.limit !== "自定义";
+    };
+    const limitCtl = el("div", "h3d-refvid-pair");
+    limitCtl.append(limitSel, limitNum);
+    mkRow("时长上限", limitCtl,
+        "**最长段**（默认）：按本链最长的一段截 —— 官方 `frames[:frame_count]` 决定"
+        + "超出的帧根本进不了模型，留着只按目标画布占内存（1344×768×124 帧 ≈ 1.5GB）；"
+        + "**不限**：整条素材都归一；**自定义**：按秒截。"
+        + "⚠ 不论选哪一档，后端都有一条**独立硬上限**（最长段 ×1.5 + 一格，下限 124 帧；"
+        + "拿不到段长时 362 帧）—— 它只在报告里说明，不静默吞掉素材。");
+
+    /* ⑨ 音轨 */
+    mkRow("参考视频音频", mkCheck("audio"),
+        "勾上 = 视频音轨作为 `<Audio j>` 参考（官方口径；素材无音轨也占一个音频号）。"
+        + "取消 = **音轨不注入也不占号**，等价于「视频参考只接图像接口」——"
+        + "注意它会改变正文里独立音频的 `<Audio j>` 编号，映射条会跟着变（后端三处同规则）。");
+
+    /* ⑩ 试算 */
+    const tryRow = el("div", "h3d-perf-row");
+    const tryTop = el("div", "h3d-perf-top");
+    const tryBtn = el("button", "h3d-btn h3d-btn-cyan", "🔎 试算（只探测，不解码）");
+    tryBtn.type = "button";
+    const tryHint = el("div", "h3d-perf-hint",
+        "拿当前项目池子里**已引用/已入库的视频素材**跑一遍：原始 fps/尺寸/时长 → "
+        + "处理后的帧数/尺寸/时长。改了上面任何一项点它都会按当前草稿重算。");
+    tryTop.append(el("label", "", "素材实测"), tryBtn);
+    tryRow.append(tryTop, tryHint);
+    const tryBox = el("div", "h3d-refvid-try");
+    tryRow.append(tryBox);
+    body.append(tryRow);
+    const runTry = async () => {
+        tryBox.replaceChildren(el("div", "h3d-perf-hint", "试算中…"));
+        const ds = getDs(node);
+        const items = (ds.ref_assets || [])
+            .filter((a) => (a.kind || "image") === "video")
+            .map((a) => ({ label: a.label || a.ref_name || a.file,
+                           file: a.file || "", asset_id: a.asset_id || "" }));
+        if (!items.length) {
+            tryBox.replaceChildren(el("div", "h3d-perf-hint",
+                "当前项目池子里还没有视频素材 —— 先在素材库上传 / 引用一个视频。"));
+            return;
+        }
+        /* ⚠ 存档目录必须走 getDirValue(node) —— 本文件里**没有**模块级的 `state`
+         * 变量（`renderV2Section` 里那个 `state` 是从 `data` 解构出来的局部量），
+         * 这里写 `state.dir` 会当场 ReferenceError。 */
+        const dir = getDirValue(node) || "";
+        const r = await A.refvidPlan({ dir, items, refvid: draft,
+                                       max_frames: maxSegmentFrames(node) });
+        const b = r && r.body;
+        if (!b || !b.ok) throw new Error((b && b.message) || "接口不可用");
+        const rows = b.rows || [];
+        tryBox.replaceChildren();
+        for (const it of rows) {
+            const line = el("div", it.ok ? "h3d-refvid-ok" : "h3d-refvid-bad");
+            if (!it.ok) { line.textContent = `✕ ${it.label}：${it.error}`; tryBox.append(line); continue; }
+            line.textContent = (it.report && it.report[0]) || it.label;
+            tryBox.append(line);
+            for (const n of (it.report || []).slice(1)) {
+                tryBox.append(el("div", "h3d-perf-hint", "· " + n));
+            }
+        }
+    };
+    tryBtn.onclick = () => { runTry().catch((e) => {
+        tryBox.replaceChildren(el("div", "h3d-perf-hint h3d-lref-warn",
+            "试算失败：" + ((e && e.message) || e)));
+    }); };
+
+    /* 保存 / 恢复默认 */
+    saveBtn.disabled = false;
+    saveBtn.onclick = async () => {
+        saveBtn.disabled = true;
+        saveBtn.textContent = "保存中…";
+        try {
+            const b = (await A.refvidSet(draft)).body;
+            if (!b || !b.ok) throw new Error("后端未接受（详见 ComfyUI 控制台）");
+            _refvidCache = b.data || null;
+            status.textContent = "已保存并生效（下一次渲染生效）";
+            close();
+            scheduleRefresh(60);
+        } catch (e) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = "保存并应用";
+            alert("保存失败：" + ((e && e.message) || e));
+        }
+    };
+    resetBtn.onclick = async () => {
+        if (!window.confirm("把参考视频缩放恢复为默认？\n\n"
+            + "默认 = 总开关关闭（完全透传，与官方行为一致），设置写回 refvid.json。")) return;
+        resetBtn.disabled = true;
+        try {
+            const b = (await A.refvidSet({})).body;
+            if (!b || !b.ok) throw new Error("后端未接受");
+            _refvidCache = b.data || null;
+            close();
+            openRefVideoSettings(node);
+            scheduleRefresh(60);
+        } catch (e) {
+            resetBtn.disabled = false;
+            alert("恢复默认失败：" + ((e && e.message) || e));
+        }
+    };
+}
+
 /* 📖 启动命令速查弹窗（顶栏入口，与 ⚡ 性能优化 同级）。
  *
  * 为什么单独一个弹窗：17 个分区、140+ 条命令，每条都要带「为什么要这样」——
@@ -7307,6 +7661,17 @@ function injectStyles() {
     .h3d-perf-top input[type=number]{width:96px}
     .h3d-perf-top input[type=checkbox]{width:15px;height:15px;accent-color:#7fc79f;flex:none}
     .h3d-perf-hint{margin-top:4px;color:var(--h3d-muted);font-size:11.5px;line-height:1.65}
+    /* 🎬 参考视频缩放弹窗：只补三处布局件，其余全部复用 .h3d-perf-* 的壳。
+     * 右侧控件常常是两个（宽高比 + 百万像素 + 快捷按钮）→ 给一个横向组，
+     * 免得被 .h3d-perf-top 的 flex 挤成一条。 */
+    .h3d-refvid-pair{display:flex;align-items:center;gap:6px;flex:none;flex-wrap:wrap}
+    .h3d-refvid-pair select,.h3d-refvid-pair input[type=number]{border:1px solid #3a352c;border-radius:6px;background:#211f1a;color:var(--h3d-bone);padding:5px 7px;font-size:12px;outline:none;font-family:inherit}
+    .h3d-refvid-pair input[type=number]{width:80px}
+    .h3d-refvid-pair input:disabled{opacity:.45}
+    .h3d-refvid-wh{color:var(--h3d-muted);font-size:11.5px;font-family:ui-monospace,Consolas;min-width:88px}
+    .h3d-refvid-try{margin-top:7px;border:1px solid #37332b;border-radius:8px;background:#181712;padding:8px 10px;max-height:260px;overflow:auto}
+    .h3d-refvid-ok{margin:2px 0;color:#c8c2b4;font-size:11.5px;line-height:1.65;word-break:break-all}
+    .h3d-refvid-bad{margin:2px 0;color:#e08c8c;font-size:11.5px;line-height:1.65;word-break:break-all}
     .h3d-perf-status{margin:8px 0 0;color:#8fc9a5;font-size:11.5px;line-height:1.6;white-space:pre-wrap}
 
     /* ---- 📖 启动命令速查弹窗（2026-09-27 加）----
@@ -8187,6 +8552,23 @@ function renderV2Section(sec, data) {
         };
         hub.append(b);
         sec.append(hub);
+
+        /* 🎬 参考视频缩放：**紧挨素材库下方**（用户指定的位置）。
+         * 它管的是"素材进模型前怎么处理"，与素材库是同一件事的两半：
+         * 库管"有哪些素材"，这里管"素材被怎么喂给模型"。 */
+        const rv = el("button", "h3d-hubbtn",
+            "🎬 参考视频缩放" + `<small>${escapeHtml(refvidSummary())}</small>`);
+        rv.type = "button";
+        rv.title = "上传的视频素材在执行生成前自动缩放 / 重定时到 24fps / 对齐 H3 的 17k+5 帧网格"
+            + "（可关音轨参考）。设置为**机器级全局**，跨项目共用；点开可先试算。";
+        rv.onclick = () => openRefVideoSettings(data?.node);
+        sec.append(rv);
+        if (_refvidCache === null) {
+            /* 设置还没取到：取完刷一次让按钮上的摘要变准。只在"本来就没值"时刷一次，
+             * 否则每次渲染都触发刷新 = 死循环。 */
+            loadRefvid().then(() => scheduleRefresh(80)).catch(() => {});
+        }
+
         sec.append(el("div", "h3d-foot",
             "素材按「缩略图 + 徽标」铺网格；引用到段 / 标注首尾帧 / 调入项目 / 暂存 input 都在右键菜单里。"));
     } catch (e) {
@@ -9989,7 +10371,8 @@ async function resetAllParams(node) {
         + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 检测重摇）\n"
         + "· 语义桥（关闭 / BUNNY V2 / 0.1 / 全量过桥）\n"
         + "· 二采放大（关闭 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n"
-        + "· 性能优化（机器级：块交换 / 分块 / 编码器 / 显存守卫等）\n\n"
+        + "· 性能优化（机器级：块交换 / 分块 / 编码器 / 显存守卫等）\n"
+        + "· 参考视频缩放（机器级：关闭 = 透传）\n\n"
         + "以上默认值与新版默认工作流同源。\n"
         + "不含：AI 优化设置、每段提示词与锚定。\n"
         + "版本更新导致参数错位时，重置即回到节点当前定义的默认值。")) return;
@@ -10007,6 +10390,18 @@ async function resetAllParams(node) {
         if (A && A.perfSet) await A.perfSet({});
     } catch (e) {
         console.warn("[h3-director] 全局重置：性能优化恢复默认失败（画布参数已重置）", e);
+    }
+    /* 参考视频缩放（同为机器级全局）走同一套：POST 空对象 → refvideo.parse_state
+     * 以 DEFAULT_REFVID 起底 = 关闭总开关（透传）。它**不在 ds 里**，所以除了
+     * 这一处没有别的重置入口。 */
+    try {
+        const A = window.H3Api;
+        if (A && A.refvidSet) {
+            const b = (await A.refvidSet({})).body;
+            _refvidCache = (b && b.data) || null;
+        }
+    } catch (e) {
+        console.warn("[h3-director] 全局重置：参考视频缩放恢复默认失败（画布参数已重置）", e);
     }
     repaintParams();
     scheduleRefresh(120);

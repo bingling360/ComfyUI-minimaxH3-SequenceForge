@@ -38,12 +38,13 @@ No monkey-patching. No extra Python dependencies. Official MiniMax H3 nodes only
 26. [Custom sigmas (distilled LoRAs)](#26-custom-sigmas-distilled-loras)
 27. [Asset library](#27-asset-library)
 28. [Performance settings](#28-performance-settings)
-29. [Seam metrics](#29-seam-metrics)
-30. [Repository layout](#30-repository-layout)
-31. [HTTP API](#31-http-api)
-32. [Upstream tracking](#32-upstream-tracking)
-33. [Removed in 1.0](#33-removed-in-10)
-34. [Credits and licensing](#34-credits-and-licensing)
+29. [Reference video normalization](#29-reference-video-normalization)
+30. [Seam metrics](#30-seam-metrics)
+31. [Repository layout](#31-repository-layout)
+32. [HTTP API](#32-http-api)
+33. [Upstream tracking](#33-upstream-tracking)
+34. [Removed in 1.0](#34-removed-in-10)
+35. [Credits and licensing](#35-credits-and-licensing)
 
 ---
 
@@ -611,7 +612,32 @@ See [`docs/HyperFlow适配与自定义Sigmas.md`](docs/HyperFlow适配与自定�
 
 ---
 
-## 29. Seam metrics
+## 29. Reference video normalization
+
+Reference videos (`<Video k>`) can be normalized before they reach the model. The entry sits at the bottom-left of the console, directly under **🗂 Asset library**, and opens a dialog modelled on **⚡ Performance settings**: machine-level, global, stored in `<user>/minimax_h3/refvid.json`, shared across projects.
+
+Why it exists — the official `MiniMaxH3ReferenceToVideo` already does two of these implicitly and does not do the other two at all:
+
+| Step | Official behaviour | With this module |
+|---|---|---|
+| Canvas | `adapt_canvas()`: 768 short edge, 768×1344 area cap, 32-aligned, downscale only | explicit **aspect ratio × megapixels** (the same Resolution Selector math as the chain canvas); the default `16:9 @ 0.98MP` = 1344×768 is exactly the official reference canvas |
+| Frame grid | `frames[:frame_count]`, then `while n % 17 != 5: n -= 1` (up to 16 frames cut) | explicit direction: **down** (official) / nearest / up |
+| Frame rate | **none** — frames are treated as 24 fps (Qwen samples at 2 fps, timestamps `i / 2`), so a 30 fps clip plays 25% slower and is then truncated | retimed to 24 fps along the time axis (`round(i × src_fps ÷ 24)`), duration preserved |
+| Soundtrack | **none** — the whole track is encoded while the picture gets truncated | cut to the same time window; or switch **Reference video audio** off (the video then contributes picture only, i.e. the equivalent of an image-only reference) |
+
+Fit modes for mismatched aspect ratios: **crop to fill** (official `_resize(..., "center")`), **letterbox**, **stretch** (official `"disabled"`). Resampling: `lanczos` (default, as in the official node), `bicubic`, `bilinear`, `area`, `nearest-exact`.
+
+Notes:
+
+- The master switch defaults to **off** — pass-through, i.e. today's official behaviour, byte for byte. It only enters the per-segment hash once enabled, and only for segments that reference a video, so existing archives keep resuming without a redo.
+- It applies to **reference videos only**: manual anchors, the prologue and reference images are untouched (anchors need exact latent shapes; the prologue arrives as a canvas tensor with no source fps).
+- **🔎 Try it** runs `probe` + `plan` server-side without decoding anything and prints `original fps/size/duration → processed frames/size/duration` per clip.
+- Reference videos are decoded through a **frame window** (only up to the last frame that will actually be used) and downscaled immediately, instead of decoding the whole clip at full resolution as float32 (1080p/30fps/10s ≈ 7.4 GB resident).
+- Turning **Reference video audio** off changes the `<Audio j>` numbering of independent audio references, so the reference-bar token map follows it (backend `nodes._kind_tokens` / `asset_store.compile_refs` / frontend `paintAll` share one rule).
+
+---
+
+## 30. Seam metrics
 
 "Good seam?" is not just one frame difference. The sampler measures a **five-dimensional z-score** per seam (seam value vs the segment's robust median / 1.4826×MAD baseline), written to `manifest.seam_metrics`; the Seam Doctor report adds a `[baseline]` line.
 
@@ -629,7 +655,7 @@ See [`docs/HyperFlow适配与自定义Sigmas.md`](docs/HyperFlow适配与自定�
 
 ---
 
-## 30. Repository layout
+## 31. Repository layout
 
 ```
 ComfyUI-minimaxH3-SequenceForge/
@@ -716,11 +742,11 @@ Runtime output (not in the repo): cuts / segments / archives live in `ComfyUI/ou
 
 ---
 
-## 31. HTTP API
+## 32. HTTP API
 
 All routes are registered under both the root path and `/api`. Groups:
 
-- **Diagnostics / status:** `ping`, `busy`, `perf`, `launch_ref`, `vram_cleanup`, `grid_spec`
+- **Diagnostics / status:** `ping`, `busy`, `perf`, `refvid`, `refvid_plan`, `launch_ref`, `vram_cleanup`, `grid_spec`
 - **Projects:** `projects`, `project`, `create_project`, `save_prompts`, `delete_project`, `delete_file`, `merge`, `upscale_reset`, `redo_cancel`, `latent_slice`, `latent_delete`, `trim`, `probe`, `move_media`, `split_av`
 - **Models / config:** `upscale_models`, `bridge_models`, `vae_files`
 - **Prompt optimization:** `optimize`, `optimize_stream`, `optimize_multi`, `optimize_multi_stream`, `expand`, `expand_multi`, `expand_validate`, `expand_optimize`, `expand_optimize_stream`
@@ -730,13 +756,13 @@ All routes are registered under both the root path and `/api`. Groups:
 
 ---
 
-## 32. Upstream tracking
+## 33. Upstream tracking
 
 The second-pass upscale network is ported line-by-line from [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) (only the **network structure and weight loading**, not its node layer or inference interface). The tracking ledger, the difference list vs. upstream, and the sync SOP are all in **[`docs/UPSTREAM.md`](docs/UPSTREAM.md)** — **read it before editing `upscale_net.py`** so you do not "fix" a deliberate local enhancement back into a bug or re-research something upstream already implements.
 
 ---
 
-## 33. Removed in 1.0
+## 34. Removed in 1.0
 
 The following were removed from the plugin. Historical notes are available in `docs/` and the git history:
 
@@ -749,7 +775,7 @@ The following were removed from the plugin. Historical notes are available in `d
 
 ---
 
-## 34. Credits and licensing
+## 35. Credits and licensing
 
 This plugin is released under **Apache-2.0**.
 

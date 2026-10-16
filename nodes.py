@@ -50,6 +50,7 @@ from . import metrics
 from . import guides
 from . import grid
 from . import perf
+from . import refvideo
 from . import vae_chunk
 from . import semantic_bridge
 from .grid import (video_latent_t, latent_t_to_frames, frames_to_latent_t,
@@ -889,9 +890,14 @@ def _parse_director_state(raw):
 
 
 # ---- 官方 Resolution Selector 同款画布换算 + 时长网格吸附 ----
+#
+# 画布换算的**单一真源在 refvideo.py**（纯逻辑、零 ComfyUI 依赖，可单测）。
+# 这里保留同名别名与包装，是为了不动既有调用方/测试（`nodes._AR_RATIO` 等）。
+# 参考视频面板用的是**同一个函数**——「链画布」与「参考视频目标画布」口径必须
+# 逐位一致，否则用户按同样的档位填两处会得到不同数字。
 
-_AR_RATIO = {"21:9": 21 / 9, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4, "1:1": 1.0}
-_MP_OPTIONS = [round(i * 0.1, 1) for i in range(1, 21)]   # 0.1–2.0MP，0.1 步进（官方箭头微调同款）
+_AR_RATIO = refvideo.AR_RATIO
+_MP_OPTIONS = refvideo.MP_OPTIONS   # 0.1–2.0MP，0.1 步进（官方箭头微调同款）
 _REF_BRACKET = re.compile(r"\[\[([^\[\]]{1,24})\]\]")
 # 负向后顾：`@` 前不能是字母数字下划线，免得把 a@b.com 里的 b 当成素材标签
 _REF_AT = re.compile(
@@ -933,11 +939,9 @@ def _resolve_canvas(ar, mp):
     1MP = 1024×1024 = 1048576 px（官方口径，非 1e6）；两侧各自 round 对齐 32 倍数，无上限收敛。
     16:9 档位对照官方节点：0.2→608×352 / 0.5→960×544 / 0.98→1344×768（H3 原生）/ 1.0→1376×768 /
     1.2→1504×832 / 1.5→1664×928 / 2.0→1920×1088；9:16+1.0 → 768×1376。
+    实现在 refvideo.resolve_canvas（单一真源，链画布与参考视频面板共用）。
     """
-    r = _AR_RATIO[str(ar)]
-    total = float(mp) * 1024 * 1024
-    w0, h0 = (total * r) ** 0.5, (total / r) ** 0.5
-    return round(w0 / 32) * 32, round(h0 / 32) * 32
+    return refvideo.resolve_canvas(ar, mp)
 
 
 def _describe_canvas(w, h):
@@ -981,7 +985,7 @@ def _normalize_order(label_order):
     return out
 
 
-def _kind_tokens(label_order):
+def _kind_tokens(label_order, video_audio=True):
     """[(kind, 标签)] -> 按类别独立编号的 {标签: token}（图 <Picture k> / 视 <Video k> / 音 <Audio j>）。
 
     同一标签重复出现（一段内引用多次）**只编号一次**：编号是素材的身份，不是
@@ -998,13 +1002,20 @@ def _kind_tokens(label_order):
     出现对应 tag，模型才会真正使用该素材）。
     同规则还有前端映射条（h3_director.js `paintAll`）与 `asset_store.compile_refs`，
     三处必须一起改，否则界面显示与实跑对不上。
+
+    `video_audio=False`（参考视频设置里「参考视频音频=不参考」，全局机器级）：
+    视频音轨**不占音频号**、也不注入 `ref_video_audios`（值传 None 即可，官方那边
+    `if soundtrack is not None` 不成立 → 既不插 `<Audio j>` 也不编码音轨），
+    等价于「视频参考只接图像接口」。该开关改的是正文里的 `<Audio j>` 编号，
+    所以三处同规则依然成立，只是预扣这一步整体关掉。
     """
     counters = {"image": 0, "video": 0, "audio": 0}
-    _seen_video = set()
-    for kind, lbl in label_order:
-        if kind == "video" and lbl not in _seen_video:
-            _seen_video.add(lbl)
-            counters["audio"] += 1        # 该视频的音轨占掉一个 <Audio j>
+    if video_audio:
+        _seen_video = set()
+        for kind, lbl in label_order:
+            if kind == "video" and lbl not in _seen_video:
+                _seen_video.add(lbl)
+                counters["audio"] += 1        # 该视频的音轨占掉一个 <Audio j>
     mapping = {}
     for kind, lbl in label_order:
         if lbl in mapping:
@@ -1017,15 +1028,16 @@ def _kind_tokens(label_order):
     return mapping
 
 
-def _apply_label_tokens(prompt, label_order):
+def _apply_label_tokens(prompt, label_order, video_audio=True):
     """把提示词里的 `@标签` 替换成该段压实编号后的 <Picture k>/<Video k>/<Audio j>。
 
     label_order 为该段按序引用的 (kind, 标签)（或旧格式纯标签=image）；各类别独立从 1
     编号；长标签先替换，防「角色1」吃掉「角色10」前缀。
     旧写法 `[[标签]]` 一并认（老项目存档还能跑）；`[[..]]` 是引用专用写法，
     未知即报错；`@` 太常见（邮箱、@2x 之类），未知的不拦，避免误伤普通文本。
+    video_audio 见 `_kind_tokens`（False = 视频音轨不占音频号）。
     """
-    mapping = _kind_tokens(_normalize_order(label_order))
+    mapping = _kind_tokens(_normalize_order(label_order), video_audio)
     out = prompt
     for lbl in sorted(mapping, key=len, reverse=True):
         out = out.replace(f"@{lbl}", mapping[lbl])
@@ -1036,7 +1048,7 @@ def _apply_label_tokens(prompt, label_order):
     return out
 
 
-def _reference_tags_minimal(label_order):
+def _reference_tags_minimal(label_order, video_audio=True):
     """段首最小引用声明：按**官方标签语义**分流的最小句式（不写散文）。
 
     官方 ref-en.txt §2 的四类标签语义是**互斥**的，不能一律写成 `<Picture N>`：
@@ -1073,8 +1085,9 @@ def _reference_tags_minimal(label_order):
     头独占一行、条目逐行跟后面，照官方完整示例）。不带头的裸条目会落在所有字段
     之前变成"前言"，被 prompts.validate_compiled 判 E_OVERRIDE_PREAMBLE。
     无 ComfyUI 可单测（纯函数，仅依赖 _normalize_order/_kind_tokens）。
+    video_audio=False（参考视频音频=不参考）时视频音轨不占音频号，见 `_kind_tokens`。
     """
-    mapping = _kind_tokens(_normalize_order(label_order))
+    mapping = _kind_tokens(_normalize_order(label_order), video_audio)
     lines = []
     # mapping 同类别内按 _kind_tokens 的编号递增，所以图 <Picture k> 的 k 与
     # 该图在本段图池里的序号一致 —— 引用句里直接指明来源图号，避免模型猜。
@@ -1408,6 +1421,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 与 ds.perf 分开：性能设置是**机器相关**的（这台卡多大、内存多少），
         # 全局落盘、跨项目共用，不进导演台状态。整链读一次（mtime 缓存），别每段读盘。
         _pf = perf.current_settings()
+        # ---- 参考视频归一设置（**机器级、全局**，与 perf.json 同目录的 refvid.json）----
+        # 整链读一次（mtime 缓存）。作用范围：只作用于**参考视频引用**
+        # （<Video k> 那条通路），锚 / 序章 / 参考图一律不动。
+        #   · on=False（出厂默认）= 完全透传，即今天的官方行为，不进指纹；
+        #   · on=True  = 帧窗解码 + fps 重定时 + lanczos 缩放 + 17k+5 对齐，
+        #                并进逐段指纹（改设置 → 引用视频的段重做）；
+        #   · audio=False 与 on 无关：只把视频音轨从参考里摘掉（等价于视频只接
+        #     图像接口），它改的是正文里的 <Audio j> 编号 → 也必须进指纹。
+        _rv_cfg = refvideo.current()
+        _rv_audio = bool(_rv_cfg.get("audio", True))
+        _rv_on = bool(_rv_cfg.get("on", False))
         # 语义桥（ds.bridge）：逐项目的条件增强，与性能设置分开 —— 那个是机器相关、
         # 全局落盘；这个改的是画出来的东西，必须跟着作品走。
         _bridge_cfg = semantic_bridge.config(ds)
@@ -1685,7 +1709,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 order = []
                 if _AS is not None:
                     try:
-                        _res = _AS.compile_refs(_reg, _keys, i + 1)
+                        _res = _AS.compile_refs(_reg, _keys, i + 1, _rv_audio)
                     except Exception:
                         _res = {"ok": False, "errors": [{"code": "E_REF_UNKNOWN"}],
                                 "blocks": []}
@@ -1744,8 +1768,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if order:
                     # 显性语义：tag 必须落进最终文本模型才用素材；正文已写 tag 则直通，
                     # 缺的只补最小映射行（不写散文）。未知 [[..]] 由替换函数点名报错。
-                    mapping = _kind_tokens(_normalize_order(order))
-                    full = _apply_label_tokens(full, order)
+                    mapping = _kind_tokens(_normalize_order(order), _rv_audio)
+                    full = _apply_label_tokens(full, order, _rv_audio)
                     uncovered = _uncovered_tags(full, mapping)
                     # 帧锚（首帧图/尾帧图）也会进 order（要拿 <Picture k> 的 vision block），
                     # 但**不该由 subject_definitions 声明**：
@@ -1761,7 +1785,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     if _decl:
                         sub = [(k, lbl) for k, lbl in _normalize_order(order)
                                if lbl in _decl]
-                        full = _reference_tags_minimal(sub) + "\n" + full
+                        full = _reference_tags_minimal(sub, _rv_audio) + "\n" + full
                     if _real_refs:
                         # ⚠ 有参考素材 = 官方 **Ref2VA**，主字段名必须是 detailed_description。
                         # 官方 ref2v 文档的字段对照表写死：base 任务用
@@ -1974,6 +1998,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _store_hits = []   # P2：经 store 三级寻址命中的标签（报告用，不进指纹）
         # 张量占位：全部由 _ensure_pool_tensors 按引用集填充（P4d：画布回退分支已删除）
         pool_tensors = {"image": {}, "video": {}, "audio": {}}
+        # 参考视频**归一后**的 (帧, 音轨|None)：参考通路只吃这一份（见 _ensure_pool_tensors）。
+        # 与 pool_tensors["video"] 分开的理由：
+        #   · pool_tensors 是「原始素材」语义，锚通路（_anchor_video）按精确形状取用，
+        #     缩放会把它从"能拼"改成"硬报错"；
+        #   · 归一开关关着时二者内容相同（同一对象），开着时参考侧是缩放+重定时后的，
+        #     且**不再整片解码原分辨率**（1080p/30fps/10s ≈ 7.4GB float32 常驻）。
+        _ref_videos = {}
         _pool_loaded = set()   # 已加载标签（_ensure_pool_tensors 幂等守卫）
         refs = {"ref_videos": {}, "ref_video_audios": {}, "ref_audios": {}}
         # 帧锚**不算**"参考素材"：判定一段是不是混合模式（帧锚+素材）时要把帧锚
@@ -2935,6 +2966,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
             _fi = seg_frame_imgs[i] if i < len(seg_frame_imgs) else ("", "")
             if _fi[0] or _fi[1]:
                 tag = f"fimg:{_fi[0]}:{_fi[1]}|{tag}"
+            # 参考视频归一（全局机器级设置）：**只对引用了视频的段**加键，且只在
+            # 「偏离默认」时加 —— 出厂默认（关 / 参考音频）下哈希逐字节不变，
+            # 既有项目存档续跑零影响。理由：归一改的是进模型的参考张量与正文里的
+            # <Audio j> 编号，不进指纹就会出现「同一条链上两种口径的段」。
+            if any(_k == "video" for _k, _ in seg_label_orders[i]):
+                if _rv_on:
+                    tag = f"rv:{refvideo.signature(_rv_cfg)}|{tag}"
+                if not _rv_audio:
+                    tag = f"rva:0|{tag}"
             seg_hashes.append(checkpoint.prompt_hash(tag))
 
         exec_hashes = list(seg_hashes)   # 执行序列 = 提示词段按序，没有插入槽要单独指纹
@@ -3124,6 +3164,109 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 return root
             return None
 
+        # ---- 参考视频归一（全局机器级设置，只作用于参考视频引用）----
+        #
+        # 为什么单独一条通路而不是就地改 `_decode_video_file`：
+        #   · 锚通路（`_anchor_video`）要的是**原始**张量（C/H/W 硬约束，缩放会从
+        #     "能拼"变"硬报错"）、序章走画布张量链接（拿不到源文件与真 fps）；
+        #   · 参考通路要的是**归一后**的（缩放 / 24fps 重定时 / 17k+5 / 音轨同窗）。
+        # 所以按语义分两份，各取所需。
+        _rv_report = []      # 归一报告行（进 report，只报一次）
+
+        def _abs_media_path(_abs, _fn):
+            """素材 -> 绝对路径（store 命中的已是绝对路径；否则按 input 目录解析）。"""
+            if _abs:
+                return _abs
+            if not _fn:
+                return None
+            try:
+                return folder_paths.get_annotated_filepath(str(_fn))
+            except Exception:
+                return None
+
+        def _resize_ref_frames(imgs, _p, _cfg):
+            """归一后的帧张量 -> 目标画布（补黑边走两步：先等比缩到内框，再补零）。"""
+            _m = str(_cfg.get("resample") or "lanczos")
+            x = imgs[..., :3].movedim(-1, 1).float()
+            if _p["crop"] == "pad":
+                iw, ih, px, py = _p["pad"]
+                y = comfy.utils.common_upscale(x, iw, ih, _m, "disabled")
+                out = y.new_zeros((y.shape[0], 3, _p["h"], _p["w"]))
+                out[:, :, py:py + y.shape[2], px:px + y.shape[3]] = y
+                return out.movedim(1, -1)
+            return comfy.utils.common_upscale(
+                x, _p["w"], _p["h"], _m, _p["crop"]).movedim(1, -1)
+
+        def _prepare_ref_video(label, path):
+            """素材 -> (帧, 音轨|None)：帧窗解码 + fps 重定时 + 缩放 + 17k+5 + 音轨同窗。
+
+            探测失败回退 None（调用方回落旧通路），规划失败（素材不足 5 帧等）直接抛
+            —— 那种素材官方节点稍后也会炸，早报错才能点名是哪一条。
+            """
+            _maxf = max(seg_lengths) if seg_lengths else 0
+            try:
+                from . import media as _media
+            except ImportError:
+                import media as _media
+            try:
+                info = _media.probe_media(path)
+            except Exception as e:
+                _rv_report.append(f"⚠ 参考视频「{label}」探测失败（{e}）：本次沿用原始素材"
+                                  "（不缩放、不改帧率）")
+                return None
+            _p = refvideo.plan(info, _rv_cfg, _maxf, label)
+            # 帧窗解码：只读到真正会用到的最后一帧（旧通路是整片解码成 float32，
+            # 1080p/30fps/10s ≈ 7.4GB 常驻 CPU —— 「跑着跑着断连」的隐藏来源之一）。
+            imgs, wav, sr = _media.decode_av(path, 0, _p["src_end"], info.get("fps"))
+            # 抽帧表按**探针估算**的帧数算（probe_media 的 frames 是估算值），
+            # 真实解码帧数可能少一点 → 越界一律夹到末帧（补重复帧），绝不 IndexError。
+            _n_src = int(imgs.shape[0]) if getattr(imgs, "shape", None) else 0
+            if not _n_src:
+                raise ValueError(f"参考视频「{label}」解不出画面帧")
+            _idx = [min(int(j), _n_src - 1) for j in _p["src_idx"]]
+            if len(_idx) < _p["out_frames"]:
+                _idx += [_n_src - 1] * (_p["out_frames"] - len(_idx))
+            imgs = imgs[_idx]
+            imgs = _resize_ref_frames(imgs, _p, _rv_cfg)
+            if not _rv_audio:
+                # 音频开关关：**不注入** ref_video_audios（值 None 即可，官方那边
+                # `if soundtrack is not None` 不成立 → 不插 <Audio j>、不编码音轨），
+                # 等价于「视频参考只接图像接口」。
+                aud = None
+            elif sr and wav is not None and int(wav.numel()):
+                a0 = int(round(_p["a_start"] * float(sr)))
+                a1 = int(round(_p["a_end"] * float(sr)))
+                aud = {"waveform": wav[:, a0:a1].unsqueeze(0), "sample_rate": int(sr)}
+            else:
+                # 无音轨素材照样回静音 dict（不是 None）：官方按 `ref_video_audio_N`
+                # 这个键**是否存在**决定要不要插 <Audio j> —— 只要挂了参考视频就必占
+                # 一个音频号，静音与否都一样（见 _decode_video_file 的长注释）。
+                aud = {"waveform": torch.zeros(1, 1, 0), "sample_rate": 24000}
+            _rv_report.extend(_p["report"])
+            return (imgs, aud)
+
+        def _pool_video(label, _abs, _fn, _proot):
+            """视频素材入池：归一开则只产 `_ref_videos`（不落原分辨率整片）。"""
+            if _rv_on:
+                _path = _abs_media_path(_abs, _fn)
+                _hit = None
+                if _path:
+                    try:
+                        _hit = _prepare_ref_video(label, _path)
+                    except ValueError:
+                        raise
+                    except Exception as e:
+                        _rv_report.append(
+                            f"⚠ 参考视频「{label}」归一失败（{type(e).__name__}: {e}）："
+                            "本次沿用原始素材（不缩放、不改帧率）")
+                if _hit is not None:
+                    _ref_videos[label] = _hit
+                    return
+            _raw = (_decode_video_file(_abs, label) if _abs is not None
+                    else _load_input_video(_fn, _proot))
+            pool_tensors["video"][label] = _raw
+            _ref_videos[label] = _raw
+
         def _ensure_pool_tensors():
             """加载引用集张量（幂等：已加载标签跳过）。assets/ 文件需项目目录。
 
@@ -3152,7 +3295,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         if _k == "image":
                             pool_tensors["image"][_lbl] = _decode_image_file(_abs)
                         elif _k == "video":
-                            pool_tensors["video"][_lbl] = _decode_video_file(_abs, _lbl)
+                            _pool_video(_lbl, _abs, None, _proot)
                         else:
                             pool_tensors["audio"][_lbl] = _decode_audio_file(_abs)
                         if _lbl not in _store_hits:
@@ -3160,7 +3303,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     elif _k == "image":
                         pool_tensors["image"][_lbl] = _load_input_image(_fn, _proot)
                     elif _k == "video":
-                        pool_tensors["video"][_lbl] = _load_input_video(_fn, _proot)
+                        _pool_video(_lbl, None, _fn, _proot)
                     else:
                         pool_tensors["audio"][_lbl] = _load_input_audio(_fn, _proot)
                 except ValueError:
@@ -3191,6 +3334,30 @@ class H3SeamlessChainSampler(io.ComfyNode):
             return _load_input_image(fn, _project_root_for_assets())
 
         _ensure_pool_tensors()
+        # 参考视频归一报告（每条素材一行，只报一次）：用户要能一眼看到
+        # 「我上传的素材到底被缩成了什么」——静默变换是这个项目最忌的。
+        for _line in _rv_report:
+            report.append(_line)
+        if _rv_on and not _rv_report:
+            report.append("参考视频缩放已开启，但本次没有任何视频素材被引用（无事可做）")
+
+        def _ref_pool_view():
+            """参考通路用的素材视图：视频取**归一后**的，图/音取原始池。
+
+            二采（upscale.render_segment → _build_seg_refs）与一采必须吃同一份，
+            否则基础链缩放、高清链不缩放 —— 一条数据两个真相。
+            """
+            return {"image": pool_tensors["image"],
+                    "video": _ref_videos,
+                    "audio": pool_tensors["audio"]}
+
+        def _ref_media(lbl, kind):
+            """(标签, 类别) -> 参考素材张量；缺则 None。视频优先归一结果。"""
+            if kind == "video":
+                hit = _ref_videos.get(lbl)
+                return hit if hit is not None else pool_tensors["video"].get(lbl)
+            return pool_tensors.get(kind, {}).get(lbl)
+
         # 段级首尾帧参考图（提示词框按钮，新入口）优先：首段首帧图 = i2v 起手帧、
         # 末段尾帧图 = FL2VA 剧情终点锚；其次才是库内旧标注锚（旧链零变化）
         if 首帧图片 is None and _head_seg:
@@ -3554,7 +3721,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     _, proj_upscale = upscale.render_segment(
                         _up_model, clip, video_vae, audio_vae, negative, up_cfg, up_net,
                         root, g, video_t, audio_t, kind, idx,
-                        seg_prompts, seg_label_orders, pool_tensors, refs,
+                        seg_prompts, seg_label_orders, _ref_pool_view(), refs,
                         首帧图片 if (kind == "prompt" and idx == 0 and seg_first_on[0]) else None,
                         guide_kf, tail_kf, head_kf, cur_seed,
                         skip_f, vis_len,
@@ -4051,16 +4218,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     seg_refs = {"ref_images": {}, "ref_videos": {}, "ref_video_audios": {}, "ref_audios": {}}
                     _n = {"image": 0, "video": 0, "audio": 0}
                     for _k, _lbl in seg_label_orders[i]:
-                        if _lbl not in pool_tensors.get(_k, {}):
+                        _media_t = _ref_media(_lbl, _k)
+                        if _media_t is None:
                             continue
                         if _k == "image":
-                            seg_refs["ref_images"][f"ref_image_{_n['image']}"] = pool_tensors["image"][_lbl]
+                            seg_refs["ref_images"][f"ref_image_{_n['image']}"] = _media_t
                         elif _k == "video":
-                            _imgs, _aud = pool_tensors["video"][_lbl]
+                            _imgs, _aud = _media_t
                             seg_refs["ref_videos"][f"ref_video_{_n['video']}"] = _imgs
                             seg_refs["ref_video_audios"][f"ref_video_audio_{_n['video']}"] = _aud
                         else:
-                            seg_refs["ref_audios"][f"ref_audio_{_n['audio']}"] = pool_tensors["audio"][_lbl]
+                            seg_refs["ref_audios"][f"ref_audio_{_n['audio']}"] = _media_t
                         _n[_k] += 1
                     # P4d：画布接线已删除，无未被接管类别（旧合并循环已删）
                     _t = time.perf_counter()

@@ -149,6 +149,11 @@ function ok(cond, msg) {
         pendingLinkIntents: { scope: "derived" },
         pendingOutputIntents: { scope: "derived" },   // 输出侧意图：同一次载入重建/清空，不跨项目攒状态
         _linkRepairNoted: { scope: "derived" },   // 载入钩子里随 pendingLinkIntents 一并 clear
+        /* 🎬 参考视频缩放（2026-10-16）：**机器级全局**设置（refvid.json），
+         * 跨项目共用是**设计口径**（用户拍板「全局机器级」），不是漏了作用域
+         * —— 所以按界面态登记，不做 dir 分桶。 */
+        _refvidCache: { scope: "ui" },
+        _refvidLoading: { scope: "ui" },
     };
 
     const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");

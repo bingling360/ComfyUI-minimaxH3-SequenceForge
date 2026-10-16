@@ -166,7 +166,9 @@ def _nodes_src():
 
 def test_nodes_validation_kernel():
     src = _nodes_src()
-    assert "compile_refs(_reg, _keys, i + 1)" in src
+    # 校验核必须把「参考视频音频」开关透传下去：干跑显示的 <Audio j> 编号
+    # 与实跑同源（关掉视频音轨参考时音频号不再被视频预扣）。
+    assert "compile_refs(_reg, _keys, i + 1, _rv_audio)" in src
     assert "_asset_registry()" in src and "build_execution_registry" in src
     # 旧报错文案逐字保留（旧链行为兼容）
     assert "引用了未知素材标签" in src and "可用标签 {pool_labels}" in src

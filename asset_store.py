@@ -615,13 +615,17 @@ def ref_key(ref) -> tuple:
     return str(ref or "").strip(), ""
 
 
-def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
+def compile_refs(registry: dict, refs, seg_no: int = 1, video_audio: bool = True) -> dict:
     """段引用编译 -> {ok, blocks, tag_map, errors}。
 
     blocks 保序：[{asset_id, alias, kind, token, use?}]，token 按类型独立 1-based
     （与 nodes._kind_tokens 同规则，**含"每个参考视频的音轨先占一个音频号"**）；
     单段 9/3/3 超限与未知引用返回 errors
     （code 复用 E_REF_UNKNOWN / E_MEDIA_LIMIT，前端可沿用旧文案）。
+
+    `video_audio=False`（参考视频设置里「参考视频音频=不参考」，全局机器级）：
+    视频音轨不占音频号 —— 与 `nodes._kind_tokens` / 前端 `paintAll` 同规则，
+    三处必须一起变，否则干跑显示的编号与实跑对不上。
     """
     by_id = (registry or {}).get("by_id") or {}
     by_alias = (registry or {}).get("by_alias") or {}
@@ -663,11 +667,13 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
     # ref_video_audio_N 都插一条 <Audio j>（排在 <Video k> 之前），而节点对每个
     # 参考视频都塞了音轨槽 → 不预扣会让同段独立音频整体错位（1 个视频偏 1）。
     # 与 nodes._kind_tokens / 前端映射条同规则，三处必须一致。
-    _seen_v = set()
-    for rec, _use in order:
-        if rec["kind"] == "video" and rec["asset_id"] not in _seen_v:
-            _seen_v.add(rec["asset_id"])
-            counters["audio"] += 1
+    # video_audio=False（不参考视频音频）时整块关掉：音轨不注入，自然也不占号。
+    if video_audio:
+        _seen_v = set()
+        for rec, _use in order:
+            if rec["kind"] == "video" and rec["asset_id"] not in _seen_v:
+                _seen_v.add(rec["asset_id"])
+                counters["audio"] += 1
     for rec, use in order:
         counters[rec["kind"]] = counters.get(rec["kind"], 0) + 1
         tok = _TOKEN_FMT[rec["kind"]].format(counters[rec["kind"]])
@@ -686,14 +692,14 @@ def compile_refs(registry: dict, refs, seg_no: int = 1) -> dict:
     return {"ok": not errors, "blocks": blocks, "tag_map": tag_map, "errors": errors}
 
 
-def compile_segments(registry: dict, segments) -> dict:
+def compile_segments(registry: dict, segments, video_audio: bool = True) -> dict:
     """多段干跑 -> {ok, segs: [compile_refs...], errors}（segments[i] 可为 refs 数组或 {refs}）。"""
     segs, all_errs = [], []
     for i, seg in enumerate(segments or []):
         refs = seg.get("refs") if isinstance(seg, dict) else seg
         if not isinstance(refs, list):
             refs = []
-        r = compile_refs(registry, refs, i + 1)
+        r = compile_refs(registry, refs, i + 1, video_audio)
         segs.append(r)
         all_errs.extend(r["errors"])
     return {"ok": not all_errs, "segs": segs, "errors": all_errs}

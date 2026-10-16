@@ -190,10 +190,19 @@ def test_install_ff_chunking_reports_reason_when_off():
 
 
 def _load_canvas_helpers():
-    """从 nodes.py 抽 _AR_RATIO/_MP_OPTIONS/_resolve_canvas/_describe_canvas（不 import ComfyUI）。"""
+    """从 nodes.py 抽 _AR_RATIO/_MP_OPTIONS/_resolve_canvas/_describe_canvas（不 import ComfyUI）。
+
+    ⚠ 2026-10-16 起画布换算的**真源搬到 refvideo.py**（纯模块，零 ComfyUI 依赖），
+    nodes 里只剩别名与包装（`_AR_RATIO = refvideo.AR_RATIO`）。所以抽取时必须把
+    真模块塞进命名空间，否则那两行赋值当场 NameError —— 报错会伪装成"抽取失败"。
+    """
+    spec = importlib.util.spec_from_file_location(
+        "h3sf_refvideo_probe", os.path.join(ROOT, "refvideo.py"))
+    refvideo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(refvideo)
     src = open(os.path.join(ROOT, "nodes.py"), encoding="utf-8").read()
     tree = ast.parse(src)
-    ns = {}
+    ns = {"refvideo": refvideo}
     want_const = ("_AR_RATIO", "_MP_OPTIONS")
     want_fn = ("_resolve_canvas", "_describe_canvas")
     for node in tree.body:

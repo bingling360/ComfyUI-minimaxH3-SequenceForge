@@ -36,6 +36,12 @@ from . import library as h3lib
 from . import launch_ref
 from . import perf
 from . import projects
+# 单测里 routes.py 会以顶层模块方式 exec（没有包上下文）→ 兼容两种导入。
+# 这是本文件内部一贯的写法（handler 里那批 `from . import X` 都带 ImportError 兜底）。
+try:
+    from . import refvideo
+except ImportError:
+    import refvideo
 
 _registered = False
 _mounted = []  # [(目标对象, {(method, path)})]：按对象身份防重复挂载（持引用防 id 复用）
@@ -91,6 +97,9 @@ ROUTES = [
     ("POST", "/h3chain/expand_validate"),
     ("GET", "/h3chain/perf"),
     ("POST", "/h3chain/perf"),
+    ("GET", "/h3chain/refvid"),
+    ("POST", "/h3chain/refvid"),
+    ("POST", "/h3chain/refvid_plan"),
     ("GET", "/h3chain/launch_ref"),
     ("GET", "/h3chain/launch_ref.txt"),
     ("GET", "/h3chain/lib_list"),
@@ -308,6 +317,54 @@ def _err(message, code="BAD_REQUEST", status=400, **extra):
     body = {"ok": False, "code": code, "message": message}
     body.update(extra)
     return web.json_response(body, status=status)
+
+
+def _refvid_src_path(item, proot, libroot):
+    """素材条目 -> 存在的绝对路径（只读探针用；找不到返回 None）。
+
+    查找序与节点执行期一致（三级寻址的**只读版**）：
+      ① 项目内相对路径（`assets/...` 或裸文件名，checkpoint.resolve_project_file）
+      ② 全局库（asset_id 命中库内记录取 file；或 file 直接当库根相对路径）
+      ③ input 目录（folder_paths.get_annotated_filepath）
+    不抛错：探针是辅助功能，一行坏素材不该让整张表 500。
+    """
+    try:
+        from . import checkpoint as _ckpt
+    except ImportError:
+        import checkpoint as _ckpt
+    file = str(item.get("file") or "").strip().replace("\\", "/")
+    aid = str(item.get("asset_id") or "").strip()
+    if proot and file:
+        try:
+            p = _ckpt.resolve_project_file(proot, file)
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    if libroot:
+        cand = file
+        if aid and not cand:
+            try:
+                from . import asset_store
+                for e in (asset_store.load_library(libroot).get("assets") or []):
+                    if str(e.get("asset_id") or "") == aid:
+                        cand = str(e.get("file") or "")
+                        break
+            except Exception:
+                cand = ""
+        if cand:
+            p = os.path.join(libroot, *[x for x in cand.split("/") if x and x != "."])
+            if os.path.isfile(p):
+                return p
+    if file:
+        try:
+            from folder_paths import get_annotated_filepath
+            p = get_annotated_filepath(file)
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    return None
 
 
 def add_routes(routes):
@@ -601,11 +658,22 @@ def add_routes(routes):
             reg = asset_store.build_registry(globals_, links, legacy)
         except Exception as e:
             return _err(f"资产注册表构建失败：{e}", code="BAD_REQUEST", status=400)
+        # 参考视频音频开关（全局机器级）：干跑显示的 <Audio j> 编号必须与实跑一致，
+        # 所以这里读同一个设置源（refvideo.json）。
+        _va = True
+        try:
+            from . import refvideo as _rv
+        except ImportError:
+            import refvideo as _rv
+        try:
+            _va = bool(_rv.current().get("audio", True))
+        except Exception:
+            _va = True
         if isinstance(data.get("segments"), list):
-            res = asset_store.compile_segments(reg, data["segments"])
+            res = asset_store.compile_segments(reg, data["segments"], _va)
             status = 200 if res["ok"] else 422
             return web.json_response({"ok": res["ok"], **res}, status=status)
-        res = asset_store.compile_refs(reg, data.get("refs") or [], 1)
+        res = asset_store.compile_refs(reg, data.get("refs") or [], 1, _va)
         status = 200 if res["ok"] else 422
         return web.json_response({"ok": res["ok"], **res}, status=status)
 
@@ -1939,6 +2007,107 @@ def add_routes(routes):
                                   "applied": perf.apply_runtime(table),
                                   "upcast": perf.upcast_attention_state()})
 
+    async def refvid_get(request):
+        """参考视频归一设置（全局机器级）：面板的唯一数据来源。
+
+        与 `/h3chain/perf` 同构：设置真源在后端 `refvideo.py`
+        （DEFAULT_REFVID / parse_state），前端只显示、不自己算档位。
+        另外回三样只读辅助：可选档位表（画布反解用）、当前链无（面板不需要）、
+        以及 `audio` 的语义说明由前端写死文案。
+        """
+        table = refvideo.load_settings()
+        return web.json_response({
+            "ok": True, "data": table,
+            # 前端「跟随链画布」快捷按钮要用同一张档位表 —— 从后端下发，
+            # 免得两边各写一份（既有铁律：参数单一真源）。
+            "ar_ratio": list(refvideo.AR_RATIO.keys()),
+            "mp_options": list(refvideo.MP_OPTIONS),
+            "fits": list(refvideo.FITS),
+            "resamples": list(refvideo.RESAMPLES),
+            "grids": list(refvideo.GRIDS),
+            "limits": list(refvideo.LIMITS),
+            "path": refvideo.settings_path(),
+        })
+
+    async def refvid_set(request):
+        """参考视频归一设置：写全局设置并立即生效（渲染期读的就是这个文件）。"""
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        raw = (data or {}).get("refvid")
+        if not isinstance(raw, dict):
+            return _err("缺少 refvid 对象", code="BAD_REQUEST", status=400)
+        table = refvideo.save_settings(raw)
+        if table is None:
+            return _err("无法写入参考视频设置（用户目录不可用）", code="NO_DIR", status=500)
+        return web.json_response({"ok": True, "data": table})
+
+    async def refvid_plan(request):
+        """参考视频**试算**（只读、不解码、不落盘）：素材 -> 探针 + 归一方案。
+
+        体 {dir?, items?: [{label?, file?, asset_id?}]} -> {ok, rows: [...]}。
+        rows[i] = {label, ok, path?, info?, plan?, report?[], error?}
+        —— 弹窗里那张「原始 fps/尺寸/时长 → 处理后的帧数/尺寸/时长」的表就是它。
+
+        为什么要单独一个入口：用户要能**在跑之前**看到「我上传的素材会被变成什么」。
+        探测失败只让该行 ok=false，绝不 500（一行坏素材不该让整张表消失）。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        items = data.get("items")
+        if not isinstance(items, list):
+            return _err("缺少 items 数组", code="BAD_REQUEST", status=400)
+        cfg = refvideo.parse_state(data.get("refvid") or refvideo.load_settings())
+        try:
+            max_frames = int(data.get("max_frames") or 0)
+        except (TypeError, ValueError):
+            max_frames = 0
+        try:
+            from . import checkpoint as _ckpt
+        except ImportError:
+            import checkpoint as _ckpt
+        from . import asset_store
+
+        name = projects.safe_name(str(data.get("dir") or ""))
+        proot = os.path.join(_ckpt.projects_root(), name) if name else None
+        libroot = None
+        try:
+            libroot = asset_store.try_library_root()
+        except Exception:
+            libroot = None
+        rows = []
+        try:
+            from . import media as _media
+        except ImportError:
+            import media as _media
+        for it in items[:200]:
+            it = it if isinstance(it, dict) else {}
+            label = str(it.get("label") or it.get("file") or it.get("asset_id") or "")
+            src = _refvid_src_path(it, proot, libroot)
+            if not src:
+                rows.append({"label": label, "ok": False,
+                             "error": "找不到素材文件（项目资产 / 全局库 / input 都未命中）"})
+                continue
+            try:
+                info = await asyncio.get_event_loop().run_in_executor(
+                    None, _media.probe_media, src)
+                p = refvideo.plan(info, cfg, max_frames, label)
+            except Exception as e:
+                rows.append({"label": label, "ok": False, "path": src,
+                             "error": f"{type(e).__name__}: {e}"})
+                continue
+            rows.append({
+                "label": label, "ok": True, "path": src, "info": info,
+                "report": list(p["report"]),
+                "plan": {k: p[k] for k in
+                         ("w", "h", "out_frames", "src_fps", "src_frames",
+                          "src_dur", "crop", "no_upscale_hit")},
+            })
+        return web.json_response({"ok": True, "rows": rows})
+
     async def lib_status(request):
         dir_name = str(request.query.get("dir") or "")
         items = _indexed(dir_name)
@@ -2943,6 +3112,9 @@ def add_routes(routes):
         ("GET", "/h3chain/ping", ping),
         ("GET", "/h3chain/perf", perf_get),
         ("POST", "/h3chain/perf", perf_set),
+        ("GET", "/h3chain/refvid", refvid_get),
+        ("POST", "/h3chain/refvid", refvid_set),
+        ("POST", "/h3chain/refvid_plan", refvid_plan),
         ("GET", "/h3chain/launch_ref", launch_ref_get),
         ("GET", "/h3chain/launch_ref.txt", launch_ref_txt),
         ("GET", "/h3chain/lib_list", lib_list),

@@ -222,6 +222,14 @@
      * 前端不自己算档位，只做开关 + 显示后端给的只读诊断。 */
     perfGet: () => _call("/h3chain/perf"),
     perfSet: (perf) => _json("POST", "/h3chain/perf", { perf: perf || {} }),
+    /* ---- 参考视频缩放设置（全局，跨项目；与性能优化并列但**分开存**）----
+     * 真源在后端 refvideo.py：DEFAULT_REFVID / parse_state / plan。
+     * 前端不自己算目标画布 —— 档位表（ar_ratio / mp_options）由 GET 下发，
+     * 用的是与链画布**同一个** resolve_canvas。 */
+    refvidGet: () => _call("/h3chain/refvid"),
+    refvidSet: (refvid) => _json("POST", "/h3chain/refvid", { refvid: refvid || {} }),
+    /* 试算（只读）：素材 -> 探针 + 归一方案报告，跑之前就能看到「会变成什么」 */
+    refvidPlan: (payload) => _json("POST", "/h3chain/refvid_plan", payload || {}),
     /* 启动命令速查（📖 启动命令弹窗）。数据源在后端 launch_ref.py（单一真源），
      * 与 docs/ComfyUI启动命令速查.txt 同源。 */
     launchRef: () => _call("/h3chain/launch_ref"),

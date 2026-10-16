@@ -3281,6 +3281,188 @@ function parseMasterPrompt(text) {
     return out;
 }
 
+/* ---- 外部 agent 的 JSON 导入 ----
+ *
+ * 与文本通道**同一个分配口径**：JSON 只是"外部 agent 的另一个外包装"，解析完得到
+ * 的就是与 parseMasterPrompt 同构的 { segs:[{main,seconds,unlink}] }，后面照旧走
+ * applyMasterPromptParsed —— 不另开一条写入路径（两条路径必然对不上，那正是
+ * "总提示词框引用不对"这类 bug 的来源）。
+ *
+ * 只认三段式（与总提示词框完全同构）：
+ *   { "segments": [ { "duration": 10, "standalone": false, "prompt": "…（官方格式正文）" } ] }
+ * 宽容到能吃下这几种外形（都是外部 agent 常见吐法）：
+ *   · 顶层直接是数组；
+ *   · 段数组换名（segs / shots / prompts / list / items / 段落 / 分段）；
+ *   · 单段对象（没有数组，顶层就写着 prompt / duration / standalone）；
+ *   · 把整篇总提示词文本塞进 `master_prompt` / `text` 字段 → 直接转交文本解析器；
+ *   · 段里不给 prompt 整串，而是按官方字段拆着给（integrated_multimodal_description
+ *     等）→ 按官方顺序拼回正文。
+ * 字段名大小写不敏感；时长吃 number / "10" / "10s"；独立镜头吃 bool / yes|no / 是|否 / 1|0。
+ *
+ * ★ 中文镜像字段（prompt_zh / zh / 中文 / chinese）**一律不取**：JSON 里那份中文是
+ *   给人对照看的，取了就是把中文混进英文正文 —— H3 最典型的翻车（模型会把中文当成
+ *   画面里可见的字烧上去）。同理，素材引用**不在这里出现**：本段挂哪些素材仍然由
+ *   正文里的 @素材名 序列派生（syncRefsFromText），JSON 里没有第二份清单。 */
+const MPJ_LIST_KEYS = ["segments", "segs", "shots", "prompts", "list", "items", "段落", "分段"];
+/* 顶层"整篇文本"字段。**故意不含 prompt**：`{"prompt": "…", "duration": 10}` 是
+ * 单段对象的常见写法，把它当整篇文本解析会把 duration 静默吃掉。 */
+const MPJ_TEXT_KEYS = ["master_prompt", "masterprompt", "master", "raw", "text", "总提示词"];
+const MPJ_PROMPT_KEYS = ["prompt", "main", "content", "body", "提示词", "正文"];
+const MPJ_DUR_KEYS = ["duration", "seconds", "sec", "dur", "length", "duration_seconds", "时长"];
+const MPJ_SOLO_KEYS = ["standalone", "unlink", "independent", "独立镜头"];
+const MPJ_IDX_KEYS = ["index", "idx", "n", "no", "order", "序号", "段号"];
+/* 官方字段对象（不给 prompt 整串、按官方字段拆着给）的拼装顺序：与 06-rules 的
+ * 字段顺序一致，字段间空行分节（与文本通道里官方三/六字段的写法同形）。 */
+const MPJ_FIELD_ORDER = ["summary", "subject_definitions", "retention_analysis",
+    "detailed_description", "integrated_multimodal_description",
+    "overall_soundscape", "non_diegetic_music"];
+
+/** 键名小写表：外部 agent 的 JSON 大小写全靠缘分（Duration / duration / DURATION）。 */
+function mpjKeys(obj) {
+    const m = new Map();
+    for (const k of Object.keys(obj || {})) m.set(String(k).trim().toLowerCase(), obj[k]);
+    return m;
+}
+/** 按候选键顺序取第一个**存在**的值（区分"没写"与"写了空串"：前者不动字段，
+ *  后者是显式清空——与文本通道的口径一致）。 */
+function mpjPick(map, keys) {
+    for (const k of keys) { if (map.has(k)) return map.get(k); }
+    return undefined;
+}
+/** 秒数：number / "10" / "10s" / "10 秒" 都吃；无效返回 undefined（= 不动该段时长）。 */
+function mpjSeconds(v) {
+    if (v === null || v === undefined || v === "") return undefined;
+    if (typeof v === "number") return isFinite(v) && v > 0 ? v : undefined;
+    const m = String(v).match(/-?\d+(?:\.\d+)?/);
+    if (!m) return undefined;
+    const n = Number(m[0]);
+    return isFinite(n) && n > 0 ? n : undefined;
+}
+/** 独立镜头：bool / yes|no / 是|否 / 1|0 → true|false；认不出返回 undefined（不动）。 */
+function mpjStandalone(v) {
+    if (v === null || v === undefined || v === "") return undefined;
+    if (typeof v === "boolean") return v;
+    if (typeof v === "number") return v === 1 ? true : (v === 0 ? false : undefined);
+    const s = String(v).trim().toLowerCase();
+    if (s === "1") return true;
+    if (s === "0") return false;
+    if (MP_YES.includes(s)) return true;
+    if (MP_NO.includes(s)) return false;
+    return undefined;
+}
+/** 一段的正文：字符串直接用；对象按 prompt 系列取，取不到再按官方字段拼。 */
+function mpjPromptOf(item) {
+    if (typeof item === "string") return item;
+    if (!item || typeof item !== "object") return undefined;
+    const m = mpjKeys(item);
+    let v = mpjPick(m, MPJ_PROMPT_KEYS);
+    if (v === undefined || v === null || String(v).trim() === "") {
+        const parts = [];
+        for (const k of MPJ_FIELD_ORDER) {
+            const f = m.get(k);
+            if (f !== undefined && f !== null && String(f).trim() !== "") {
+                parts.push(`${k}: ${String(f).trim()}`);
+            }
+        }
+        v = parts.length ? parts.join("\n\n") : undefined;
+    }
+    return v === undefined || v === null ? undefined : String(v);
+}
+
+/** 解析外部 agent 的 JSON。返回 { ok, error?, title?, segs:[{main,seconds,unlink}], notes:[] }。
+ *  segs 与 parseMasterPrompt 同构，可直接喂给 applyMasterPromptParsed。 */
+function parseMasterPromptJson(raw) {
+    const out = { ok: false, error: "", title: "", segs: [], notes: [] };
+    let data = null;
+    try {
+        /* 去 BOM：Windows 上写出来的 .json 常常带它，带 BOM 的 JSON.parse 必抛
+         * "Unexpected token"（表现是"文件明明是合法 JSON，导入却说不是"）。 */
+        data = JSON.parse(String(raw ?? "").replace(/^\uFEFF/, ""));
+    } catch (e) {
+        out.error = `不是合法 JSON：${e && e.message ? e.message : e}`;
+        return out;
+    }
+    let list = null;
+    if (Array.isArray(data)) {
+        list = data;
+    } else if (data && typeof data === "object") {
+        const m = mpjKeys(data);
+        out.title = String(mpjPick(m, ["title", "name", "project", "标题"]) || "").trim();
+        const arr = mpjPick(m, MPJ_LIST_KEYS);
+        if (Array.isArray(arr)) {
+            list = arr;
+        } else {
+            const t = mpjPick(m, MPJ_TEXT_KEYS);
+            /* 整篇文本包在 JSON 里（agent 只把总提示词文本塞了进来）→ 交文本解析器。
+             * 走同一条解析链路，JSON 通道与文本通道就不会出现"同一份内容两套结果"。 */
+            if (typeof t === "string" && t.trim()) {
+                const p = parseMasterPrompt(t);
+                out.segs = p.segs || [];
+                out.notes = (p.notes || []).slice();
+                out.ok = out.segs.length > 0;
+                if (!out.ok) out.error = "文本字段里没解析到任何段落";
+                return out;
+            }
+            list = [data];                     // 单段对象（没有数组、也没有整篇文本）
+        }
+    } else {
+        out.error = "JSON 顶层既不是对象也不是数组";
+        return out;
+    }
+    if (!Array.isArray(list) || !list.length) {
+        out.error = "没找到段数组（segments / segs / shots / prompts），也没有整篇文本字段";
+        return out;
+    }
+    /* 段序号：给了 index 就按它排（外部 agent 常常边生成边乱序追加），否则按数组顺序。
+     * 排完顺序与数组一致就不吭声——"已重排"只在真的换过顺序时提示。 */
+    const ordered = list.map((it, i) => {
+        let n = i + 1;
+        if (it && typeof it === "object") {
+            const ix = Number(mpjPick(mpjKeys(it), MPJ_IDX_KEYS));
+            if (Number.isFinite(ix)) n = ix;
+        }
+        return { n, it };
+    });
+    const before = ordered.map((x) => x.n).join(",");
+    ordered.sort((a, b) => a.n - b.n);
+    if (ordered.map((x) => x.n).join(",") !== before) {
+        out.notes.push("段序号（index）与数组顺序不一致，已按 index 重排");
+    }
+    const badEmpty = [], badDur = [], badSolo = [];
+    out.segs = ordered.map(({ it }, i) => {
+        const seg = newMasterSeg();
+        const body = mpjPromptOf(it);
+        seg.main = body === undefined ? "" : body;
+        if (body === undefined) badEmpty.push(String(i + 1));
+        const m = (it && typeof it === "object") ? mpjKeys(it) : new Map();
+        const rawDur = mpjPick(m, MPJ_DUR_KEYS);
+        seg.seconds = mpjSeconds(rawDur);
+        if (seg.seconds === undefined && String(rawDur ?? "").trim()) badDur.push(String(i + 1));
+        const rawSolo = mpjPick(m, MPJ_SOLO_KEYS);
+        seg.unlink = mpjStandalone(rawSolo);
+        if (seg.unlink === undefined && String(rawSolo ?? "").trim()) badSolo.push(String(i + 1));
+        return seg;
+    });
+    const show = (arr) => arr.slice(0, 6).join("、") + (arr.length > 6 ? " …" : "");
+    if (badEmpty.length) {
+        out.notes.push(`${badEmpty.length} 段没有 prompt 正文（已留空）：第 ${show(badEmpty)} 段`);
+    }
+    if (badDur.length) {
+        out.notes.push(`${badDur.length} 段的时长不是有效秒数（已忽略，该段时长不动）：第 ${show(badDur)} 段`);
+    }
+    if (badSolo.length) {
+        out.notes.push(`${badSolo.length} 段的 standalone 应为 yes/no（已忽略）：第 ${show(badSolo)} 段`);
+    }
+    /* 一段正文都没有 = 这份 JSON 不是提示词（多半是别的东西，或者字段名全不对）：
+     * 宁可报错也别把 N 个空段写进链上——那会把现有段落静默清空。 */
+    if (!out.segs.some((s) => String(s.main ?? "").trim())) {
+        out.error = "没有读到任何提示词正文（每段都要有 prompt 字段，或按官方字段拆着给）";
+        return out;
+    }
+    out.ok = true;
+    return out;
+}
+
 /** 工作台状态 -> 分段文本（[Segment N] + Duration / Standalone / Prompt）。
  *  段级标签只有这三个：**资产引用不在这里**——它就写在提示词正文里的 @素材名，
  *  与段卡提示词框同一套语义（导出正文 = 导出引用，不需要第二份清单）。
@@ -3335,8 +3517,16 @@ function exportMasterPrompt(node) {
  *  seg.refs 由正文里的 @素材名 序列派生（syncRefsFromText），没有第二份清单。
  *  返回解析结果供界面提示。 */
 function applyMasterPrompt(node, text) {
-    const p = parseMasterPrompt(text);
-    if (!p.segs.length) return p;
+    return applyMasterPromptParsed(node, parseMasterPrompt(text));
+}
+
+/** 分配**已解析**的结果到当前链（文本与 JSON 两条通道的唯一写入口）。
+ *  为什么拆成"解析"与"写入"两步：JSON 通道若先渲染成文本再解析一遍，正文里任何
+ *  长得像 `[Segment N]` 的行都会当场把一段劈成两段（文本解析器见到段头就开新段，
+ *  这是它应有的行为）。JSON 已经是结构化的，直接进这里就不会被二次解析走样。
+ *  两条通道共用这一份写入逻辑，"文本粘贴"与"JSON 导入"才不会给出两套结果。 */
+function applyMasterPromptParsed(node, p) {
+    if (!p || !Array.isArray(p.segs) || !p.segs.length) return p || { segs: [], notes: [] };
     const ds = getDs(node);
     const old = Array.isArray(ds.segments) ? ds.segments : [];
     ds.prompts = p.segs.map((s) => (s.main === undefined ? "" : s.main));
@@ -8070,6 +8260,14 @@ function injectStyles() {
     .h3d-mpta:focus{border-color:#a8d8bd}
     .h3d-mpinfo{color:var(--h3d-muted);font-size:12px;min-height:18px;margin-bottom:4px}
     .h3d-mpbtn{display:block;margin:8px 0 0}
+    /* 入口那一排（总提示词 + 导入 JSON）：两个按钮并排，不再各占一行 */
+    .h3d-mprow{display:flex;gap:8px;flex-wrap:wrap}
+    /* ---- 外部 agent 的 JSON 导入预览 ---- */
+    .h3d-jprev{max-height:min(42vh,380px);overflow:auto;display:flex;flex-direction:column;gap:5px;margin:10px 0 2px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;padding:8px 10px}
+    .h3d-jrow{display:flex;gap:8px;align-items:baseline;font-size:12px}
+    .h3d-jrow b{flex:none;color:var(--h3d-bone);font-weight:600}
+    .h3d-jrow span{color:var(--h3d-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .h3d-jrow.empty span{color:#e89090}
 
     /* ---- 总提示词工作台入口（纯分段流水线，见 openMasterPromptModal） ----
      * 单框可拖右下角伸缩（resize 挂在 wrapper 上，wrapper 内部编辑器
@@ -8357,8 +8555,18 @@ function openDesk() {
     const mpBtn = el("button", "h3d-btn h3d-mpbtn", "📋 总提示词");
     mpBtn.title = "多段工作台：一个框管全片，用 [Segment N] 分段，框里就是直接进模型的提示词；"
         + "可一键洗成 H3 官方格式再分配回段落（扩写在段卡上做）";
-    mpBtn.onclick = openMasterPromptModal;
-    cHead.append(mpBtn);
+    mpBtn.onclick = () => openMasterPromptModal();
+    /* 📥 导入 JSON：外部 agent 直接吐**文件**的那条路（不必再从聊天界面复制，
+     * markdown 渲染吃掉换行是"整篇塌成一段"的头号来源）。与总提示词框同一套
+     * 段级字段与写入逻辑，只是入口不同：一个是粘文本，一个是选文件。 */
+    const mpJsonBtn = el("button", "h3d-btn h3d-mpbtn", "📥 导入 JSON");
+    mpJsonBtn.title = "导入外部 agent 输出的多段提示词 JSON：按 segments 数组分配到各段"
+        + "（每段只有 提示词 / 时长 / 独立镜头 三段式，素材引用照旧写正文里的 @素材名）。\n"
+        + "会先给一份预览（每段时长与正文首行），确认后才写入。";
+    mpJsonBtn.onclick = importMasterPromptJson;
+    const mpRow = el("div", "h3d-mprow");
+    mpRow.append(mpBtn, mpJsonBtn);
+    cHead.append(mpRow);
     colC.append(cHead);
     const colR = el("aside", "h3d-col right");
     const rParams = el("section", "h3d-rsec h3d-psec");
@@ -11669,7 +11877,7 @@ overall_soundscape: The vendors' calls fade with distance while her footsteps be
 
 non_diegetic_music: N/A`;
 
-function openMasterPromptModal() {
+function openMasterPromptModal(prefill) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
     if (document.querySelector(".h3d-overlay")) return;
@@ -11713,7 +11921,9 @@ function openMasterPromptModal() {
      * 裸 textarea 加一个「参考：」标签，那正是"总提示词框的素材引用和分段两回事"
      * 的根因。现在两者没有任何语义差异，只有"一段 vs 全篇"这个粒度差别。 */
     const ta = createPromptEditor({
-        value: "",
+        /* 预填（来自 JSON 导入的「在总提示词框里查看」）：默认仍是空框 —— 这个框
+         * 不是段卡提示词的镜像，打开时不自动载入，见函数头注释。 */
+        value: prefill ? String(prefill) : "",
         labels: () => refLabelsOf(mpPool()),
         assets: () => refInfoMapOf(mpPool()),
         /* 官方标签 <Picture N> 可视化打开：外部 agent / 官方格式的文本里是这种写法，
@@ -11755,10 +11965,15 @@ function openMasterPromptModal() {
     const err = el("div", "h3d-err", "");
     const row = el("div", "h3d-dialog-row");
     const bLoad = el("button", "h3d-btn", "从当前链载入");
+    /* 从文件导入（与顶栏那个按钮同一个动作）：人在这里粘文本，agent 那边给文件，
+     * 两条路进的是同一套解析与分配，写完的结果一模一样。 */
+    const bImport = el("button", "h3d-btn", "📥 导入 JSON");
+    bImport.title = "从文件导入外部 agent 输出的多段提示词 JSON（先预览再写入）";
+    bImport.onclick = importMasterPromptJson;
     const bClear = el("button", "h3d-btn", "清空");
     const cancel = el("button", "h3d-btn", "取消");
     const ok = el("button", "h3d-btn h3d-btn-cta", "解析并分配");
-    row.append(bLoad, bClear, cancel, ok);
+    row.append(bLoad, bImport, bClear, cancel, ok);
     dialog.append(stack, info, err, row);
     overlay.append(dialog);
     overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
@@ -11786,6 +12001,9 @@ function openMasterPromptModal() {
         return p;
     };
     ta.addEventListener("input", paint);
+    /* 预填进来时立刻 paint 一次：让「识别 N 段 / 总时长 / 引用 N 处」当场显示，
+     * 否则要等用户敲一个字才出（观感就是"导入完了却看不出识别成几段"）。 */
+    if (prefill) paint();
 
     /* 「从当前链载入」：**只在手动点的时候**发生。
      * 打开时不再自动载入 —— 这个框不是段卡提示词的镜像/结果框。自动载入会让人
@@ -11816,6 +12034,115 @@ function openMasterPromptModal() {
         if (p.notes.length) alert("注意：\n- " + p.notes.join("\n- "));
     };
     ok.onclick = submit;
+}
+
+/* ---- 外部 agent 的 JSON 导入 ----
+ *
+ * 为什么还要一条 JSON 通道：文本通道是给人**粘**的，而 agent 的产出是**文件**。
+ * 让 agent 直接吐 JSON（而不是一大段 [Segment N] 文本）有两个实打实的好处：
+ *   · 不必再从聊天界面复制——markdown 渲染会吃掉换行，那是"整篇塌成一段"的头号来源；
+ *   · 正文里的空行 / 缩进 / `<Picture N>` 这类字面量不会被任何渲染层改动。
+ * 但**通道只有两条、写入只有一条**：JSON 解析完与文本解析完是同一个结构，
+ * 都走 applyMasterPromptParsed。段级字段仍然只有三个（提示词 / 时长 / 独立镜头），
+ * 素材引用仍然只认正文里的 @素材名 —— JSON 里没有第四样东西。 */
+
+/** 选文件 → 解析 → 预览 → 写入。读取全在本地（FileReader），不经过服务端：
+ *  这只是提示词，没必要先上传一遍再读回来。 */
+function importMasterPromptJson() {
+    const node = findNode();
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
+    const inp = document.createElement("input");
+    inp.type = "file";
+    inp.accept = ".json,application/json,text/plain";
+    inp.style.display = "none";
+    document.body.append(inp);
+    /* 选完即销毁：留着这个 input 复用，第二次选**同一个**文件时 change 不再触发
+     * （浏览器对同一文件的既有行为），表现为"第二次导入点了没反应"。 */
+    const drop = () => { try { inp.remove(); } catch (e) { /* 已移除 */ } };
+    inp.addEventListener("change", () => {
+        const f = inp.files && inp.files[0];
+        if (!f) { drop(); return; }
+        const fr = new FileReader();
+        fr.onload = () => {
+            const name = String(f.name || "");
+            drop();
+            openMasterPromptJsonPreview(node, parseMasterPromptJson(String(fr.result ?? "")), name);
+        };
+        fr.onerror = () => { drop(); setLed("err", "读取文件失败"); };
+        fr.readAsText(f);
+    });
+    inp.click();
+}
+
+/** 写入前的预览（唯一闸门）：列出每段的时长 / 独立镜头 / 正文首行，点了「写入」才动链。
+ *  不做静默写入：整链替换是不可撤销的，而外部 agent 的文件长得往往跟想的不一样。 */
+function openMasterPromptJsonPreview(node, p, fileName) {
+    if (!node) { alert("画布上未找到 H3 Seamless Chain 节点（只读模式）"); return; }
+    if (!p || !p.ok) {
+        alert(`导入失败：${(p && p.error) || "没解析到任何段落"}`);
+        return;
+    }
+    const segs = p.segs || [];
+    const name = String(fileName || "").trim();
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog h3d-dialog-wide");
+    dialog.append(el("h3", "", `📥 导入多段提示词${p.title ? ` · ${escapeHtml(p.title)}` : ""}`));
+    const lead = el("p", "h3d-lead",
+        (name ? `文件 <b>${escapeHtml(name)}</b>：` : "")
+        + `识别到 <b>${segs.length}</b> 段。写入会把当前链的提示词<b>整链替换</b>`
+        + "（段数跟着这份 JSON 走；已生成的段落文件不受影响）。素材引用照旧由正文里的 "
+        + "<code>@素材名</code> 派生，不在这里另填。");
+    const info = el("div", "h3d-mpinfo", "");
+    const list = el("div", "h3d-jprev");
+    const err = el("div", "h3d-err", "");
+    const row = el("div", "h3d-dialog-row");
+    const bView = el("button", "h3d-btn", "在总提示词框里查看");
+    bView.title = "先不写入：把这份 JSON 渲染成总提示词文本看看（可在那里改完再点「解析并分配」）";
+    const cancel = el("button", "h3d-btn", "取消");
+    const ok = el("button", "h3d-btn h3d-btn-cta", `写入 ${segs.length} 段`);
+    row.append(bView, cancel, ok);
+    dialog.append(lead, info, list, err, row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+    document.body.append(overlay);
+
+    /* 引用计数与段卡同一条 refsFromText：这里显示几处，写入后 seg.refs 就是几个 */
+    const pool = (() => { try { return getDs(node).ref_assets || []; } catch (e) { return []; } })();
+    const nRef = segs.reduce((a, s) => a + refsFromText(String(s.main ?? ""), pool).length, 0);
+    const total = segs.reduce((a, s) => a + (Number(s.seconds) || 0), 0);
+    const nSolo = segs.filter((s) => s.unlink === true).length;
+    info.innerHTML = `识别 <b>${segs.length}</b> 段 · 总时长 <b>${Math.round(total)}s</b>`
+        + (nSolo ? ` · 独立镜头 <b>${nSolo}</b>` : "")
+        + (nRef ? ` · 素材引用 <b>${nRef}</b> 处` : "");
+    segs.forEach((s, i) => {
+        const body = String(s.main ?? "");
+        const first = body.split(/\r\n|\r|\n/).find((l) => l.trim()) || "";
+        const r = el("div", `h3d-jrow${first ? "" : " empty"}`);
+        const sec = Number(s.seconds) > 0 ? `${s.seconds}s` : "时长不动";
+        const solo = s.unlink === true ? "独立镜头"
+            : (s.unlink === false ? "连续接上段" : "接续不变");
+        r.append(el("b", "", `段 ${i + 1}`));
+        r.append(el("span", "", `${sec} · ${solo} · `
+            + (first ? escapeHtml(first.slice(0, 90)) : "（这段没有正文）")));
+        r.title = body.slice(0, 400);
+        list.append(r);
+    });
+    err.textContent = (p.notes || []).length ? "⚠ " + p.notes.join("；") : "";
+
+    const close = () => overlay.remove();
+    cancel.onclick = close;
+    bView.onclick = () => { close(); openMasterPromptModal(mpRenderState(segs)); };
+    ok.onclick = () => {
+        const r = applyMasterPromptParsed(node, p);
+        flushPrompts(node);                       // 同步项目 manifest 底稿
+        setLed("done", `JSON 已分配到 ${segs.length} 段`);
+        /* 底下可能还压着总提示词框（从框里发起的导入），一起收掉 */
+        document.querySelectorAll(".h3d-overlay").forEach((o) => o.remove());
+        scheduleRefresh(60);
+        const notes = (r && r.notes) || [];
+        if (notes.length) alert("注意：\n- " + notes.join("\n- "));
+    };
 }
 
 

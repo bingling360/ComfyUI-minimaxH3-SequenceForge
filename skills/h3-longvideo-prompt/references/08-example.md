@@ -1,6 +1,6 @@
 # 08 · 完整范例（照这个写）
 
-题材：30 秒藏族高原洪水 PV，CG 三维渲染，宏观大远景，不做人物近景。
+题材：30 秒藏族高原洪水 PV，CG 三维渲染，宏观大远景，不做人物近景。  
 配置：10 秒 / 段 × 3 段（此处示范前 2 段）；用户已按附录生成好参考图；走 Ref2VA 六段式（全段引用）。
 
 ## 交付文本（直接可粘贴）
@@ -99,21 +99,21 @@ non_diegetic_music: 极慢速的持续低音弦乐，底下垫一声低鼓的轻
 
 ## 这个范例做对了什么
 
-| 要点 | 体现 |
-|---|---|
-| 段间强关联 | 段2 首句明写「Continuing from the previous segment」「continuing the previous segment's camera position and side-backlight direction」；段1 的裂痕→段2 扩展成崩塌；段1 埋的「峡谷」在段2 兑现 |
-| 长度配得上时长 | 两段主描述各约 280 汉字（10 秒 × 20–40 字/秒 = 200–400） |
-| 六个字段齐全 + 顺序固定 | subject_definitions → summary → retention_analysis → detailed_description → overall_soundscape → non_diegetic_music |
-| 段级标签写在 `Prompt:` 之前 | 段头 / `Duration` / `Standalone` / `Prompt`，顺序固定，**全英文** |
-| `Standalone:` 显式写出 | 每段都写 `Standalone: no`（全片连续），不是省略 |
-| 参考图默认全段引用 | 两段都引用了场景图；段2 追加洪水图 |
-| **引用位置正确** | `@` 只出现在 `subject_definitions` 定义行；`summary` / `retention_analysis` / `detailed_description` 一律用 `<Subject N>` 指代 |
-| **标签语义正确** | 可复用的内容（山、洪水）用 `<Subject N>`；`<Picture N>` 只作「图本身」出现 |
-| 保留标记分流 | 可见内容走 `fully_preserved` / `partially_preserved`；没有音频所以不出现 `fully_copy` 那套 |
-| 配乐走非叙事 | 只写乐器、速度、力度，不写「悲壮 / 史诗」 |
-| 无对白不硬凑 | 全片无对白，`overall_soundscape` 只写环境音与物理声 |
-| `[Shot 1]` 无时间戳 | 后续 `[Shot 2]` / `[Shot 3]` 带 `At MM:SS.mmm`，递增且 ≤ 10 秒 |
-| 风格句在 `[Shot 1]` 之前 | 「A CG three-dimensional render with live-action-grade volumetric and global illumination.」独立成句，先立风格再开镜 |
+| 要点                  | 体现                                                                                                                                                            |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 段间强关联               | 段2 首句明写「Continuing from the previous segment」「continuing the previous segment's camera position and side-backlight direction」；段1 的裂痕→段2 扩展成崩塌；段1 埋的「峡谷」在段2 兑现 |
+| 长度配得上时长             | 两段主描述各约 280 汉字（10 秒 × 20–40 字/秒 = 200–400）                                                                                                                    |
+| 六个字段齐全 + 顺序固定       | subject_definitions → summary → retention_analysis → detailed_description → overall_soundscape → non_diegetic_music                                           |
+| 段级标签写在 `Prompt:` 之前 | 段头 / `Duration` / `Standalone` / `Prompt`，顺序固定，**全英文**                                                                                                        |
+| `Standalone:` 显式写出  | 每段都写 `Standalone: no`（全片连续），不是省略                                                                                                                              |
+| 参考图默认全段引用           | 两段都引用了场景图；段2 追加洪水图                                                                                                                                            |
+| **引用位置正确**          | `@` 只出现在 `subject_definitions` 定义行；`summary` / `retention_analysis` / `detailed_description` 一律用 `<Subject N>` 指代                                             |
+| **标签语义正确**          | 可复用的内容（山、洪水）用 `<Subject N>`；`<Picture N>` 只作「图本身」出现                                                                                                           |
+| 保留标记分流              | 可见内容走 `fully_preserved` / `partially_preserved`；没有音频所以不出现 `fully_copy` 那套                                                                                     |
+| 配乐走非叙事              | 只写乐器、速度、力度，不写「悲壮 / 史诗」                                                                                                                                        |
+| 无对白不硬凑              | 全片无对白，`overall_soundscape` 只写环境音与物理声                                                                                                                          |
+| `[Shot 1]` 无时间戳     | 后续 `[Shot 2]` / `[Shot 3]` 带 `At MM:SS.mmm`，递增且 ≤ 10 秒                                                                                                        |
+| 风格句在 `[Shot 1]` 之前  | 「A CG three-dimensional render with live-action-grade volumetric and global illumination.」独立成句，先立风格再开镜                                                        |
 
 ## 反例提醒
 

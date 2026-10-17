@@ -452,9 +452,10 @@ def test_encode_hq_is_a_two_state_switch():
 
     用户拍板（2026-09-23）：crf 与 preset/抖动**分开** —— 档位只留「开不开抗糊/
     抗条纹」，crf 由 `x264_crf` 单独调。所以真值表必须**恰好两态**。
+    2026-10-17 用户拍板把默认改回**关**（重摇后画质反馈，见 perf 注释）。
     """
     import ast
-    assert perf.DEFAULT_PERF["encode_hq"] is True
+    assert perf.DEFAULT_PERF["encode_hq"] is False
     assert perf.PERF_TYPES["encode_hq"] == (bool,)
     with open(os.path.join(ROOT, "upscale.py"), encoding="utf-8") as f:
         tree = ast.parse(f.read())

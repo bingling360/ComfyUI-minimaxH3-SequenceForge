@@ -383,20 +383,27 @@ def _parse_redo_segs(ds, done, exec_kinds, off, disabled=None):
     return out
 
 
+_REDO_SEED_STEP = 7919   # 重摇步长（素数；与接缝自动重摇的 `cur_seed += 7919` 同款）
+
+
 def _redo_seed(ctrl_seed, i, archived):
-    """重摇段种子：控件种子等差序列（与「重跑起始段」同规则），再与该段存档
-    种子相同时 +1（bump）——保证每次重摇种子必变，驱动 base_hash 变化，
-    二采记录自动失效重渲（重摇换种子 = 高清必须跟着重做）。
-    连续多次重摇同段：本段存档种子已被上次更新，bump 天然交替不出死循环。
+    """重摇段种子：**从本段存档种子推进一个素数步长**（无存档才回落到控件种子）。
+
+    为什么不再用「控件种子 + i」：一次跑完的链里 `seeds[g]` 恰好就等于
+    `控件种子 + i`，于是首次重摇落到 +1、第二次又落回 `控件种子 + i`（＝原版）、
+    第三次再 +1 …… **连续重摇只在两个种子之间来回**，用户第二版拿到的正是原来
+    那一版（观感就是"重摇没用 / 越摇越差"）。从存档种子推进则每次都换新种子，
+    且按模运算周期不会回到任何旧版；base_hash 每次都变 → 二采记录自动失效
+    重渲（重摇换种子 = 高清必须跟着重做）。
+
+    `archived` 缺失/非法（极老存档、槽位越界）才退回「控件种子 + i」，与
+    「重跑起始段」同规则。想指定某个种子：用「重跑起始段」+ 改控件种子。
     """
-    s = (int(ctrl_seed) + i) % 0xffffffffffffffff
-    if archived is not None:
-        try:
-            if s == int(archived) % 0xffffffffffffffff:
-                s = (s + 1) % 0xffffffffffffffff
-        except (TypeError, ValueError):
-            pass
-    return s
+    try:
+        return (int(archived) + _REDO_SEED_STEP) % 0xffffffffffffffff
+    except (TypeError, ValueError):
+        pass
+    return (int(ctrl_seed) + i) % 0xffffffffffffffff
 
 
 def _merged_list(new_seq, old_seq, upto):
@@ -1894,7 +1901,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 编码画质开关（preset + 暗部 aq + 抖动）与 crf 数值**分开**：
             # 开关管「哪套 preset/抖动」，crf 单独给（面板上按编码器显隐）。
             # 两者正交 —— 开关不会带着改 crf，改 crf 也不会动开关。
-            up_cfg["encode_hq"] = bool(_pf.get("encode_hq", True))
+            up_cfg["encode_hq"] = bool(_pf.get("encode_hq", False))
             up_cfg["x264_crf"] = _pf.get("x264_crf")
             # 精化二采分块（机器级，不进指纹）：时序切段 / 空间 tile。
             # 值从 perf 直下 —— upscale.parse_state 不再解析它们（见那里的注释）。
@@ -1941,7 +1948,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 原先节点上有个「一采编码」下拉，与性能设置里的「画质档位」是同一张表 ——
         # 两个入口改同一个旋钮，已删除（2026-09-23）。二采开启时其高清产物同名覆盖，
         # 本档只作用于二采未覆盖的段与基础成片。
-        _bhq = bool(_pf.get("encode_hq", True))
+        _bhq = bool(_pf.get("encode_hq", False))
         _bcrf, _bpreset, _baq, _bdith = upscale.resolve_encode_quad(
             _bhq, _pf.get("x264_crf"))
 

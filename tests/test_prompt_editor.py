@@ -315,7 +315,9 @@ def test_master_prompt_single_box_modal():
        不再有「参考：」那条第二通道）。
     """
     d = _src()
-    block = _fn_block(d, "function openMasterPromptModal()")
+    # 用**前缀**取函数：签名后来加了 `prefill`（总提示词 JSON 导入要预填），
+    # 钉死空括号会让这条守卫因为「参数变了」而不是「内容变了」红掉。
+    block = _fn_block(d, "function openMasterPromptModal(")
     # 单框：三框时代的箱体/句柄全删
     assert "h3d-mpboxwrap-main" in block
     for dead in ["mkBox", "boxI", "boxS", "boxR",
@@ -335,7 +337,10 @@ def test_master_prompt_single_box_modal():
     assert "if (((getDs(node).prompts" not in d, "打开时不应自动载入链上提示词"
     assert "bLoad.onclick = () => loadFromChain();" in block
     # ③ 资产引用与段卡同一套：分配时由正文 @序列 派生 seg.refs
-    alloc = _fn_block(d, "function applyMasterPrompt(node, text)")
+    # ⚠ 断言要打在**真正做分配的那个函数**上：`applyMasterPrompt` 后来瘦成了
+    # 「解析 + 交给 applyMasterPromptParsed」的两行壳（JSON 导入共用同一条链路），
+    # 钉在外壳上会因为「实现搬家」红掉，而不是因为语义变了。
+    alloc = _fn_block(d, "function applyMasterPromptParsed(node, p)")
     assert "syncRefsFromText(ds, i," in alloc, "seg.refs 必须由正文派生，不能另写一套"
     assert "s.refs !== undefined" not in alloc, "「参考：」标签应已停用"
     assert "base.scene_prompt" not in alloc, "旧四框字段不该再写回"

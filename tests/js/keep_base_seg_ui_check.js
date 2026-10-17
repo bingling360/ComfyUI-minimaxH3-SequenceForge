@@ -231,6 +231,49 @@ async function boot(w) {
         }
     }
 
+    /* ---------- 5) 缓存钥匙：同名覆盖的段产物，URL 必须带 v=<updated_at> ----------
+     * 重摇 / 二采接管都写回**同一个** finals/seg_NNN.mp4（一采另存同理
+     * base_seg_NNN.mp4），而 /api/view 是 FileResponse、没有 Cache-Control
+     * （启发式可缓存）→ 同一个 URL 再打开会命中旧字节。用户看到的就是
+     * 「重摇完了，段卡「一采分段成片」还是上一版，只有去文件夹里才看得到新的」。
+     * 钉两件事：①URL 带上 manifest.updated_at；②它变了 URL 跟着变。 */
+    {
+        const { w } = env({
+            base_videos: ["finals/base_seg_000.mp4"], upscale: UP_DONE,
+            mf: { updated_at: 1700000000 },
+        });
+        await boot(w);
+        const doc = w.document;
+        const b = segButtons(doc);
+        ok(!!b.base, "带 updated_at 时一采按钮仍要出现");
+        if (b.base) {
+            b.base.click();
+            const src = viewerSrc(doc);
+            ok(src.indexOf("v=1700000000000") >= 0,
+                "一采入口 URL 必须带 v=<updated_at 毫秒> 当缓存钥匙", src);
+            closeViewer(doc);
+        }
+        if (b.up) {
+            b.up.click();
+            ok(viewerSrc(doc).indexOf("v=1700000000000") >= 0,
+                "二采入口 URL 也必须带同一个缓存钥匙", viewerSrc(doc));
+            closeViewer(doc);
+        }
+        // 版本号变了 → URL 必须跟着变（否则浏览器照旧给旧字节）
+        const { w: w2 } = env({
+            base_videos: ["finals/base_seg_000.mp4"], upscale: UP_DONE,
+            mf: { updated_at: 1700000001 },
+        });
+        await boot(w2);
+        const b2 = segButtons(w2.document);
+        if (b2.base) {
+            b2.base.click();
+            ok(viewerSrc(w2.document).indexOf("v=1700000001000") >= 0,
+                "manifest 更新后 URL 必须换一个新钥匙", viewerSrc(w2.document));
+            closeViewer(w2.document);
+        }
+    }
+
     console.log(fails ? `\n${fails} 个断言失败` : "\nkeep_base_seg_ui_check 全部通过");
     process.exit(fails ? 1 : 0);
 })();

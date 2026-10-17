@@ -152,7 +152,7 @@ function h3dPane(title, open) {
     return { g, body: b };
 }
 
-function viewUrl(subfolder, filename) {
+function viewUrl(subfolder, filename, ver) {
     // 四库兼容：filename 含 "finals/seg_000.mp4" 前缀时拆进 subfolder，
     // 使 /api/view 的 subfolder/filename 口径与 Comfy 原生一致（旧裸名直通）。
     let sub = String(subfolder || "");
@@ -162,7 +162,13 @@ function viewUrl(subfolder, filename) {
         file = parts.pop() || "";
         if (parts.length) sub = sub ? `${sub}/${parts.join("/")}` : parts.join("/");
     }
-    return `/api/view?type=output&subfolder=${encodeURIComponent(sub)}&filename=${encodeURIComponent(file)}`;
+    const base = `/api/view?type=output&subfolder=${encodeURIComponent(sub)}`
+        + `&filename=${encodeURIComponent(file)}`;
+    /* `ver` = 缓存钥匙（可选）。段产物是**同名覆盖**的（seg_NNN.mp4 /
+     * base_seg_NNN.mp4 / thumb_NNN.png），而 /api/view 只带 Last-Modified/ETag、
+     * 没有 Cache-Control（同 fetchManifest 注释）→ 浏览器按启发式缓存，同一 URL
+     * 再打开可以合法地给旧字节。调用方把 manifest 版本号传进来，内容一变 URL 就变。 */
+    return ver ? `${base}&v=${encodeURIComponent(String(ver))}` : base;
 }
 
 /** 带超时的 fetch：后端一旦被卡死（历史上确有其事——标签唯一化死循环把 aiohttp
@@ -5129,10 +5135,15 @@ const H3_PERF_FIELDS = [
           + "**NVENC 不认 crf**，两者必须分开传，否则 NVENC 会静默丢掉质量档。"
           + "因 NVENC 压缩效率略低，同画质可比 crf 再调低 2–4。" },
     { key: "encode_hq", label: "高清编码档（preset + 抗条纹）", kind: "bool", group: "成片与编码 · 编码",
-      hint: "**开**（默认）：medium preset（veryfast 的率失真差约 5–15%，是编码层的二次模糊）"
+      hint: "**关**（默认）：veryfast · 无 aq · 无抖动 —— 编码更快，像素按原样量化，"
+          + "不额外往画面里加一层高频纹理。"
+          + "**开**：medium preset（veryfast 的率失真差约 5–15%，是编码层的二次模糊）"
           + "+ aq-mode 3（暗部自适应量化，保暗场细节）+ Bayer 抖动（打散 8bit 量化台阶，"
-          + "消解渐变色带 / 天空横向条纹）。**关** = veryfast 无抖动（编码更快；"
-          + "NVENC 下 preset / aq 本就不生效，只有抖动有效）。"
+          + "消解渐变色带 / 天空横向条纹）。"
+          + "（NVENC 下 preset / aq 本就不生效，只有抖动有效。）"
+          + "⚠ 抖动是 **4×4 固定网格**（每帧位置完全相同、不随画面运动）：它确实能打散色带"
+          + "（实测每行同值连续段 5.7→2.8 px），但会在平场/暗部留下一层静止的细网纹理"
+          + "—— 觉得重摇后画面「脏 / 糊」，先确认这里是**关**的。"
           + "⚠ 与 crf / cq **正交** —— 本开关只管 preset + 抖动，质量数值在上面单独调，"
           + "两边互不覆盖。开了会进二采指纹（换了档 → 既有高清段判失效重做）" },
 
@@ -7611,11 +7622,12 @@ function segMediaHtml(state, mf, idx) {
     const g = idx + planOff(mf);   // 全局槽位：序章占 0，manifest 数组按全局槽位索引
     if (g >= done || !state?.dir) return null;
     const sub = `h3_projects/${state.dir}`;
+    const ver = mfVer(mf);
     const thumbFile = (mf.thumbs || [])[g];
     const videoFile = (mf.videos || [])[g];
-    const thumbSrc = thumbFile ? viewUrl(sub, thumbFile) : "";
+    const thumbSrc = thumbFile ? viewUrl(sub, thumbFile, ver) : "";
     if (videoFile) {
-        return `<video class="h3d-segvideo" controls preload="metadata"${thumbSrc ? ` poster="${thumbSrc}"` : ""} src="${viewUrl(sub, videoFile)}"></video>`;
+        return `<video class="h3d-segvideo" controls preload="metadata"${thumbSrc ? ` poster="${thumbSrc}"` : ""} src="${viewUrl(sub, videoFile, ver)}"></video>`;
     }
     if (thumbSrc) return `<img loading="lazy" src="${thumbSrc}" alt="段${idx + 1}">`;
     return null;
@@ -7657,24 +7669,42 @@ function upRecValid(mf, g) {
     return rec.base_hash === `${ph}|${sd}` ? rec : null;
 }
 
+/** 项目存档版本号：给 `viewUrl` 当缓存钥匙（见 viewUrl 注释）。
+ *
+ * 段产物全部是**同名覆盖**：重摇 / 二采接管 / 重新编码都写回同一个
+ * `finals/seg_NNN.mp4`（一采另存同理 `base_seg_NNN.mp4`、缩略图 `thumb_NNN.png`）。
+ * 而 `/api/view` 是 FileResponse，只带 Last-Modified/ETag、没有 Cache-Control
+ * （与 fetchManifest 注释同一个根因）→ 浏览器按启发式缓存，同一个 URL 再打开
+ * 可以合法地放旧字节。用户看到的就是「重摇完了，段卡『一采分段成片』还是上一版，
+ * 只有去文件夹里才看得到新的」。
+ *
+ * `manifest.updated_at` 每次写盘都会变（逐段保存都写），拿它当 `v=` 既让 URL
+ * 跟着内容走，又不会把没变的文件也一起重新下载。读不到就返回空串
+ * （= 不加参数，退回旧行为，绝不因此报错）。 */
+function mfVer(mf) {
+    const t = Number(mf && mf.updated_at);
+    return Number.isFinite(t) && t > 0 ? Math.round(t * 1000) : "";
+}
+
 function segMediaInfo(state, mf, idx) {
     const done = mf?.done ?? 0;
     const g = idx + planOff(mf);
     if (g >= done || !state?.dir) return null;
     const sub = `h3_projects/${state.dir}`;
+    const ver = mfVer(mf);
     const videoFile = (mf.videos || [])[g];
     const thumbFile = (mf.thumbs || [])[g];
     if (!videoFile && !thumbFile) return null;
     const baseFile = (mf.base_videos || [])[g] || "";
     const upRec = upRecValid(mf, g);
     const upDone = !!upRec;
-    const segUrl = videoFile ? viewUrl(sub, videoFile) : "";
-    const thumbUrl = thumbFile ? viewUrl(sub, thumbFile) : "";
+    const segUrl = videoFile ? viewUrl(sub, videoFile, ver) : "";
+    const thumbUrl = thumbFile ? viewUrl(sub, thumbFile, ver) : "";
     return {
         videoUrl: segUrl,               // 段视频（= 二采结果，若该段做过二采）
         thumbUrl,
         file: videoFile || thumbFile || "",
-        baseUrl: baseFile ? viewUrl(sub, baseFile)
+        baseUrl: baseFile ? viewUrl(sub, baseFile, ver)
             : (upDone ? "" : segUrl),   // 无二采记录 → 段视频就是基础版
         baseFile: baseFile || (upDone ? "" : (videoFile || "")),
         upUrl: upDone ? segUrl : "",
@@ -8625,6 +8655,10 @@ function cardsSignature(data) {
     return JSON.stringify({
         dir: state?.dir ?? "",
         done: state?.done ?? 0,
+        /* 存档版本号进签名：段产物同名覆盖（重摇 / 二采接管），URL 里的 `v=` 跟着
+         * manifest.updated_at 变；签名不带它的话卡片不重建，DOM 里还挂着旧 URL
+         * —— 那正是「重摇后段卡还播上一版」的另一半原因（见 mfVer）。 */
+        ver: mfVer(mf),
         total: plan?.length ?? 0,
         review: !!state?.review,
         reroll: state?.reroll ?? 0,

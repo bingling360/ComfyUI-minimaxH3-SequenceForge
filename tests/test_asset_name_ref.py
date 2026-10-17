@@ -161,14 +161,18 @@ def test_collect_seg_media_keeps_video_and_audio():
         "media.kind 必须跟随素材真实类别，不能一律写 image"
     assert 'media.push({ kind: "audio", label: nm })' in block, \
         "音频参考要进 media（带 kind: audio，不带 images）"
-    assert 'media.push({ kind: _k, label: nm, images: [dataUrl] })' in block, \
+    assert re.search(r'media\.push\(\{\s*kind:\s*_k,\s*label:\s*nm,\s*images:', block), \
         "图/视频参考的 media.kind 要用素材真实 kind"
+    # 抽不到画面（视频首帧失败 / 图取不到）时**不许 continue**：少一项，官方
+    # <Picture k>/<Video k> 编号就整体前移，回填时 <Picture 1> 会指到另一张图。
+    assert "if (!dataUrl) continue;" not in block, \
+        "取不到预览也要占位，否则编号会塌陷（用户报的「顺序错乱」）"
 
 
 def test_collect_seg_media_note_mentions_marks():
     src = open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8").read()
     block = _fn_block(src, "async function collectSegMedia")
-    assert "notes.push(`@${nm}`)" in block, "note 里应给出 @标注"
+    assert re.search(r"notes\.push\(`@\$\{nm\}", block), "note 里应给出 @标注"
     assert "不要写 <Picture N>" in block
     assert "@图片N" in block or "图片1" in block, "note 要说明标注形态（@图片N）"
 

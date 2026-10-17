@@ -3918,6 +3918,17 @@ function v2RefsFromSchedule(ds, segIdx) {
      * 素材，被富文本框标成"悬空"红框（其实它就指向这张帧图）② 帧锚和第一个
      * 参考素材撞号，正文里手写的 <Picture 1> 和帧锚指向两张不同的图。 */
     const fi = (seg.frame_img && typeof seg.frame_img === "object") ? seg.frame_img : {};
+    /* 引用键 → 池条目。**必须认引用名（ref_name，含后缀）**：seg.refs 是
+     * refsFromText 用 refKeyOf 写进去的，存的就是 `xxx.mp4` 这种全名，而池条目的
+     * `label` 是**别名（无后缀）**。以前只比 `x.label === label`，带后缀的引用
+     * 一条都匹配不上 → kind 全部回落成 image，于是：
+     *   ① 视频/音频被算进 <Picture k>，图片整体错位一格；
+     *   ② 映射表里根本没有 <Video 1> → 正文里的 `<Video 1>` 在编辑框里被当成
+     *      "挂不到素材的悬空引用"标红（用户报的"有视频就把素材认成没有"）；
+     *   ③ 错位后 <Picture 1> 指向的是那条视频 → "提示词内部的缩略图不对"。
+     * 三处同口径：refKeyOf（全名）/ label（别名，旧档）/ asset_id。 */
+    const hitOf = (key) => pool.find((x) => x
+        && (refKeyOf(x) === key || x.label === key || x.asset_id === key));
     for (const fkey of ["first", "end"]) {
         const f = String(fi[fkey] || "").trim();
         if (!f) continue;
@@ -3928,9 +3939,26 @@ function v2RefsFromSchedule(ds, segIdx) {
         cnt.image = (cnt.image || 0) + 1;
         out.push({ label: `<Picture ${cnt.image}>`, src: lbl, anchor: fkey });
     }
-    for (const label of (seg.refs || [])) {
+    const refs = [];
+    for (const raw of (seg.refs || [])) {
+        const key = String(raw || "").trim();
+        if (!key || refs.includes(key)) continue;               // 重复引用只占一个编号
+        refs.push(key);
+    }
+    /* 音频号先给每条参考视频的音轨预扣一个（官方 tokenizer 会插一条
+     * <Audio j>，且排在 <Video k> 之前）。与引用条 paintAll、后端
+     * nodes._kind_tokens 三处同规则 —— 少这一扣，同段独立音频的编号会整体
+     * 偏"视频条数"那么多，正文里的 <Audio j> 就指到视频音轨上。 */
+    const vaOn = (typeof refvidAudioOn === "function") ? !!refvidAudioOn() : true;
+    if (vaOn) {
+        for (const key of refs) {
+            const a = hitOf(key);
+            if (a && String(a.kind || "image") === "video") cnt.audio += 1;
+        }
+    }
+    for (const label of refs) {
         if (out.some((r) => r.src === label)) continue;         // 帧锚已占号
-        const a = pool.find((x) => x && (x.label === label || x.asset_id === label));
+        const a = hitOf(label);
         const kind = (a && KIND_LIST.includes(a.kind)) ? a.kind : "image";
         cnt[kind] = (cnt[kind] || 0) + 1;
         out.push({ label: `<${KIND_TOKEN[kind]} ${cnt[kind]}>`, src: label });
@@ -4255,6 +4283,62 @@ async function optImageToDataUrl(url) {
     } catch (e) { return null; }
 }
 
+/** 视频抽首帧成 data URL（给 LLM 看"这条参考视频长什么样"）。
+ *
+ *  以前视频走 optImageToDataUrl：那边 `blob.type.startsWith("image/")` 一票否决，
+ *  视频必然拿到 null → `if (!dataUrl) continue` 把整条参考视频从 media 里抹掉。
+ *  后果是一串连锁：
+ *    ① media 里没有它 → 后端 labels 名单里没有 视频1 → 模型根本不知道挂了视频；
+ *    ② 正文里的 `@视频1` 照抄成 `<Video 1>` 后译不回来（officialToMarks 按 media
+ *       编号建表，表里没这个号）→ 原样落盘成"悬空引用"红框；
+ *    ③ 少一项，其余素材的编号也可能与模型看到的对不上 → 张冠李戴。
+ *  <video> + canvas 抽一帧即可（同源、无跨域；失败只是没有画面，不影响编号）。 */
+async function optVideoFrameToDataUrl(url) {
+    if (!url || typeof document === "undefined") return null;
+    return await new Promise((resolve) => {
+        let done = false;
+        let v = null;
+        const fin = (val) => {
+            if (done) return;
+            done = true;
+            try { if (v) { v.removeAttribute("src"); v.load(); } } catch (e) { /* 忽略 */ }
+            resolve(val);
+        };
+        try {
+            v = document.createElement("video");
+            v.muted = true;
+            v.playsInline = true;
+            v.preload = "auto";
+            const grab = () => {
+                try {
+                    const w = v.videoWidth, h = v.videoHeight;
+                    if (!w || !h) return fin(null);
+                    const cv = document.createElement("canvas");
+                    const scale = Math.min(1, 720 / Math.max(w, h));
+                    cv.width = Math.max(2, Math.round(w * scale));
+                    cv.height = Math.max(2, Math.round(h * scale));
+                    const ctx = cv.getContext("2d");
+                    if (!ctx) return fin(null);
+                    ctx.drawImage(v, 0, 0, cv.width, cv.height);
+                    fin(cv.toDataURL("image/jpeg", 0.9));
+                } catch (e) { fin(null); }
+            };
+            /* 首帧有时在 loadeddata 就已解码；有些容器要 seek 一下才有画面。
+             * 两条路都走，谁先到算谁（fin 自带幂等）。 */
+            v.addEventListener("loadeddata", () => {
+                try {
+                    if (v.duration && isFinite(v.duration)) v.currentTime = Math.min(0.1, v.duration / 2);
+                } catch (e) { /* 忽略 */ }
+                grab();
+            });
+            v.addEventListener("seeked", grab);
+            v.addEventListener("error", () => fin(null));
+            setTimeout(() => fin(null), 5000);      // 兜底：解不出来就别卡住优化流程
+            v.src = url;
+        } catch (e) { fin(null); }
+    });
+}
+
 /** 收集本段要喂给 AI 的图：先首尾帧锚（结构锚，模型必须先看见起点与终点），
  *  再是本段引用的素材。统一按 <Picture N> 顺序编号。
  *  以前每张图的 label 都写死成 <picture>：多图时系统提示里出现重复标签，
@@ -4312,6 +4396,10 @@ async function collectSegMedia(node, ds, idx) {
     const notes = [];
     /* 标注 -> 素材全名：LLM 返回的是 `@图片1`，回写前要用它译回 `@女主.png` */
     const markMap = {};
+    /* 各类别在 media 里的序号 —— 就是 <Picture/Video/Audio k> 的 k。
+     * officialToMarks 回填时按 media 顺序建表，这里把同一套编号写进名单，
+     * 模型才不会自己"数一遍"数错（两个 turnaround 张冠李戴就是这么来的）。 */
+    const seq = { image: 0, video: 0, audio: 0 };
     for (const asset of picks) {
         /* label 用**标注**（图片1 / 视频1 / 音频1），不再用素材全名：
          * LLM 看见长文件名（`微信图片_20260730….png`）很容易抄错，标注短而稳，
@@ -4323,23 +4411,32 @@ async function collectSegMedia(node, ds, idx) {
             /* 音频没有画面可预览，也**不该**塞进 images：它只是"有这条素材"的
              * 声明。带上 kind 让模型知道该写 <Audio N> 而不是 <Subject N>。 */
             if (asset.mark && asset.label) markMap[asset.mark] = asset.label;
+            seq.audio += 1;
             media.push({ kind: "audio", label: nm });
-            if (nm) notes.push(`@${nm}`);
+            if (nm) notes.push(`@${nm}（音频 = <Audio ${seq.audio}>）`);
             continue;
         }
         if (media.length >= 8) break;
-        const dataUrl = await optImageToDataUrl(
-            assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id));
-        if (!dataUrl) continue;
+        /* 视频抽首帧（optImageToDataUrl 只收 image/*，视频必然 null —— 以前就在
+         * 这一步被 continue 掉，整条参考视频从此消失）。取不到画面也**照样入列**：
+         * media 少一项，编号就会整体错位、回填也译不回来。 */
+        const purl = assetPreviewUrl(getDirValue(node), asset.file, asset.asset_id);
+        const dataUrl = _k === "video"
+            ? await optVideoFrameToDataUrl(purl)
+            : await optImageToDataUrl(purl);
         if (asset.mark && asset.label) markMap[asset.mark] = asset.label;
-        /* 视频：取首帧当缩略图，但 kind 必须是 "video" —— 否则模型会拿
-         * <Subject N> 去指代一条视频，官方语义直接错位。 */
-        media.push({ kind: _k, label: nm, images: [dataUrl] });
-        if (nm) notes.push(`@${nm}`);
+        /* 视频 kind 必须是 "video" —— 否则模型会拿 <Subject N> 去指代一条视频，
+         * 官方语义直接错位。 */
+        const tk = (_k === "video") ? "video" : "image";
+        seq[tk] += 1;
+        const tok = `<${KIND_TOKEN[tk]} ${seq[tk]}>`;
+        media.push({ kind: _k, label: nm, images: dataUrl ? [dataUrl] : [] });
+        if (nm) notes.push(`@${nm}（${tk === "video" ? "视频" : "图片"} = ${tok}）`);
     }
     const base = notes.length
         ? `随图说明：可用素材 ${notes.join("、")}`
-          + "（正文里直接写 @名字 引用，不要写 <Picture N>）。"
+          + "（正文里直接写 @名字 引用，不要写 <Picture N>；"
+          + "真要用官方标签时，括号里的编号就是它，别自己重新数）。"
         : "";
     /* 混合模式的关键一句：模型必须分清"哪几张是硬钉的锚、哪些只是参考"。
      * 不点名的话 LLM 会把首帧图当成普通素材去"描述外观"，甚至把它写进

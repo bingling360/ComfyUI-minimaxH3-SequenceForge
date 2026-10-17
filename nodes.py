@@ -219,6 +219,29 @@ def _apply_anchor_noise(cond, aug):
     })
 
 
+# 未接「音频VAE」时的标称采样率（静音占位用）。
+# 取 32000 而不是随手一个值：H3 音频 VAE 的输出就是 32kHz
+#（comfy/ldm/minimax/audio_vae.py：sample_rate = output_sample_rate = 32000；
+#  40 latent token/s × 800 hop = 32000 样本/s，与 grid.FRAME_RESCALE=5/3 @24fps 自洽）。
+# 同率的好处：静音段与真音频段混拼时 PyAV 那条重采样支路是零开销直通；
+# 即使跨运行混了不同率，concat_av_mp4 也会按首个含音轨源统一重采样。
+AUDIO_SR_NO_VAE = 32000
+
+
+def _silent_wav(frames, channels=2, device=None):
+    """未接音频 VAE 时的静音占位：与画面等长的零波形 [1, C, T] + 标称采样率。
+
+    与 _decode_audio 的返回形态严格一致（[1,C,T] / int），调用方（裁剪、响度对齐、
+    分段落盘、成片拼接）不用区分两种来源。零波形让 mp4 拿到一条等长的静音 AAC 轨，
+    而不是 0 样本的空轨——后者会让下游播放器/合并逻辑拿不到时长基准。
+    """
+    n = max(0, int(round((float(frames) / 24.0) * AUDIO_SR_NO_VAE)))
+    wav = torch.zeros(1, max(1, int(channels)), n)
+    if device is not None:
+        wav = wav.to(device)
+    return wav, AUDIO_SR_NO_VAE
+
+
 def _decode_audio(audio_vae, audio_latent, norm_skip_frac=0.0):
     # 与官方 VAEDecodeAudio（comfy_extras/nodes_audio.vae_decode_audio）保持一致；
     # norm_skip_frac>0 时归一化 std 只统计保留区——锚定区音频随后整段裁掉，
@@ -1222,7 +1245,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Clip.Input("文本编码器", optional=True,
                               tooltip="生成用 CLIP（转码专跑不需要，可空）"),
                 io.Vae.Input("视频VAE"),
-                io.Vae.Input("音频VAE"),
+                # 音频 VAE 改为可选（2026-10-17）：不接 = 全链按静音处理（不编码、
+                # 不解码音轨，分段/成片 mp4 是等长静音轨）。很多人手头根本没有这个
+                # 权重（或只想做纯画面迁移），不该被一个必填槽卡住整条链。
+                # 参考音频（<Audio j>）不接也照常进文本编码器参与描述——与官方
+                # MiniMaxH3ReferenceToVideo 同口径（"Without it reference audio
+                # only conditions the text encoder."），只是不再走音频 latent 分支。
+                io.Vae.Input("音频VAE", optional=True,
+                             tooltip="音频 VAE（**可选**）：不接 = 全链静音（不编码也不解码音轨，"
+                                     "分段与成片 mp4 为等长静音轨）。"
+                                     "参考音频仍照常进文本编码器参与画面描述，只是不再走音频 latent。"
+                                     "需要出声时接上即可；「起始视频音轨」与「仅音频/图像+音频」"
+                                     "取用分支的锚点必须有它（缺了会点名报错，不静默降级）"),
                 # 「自定义」画幅已删（2026-09-27）：画布唯一来源 = 宽高比 × 百万像素。
                 # 旧存档里的「自定义」由前端迁移成最接近的 AR×MP 档（见 h3_director.js
                 # nearestCanvasCombo），后端不再留兜底分支。
@@ -2211,6 +2245,17 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 end_tokens=end_tokens, full_bridge=full_bridge0, with_video=bool(want_v))
         from . import qc  # 桥帧打分 + 接缝测量共用（延迟导入：无 ComfyUI 环境下结构单测不触达）
         clip, video_vae, audio_vae = 文本编码器, 视频VAE, 音频VAE
+        # ---- 无音频模式（「音频VAE」可选，未接即此态）----
+        # 采样仍是官方 AV latent（音频分支照常跑、照常落存档），只是**不编/不解码
+        # 音频**：没有音频 VAE 就没有可解码的东西，音轨一律按等长静音处理。
+        # ⚠ 别在这里"跳过音频 latent"——官方节点与采样器都要求嵌套 AV latent 的两个
+        # 分支同时在场（缺音频分支会在 unbind/模型侧直接崩），保持张量形状不变是最省
+        # 事也最安全的做法。
+        无音频 = audio_vae is None
+
+        def _audio_dev():
+            """音频张量的目标设备：未接音频 VAE 时随视频 VAE（音频分支仍跟着采样走）。"""
+            return video_vae.device if 无音频 else audio_vae.device
 
         def _load_library_latent(file):
             """latent 库文件 -> (video_cpu, audio_cpu|None)；**取不到直接抛**。
@@ -2365,6 +2410,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             want_a = a["branches"]["av"] in ("both", "audio")
             # 纯音频源：不占视频行，无 C/H/W 约束，也不需要链分辨率基准
             if kind == "audio":
+                if 无音频:
+                    raise ValueError(f"锚点 {a['id']}：音频源需要「音频VAE」才能编码"
+                                     "（当前未接 → 全链按静音处理，音频锚无从取用）。"
+                                     "请接上音频 VAE，或改用图像/视频/latent 源")
                 _aud = _anchor_audio(ref)
                 ea = _encode_audio_latent(audio_vae, _aud,
                                           audio_tokens_for_frames(int(a["window"])))
@@ -2435,6 +2484,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     raise ValueError(f"锚点 {a['id']}：图片源没有音轨，"
                                      "「图像+音频/仅音频」的音频分支无从取用"
                                      "（请改用带音频的视频/latent，或改「仅图像」）")
+                if want_a and 无音频:
+                    raise ValueError(f"锚点 {a['id']}：取用「音频」分支需要「音频VAE」"
+                                     "（当前未接 → 全链按静音处理，音频分支无法编码）。"
+                                     "请接上音频 VAE，或把该锚的取用分支改成「仅图像」")
                 if not want_v:
                     hw_src = (None, _aud)   # 只要音频：跳过视频 VAE 编码
                 else:
@@ -2448,7 +2501,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                       if _imgs is not None else None)
                 ea = None
                 _wav = _aud.get("waveform") if isinstance(_aud, dict) else None
-                if _wav is not None and int(_wav.shape[-1]) > 0:
+                # 无音频模式：跳过音频 VAE 编码（需要音频的取用分支已在上面点名报错，
+                # 能走到这里的都是「仅图像」，音频分支本来就不注入）
+                if _wav is not None and int(_wav.shape[-1]) > 0 and not 无音频:
                     # 音频按取用窗对齐（不是全曲砸进来）：音频窗 = 窗宽帧数对应的 token 数，
                     # 与段首桥 _tail_keyframe 的 at=audio_tokens_for_frames(ctx_frames) 同一契约
                     _at = audio_tokens_for_frames(int(a["window"]))
@@ -2465,7 +2520,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 if int(ea.shape[-1]) > _at:
                     ea = ea[..., -_at:].clone()
             return (ev.to(video_vae.device) if ev is not None else None,
-                    (ea.to(audio_vae.device) if ea is not None else None))
+                    (ea.to(_audio_dev()) if ea is not None else None))
         # 链路自动推导（无手动模式）：有有效引用即走 ref conditioning；
         # 首帧可与引用共存（头锚 keyframe 叠加）。均匀链的推导值与旧版逐字一致，
         # 旧存档续跑指纹不受影响。
@@ -2502,6 +2557,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _mode = str(生成模式)   # 旧控件占位：后端不再读取，仅报告回显
         _ctx_txt = f"上下文 {ctx} 帧" if ctx > 0 else "引导桥 关闭（段间硬切，响度对齐仍生效）"
         report = [f"H3 Seamless Chain：{len(seg_prompts)} 段，链路 {chain}（按实际引用自动推导），{_ctx_txt}"]
+        if 无音频:
+            report.append("未接「音频VAE」：全链按静音处理（音轨不编码也不解码，分段与成片 mp4 为静音；"
+                          "参考音频仍进文本编码器参与画面描述）。要出声把音频 VAE 接回本槽即可")
         if _te_drop:
             report.append("显存瘦身：cond 编码后即把文本编码器请出显存"
                           "（te_drop_after_cond；⚠ 它**不省内存**，只腾显存，"
@@ -3690,7 +3748,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 重摇段本体的注入帧数（分段优先）：for_pi=g 对应的提示词段
             _fpi = exec_items[g - off][1] if 0 <= g - off < len(exec_items) \
                 and exec_items[g - off][0] == "prompt" else -1
-            return _inject_guide(pv.to(video_vae.device), pa.to(audio_vae.device),
+            return _inject_guide(pv.to(video_vae.device), pa.to(_audio_dev()),
                                  _fpi, end_tokens=prev_end_t)
 
         def _redo_next_anchor(g):
@@ -3979,7 +4037,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if use_ckpt and done >= 1:
                 pv, pa = checkpoint.load_segment(root, 0)
                 pv = pv.to(video_vae.device)
-                pa = pa.to(audio_vae.device)
+                pa = pa.to(_audio_dev())
                 prologue_origin = "存档载入"
             else:
                 raw_fc = int(起始视频.shape[0])
@@ -3988,7 +4046,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     raise ValueError("起始视频至少需要 5 帧（约 0.2 秒 @24fps），请换更长的视频")
                 pv = video_vae.encode(_center_cover(起始视频[:fc], width, height))
                 _chain_ref[0] = pv
-                if 起始视频音轨 is not None:
+                # 未接音频 VAE 时**序章音轨一并忽略**（没有可编码的东西），
+                # latent 位仍填零张量——嵌套 AV latent 要求两个分支都在场。
+                if 起始视频音轨 is not None and not 无音频:
                     pa = _encode_audio_latent(audio_vae, 起始视频音轨, audio_tokens_for_frames(fc))
                 else:
                     pa = torch.zeros(1, 32, 2, audio_tokens_for_frames(fc), device=video_vae.device)
@@ -4016,13 +4076,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 report.append(f"序章：上传视频编码为段 1/{total}（{fc} 帧"
                               + ("，超长仅取前段" if raw_fc > fc else "")
                               + "，经一次 VAE 重编码，按 24fps 处理"
-                              + ("，未接音轨按静音处理" if 起始视频音轨 is None else "") + "）")
+                              + ("，未接音轨按静音处理" if 起始视频音轨 is None
+                                 else "，未接音频VAE、音轨已忽略（全链静音）" if 无音频
+                                 else "") + "）")
             pframes, _presc = _decode_rescue(pv, "序章")
             if _presc:
                 report.append("序章 解码 OOM：已自动腾挪并原参重试成功（参数与产物均无降级）")
             if len(pframes.shape) == 5:
                 pframes = pframes.reshape(-1, pframes.shape[-3], pframes.shape[-2], pframes.shape[-1])
-            pwav, sample_rate = _decode_audio(audio_vae, pa)
+            pwav, sample_rate = (_silent_wav(int(pframes.shape[0]))
+                                 if 无音频 else _decode_audio(audio_vae, pa))
             _hi_ready, _hi_tried = _up_hi(0, pv, pa, "prologue", None, None, None, None, 0,
                                           0, pframes.shape[0], pwav, sample_rate)
             if not _hi_ready:
@@ -4095,8 +4158,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
             if len(frames.shape) == 5:
                 frames = frames.reshape(-1, frames.shape[-3], frames.shape[-2], frames.shape[-1])
             # 音频归一化只统计保留区（见 _decode_audio）：锚定区音频不计入 std
-            wav, sample_rate = _decode_audio(audio_vae, audio_t,
-                                             norm_skip_frac=skip_f / sampled_fc if skip_f else 0.0)
+            # 无音频模式：不调音频 VAE，直接给等长静音（后续按同一比例裁剪）
+            wav, sample_rate = (_silent_wav(int(frames.shape[0])) if 无音频
+                                else _decode_audio(audio_vae, audio_t,
+                                                   norm_skip_frac=skip_f / sampled_fc
+                                                   if skip_f else 0.0))
             seg_bridge_score = None
             if 桥帧门控 != "关闭" and next_bridge:
                 window = frames[max(skip_f, frames.shape[0] - (ctx + gate_limit)):]
@@ -4258,7 +4324,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 video_t, audio_t = checkpoint.load_segment(root, g)
                 video_t = video_t.to(video_vae.device)
                 _chain_ref[0] = video_t
-                audio_t = audio_t.to(audio_vae.device)
+                audio_t = audio_t.to(_audio_dev())
                 dt = 0.0
                 cur_seed = seeds[g] if g < len(seeds) else None
                 frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
@@ -5043,6 +5109,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
             kwargs.setdefault("模型", None)
             kwargs.setdefault("文本编码器", None)
             kwargs.setdefault("二采模型", None)
+            # 「音频VAE」改为 optional（2026-10-17）后同样可能不在 kwargs 里
+            #（没接线的可选输入不进参数表）：补 None = 进入无音频模式（全链静音），
+            # 否则 _execute_inner 会因为缺这个位置参数直接 TypeError。
+            kwargs.setdefault("音频VAE", None)
             return cls._execute_inner(*args, **kwargs)
         finally:
             _ckpt.unmark_busy()

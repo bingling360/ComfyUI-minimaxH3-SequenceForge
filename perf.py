@@ -240,6 +240,22 @@ DEFAULT_PERF = {
     # 「auto」= Linux 开 / Windows 关，可手动拨回（见 te_drop_after_cond_enabled）。
     # 消费端：cond_cache.CachedClipProxy。
     "te_drop_after_cond": True,
+    # ★ 统一卸载开关（2026-10-18，用户拍板）。
+    #
+    # 开 → 三处**无条件**卸干净：
+    #   ① cond 编码后卸文本编码器（接管 te_drop_after_cond，仍保留旧键只为读旧配置）
+    #   ② 采样结束后、VAE 解码前卸主干模型（`_vram_oom_cleanup()`）
+    #   ③ 每段产物落盘后再整块清一次（unload_all_models + gc + empty_cache）
+    # 关 → 一处都不卸，权重全留在显存/内存里给下一段复用（大显存卡最快）。
+    #
+    # 为什么收敛成一个开关：这三个点原来的动机是同一件事（给下一步腾地方），
+    # 拆成多个旋钮会出现「前一处留着、后一处又卸掉」的自相矛盾中间态。
+    # ⚠ 关键事实（2026-10-18 实测）：`unload_all_models()` 走 for_dynamic=False →
+    #   model_unload → detach，会**同时**释放显存和内存里那块 staged 副本
+    #   （实测 rss 20577MB → 6351MB，一次回落 14.2GB）。
+    #   而 `load_models_gpu()` 那条路对动态模型是 no-op（「不为别的动态模型卸动态模型」），
+    #   所以在 VAE 解码前**必须**有一个显式的 unload_all_models()，否则模型一直驻留。
+    "unload_everywhere": True,
     # ★ 解码前的**内存**预算体检（2026-10-13）——本轮唯一的「是对症药」的机制。
     #
     # 为什么必须单独做一条：现有全部机制（段末清理 / 无主显存回收 / oom_retry /
@@ -406,6 +422,7 @@ PERF_TYPES = {
     "vae_decode_chunk_tokens": (int,),
     "vae_decode_blend": (int,),
     "te_drop_after_cond": (bool, "auto"),
+    "unload_everywhere": (bool,),
     # 编码（两个维度：实现 / 质量档；质量档随 encoder 换含义，crf 与 cq 分开存）
     "encoder": (str,),
     "x264_crf": (int,),

@@ -138,7 +138,14 @@ function escapeHtml(s) {
  * 于是 `**启动时**` 的字面星号就露在界面上了 —— `perf_modal_check` 的
  * 「说明里还露着字面星号」那条断言抓到过。新文案一律走这里。 */
 function mdBold(s) {
-    return String(s ?? "").replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+    return String(s ?? "")
+        /* 行内代码 `` `...` `` → <code>，并且**代码里的尖括号必须先转义**。
+         * 2026-10-18 用户截图：`勾上 = 视频音轨作为 `<Audio j>` 参考（…）` 整条提示
+         * 只剩前半截 —— 因为整串被塞进 innerHTML，浏览器把 `<Audio j>` 当成标签开始
+         * 解析，`j` 被吃成属性、后面的中文全被当成属性值丢掉。
+         * 全站有 51 处这种写法（`<Video k>` / `<Picture N>` / `<Audio j>`），一次收口。 */
+        .replace(/`([^`]+)`/g, (_, code) => "<code>" + escapeHtml(code) + "</code>")
+        .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
 }
 
 /** 可折叠编辑区（主提示词框的三段式外观，总提示词工作台段卡复用同一套）。
@@ -5253,18 +5260,16 @@ const H3_PERF_FIELDS = [
           + "权重那半 ComfyUI 自己算得到，激活那半只有实测才看得见" },
     { key: "upcast_attention", label: "Upcast Attention", kind: "tri", group: "通用与机器 · 运行时",
       hint: "attention 强制走 fp32：更稳但更吃显存、更慢。**小显存卡通常关**；auto = 跟随启动参数。改动立即生效" },
-    { key: "te_drop_after_cond", label: "cond 后释放文本编码器", kind: "tri", group: "通用与机器 · 运行时",
-      hint: "每次 cond 编码完调 `unload_model_and_clones` 把 TE 请出去。"
-          + "⚠ **它省的是显存，不是内存**（2026-10-13 实测：内存占用**无变化**）。"
-          + "ComfyUI 语境下「卸载」= 把权重从显卡搬回内存，**不是从内存删掉** —— 所以那 25.9GB 的权重副本该在还在，"
-          + "内存地板一点不动。它实际做三件事：① 权重搬回主机（`model_patches_to(offload_device)`）；"
-          + "② 从 ComfyUI 的 `current_loaded_models` 账本里**摘掉**（下次要用得重新 load + 重新 patch）；"
-          + "③ `soft_empty_cache()` 把 CUDA 缓存块还给驱动。"
-          + "**收益场景**：小显存卡上给采样/解码腾出显存窗口，别让 TE 的分页窗口长期占着显卡。"
-          + "**代价**：每段首次编码多一次回载 + 重 patch（约 45s）。"
-          + "★ 默认开（2026-10-12 拍板）；但当初「避免云端无 swap 容器被 OOM kill」的理由"
-          + "**已被实测推翻**（内存不降就救不了内存侧），要不要改回 auto 由你定。"
-          + "auto = Linux 开 / Windows 关。改动立即生效" },
+    { key: "unload_everywhere", label: "全程卸载（省内存/显存）", kind: "bool", group: "通用与机器 · 运行时",
+      hint: "一个开关管三处**无条件**卸载：① cond 编码后卸文本编码器；② 采样结束后、VAE 解码前把主干模型整块卸回主机；"
+          + "③ 每段产物落盘后再清一次（`unload_all_models` + gc + `empty_cache`）。"
+          + "关掉 = 一处都不卸，权重全留在显存/内存里给下一段复用（大显存卡最快）。"
+          + "★ 关键：`unload_all_models()` 走 `for_dynamic=False` → detach，会**同时**释放显存和内存里那块 staged 副本"
+          + "（2026-10-18 实测 RSS 20577→6351MB，一次回落 14.2GB）；"
+          + "而解码前那条 `load_models_gpu([vae.patcher])` 对动态模型是 **no-op**"
+          + "（「不为别的动态模型卸动态模型」）——没人主动让路，所以必须在解码前显式卸一次，"
+          + "否则 VAE 那 2.68GB staged 副本会把 RSS 顶爆（Linux 无 swap 直接 SIGKILL，`oom_retry` 来不及救）。"
+          + "代价 = 每段多一次权重回载（Nas 上约 40s）。接管旧的「cond 后释放文本编码器」，旧键仅为读旧配置保留" },
     { key: "index_mode", label: "素材库索引失效口径", kind: "sel", group: "通用与机器 · 素材库",
       opts: [["fingerprint", "目录指纹（推荐）"], ["ttl", "固定 3 秒过期"]],
       hint: "指纹：没增删文件就一直复用，翻页不再重建索引（1200 条目实测省掉 1895ms）；ttl：老行为，遇到「新素材不显示」可退回" },
@@ -5729,7 +5734,7 @@ async function openRefVideoSettings(node) {
         const top = el("div", "h3d-perf-top");
         top.append(el("label", "", label), ctl);
         row.append(top);
-        if (hint) row.append(el("div", "h3d-perf-hint", hint));
+        if (hint) row.append(el("div", "h3d-perf-hint", mdBold(hint)));
         body.append(row);
         return row;
     };

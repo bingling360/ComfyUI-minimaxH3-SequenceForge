@@ -503,6 +503,24 @@ def _vram_used_gb():
     return None
 
 
+def _unload_everywhere():
+    """统一卸载开关（perf.unload_everywhere）。
+
+    开 → 三处无条件卸干净：cond 后卸 TE、采样后（解码前）卸主干、段末再清一次。
+    关 → 一处都不卸，权重全留在显存/内存里给下一段复用。
+
+    为什么是一个开关而不是三个（2026-10-18，用户拍板）：这三处的动机本是同一件事
+    ——给下一步腾地方。拆开会出现「前一处留着、后一处又卸掉」的自相矛盾中间态。
+    ⚠ 读不到设置时按**开**处理：这是小显存 / 云端无 swap 机器的保命档，
+    误判成关会直接换来 OOM killer 的 SIGKILL（Python 侧无机会自救）。
+    """
+    try:
+        v = perf.current_settings().get("unload_everywhere")
+        return True if v is None else bool(v)
+    except Exception:
+        return True
+
+
 def _vram_oom_cleanup():
     """OOM 自救的腾挪动作：卸载驻留模型 → 回收 Python 残留 → 归还缓存块。
 
@@ -867,8 +885,13 @@ def _decode_video_file(abs_path, filename=""):
     if comps.images is None or not getattr(comps.images, "shape", None):
         raise ValueError(f"参考视频「{filename or abs_path}」解不出画面帧：请确认是可解码的 24fps 视频（2-15 秒）")
     if comps.audio is None:
-        import torch as _t
-        comps.audio = {"waveform": _t.zeros(1, 1, 0), "sample_rate": 24000}
+        # 无音轨：给「与画面等长的静音」，**不能给 0 样本**。
+        # 0 样本（旧写法 _t.zeros(1,1,0)）在「音频VAE」接了的时候会被官方
+        # _encode_ref_audio 拿去编码 → comfy.audio.resample 里 reshape(-1, 0) →
+        # RuntimeError: cannot reshape tensor of 0 elements into shape [-1, 0]。
+        # 用 32kHz（=音频VAE 采样率）可以让 resample 直接零开销直通。
+        _wav, _sr = _silent_wav(int(comps.images.shape[0]))
+        comps.audio = {"waveform": _wav, "sample_rate": _sr}
     return comps.images, comps.audio
 
 
@@ -2547,10 +2570,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 为什么挂在这层：全链的 TE encode 唯一入口就是这个代理，正/负向、一采/二采
         # 的重建全走它；挂在别处（各 cond 构建点）就是多处重复还容易漏。
         try:
-            _te_drop = perf.te_drop_after_cond_enabled(
-                perf.current_settings().get("te_drop_after_cond"))
+            _te_drop = _unload_everywhere()
         except Exception:
-            _te_drop = perf.te_drop_after_cond_enabled("auto")
+            _te_drop = True
         clip = CachedClipProxy(clip, drop_after_encode=_te_drop)
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
@@ -2561,9 +2583,8 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append("未接「音频VAE」：全链按静音处理（音轨不编码也不解码，分段与成片 mp4 为静音；"
                           "参考音频仍进文本编码器参与画面描述）。要出声把音频 VAE 接回本槽即可")
         if _te_drop:
-            report.append("显存瘦身：cond 编码后即把文本编码器请出显存"
-                          "（te_drop_after_cond；⚠ 它**不省内存**，只腾显存，"
-                          "代价=每段首次编码多一次回载）")
+            report.append("全程卸载：cond 编码后即把文本编码器请出显存，采样后卸主干模型，"
+                          "段末再整块清理（unload_everywhere；关掉则全程保留缓存）")
 
         # ---- 手动锚定（Anchor Studio）：唯一入口 ----
         # 所有「把某段 latent / 素材钉到本段某位置」的诉求统一走 seg.anchors[]（规划 §2/§3）。
@@ -3345,7 +3366,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 # 无音轨素材照样回静音 dict（不是 None）：官方按 `ref_video_audio_N`
                 # 这个键**是否存在**决定要不要插 <Audio j> —— 只要挂了参考视频就必占
                 # 一个音频号，静音与否都一样（见 _decode_video_file 的长注释）。
-                aud = {"waveform": torch.zeros(1, 1, 0), "sample_rate": 24000}
+                # ⚠ 静音必须是**与片段等长**的真波形，不能是 0 样本：接了「音频VAE」
+                # 时官方会把这段音轨编码进 ref audio latent，0 样本会在
+                # comfy.audio.resample 里 reshape(-1, 0) 抛 RuntimeError（老 bug）。
+                _adur = max(0.0, float(_p["a_end"]) - float(_p["a_start"]))
+                _an = max(1, int(round(_adur * AUDIO_SR_NO_VAE)))
+                aud = {"waveform": torch.zeros(1, 2, _an), "sample_rate": AUDIO_SR_NO_VAE}
             _rv_report.extend(_p["report"])
             return (imgs, aud)
 
@@ -3920,6 +3946,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # total 口径 = 执行序列 + 序章槽，与「存档续跑」报告行、_off_slots 三处一致。
         pbar = comfy.utils.ProgressBar(len(exec_items))
         total = len(exec_items) + off
+        # 统一卸载开关只读一次：循环里每段都问一次 perf 会把配置读取放大成 O(段数)，
+        # 而且中途改设置会让同一轮里前后段走不同策略（脏状态）。
+        _unload_ev = _unload_everywhere()
         prompt_list = (["「序章（上传视频）」"] if off else []) + [
             seg_prompts[it[1]] for it in exec_items]
         thumbs, videos, seams, bridge_scores = [], [], [], []
@@ -3976,6 +4005,18 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 （段间从不发生；手动逐段跑就正常，正是因为它每段都做一次）；
               · `_reclaim_orphan_vram()` 再按「设备占用 − 账本占用」判据回收一次。
             """
+            # ★ 采样已结束 → 主干模型此刻用不上了，先整块卸回主机再解码。
+            #   这是本机唯一能真救 OOM 的动作：`load_models_gpu([vae.patcher])` 对动态模型
+            #   是 **no-op**（「不为别的动态模型卸动态模型」），没有任何一方会主动让路；
+            #   而下面的 `oom_retry` 只在**抛 OOM 异常**后才触发，Linux 无 swap 下的
+            #   SIGKILL 根本不给 Python 机会（2026-10-18 实测：解码入口时 MiniMaxH3 仍
+            #   loaded=14.91GB，VAE 那 2.68GB staged 副本把 RSS 顶到 25.4GB → 撞 k8s pod
+            #   的 24GiB 上限被 SIGKILL）。unload_all_models() 走 for_dynamic=False →
+            #   detach，会连带释放那块 staged 副本（实测 RSS 20577→6351MB）。
+            if _unload_everywhere():
+                _vram_oom_cleanup()
+                print(f"[H3性能] {label} 解码前：采样已结束，按「全程卸载」把主干模型"
+                      "整块卸回主机（显存+内存一起还回去）", flush=True)
             _comfy_exec_cleanup()
             _log_reclaim(_reclaim_orphan_vram(tag=f"{label} 解码前"),
                          f"{label} 解码前")
@@ -4357,6 +4398,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                             seg_refs["ref_images"][f"ref_image_{_n['image']}"] = _media_t
                         elif _k == "video":
                             _imgs, _aud = _media_t
+                            # 兜底收口：任何来源的 0 样本音轨都在这里被换成等长静音。
+                            # 官方 _encode_ref_audio 对 0 样本会 reshape(-1, 0) 直接抛
+                            # RuntimeError（只要「音频VAE」接了就会执行到那段）。
+                            _wv = (_aud or {}).get("waveform") if _aud else None
+                            if _aud is not None and getattr(_wv, "numel", lambda: 1)() == 0:
+                                _w, _s = _silent_wav(int(seg_len))
+                                _aud = {"waveform": _w, "sample_rate": _s}
                             seg_refs["ref_videos"][f"ref_video_{_n['video']}"] = _imgs
                             seg_refs["ref_video_audios"][f"ref_video_audio_{_n['video']}"] = _aud
                         else:
@@ -4639,6 +4687,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     checkpoint.save_segment(root, g, video_t, audio_t)
                     if not replay:
                         _auto_latent_save(g, i, video_t, audio_t, frames)
+                # 段末无条件清理（perf.unload_everywhere）：本段产物已落盘，权重整块卸回
+                # 主机，把内存/显存地板还给下一段。代价=下段重新流动权重（NAS 上约 40s）。
+                if _unload_ev:
+                    _vram_oom_cleanup()
             report.extend(gate_lines)
             bridge_scores.append(seg_bridge_score)
             trims.append(seg_lengths[i] - vis_len)

@@ -247,10 +247,18 @@ def test_align_button_hangs_off_the_duration_field():
     src = _src(os.path.join("web", "h3_director.js"))
     body = _jsslice(src, "renderWidgetField", 5000)
     i = body.index("if (name === W_DUR) {")
-    seg = body[i:i + 1200]
+    # ⚠ 窗口**按结构切，不按定长切**：原先是 `body[i:i + 1200]`，而按钮的
+    # title 文案每加一句它就往外挪 —— 2026-10-18 实测那句文案已经把调用点
+    # 挤出窗口 35 个字符，于是这条在 HEAD 上就是红的，跟代码对不对毫无关系。
+    # 切到**下一个同级的 if 分支**为止，才是「这一格自己的代码」。
+    j = body.find("if (name === ", i + 1)
+    seg = body[i:j] if j != -1 else body[i:]
     assert "alignRefVideoTime(node)" in seg, "对齐按钮必须调用 alignRefVideoTime"
     assert "extra = alignBtn" in seg, "按钮要单独占一行（否则 58px 的数字框被挤成缝）"
-    assert "field.append(extra)" in body
+    # 挂载方式早就换了：现在是 `extra` → `_extraEl` 单独占一行再进 grid
+    # （旧的 `field.append(extra)` 全仓零命中，钉它等于钉一个不存在的写法）。
+    assert "erow.append(extra)" in body, "按钮必须真的挂回这一格（否则它不会被渲染）"
+    assert "field._extraEl = erow" in body, "按钮行要挂成独立一行（跨整行），不塞进数字框那行"
 
 
 def test_align_only_writes_segment_seconds():

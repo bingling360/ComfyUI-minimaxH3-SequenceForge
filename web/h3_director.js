@@ -8675,11 +8675,16 @@ function injectStyles() {
     .h3d-seedrow input::-webkit-outer-spin-button,.h3d-seedrow input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
     .h3d-seedrow input[type=number]{-moz-appearance:textfield;appearance:textfield}
     .h3d-seedrow .h3d-btn{padding:4px 8px;flex:none}
-    /* 「每段时长」下方那行项目级对齐按钮：占满整格、不与 58px 的数字框抢宽度。
-     * ★ 文案较长（对齐动作迁移参考视频时间）→ **强制不折行**（nowrap），
-     * 所在那一格改为横跨整行（.h3d-param-wide），否则会被挤成上下两截。 */
-    .h3d-alignbtn{width:100%;margin-top:5px;padding:4px 6px;font-size:11px;white-space:nowrap}
-    .h3d-param-wide{grid-column:1/-1}
+    /* 「每段时长」下面那行项目级对齐按钮：**自己占一整行**（grid 的独立项），
+     * 不跟时长输入框挤在同一格里 —— 那样会把输入框拉成一整条。
+     * ★ 文案较长（对齐动作迁移参考视频时间）→ 强制不折行。 */
+    .h3d-alignrow{grid-column:1/-1}
+    .h3d-alignbtn{width:100%;padding:4px 6px;font-size:11px;white-space:nowrap}
+    /* 时长格右侧的帧数小标：暖色小胶囊，跟暗褐面板同色系（不抢眼，但一眼能读到） */
+    .h3d-frames{flex:none;align-self:center;display:inline-flex;align-items:center;
+        padding:3px 8px;border:1px solid #4a4234;border-radius:999px;
+        background:#26221b;color:#bdaa83;
+        font:10.5px/1.3 ui-monospace,Consolas,monospace;letter-spacing:.2px;white-space:nowrap}
     .h3d-psec .h3d-foot,.h3d-asec .h3d-foot,.h3d-projsec .h3d-foot{padding:0 16px 14px}
 
     /* ---- 新建项目模态 ---- */
@@ -11097,9 +11102,22 @@ function renderWidgetField(node, name, labelOverride) {
             inp.max = inp.max || 2.0;
         }
         if (name === W_DUR) {
-            /* 项目级时间入口旁边的对齐按钮：把「每段时长」这条时间轴一次性钉到
+            /* 时长格右侧的帧数小标：秒 → 帧（24fps 是 H3 的时间基准，也是参考视频的播放口径）。
+             * 只做换算、不做网格吸附，所以写「≈」：真正采样时按 17k+5 向下吸附，
+             * 可能比这个数少几帧。比空着好看，也顺手回答了「这段到底多长」。 */
+            const frames = el("span", "h3d-frames");
+            const updFrames = () => {
+                const s = Number(inp.value);
+                frames.textContent = (Number.isFinite(s) && s > 0) ? `≈${Math.round(s * 24)} 帧` : "—";
+            };
+            frames.title = "按 24fps 折算的帧数（H3 时间基准 / 参考视频播放口径）；"
+                + "实际采样按 17k+5 网格向下吸附，可能比这个数少几帧";
+            inp.addEventListener("input", updFrames);   // 边输边更新，不等提交
+            updFrames();
+            row.append(frames);
+            /* 项目级时间入口下面的对齐按钮：把「每段时长」这条时间轴一次性钉到
              * 参考视频上（只改引用了视频的段，见 alignRefVideoTime）。
-             * 单独占一行 —— 塞进 58px 宽的数字行会把输入框挤成一条缝。 */
+             * 单独占一整行（.h3d-alignrow）—— 半格放不下这行字，塞进数字行又会把输入框挤成一条缝。 */
             const alignBtn = el("button", "h3d-btn h3d-alignbtn", "⏱ 对齐动作迁移参考视频时间");
             alignBtn.type = "button";
             alignBtn.title = "项目级：按**当前参考视频设置**算出 video1 在模型眼里有多长"
@@ -11125,9 +11143,14 @@ function renderWidgetField(node, name, labelOverride) {
             row.append(dice);
         }
         field.append(row);
-        /* 带附加按钮的那一格（当前只有「每段时长」的对齐按钮）横跨整行：
-         * 半格宽度放不下这行字，不跨行就会折成两截。 */
-        if (extra) { field.classList.add("h3d-param-wide"); field.append(extra); }
+        /* 附加按钮（当前只有「每段时长」下面那个对齐按钮）**不塞进这一格**：
+         * 交给调用方作为 grid 的独立一项跨整行（`_extraEl`）——
+         * 塞进来的话整格都得跨行，输入框会被拉成一整条，很难看。 */
+        if (extra) {
+            const erow = el("div", "h3d-alignrow");
+            erow.append(extra);
+            field._extraEl = erow;
+        }
     }
     return field;
 }
@@ -11275,7 +11298,10 @@ function renderParamsZone(sec, data) {
         "<summary>📐 基础设置（分辨率 / 时长 / 采样器 / 存档与成片）</summary>");
     const bgrid = el("div", "h3d-adv-grid");
     for (const name of BASIC_DEFS) {
-        bgrid.append(renderWidgetField(node, name, PARAM_LABELS[name]));
+        const f = renderWidgetField(node, name, PARAM_LABELS[name]);
+        bgrid.append(f);
+        /* 「每段时长」的对齐按钮作为独立一项插在后面，横跨整行 */
+        if (f._extraEl) bgrid.append(f._extraEl);
     }
     /* 徽章：画布唯一来源 = 宽高比×百万像素（宽/高控件已是旧版兼容位，不进面板） */
     const badgeTxt = canvasBadgeText(node);

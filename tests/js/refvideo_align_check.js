@@ -155,8 +155,20 @@ function mkDs(extra) {
         const node = mkNode(mkDs());
         const { w } = load({ node, H3Api: {} });
         const field = w.renderWidgetField(node, "每段时长");
-        const btn = field.querySelector("button.h3d-alignbtn");
+        /* 对齐按钮**不在**时长那一格里：它是 grid 的独立一项（field._extraEl，跨整行）。
+         * 塞进同一格就得整格跨行，输入框会被拉成一整条（用户否过这一版）。 */
+        const extraRow = field._extraEl;
+        ok(!!extraRow && extraRow.className.indexOf("h3d-alignrow") >= 0,
+            "对齐按钮应作为独立整行（h3d-alignrow）挂在时长格后面");
+        const btn = (extraRow || field).querySelector("button.h3d-alignbtn");
         ok(!!btn, "「每段时长」下方有对齐按钮（项目级时间入口旁边）");
+        /* 时长格本身保持半格，右侧用小标占位（帧数），不再空着一大片 */
+        ok(!field.classList.contains("h3d-param-wide"), "时长格不该跨整行（输入框会被拉宽）");
+        const fchip = field.querySelector("span.h3d-frames");
+        ok(!!fchip, "时长格右侧应有帧数小标");
+        const durW = node.widgets.find((x) => x.name === "每段时长");
+        ok(fchip && fchip.textContent.indexOf(String(Math.round(Number(durW.value) * 24))) >= 0,
+            "帧数小标应按 24fps 折算：" + (fchip && fchip.textContent));
         ok(btn && btn.textContent.indexOf("对齐动作迁移参考视频") >= 0,
             "按钮文案写明是对齐动作迁移参考视频时间：" + (btn ? btn.textContent : "无按钮"));
         ok(btn && btn.title.indexOf("官方口径") >= 0 && btn.title.indexOf("只写段时长") >= 0,

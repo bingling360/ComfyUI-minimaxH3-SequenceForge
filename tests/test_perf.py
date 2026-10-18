@@ -1004,6 +1004,36 @@ def test_watch_vram_peak_stops_thread_on_exit():
     assert box["samples"] == n, "退出后采样数不应再增长"
 
 
+# ------------------------------------- 激活峰值口径（2026-10-18 换仪器）
+
+def test_act_peak_probe_uses_torch_allocator_not_device_delta():
+    """激活峰值必须量 **torch 分配器**，不许再量设备级占用的差值。
+
+    旧口径（`mem_get_info` 采样前后差值）在 0.35 档 + DynamicVRAM 分页的卡上
+    **恒为 0**：设备占用被钉在天花板，基线自己就在峰值上，采样期间不涨，
+    差值被 `max(0, …)` 钳成 0 —— 用户看到的就是「次次都是 0」。
+    正确仪器是 `max_memory_allocated()` 的窗口增量：它量不到 aimdo 权重池
+    （perf.py 那句「0.43GB 假象」的同一事实），进来的只有激活。
+
+    AST 判据（`_get_call_keys` 不在这，直接扫属性名）：nodes.py 的探针块里
+    必须真调 `max_memory_allocated`，且**不许**再拿 `watch_vram_peak` 的峰值
+    去减基线当激活。
+    """
+    import ast
+    with open(os.path.join(ROOT, "nodes.py"), encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src)
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert "max_memory_allocated" in attrs, (
+        "激活峰值必须用 torch 分配器的 max_memory_allocated（设备级差值在分页卡上恒为 0）")
+    assert "reset_peak_memory_stats" in attrs, (
+        "窗口增量必须先 reset 峰值统计，否则量到的是进程开跑以来的总量")
+    # 反向钉死：设备级差值那套变量不许回来（`_peak_v - _base_v` 恒 0 的教训）。
+    # watch_vram_peak 本身保留 —— upscale 的精化峰值要的是绝对值口径，不在此列。
+    assert "_peak_v" not in src, (
+        "设备级峰值差值口径已废：别再把 watch_vram_peak 的峰值拿去当激活增量")
+
+
 def test_summarize_shows_local_llm_observability(logfile):
     """本地 GGUF 通道的加速项 / 显存账 / 吞吐必须进报告。"""
     perf.emit({"kind": "local_llm", "model": "qwen.gguf", "model_gb": 12.6,

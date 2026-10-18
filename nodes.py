@@ -1486,6 +1486,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 与 ds.perf 分开：性能设置是**机器相关**的（这台卡多大、内存多少），
         # 全局落盘、跨项目共用，不进导演台状态。整链读一次（mtime 缓存），别每段读盘。
         _pf = perf.current_settings()
+        # 统一卸载开关**整链只读一次**：一采三处 + 二采两处（精化前腾挪 / 高清解码前）
+        # 共用它。放进循环里每段问一次会把配置读取放大成 O(段数)，而且中途改设置
+        # 会让同一轮里前后段走不同策略（脏状态）。
+        _unload_ev = _unload_everywhere()
         # ---- 参考视频归一设置（**机器级、全局**，与 perf.json 同目录的 refvid.json）----
         # 整链读一次（mtime 缓存）。作用范围：只作用于**参考视频引用**
         # （<Video k> 那条通路），锚 / 序章 / 参考图一律不动。
@@ -1528,13 +1532,15 @@ class H3SeamlessChainSampler(io.ComfyNode):
         _oom_autoretry = bool(_pf.get("oom_autoretry", True))
         _act_peak_probe = bool(_pf.get("act_peak_probe", True))
         _frames_uint8 = str(_pf.get("frames_dtype") or "float32").lower() == "uint8"
-        _final_mode = str(_pf.get("final_mode") or "auto").lower()
+        _final_mode = str(_pf.get("final_mode") or "stream").lower()
         # 全链帧是否留在内存：**只有强制内存帧编码（final_mode=memory）才必须留**。
-        # auto / stream 都走流式拼接（从盘上分段 mp4 拼，见 _stream_final_basic），
-        # 帧不必落内存 → 省 n×h×w×12 字节（544×960×5895 帧 = 36.9GB，
-        # 曾把 64GB 机器的 CPU 分配打爆：DefaultCPUAllocator not enough memory）。
+        # stream 走流式拼接（从盘上分段 mp4 拼，见 _stream_final_basic），帧不必
+        # 落内存 → 省 n×h×w×12 字节（544×960×5895 帧 = 36.9GB，曾把 64GB 机器的
+        # CPU 分配打爆：DefaultCPUAllocator not enough memory）。
         # ⚠ 别为了「下游可能要用 IMAGE」改回无条件保留——默认工作流里主节点的
         # 「图像」输出 links 是空数组（web/h3_default_workflow.js），根本没人接。
+        # （`auto` 档 2026-10-18 已删：它的回退分支是死代码，行为与 stream 相同，
+        # 旧值由 parse_state 迁移。）
         _keep_frames = (_final_mode == "memory")
         _act_first = [True]   # 激活峰值只在首段采样时量一次
         # LoRA 权重的那一半账：ComfyUI 的 `model_size()` 把 patches 算进去了，
@@ -2566,14 +2572,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # 官方 H3 节点固定给 tokenize 传一个 list 参数，而缓存的键要求参数可哈希，
         # 于是全部旁路、命中恒为 0，容量 1/8/32 结果逐字相同（见 perf.py 同名注释）。
         from .cond_cache import CachedClipProxy
-        # cond 出口释放 TE 驻留（perf.te_drop_after_cond，auto=Linux 开 / Windows 关）。
+        # cond 出口释放 TE 驻留（统一卸载开关 `unload_everywhere` 的第 ① 处）。
         # 为什么挂在这层：全链的 TE encode 唯一入口就是这个代理，正/负向、一采/二采
         # 的重建全走它；挂在别处（各 cond 构建点）就是多处重复还容易漏。
-        try:
-            _te_drop = _unload_everywhere()
-        except Exception:
-            _te_drop = True
-        clip = CachedClipProxy(clip, drop_after_encode=_te_drop)
+        # ★ 二采那一半是**免费**跟着走的：本代理实例原样传进 upscale.render_segment，
+        #   所以「关 = 保缓存给复用」在二采的高清条件重建上同样成立。
+        clip = CachedClipProxy(clip, drop_after_encode=bool(_unload_ev))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
         _mode = str(生成模式)   # 旧控件占位：后端不再读取，仅报告回显
@@ -2582,9 +2586,11 @@ class H3SeamlessChainSampler(io.ComfyNode):
         if 无音频:
             report.append("未接「音频VAE」：全链按静音处理（音轨不编码也不解码，分段与成片 mp4 为静音；"
                           "参考音频仍进文本编码器参与画面描述）。要出声把音频 VAE 接回本槽即可")
-        if _te_drop:
-            report.append("全程卸载：cond 编码后即把文本编码器请出显存，采样后卸主干模型，"
-                          "段末再整块清理（unload_everywhere；关掉则全程保留缓存）")
+        if _unload_ev:
+            report.append("全程卸载（五处全管）：cond 编码后即把文本编码器请出显存"
+                          "（一采与二采共用同一代理），采样后卸主干模型，段末再整块清理，"
+                          "二采精化前腾挪 + 高清解码前卸主干"
+                          "（unload_everywhere；关掉则五处全部保留缓存给下一段复用）")
 
         # ---- 手动锚定（Anchor Studio）：唯一入口 ----
         # 所有「把某段 latent / 素材钉到本段某位置」的诉求统一走 seg.anchors[]（规划 §2/§3）。
@@ -2734,10 +2740,12 @@ class H3SeamlessChainSampler(io.ComfyNode):
             report.append(f"关闭自动按序生成：{len(_off_pos)} 段跳过执行不进成片（段 {'、'.join(_off_pos)}；"
                           "随时恢复零成本）")
         if up_cfg:
-            # ③ 落盘守卫接行为 + ④ 精化前腾挪强度（vram_shuffle）——都是「不进
-            # 指纹」的行为开关，交给 upscale.render_latent 消费。
+            # 落盘守卫接行为 + 统一卸载开关 —— 都是「不进指纹」的行为开关，
+            # 交给 upscale.render_latent 消费。
+            # 二采那两处（精化前腾挪、高清解码前卸主干）由 `unload_everywhere` 直接管，
+            # 不再有独立的强度旋钮（2026-10-18 收敛，见 perf.py 该键的注释）。
             up_cfg["guard_block"] = bool(_guard_block)
-            up_cfg["vram_shuffle"] = str(_pf.get("vram_shuffle") or "auto")
+            up_cfg["unload_everywhere"] = bool(_unload_ev)
         # FFN 分块：主干 OOM 正崩在 FFN 的 LoRA bypass 上（单次 6.13GB）。按 token
         # 切块算 MLP，**数学等价、零画质损失**；装之前先自测，不通过就整段不装。
         #
@@ -3941,9 +3949,6 @@ class H3SeamlessChainSampler(io.ComfyNode):
         # total 口径 = 执行序列 + 序章槽，与「存档续跑」报告行、_off_slots 三处一致。
         pbar = comfy.utils.ProgressBar(len(exec_items))
         total = len(exec_items) + off
-        # 统一卸载开关只读一次：循环里每段都问一次 perf 会把配置读取放大成 O(段数)，
-        # 而且中途改设置会让同一轮里前后段走不同策略（脏状态）。
-        _unload_ev = _unload_everywhere()
         prompt_list = (["「序章（上传视频）」"] if off else []) + [
             seg_prompts[it[1]] for it in exec_items]
         thumbs, videos, seams, bridge_scores = [], [], [], []
@@ -4606,16 +4611,42 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         t0 = time.perf_counter()
                         # 首段采样顺带量一次**激活峰值**：LoRA 权重 ComfyUI 自己算得到
                         # （进了 model_size），但 bypass adapter 的前向激活不在任何账上
-                        # ——那正是主干 OOM 的真凶（单次 6.13GB）。区间设备级峰值
-                        # 减采样前基线 = 采样引入的显存增量（激活 + 回载权重）。
+                        # ——那正是主干 OOM 的真凶（单次 6.13GB）。
+                        # ★ 口径（2026-10-18 换仪器）：以前量的是**设备级占用**
+                        #   （`mem_get_info`）采样前后的差值 —— 在 0.35 档 + DynamicVRAM
+                        #   分页的卡上**恒为 0**：设备占用被钉在天花板，基线自己就在
+                        #   峰值上，采样期间不涨，差值被 `max(0, …)` 钳成 0。那不是
+                        #   没量到，是这把尺子在这个场景下物理上量不出东西。
+                        #   激活的正确仪器是 **torch 分配器**（`max_memory_allocated`
+                        #   的窗口增量）：它量不到 aimdo 权重池 —— perf.py 那句
+                        #   「0.43GB 假象」说的同一件事，反过来正好是我们要的：
+                        #   **权重进不来，进来的只有激活**。
                         if _act_peak_probe and _act_first[0] and not replay:
                             _act_first[0] = False
-                            _base_v = _vram_used_gb()
-                            with perf.watch_vram_peak() as _w:
-                                sampled, _resc = _sample_rescue()
-                            _peak_v = _w["peak"]
-                            if _peak_v is not None and _base_v is not None:
-                                _act = max(0.0, _peak_v - _base_v)
+                            _base_alloc = None
+                            try:
+                                _base_alloc = torch.cuda.memory_allocated()
+                                torch.cuda.reset_peak_memory_stats()
+                            except Exception:
+                                _base_alloc = None
+                            sampled, _resc = _sample_rescue()
+                            _act = None
+                            if _base_alloc is not None:
+                                try:
+                                    _act = max(0.0, (torch.cuda.max_memory_allocated()
+                                                     - _base_alloc) / (1024.0 ** 3))
+                                except Exception:
+                                    _act = None
+                                # 口径守卫：权重若被装进 torch 分配器（aimdo 没托管的
+                                # 普通加载路径），增量会被权重污染 —— 数字大到离谱，
+                                # 报出去比不报更害人。宁可「未实测」。
+                                try:
+                                    _wgb = (perf.weight_bytes(模型) or 0.0) / (1024.0 ** 3)
+                                    if _act is not None and _wgb and _act > _wgb:
+                                        _act = None
+                                except Exception:
+                                    pass
+                            if _act is not None:
                                 try:
                                     _lf = perf.probe_lora_footprint(模型)
                                     print(f"[H3性能] {perf.lora_account_line(_lf['lora_weight_gb'], _lf['patch_count'], _act)}",
@@ -5055,9 +5086,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     # 基础分辨率成片走**流式拼接分段 mp4**：从盘上分段拼，不碰全链内存帧。
                     # 这是 D3 的正解（NLE 从不把整条时间线的 RGB 帧同时放内存里），
                     # 也是二采高清路径早就在用的同一套（upscale.try_final）。
-                    # ⚠ 默认口径下 all_frames 本就是空的（见 _keep_frames），流式是唯一出路。
+                    # ⚠ stream 档下 all_frames 本就是空的（见 _keep_frames），流式是唯一出路。
                     final_name, enc_err = None, None
-                    if _final_mode in ("auto", "stream"):
+                    if _final_mode == "stream":
                         final_name, enc_err = _stream_final_basic(
                             root, videos, _off_slots, crf=_bcrf, preset=_bpreset,
                             aq_mode=_baq, dither=_bdith)
@@ -5071,7 +5102,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                 crf=_bcrf, preset=_bpreset, aq_mode=_baq, dither=_bdith)
                         else:
                             # 走到这里说明没有可用的全链帧。两种来源分开说：
-                            # ① 默认口径（auto/stream）压根不留帧——流式又没成，本次无成片；
+                            # ① stream 档压根不留帧——流式又没成，本次无成片；
                             # ② memory 档但链为空（全禁用）——没有东西可编。
                             _why = enc_err or ("链为空（无可编码的段）" if not _frame_counts
                                                else "分段 mp4 不齐")

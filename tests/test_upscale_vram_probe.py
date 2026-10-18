@@ -383,18 +383,39 @@ def test_render_segment_signature_accepts_up_swap():
     assert "_up_swap=False" in sig
 
 
+def _enclosing_if_line(body, pos):
+    """pos 之前**最近**的那条 `if …:`（跳过中间的 `try:`）。
+
+    为什么不用 `assert "if _up_swap:" in body`：条件一改（比如加个并列项）这条
+    就假红，而它本该钉的是「这个动作有没有被条件包着」。
+    """
+    for ln in reversed(body[:pos].splitlines()):
+        s = ln.strip()
+        if s.startswith("if ") and s.endswith(":"):
+            return s
+    return ""
+
+
 def test_render_segment_unloads_unet_before_decode():
-    """P1-2：卸载必须发生在 decode 之前，受 _up_swap 保护，且用精准卸载。
+    """P1-2：卸载必须发生在 decode 之前，受条件保护，且用精准卸载。
 
     用 unload_model_and_clones 而非 unload_all_models：前者按 clone_base_uuid
     只卸同源模型，解码要用的 VAE 会保留（不用立刻重载）。
+
+    ⚠ 2026-10-18 条件变了：`_up_swap` 不再是唯一入口。原先只认 A≠B，于是
+    最常见的 A==B（二采沿用一采模型）配置下这个动作**从来没发生过**。现在
+    条件是 `_up_swap or 全程卸载`（并受落盘守卫门控）。语义判据放在
+    tests/test_perf_settings.py::test_pre_decode_unload_is_not_gated_on_model_swap_alone
+    那边用 AST 钉，这里只钉位置与顺序，不再钉条件字面量。
     """
     src = _read("upscale.py")
     body = src.split("def render_segment(", 1)[1]
     i_unload = body.index("unload_model_and_clones(模型)")
     i_decode = body.index("video_vae.decode(up_v)")
     assert i_unload < i_decode, "卸载必须在解码之前"
-    assert "if _up_swap:" in body[:i_unload], "必须受 _up_swap 条件保护"
+    guard = _enclosing_if_line(body, i_unload)
+    assert "_up_swap" in guard, (
+        f"卸载必须保留 `_up_swap`（A≠B 时是零代价卸载），实际守卫是 `{guard}`")
     seg = body[i_unload:i_decode]
     assert seg.index("gc.collect()") < seg.index("torch.cuda.empty_cache()"), \
         "顺序必须是 unload → gc → empty_cache（反序收不回）"

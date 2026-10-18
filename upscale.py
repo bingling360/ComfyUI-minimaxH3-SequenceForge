@@ -1757,8 +1757,15 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     _te_note = "" if _te_hit is None else \
         ("（TE命中缓存，无文本编码器前向）" if _te_hit is True
          else "（TE未命中——文本编码器前向中，魔改分页环境下可能分钟级）")
+    # 统一卸载开关 + 落盘守卫：先读出来，下面两行日志要靠它决定说什么
+    # （否则「全程卸载=关」时日志还在宣称正在腾挪，用户会以为设置没生效）。
+    _unload_ev = cfg.get("unload_everywhere", True)   # 读不到按**开**：保命档
+    _blocked = bool(cfg.get("guard_block"))
+    _do_unload = _unload_ev and not _blocked
     print(f"[H3二采] 段{seg_no}：{'放大+' if net is not None else ''}高清条件就绪{_te_note}"
-          + " → 显存腾挪（卸载驻留模型）…", flush=True)
+          + ((" → 显存腾挪（卸载驻留模型）…") if _do_unload
+             else ("（全程卸载=关：跳过腾挪，只回收残留）" if not _unload_ev
+                   else "（落盘守卫 critical：跳过腾挪）")), flush=True)
     # 抢占式显存腾挪（README 既定设计，be43db8 重构时随三级降级一起被误删，
     # 2026-08-25 1.4× 精化实测 OOM 后恢复）：cond 已建好，TE/videoVAE/audioVAE
     # 精化阶段均用不到——全卸到 CPU（含 UNET），common_ksampler 原生机制只回载
@@ -1777,47 +1784,38 @@ def render_latent(模型, clip, video_vae, audio_vae, negative, cfg, net,
     #      （本函数上面那句注释自己就写了「原生机制只回载 UNET」）
     # 判据：同一段重跑，比 69s 短且不 OOM 才算赢。32GB 卡上的既有 OOM 实测
     # 仍然有效——换卡前不要凭这台 24GB 的数据改默认行为。
+    #   ⚠ 2026-10-18 补记：**这条 A/B 以前根本做不出来**。当时只有独立的
+    #     `vram_shuffle` 旋钮，把它拨到 off 只停了二采这一处，一采那三处还在卸，
+    #     测出来的差值根本不是「腾 vs 不腾」。现在把 `unload_everywhere` 关掉
+    #     即可五处一起停手 —— 想验就验得出来。
     _t_unload = time.perf_counter()
-    # 腾挪强度（性能设置 `vram_shuffle`）：这是「节点端适配」替代启动参数
-    # `--vram-headroom` 的那一档——0.35 把显存吃到 ~100% 是官方有意拉高 H3
-    # 利用率，我们不给启动参数建议，只在自己要腾挪时按用户的卡选强度。
-    #   off  = 不卸（只回收残留 + 归还缓存块）
-    #   soft = 只卸放大网络（它是裸 nn.Module，ComfyUI 的账看不见它）
-    #   full/auto = 全卸驻留模型（现状，32GB 卡上有过 OOM 实测才加的）
-    # ⚠ auto 沿用 full：24GB 卡上疑似净亏（RSS 4.98→36.96GB），但换卡前只做
-    # A/B 不改默认——这条待办见 docs/性能优化_下一轮计划_2026-09-23.md §3。
-    _shuffle = str(cfg.get("vram_shuffle") or "auto").lower()
-    _blocked = bool(cfg.get("guard_block"))
-    if _blocked and _shuffle in ("auto", "full"):
-        # 落盘守卫=block 且判定 critical：全卸会把权重挤出到 swap，Linux 无
-        # swap 时不是变慢而是**进程被 SIGKILL**。宁可不卸，也不冒这个险。
-        _shuffle = "off"
-        print(f"[H3二采] 段{seg_no}：落盘守卫判定 critical —— 本次跳过全卸"
-              "（无 swap 机器上全卸会被 OOM killer 杀掉）", flush=True)
-    if _shuffle == "soft" and net is not None:
-        try:
-            from . import upscale_net
-            upscale_net.force_unload(net)
-        except Exception:
-            pass
-    elif _shuffle in ("", "auto", "full"):
+    # ★ 全卸由**统一卸载开关** `unload_everywhere` 接管（④/五处）。
+    # 原先这里是独立的强度旋钮 `vram_shuffle`（off/soft/auto/full），2026-10-18 已
+    # 连根删除 —— 它与一采那三处动机完全相同，并行存在必然出现中间态
+    # （关掉卸载却仍在二采全卸；且 soft 档会越权逐出放大网络，覆盖
+    # `keep_upscaler_resident`）。现在本点只是那五处之一，没有自己的旋钮。
+    if _do_unload:
         comfy.model_management.unload_all_models()
-    # off：什么都不卸，只回收残留引用 + 归还空闲缓存块
+    # 关（或被守卫挡下）= 什么都不卸，只回收残留引用 + 归还空闲缓存块
     gc.collect()
     torch.cuda.empty_cache()
     _tmark("unload", _t_unload)   # 卸载本身花了多久（腾挪的分子成本）
     _mark("unload", "卸载后")   # 埋点④卸载后（报当时占用——腾挪到底回收了多少，就看它）
     # 显式打出**回收量**：它是「这次腾挪值不值」的分子。以前要读者自己拿
     # 「cond后 − 卸载后」去减，而这两个数在两行日志里隔了好几行，没人会去减。
+    # ⚠ 只有真卸了才报：没卸时这个差值是残留回收量，报出来会让人以为腾挪生效了
+    #   （那正是 A/B 想测的东西，日志必须说真话）。
     _c = (_vram or {}).get("cond")
     _u = (_vram or {}).get("unload")
-    if _c and _u and _c[1] is not None and _u[1] is not None:
+    if _do_unload and _c and _u and _c[1] is not None and _u[1] is not None:
         print(f"[H3二采] 段{seg_no}：腾挪回收显存 {_c[1] - _u[1]:+.2f}GB"
               f"（cond后 {_c[1]:.2f} → 卸载后 {_u[1]:.2f}）"
               f" · 卸载耗时 {(_timing or {}).get('unload', 0.0):.1f}s", flush=True)
     # 面包屑：本行之后应立刻出现「Requested to load MiniMaxH3」+ 精化进度条；
     # 长时间没有 = 主模型回载（DynamicVRAM 分页加载）或上面的卸载调用本身卡死
-    print(f"[H3二采] 段{seg_no}：显存已腾挪，精化重采样回载主模型…", flush=True)
+    print(f"[H3二采] 段{seg_no}："
+          + ("显存已腾挪，精化重采样回载主模型…" if _do_unload
+             else "直接进入精化重采样（全程卸载=关，主模型留在原处）…"), flush=True)
 
     # 低强度重采样（高清 latent）：初始 = 放大后的视频 latent + 原音频 latent；
     # 采样输出的音频丢弃，分段/成片音轨 = 原轨（零音频回归）。
@@ -3035,7 +3033,15 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     except BaseException:
         _dump_partial("二采渲染中断")
         raise
-    # P1-2：解码前卸掉精化 UNET（仅在 A≠B 时——见 _up_swap 说明）。
+    # P1-2（⑤/五处）：解码前卸掉精化 UNET。
+    #
+    # 触发条件 = `_up_swap`（A≠B）**或**统一卸载开关 `unload_everywhere`。
+    # ⚠ 2026-10-18 修的条件缺口：原先只认 `_up_swap`，于是**最常见的 A==B 配置下
+    #   这个动作从来没发生过** —— 而那恰恰是它最该生效的场景（A≠B 时 UNET 反正
+    #   要被换出去，卸载是零额外代价；A==B 时才是真省下解码那一段的显存）。
+    #   「全程卸载」名为全程，却漏了二采高清解码这一处，等于用户勾了「开」仍然
+    #   留着一个 UNET 在显存里跟 VAE 抢地方。
+    #
     # 为什么值得做（三条都可核实）：
     #   ① 官方 decode 会先 load_models_gpu([vae_patcher], memory_required=…)，
     #      UNET 驻留时这一步要腾挪/换页（comfy/sd.py:1241）；
@@ -3047,7 +3053,14 @@ def render_segment(模型, clip, video_vae, audio_vae, negative, cfg, net,
     # 用 unload_model_and_clones 而非 unload_all_models：前者按 clone_base_uuid
     # 只卸同源模型，解码要用的 VAE 会保留（不用立刻重载）。
     # 顺序同项目其它腾挪点：unload → gc → empty_cache（反序收不回）。
-    if _up_swap:
+    # ⚠ 为什么这里**不用** unload_all_models（一采解码前那个口径）：一采那处的动机
+    #   是「救 OOM」（它必须连 VAE 的 staged 副本一起 detach 才收得回来），这里的
+    #   动机是「解码更快」，VAE 马上要用，卸了反而白付一次回载。
+    # ⚠ 落盘守卫 critical 时**连 `_up_swap` 那一半也一起跳过**：那次卸载在 A≠B 下
+    #   是「零额外代价」，但零代价的前提是内存还撑得住；守卫既然判定 critical，
+    #   任何把 UNET 挤出到（不存在的）swap 的动作都可能换回 SIGKILL。
+    _unload_ev = cfg.get("unload_everywhere", True)   # 读不到按**开**：保命档
+    if (_up_swap or _unload_ev) and not bool(cfg.get("guard_block")):
         try:
             comfy.model_management.unload_model_and_clones(模型)
             gc.collect()

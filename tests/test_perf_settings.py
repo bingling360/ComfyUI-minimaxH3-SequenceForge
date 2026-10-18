@@ -3,6 +3,7 @@
 针对 2026-09-23 那一轮：素材库卡顿（每张缩略图重建全量索引）与内存上涨
 （缩略图全尺寸解码）的修复。这几条挂了，说明优化被改回去了。
 """
+import ast
 import os
 import sys
 import tempfile
@@ -43,13 +44,11 @@ def test_parse_state_handles_new_fields():
         "index_mode": "ttl",
         "thumb_on_import": False,
         "thumb_max_mp": 25,
-        "vram_shuffle": "soft",
     })
     assert st["upcast_attention"] is False
     assert st["index_mode"] == "ttl"
     assert st["thumb_on_import"] is False
     assert st["thumb_max_mp"] == 25
-    assert st["vram_shuffle"] == "soft"
     # "auto" 是三态字段的合法取值，不能被当垃圾丢掉
     assert perf.parse_state({"upcast_attention": "auto"})["upcast_attention"] == "auto"
     # 非法类型应该回落到默认，而不是塞进去
@@ -331,7 +330,36 @@ def test_apply_runtime_echoes_late_keys():
     assert "encoder" in out
     # 还原
     perf.apply_runtime(perf.parse_state({"frames_dtype": "float32",
-                                         "final_mode": "auto", "oom_autoretry": True}))
+                                         "final_mode": "stream", "oom_autoretry": True}))
+
+
+# ------------------------------------- final_mode 砍档（2026-10-18）
+
+def test_final_mode_auto_is_gone_and_migrates_to_stream():
+    """`auto`（能拼就拼）必须从合法取值里消失，旧值迁移成 stream。
+
+    它死得与「删键」不同：键还在、是**取值**没了 —— 而 `parse_state` 的
+    「未知键丢弃」只救删键，救不了删值（"auto" 会以 str 的身份一路活到渲染路径，
+    然后在 `if _final_mode == "stream"` 那儿落空 → 分段不齐时静默出不了片）。
+    所以必须按值迁。
+    """
+    assert perf.DEFAULT_PERF["final_mode"] == "stream"
+    # 旧档迁移：读进来就是 stream，不会把 "auto" 带到渲染路径
+    assert perf.parse_state({"final_mode": "auto"})["final_mode"] == "stream"
+    # 现存两值不受迁移影响
+    assert perf.parse_state({"final_mode": "memory"})["final_mode"] == "memory"
+    assert perf.parse_state({"final_mode": "stream"})["final_mode"] == "stream"
+
+
+def test_final_mode_auto_is_not_a_front_end_choice():
+    """前端 opts 里不许再出现 auto —— 面板显示一个后端不认的状态最坑。"""
+    import re
+    with open(os.path.join(ROOT, "web", "h3_director.js"), encoding="utf-8") as f:
+        js = f.read()
+    m = re.search(r'key:\s*"final_mode".*?opts:\s*\[(.*?)\]', js, re.S)
+    assert m, "找不到 final_mode 的 opts 字面量"
+    assert '"auto"' not in m.group(1) and "'auto'" not in m.group(1), (
+        "final_mode 的 auto 档已删（行为与 stream 逐字节相同），别把它加回 opts")
 
 
 # ------------------------------------- 提交前审查修正（2026-09-23 同批）
@@ -383,6 +411,133 @@ def test_unload_gate_reads_only_resident_key():
         "强制卸载的正面条件必须是 keep_upscaler_resident（当前无人消费它）"
 
 
+# ------------------------------------- 二采卸载收敛（2026-10-18）
+
+def _is_unload_ev_read(node):
+    """是不是 `x.get("unload_everywhere", ...)` 这个读取（AST 判据，注释不算）。"""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get" and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "unload_everywhere")
+
+
+def _second_pass_fn(tree, name):
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    assert fn is not None, f"upscale.py 里找不到 {name}"
+    return fn
+
+
+def _unload_ev_aliases(fn):
+    """函数里承载 `unload_everywhere` 的**所有名字**（含由它推导出的临时名）。
+
+    直接钉 `_unload_ev` 这个变量名，改个名字测试就假红 —— 所以按赋值来源认，
+    不按名字认。传播几轮是为了接住 `_do_unload = _unload_ev and not _blocked`
+    这种二次派生。
+    """
+    aliases = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign) and _is_unload_ev_read(n.value):
+            aliases.update(t.id for t in n.targets if isinstance(t, ast.Name))
+    for _ in range(3):
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and any(
+                    isinstance(x, ast.Name) and x.id in aliases
+                    for x in ast.walk(n.value)):
+                aliases.update(t.id for t in n.targets if isinstance(t, ast.Name))
+    aliases.add("unload_everywhere")
+    return aliases
+
+
+def _guards_of(fn, api):
+    """函数里包着 `api(...)` 的那些 If 的条件文本（裸调用进不来 → 判据就是要它进不来）。"""
+    out = []
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.If):
+            continue
+        if any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+               and c.func.attr == api
+               for s in n.body for c in ast.walk(s)):
+            out.append(ast.unparse(n.test))
+    return out
+
+
+def _load_upscale_tree():
+    with open(os.path.join(ROOT, "upscale.py"), encoding="utf-8") as f:
+        return ast.parse(f.read())
+
+
+def test_second_pass_unload_points_follow_the_unified_switch():
+    """二采那两处卸载点必须由 `unload_everywhere` 驱动，**不再有独立强度旋钮**。
+
+    这是 `test_removed_dead_keys_stay_removed` 的正面那一半：那边钉「键不许回来」，
+    这边钉「消费端真的换了驱动源」。只钉一边会出现「键删了但没人接管」的空窗——
+    那时 `cfg.get("unload_everywhere", True)` 会因为 nodes 不再写入而恒取保命档 True，
+    二采变成**永远全卸**且用户无处可关（面板上连字段都没有）。
+    """
+    with open(os.path.join(ROOT, "upscale.py"), encoding="utf-8") as f:
+        up_keys = _get_call_keys(f.read())
+    with open(os.path.join(ROOT, "nodes.py"), encoding="utf-8") as f:
+        node_keys = _get_call_keys(f.read())
+
+    assert "vram_shuffle" not in up_keys, \
+        "精化前腾挪强度已删：二采那两处现在由 unload_everywhere 统一管，别再读旧键"
+    assert "vram_shuffle" not in node_keys, \
+        "nodes.py 不该再往 up_cfg 里写 vram_shuffle（那个键已经不存在了）"
+    assert "unload_everywhere" in up_keys, \
+        "二采的精化前腾挪与高清解码前必须读 unload_everywhere"
+    # 写入端也要在：缺了它，cfg.get 的默认值会让二采永远全卸且无处可关
+    assert "unload_everywhere" in node_keys, \
+        "nodes.py 必须把 unload_everywhere 写进 up_cfg，否则二采拿不到它"
+
+
+def test_pre_decode_unload_is_not_gated_on_model_swap_alone():
+    """二采高清解码前那次卸载，**不能只认 `_up_swap`**。
+
+    2026-10-18 修的条件缺口：原条件是 `if _up_swap:` —— 于是最常见的 A==B
+    （二采沿用一采模型）配置下这个动作**从来没发生过**，而那恰恰是它最该生效的
+    场景。「全程卸载」名为全程却漏了这一处 = 用户勾了「开」仍然留一个 UNET
+    在显存里跟 VAE 抢地方（P1-2 那三条收益全部拿不到）。
+    """
+    tree = _load_upscale_tree()
+    fn = _second_pass_fn(tree, "render_segment")
+    assert any(_is_unload_ev_read(n) for n in ast.walk(fn)), \
+        "render_segment 必须真的读 cfg['unload_everywhere']（否则二采拿不到这个开关）"
+    aliases = _unload_ev_aliases(fn)
+
+    conds = [ast.unparse(n.test) for n in ast.walk(fn)
+             if isinstance(n, ast.If)
+             and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                     and c.func.attr == "unload_model_and_clones"
+                     for s in n.body for c in ast.walk(s))]
+    assert conds, "render_segment 里找不到高清解码前的 unload_model_and_clones 分支"
+    for c in conds:
+        assert "_up_swap" in c, (
+            f"高清解码前的卸载条件必须保留 `_up_swap`（A≠B 时是零代价卸载），实际是 `{c}`")
+        assert any(a in c for a in aliases), (
+            f"高清解码前的卸载条件必须认统一卸载开关（候选 {sorted(aliases)}），"
+            f"实际是 `{c}` —— 只认 _up_swap 会让它在 A==B 配置下永不触发")
+
+
+def test_refine_pre_unload_is_guarded_by_the_switch():
+    """精化前那次 `unload_all_models()` 必须**被开关包着**，不能是裸调用。
+
+    这是「并入全程卸载」的落点：改之前它由 `vram_shuffle` 的档位决定，改成
+    裸调用就等于把 32GB 卡上的全卸变成了无条件行为 —— 用户关掉全程卸载也停不下来，
+    而第 ① 处（cond 后丢 TE）却已经停了，中间态当场复现。
+    ⚠ 只钉「有被包住的那一处」，不钉「每一处都包着」：render_latent 里另有一次
+      放大前的全卸（为搬放大网络上卡），它有自己的条件，不该被这条误伤。
+    """
+    tree = _load_upscale_tree()
+    fn = _second_pass_fn(tree, "render_latent")
+    aliases = _unload_ev_aliases(fn)
+    guards = _guards_of(fn, "unload_all_models")
+    assert any(any(a in c for a in aliases) for c in guards), (
+        f"render_latent 里必须有一处 `unload_all_models()` 被统一卸载开关包着，"
+        f"实际被包的条件只有 {guards}（候选名字 {sorted(aliases)}）—— "
+        f"裸调用 = 关掉全程卸载也停不下来")
+
+
 # ------------------------------------- 遗留修补（2026-09-23 第二轮审查）
 
 def test_no_key_in_default_perf_is_unread():
@@ -427,6 +582,14 @@ def test_no_key_in_default_perf_is_unread():
     # 容量 1/8/32 结果逐字相同）—— 实测见 cond_cache.py 顶部说明。
     # 判据升级：**有人读 ≠ 旋钮有效**。
     "cond_cache_size",
+    # `vram_shuffle`（精化前腾挪强度）是 2026-10-18 删的，死法与上面那些**不同**：
+    # 它有真消费端（upscale.render_latent 的精化前腾挪），不是假能力。
+    # 删它的理由是**语义冗余 + 必然中间态**：它管的两个点与 `unload_everywhere`
+    # 动机完全相同，两个开关并行就会出现「关了卸载却在二采全卸」；
+    # 且它的 soft 档无条件 `force_unload(net)`，会越权覆盖 `keep_upscaler_resident`
+    # （默认开）——等于把早已判死的 `unload_upscaler_cache` 从后门复活。
+    # 现在那两个点由 `unload_everywhere` 直接接管。**别再加回来**。
+    "vram_shuffle",
 ])
 def test_removed_dead_keys_stay_removed(dead):
     """被本轮删掉的死键不许回来。
@@ -435,7 +598,7 @@ def test_removed_dead_keys_stay_removed(dead):
       · `preset` / `probe` —— 从未落地，全仓零消费
       · `unload_unet_seg` / `unload_before_decode` / `frames_to_cpu` /
         `max_upscale_scale` —— 从未实现；同类诉求已有真实现
-        （`vram_shuffle` / `final_mode` / `frames_dtype`）
+        （`unload_everywhere` / `final_mode` / `frames_dtype`）
       · `guard_offload_target` —— 与 `guard_action` 语义重叠且零消费
       · `unload_upscaler_cache` —— 与 `keep_upscaler_resident` 同一件事的两面，
         而只有后者有消费端（前端曾摆着这个勾了没用的三方开关）

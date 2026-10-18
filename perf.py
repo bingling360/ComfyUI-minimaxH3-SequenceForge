@@ -106,7 +106,8 @@ DEFAULT_PERF = {
     # ⛔ 2026-09-23 本轮**连根删除** 4 个从未实现的显存策略键（`unload_unet_seg` /
     # `unload_before_decode` / `frames_to_cpu` / `max_upscale_scale`）：它们只出现在
     # DEFAULT_PERF / PROFILE_TABLE / PERF_TYPES 三张表里，全仓零消费端 —— 属于
-    # 「声明了没实现」的假能力。同类诉求现在都有真实现：段间腾挪 `vram_shuffle`、
+    # 「声明了没实现」的假能力。同类诉求现在都有真实现：**统一卸载开关
+    #   `unload_everywhere`**（2026-10-18 起连同二采的精化前腾挪 / 高清解码前一起管）、
     # 成片内存 `final_mode` / `frames_dtype`、卸载时机由 ComfyUI 按需换入决定。
     # **别再往这里加回来**：要在某个阶段省显存，走真实的消费端（有 `*_on` 开关的
     # 分块 / 显存预留），不要新造一个只有名字的键。
@@ -160,11 +161,17 @@ DEFAULT_PERF = {
     "keep_upscaler_resident": True,
 
     # 内存：成片合成
-    # auto=能拼就拼 / stream=强制流式 / memory=强制内存帧
-    # ⚠ memory 是**唯一会把全链帧留在内存**的档（内存帧编码的前提）。
-    #   auto / stream 都不留帧、成片走流式拼接 —— 长链省 n×h×w×12 字节
+    # stream=流式拼接（默认）/ memory=强制内存帧
+    # ⛔ `auto`（能拼就拼）**2026-10-18 删除**：它从来就没"能拼就拼"过 ——
+    #   `_keep_frames` 只认 memory，所以 auto 不留帧，它那套「分段 mp4 不齐时
+    #   回退内存帧编码」的退路是**死代码**（all_frames 恒空），行为与 stream
+    #   逐字节相同。留着只是给面板多一个假选择。旧 perf.json 里的 "auto" 由
+    #   parse_state 按值迁移成 "stream"（见 _LEGACY_VALUES）。
+    # ⚠ memory 是**唯一会把全链帧留在内存**的档 —— 内存帧编码的前提，也是
+    #   节点「图像」输出口唯一能出全链画面的路径（stream 档本口只有单帧占位）。
+    #   stream 不留帧、成片走流式拼接 —— 长链省 n×h×w×12 字节
     #   （544×960×5895 帧 = 36.9GB）。消费端见 nodes._keep_frames。
-    "final_mode": "auto",
+    "final_mode": "stream",
     "frames_dtype": "float32",     # float32 / uint8（帧存内存 ×¼）
 
     # 内存
@@ -224,18 +231,42 @@ DEFAULT_PERF = {
     #
     # ⚠ 它**接管**了原来的 `te_drop_after_cond`（那个键 2026-10-18 已从契约表删除：
     #   收敛之后全仓再无读取方，留着就是「只有名字的键」）。
-    # 开 → 三处**无条件**卸干净：
+    # 开 → 五处**无条件**卸干净：
+    #   ① cond 编码后卸文本编码器（一采 + 二采，见下面的「为什么 ① 免费」）
     #   ② 采样结束后、VAE 解码前卸主干模型（`_vram_oom_cleanup()`）
     #   ③ 每段产物落盘后再整块清一次（unload_all_models + gc + empty_cache）
+    #   ④ 二采精化前腾挪（unload_all_models，含 UNET）
+    #   ⑤ 二采高清解码前卸精化 UNET（unload_model_and_clones，保留 VAE）
     # 关 → 一处都不卸，权重全留在显存/内存里给下一段复用（大显存卡最快）。
     #
-    # 为什么收敛成一个开关：这三个点原来的动机是同一件事（给下一步腾地方），
+    # 为什么收敛成一个开关：这五个点原来的动机是同一件事（给下一步腾地方），
     # 拆成多个旋钮会出现「前一处留着、后一处又卸掉」的自相矛盾中间态。
+    #
+    # ⚠ ④⑤ 为什么也必须归它管（2026-10-18 二次收敛，用户拍板）：
+    #   它们原先由独立的 `vram_shuffle`（精化前腾挪强度）控制，而那四档里
+    #     · `soft` 无条件 `force_unload(net)` → 直接覆盖 `keep_upscaler_resident`
+    #       （默认开），等于把已判死的 `unload_upscaler_cache` 从后门复活；
+    #       且在纯精化模式（无放大网络）下它是个彻底的 no-op，用户却以为生效了。
+    #     · `auto`/`full` 在关掉本开关后**照样全卸** → 于是「TE 特意留住给下段复用、
+    #       精化前又被连根卸掉」——正是本开关当初要消灭的那个中间态。
+    #     · 更糟的是：有了它反而做不出 A/B。要验「24GB 卡上全卸是否净亏」，
+    #       关 `vram_shuffle` 只关了二采一处，一采那三处还在卸。
+    #   `vram_shuffle` 已连根删除，**别再引入**。
+    #
+    # ⚠ 为什么 ① 的二采那一半是「免费」的：CachedClipProxy 实例在一采里创建、
+    #   原样传进 `upscale.render_segment`，所以 ① 天然覆盖二采的高清条件重建
+    #   ——它是五条路径里唯一不需要额外接线的。
     # ⚠ 关键事实（2026-10-18 实测）：`unload_all_models()` 走 for_dynamic=False →
     #   model_unload → detach，会**同时**释放显存和内存里那块 staged 副本
     #   （实测 rss 20577MB → 6351MB，一次回落 14.2GB）。
     #   而 `load_models_gpu()` 那条路对动态模型是 no-op（「不为别的动态模型卸动态模型」），
     #   所以在 VAE 解码前**必须**有一个显式的 unload_all_models()，否则模型一直驻留。
+    #
+    # ⚠ 唯一的例外（不是中间态，是安全阀）：二采那两处 ④⑤ 额外受 `guard_action=block`
+    #   门控 —— 落盘守卫判 critical 时（无 swap 机器上全卸即 OOM killer SIGKILL，
+    #   连 except 都跑不到）它们会被跳过。①②③ 不受它管：一采那条链上有
+    #   `oom_retry` 兜底，且那三处的卸载动机是「救 OOM」而非「可选优化」，
+    #   被安全阀挡住反而会让本可救活的解码直接崩。
     "unload_everywhere": True,
     # ★ 解码前的**内存**预算体检（2026-10-13）——本轮唯一的「是对症药」的机制。
     #
@@ -303,7 +334,9 @@ DEFAULT_PERF = {
 
     # ComfyUI 运行时开关（**节点端适配，不动启动参数**）
     "upcast_attention": "auto",   # auto=跟随启动参数；True/False=强制开/关
-    "vram_shuffle": "auto",       # 精化前腾挪强度：auto / off / soft / full
+    # ⛔ `vram_shuffle`（精化前腾挪强度）已于 2026-10-18 连根删除：它管的两个点
+    #   （二采精化前腾挪 / 高清解码前卸主干）与 `unload_everywhere` 动机完全相同，
+    #   并行存在必然出现中间态。现在由 `unload_everywhere` 统一接管。
 
     # 素材库
     "index_mode": "fingerprint",  # fingerprint（目录指纹）/ ttl（3 秒硬过期）
@@ -405,7 +438,6 @@ PERF_TYPES = {
     "encode_hq": (bool,),
     # ComfyUI 运行时开关
     "upcast_attention": (bool, "auto"),
-    "vram_shuffle": (str,),
     # 素材库
     "index_mode": (str,),
     "thumb_on_import": (bool,),
@@ -1250,6 +1282,7 @@ def parse_state(raw):
     - 未知键丢弃（防止旧存档里的废弃字段一路带到渲染路径）
     - 类型不对的键整体丢弃该项（回落到默认），不做猜测式强转
     - 校验依据是 PERF_TYPES，不是 DEFAULT_PERF 的默认值类型
+    - 键还在、但某个**取值**被删掉的，按 `_LEGACY_VALUES` 迁移（见下）
     """
     out = dict(DEFAULT_PERF)
     if not isinstance(raw, dict):
@@ -1277,7 +1310,22 @@ def parse_state(raw):
                 continue
         if str in types and isinstance(v, str):
             out[k] = v
+    # 值迁移：`parse_state` 的「未知键丢弃」只救得了**删掉的键**，救不了
+    # 「键还在、某个取值没了」——那种值会以 str 的身份一路活到渲染路径。
+    for k, m in _LEGACY_VALUES.items():
+        if out.get(k) in m:
+            out[k] = m[out.get(k)]
     return out
+
+
+# 值迁移表：键还在、某个**合法取值**被删了（旧档里的那个值要映射到现存值）。
+# 与「删键」是两种不同的死法 —— 删键有 parse_state 的「未知键丢弃」兜着，
+# 删值没有，得按值迁（见 parse_state 末尾）。
+_LEGACY_VALUES = {
+    # `auto`（能拼就拼）2026-10-18 删除：行为与 stream 逐字节相同（见
+    # DEFAULT_PERF 那条注释）。**别把它加回 opts** —— 它的回退分支是死代码。
+    "final_mode": {"auto": "stream"},
+}
 
 
 def report_line(hw, profile=None):
@@ -1439,7 +1487,7 @@ RUNTIME_LATER_KEYS = (
     "refine_temporal_on", "refine_temporal_chunk", "refine_temporal_overlap",
     "refine_tile_on", "refine_tile", "refine_tile_overlap", "refine_tile_feather",
     "blocks_prefetch", "vram_reserve_gb",
-    "keep_upscaler_resident", "vram_shuffle",
+    "keep_upscaler_resident",
     "final_mode", "frames_dtype", "guard_action", "nvenc_cq", "encode_hq",
     "x264_crf",
     # 遗留修补（本轮）：守卫系数在 perf.probe_hardware 之后算守卫时才被读到。
@@ -1543,7 +1591,8 @@ def load_settings():
 
 # 渲染路径读设置的缓存：按 mtime 失效。
 #
-# 为什么需要它：一批设置（oom_autoretry / frames_dtype / final_mode / vram_shuffle…）
+# 为什么需要它：一批设置（oom_autoretry / frames_dtype / final_mode /
+# unload_everywhere…）
 # 是**渲染期**消费的，段循环里每段都会问一次。每段读一次 JSON 不算贵，但段数
 # 一多就是几十次无谓的磁盘 IO，而且中途用户在面板改了设置也应当立刻被看到
 # ——mtime 变了就重读，两件事都满足。

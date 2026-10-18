@@ -1,11 +1,11 @@
-"""默认口径不留全链帧（只有 final_mode=memory 才留）—— 源码级契约锁定。
+"""默认档不留全链帧（只有 final_mode=memory 才留）—— 源码级契约锁定。
 
 背景：全链帧 tensor 是 **CPU 内存**峰值的大头。实测 544×960 × 5895 帧
 （约 49 段、4 分钟）单张 float32 IMAGE 就要 36.9GB，把 64GB 机器的
 `DefaultCPUAllocator` 直接打爆（`not enough memory: you tried to allocate
 36943257600 bytes`，见 nodes.py:_build_chain_images）。
 
-默认口径（final_mode=auto/stream）成片走**流式拼接分段 mp4**，从盘上拼、
+默认档（final_mode=stream）成片走**流式拼接分段 mp4**，从盘上拼、
 帧用完即弃 —— 全链帧内存占用为 0。只有用户显式选 `final_mode=memory`
 （强制内存帧编码）时才必须把帧留在内存里。
 

@@ -263,7 +263,7 @@ async function t(name, fn) {
             async perfSet(perf) {
                 saved = perf;
                 return { body: { ok: true, applied: {
-                    upcast_attention: "auto", encoder: "h264_nvenc", final_mode: "auto",
+                    upcast_attention: "auto", encoder: "h264_nvenc", final_mode: "stream",
                     frames_dtype: "float32", oom_autoretry: true,
                 } } };
             },

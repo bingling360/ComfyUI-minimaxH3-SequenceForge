@@ -2507,7 +2507,7 @@ function refvidSummary() {
         + (c.audio ? " · 参考音轨" : " · 不参考音轨");
 }
 
-/* ---- ⏱ 项目级「对齐参考视频时间」（**只改段时长，不改任何设置**）----
+/* ---- ⏱ 项目级「对齐动作迁移参考视频时间」（**只改段时长，不改任何设置**）----
  *
  * 为什么是项目级：官方 `MiniMaxH3ReferenceToVideo` 的 ref_video 是一个**整段**张量，
  * 没有「第 N 段取第几秒」这回事 —— 每个引用它的段看到的都是整条视频。模型眼里的
@@ -8675,8 +8675,11 @@ function injectStyles() {
     .h3d-seedrow input::-webkit-outer-spin-button,.h3d-seedrow input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
     .h3d-seedrow input[type=number]{-moz-appearance:textfield;appearance:textfield}
     .h3d-seedrow .h3d-btn{padding:4px 8px;flex:none}
-    /* 「每段时长」下方那行项目级对齐按钮：占满整格、不与 58px 的数字框抢宽度 */
-    .h3d-alignbtn{width:100%;margin-top:5px;padding:4px 6px;font-size:11px}
+    /* 「每段时长」下方那行项目级对齐按钮：占满整格、不与 58px 的数字框抢宽度。
+     * ★ 文案较长（对齐动作迁移参考视频时间）→ **强制不折行**（nowrap），
+     * 所在那一格改为横跨整行（.h3d-param-wide），否则会被挤成上下两截。 */
+    .h3d-alignbtn{width:100%;margin-top:5px;padding:4px 6px;font-size:11px;white-space:nowrap}
+    .h3d-param-wide{grid-column:1/-1}
     .h3d-psec .h3d-foot,.h3d-asec .h3d-foot,.h3d-projsec .h3d-foot{padding:0 16px 14px}
 
     /* ---- 新建项目模态 ---- */
@@ -8703,7 +8706,7 @@ function injectStyles() {
     .h3d-mpta:focus{border-color:#a8d8bd}
     .h3d-mpinfo{color:var(--h3d-muted);font-size:12px;min-height:18px;margin-bottom:4px}
     .h3d-mpbtn{display:block;margin:8px 0 0}
-    /* 入口那一排（总提示词 + 导入 JSON）：两个按钮并排，不再各占一行 */
+    /* 入口那一排（总提示词 + 导入提示词JSON）：两个按钮并排，不再各占一行 */
     .h3d-mprow{display:flex;gap:8px;flex-wrap:wrap}
     /* ---- 外部 agent 的 JSON 导入预览 ---- */
     .h3d-jprev{max-height:min(42vh,380px);overflow:auto;display:flex;flex-direction:column;gap:5px;margin:10px 0 2px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;padding:8px 10px}
@@ -9017,10 +9020,10 @@ function openDesk() {
     mpBtn.title = "多段工作台：一个框管全片，用 [Segment N] 分段，框里就是直接进模型的提示词；"
         + "可一键洗成 H3 官方格式再分配回段落（扩写在段卡上做）";
     mpBtn.onclick = () => openMasterPromptModal();
-    /* 📥 导入 JSON：外部 agent 直接吐**文件**的那条路（不必再从聊天界面复制，
+    /* 📥 导入提示词JSON：外部 agent 直接吐**文件**的那条路（不必再从聊天界面复制，
      * markdown 渲染吃掉换行是"整篇塌成一段"的头号来源）。与总提示词框同一套
      * 段级字段与写入逻辑，只是入口不同：一个是粘文本，一个是选文件。 */
-    const mpJsonBtn = el("button", "h3d-btn h3d-mpbtn", "📥 导入 JSON");
+    const mpJsonBtn = el("button", "h3d-btn h3d-mpbtn", "📥 导入提示词JSON");
     mpJsonBtn.title = "导入外部 agent 输出的多段提示词 JSON：按 segments 数组分配到各段"
         + "（每段只有 提示词 / 时长 / 独立镜头 三段式，素材引用照旧写正文里的 @素材名）。\n"
         + "会先给一份预览（每段时长与正文首行），确认后才写入。";
@@ -11013,7 +11016,7 @@ function labeledAssetCard(node, ds, idx) {
 
 /* ---- 链参数（面板直写画布控件）：基础设置 + 视频延续（关键帧设置/检测重摇） ----
  * 基础设置 = 原生工作流画幅/时长/采样类 + 链路存档策略（审片/自动成片）
- * + 参考图像尺寸；视频延续 = 段间引导相关（大折叠套两子折叠）。
+ * + 参考图像尺寸；视频延续 = 段间引导相关（大折叠套三子折叠：关键帧 / 桥帧门控 / 检测重摇）。
  * 「存档目录」「重跑起始段」不再在导演台露出（项目与续跑由导演台自己管）——
  * 节点控件与后端逻辑照旧保留，只是不占界面。
  * 「自动保存」2026-10-12 起同样撤出界面：出厂默认「分段」即每段自动落盘，
@@ -11027,8 +11030,13 @@ function labeledAssetCard(node, ds, idx) {
 const BASIC_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数", "CFG", "采样器", "调度器",
     "审片模式", "自动成片", "参考图像尺寸"];
 const KEYFRAME_DEFS = ["引导帧数", "锚定加噪", "递减锚定", "响度对齐强度"];
-const SEAM_DEFS = ["桥帧门控", "清晰度阈值", "回退上限",
-    "接缝重摇", "重摇阈值", "重摇上限"];
+/* 接缝两块 2026-10-18 拆成两个子菜单：一个发生在**生成前**、一个在**生成后**，
+ * 混在一栏里容易看错因果（改了门控以为是重摇没生效）。
+ *   桥帧门控 = 生成前给上一段的尾帧打分（清晰度+曝光），标注/自动回退；
+ *   检测重摇 = 生成后量本段接缝帧差，超阈值换种子整段重采。 */
+const GATE_DEFS = ["桥帧门控", "清晰度阈值", "回退上限"];
+const REROLL_DEFS = ["接缝重摇", "重摇阈值", "重摇上限"];
+const SEAM_DEFS = [...GATE_DEFS, ...REROLL_DEFS];
 const PRIMARY_DEFS = [W_AR, W_MP, W_DUR, W_SEED, "步数"];
 const ADVANCED_DEFS = [
     "引导帧数", "CFG", "采样器", "调度器",
@@ -11092,7 +11100,7 @@ function renderWidgetField(node, name, labelOverride) {
             /* 项目级时间入口旁边的对齐按钮：把「每段时长」这条时间轴一次性钉到
              * 参考视频上（只改引用了视频的段，见 alignRefVideoTime）。
              * 单独占一行 —— 塞进 58px 宽的数字行会把输入框挤成一条缝。 */
-            const alignBtn = el("button", "h3d-btn h3d-alignbtn", "⏱ 对齐参考视频时间");
+            const alignBtn = el("button", "h3d-btn h3d-alignbtn", "⏱ 对齐动作迁移参考视频时间");
             alignBtn.type = "button";
             alignBtn.title = "项目级：按**当前参考视频设置**算出 video1 在模型眼里有多长"
                 + "（出厂 = 官方口径：帧按 24fps 播，网格向下吸附），"
@@ -11117,7 +11125,9 @@ function renderWidgetField(node, name, labelOverride) {
             row.append(dice);
         }
         field.append(row);
-        if (extra) field.append(extra);
+        /* 带附加按钮的那一格（当前只有「每段时长」的对齐按钮）横跨整行：
+         * 半格宽度放不下这行字，不跨行就会折成两截。 */
+        if (extra) { field.classList.add("h3d-param-wide"); field.append(extra); }
     }
     return field;
 }
@@ -11178,9 +11188,9 @@ function resetContinuityParams(node) {
      * 基础设置（分辨率/时长/采样器/存档…）不动 —— 两个组各管各的。 */
     if (!node) return;
     if (!window.confirm("把「视频延续」恢复为默认值？\n\n"
-        + "引导帧数 22 / 锚定加噪 0 / 递减锚定 关 / 响度对齐 1.0；"
-        + "桥帧门控 关 / 清晰度阈值 30 / 回退上限 34 / 接缝重摇 关 / "
-        + "重摇阈值 0.06 / 重摇上限 1。\n基础设置不受影响。")) return;
+        + "关键帧：引导帧数 22 / 锚定加噪 0 / 递减锚定 关 / 响度对齐 1.0；\n"
+        + "桥帧门控：关 / 清晰度阈值 30 / 回退上限 34；\n"
+        + "检测重摇：关 / 重摇阈值 0.06 / 重摇上限 1。\n基础设置不受影响。")) return;
     applyChainDefaults(node, [...KEYFRAME_DEFS, ...SEAM_DEFS]);
     repaintParams();
 }
@@ -11209,7 +11219,7 @@ async function resetAllParams(node) {
         return;
     }
     if (!window.confirm("把全部生成参数恢复为默认值？\n\n"
-        + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 检测重摇）\n"
+        + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 桥帧门控 / 检测重摇）\n"
         + "· 语义桥（关闭 / BUNNY V2 / 0.1 / 全量过桥）\n"
         + "· 二采放大（关闭 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n"
         + "· 性能优化（机器级：显存预留 / 分块 / 编码器 / 显存守卫等）\n"
@@ -11252,7 +11262,7 @@ function renderParamsZone(sec, data) {
     const { node } = data;
     sec.replaceChildren();
     sec.append(el("div", "h3d-sechead",
-        "<strong>链参数</strong><small>基础设置 + 视频延续（关键帧/检测重摇）</small>"));
+        "<strong>链参数</strong><small>基础设置 + 视频延续（关键帧 / 桥帧门控 / 检测重摇）</small>"));
     sec.append(resetRow("↺ 恢复默认",
         "链参数（本栏全部设置）恢复为节点默认值", () => resetChainParams(node)));
     if (!node) {
@@ -11276,10 +11286,10 @@ function renderParamsZone(sec, data) {
     }
     basic.append(bgrid);
     sec.append(basic);
-    /* —— 视频延续（大折叠套两子折叠） —— */
+    /* —— 视频延续（大折叠套三子折叠：关键帧 / 桥帧门控 / 检测重摇） —— */
     const cont = foldSection("param-cont", false,
         "<summary>🔗 视频延续（段间引导 / 关键帧 / 接缝）</summary>");
-    /* 组内恢复默认：只动本组（关键帧 + 检测重摇），基础设置不动——
+    /* 组内恢复默认：只动本组（关键帧 + 门控 + 重摇），基础设置不动——
      * 与基础设置上那个区级按钮各管各的（区级仍重置全部）。 */
     cont.append(resetRow("↺ 恢复默认",
         "「视频延续」恢复为默认（引导帧数 22 / 门控 关 / 接缝重摇 关 …）；基础设置不受影响",
@@ -11292,12 +11302,25 @@ function renderParamsZone(sec, data) {
     kgrid.append(el("div", "h3d-hint",
         "尾部 latent 保存量与分段注入帧数在各段「锚定设置」里按段覆盖（分段优先，空=跟随此处）。"));
     kf.append(kgrid);
+    /* 桥帧门控：生成**前**给上一段尾帧打分，坏尾则向前回退取好帧续拍。 */
+    const gate = foldSection("param-gate", false,
+        "<summary>🩺 桥帧门控（尾帧打分 / 标注 / 自动回退）</summary>");
+    const ggrid = el("div", "h3d-adv-grid");
+    for (const name of GATE_DEFS) ggrid.append(renderWidgetField(node, name));
+    ggrid.append(el("div", "h3d-hint",
+        "只测会成为下一段桥的那几帧（清晰度+曝光）；下段是独立镜头或末段时不测。"
+        + "「自动回退」会向前退 17/34 帧取好帧，该段可见帧数随之变短。"));
+    gate.append(ggrid);
+    /* 检测重摇：生成**后**量接缝帧差，不达标换种子整段重采。 */
     const seam = foldSection("param-seam", false,
-        "<summary>🩺 检测重摇（桥帧门控 / 接缝重摇）</summary>");
+        "<summary>🎲 检测重摇（接缝帧差 / 换种子重采）</summary>");
     const sgrid = el("div", "h3d-adv-grid");
-    for (const name of SEAM_DEFS) sgrid.append(renderWidgetField(node, name));
+    for (const name of REROLL_DEFS) sgrid.append(renderWidgetField(node, name));
+    sgrid.append(el("div", "h3d-hint",
+        "段生成后量接缝帧差，超阈值换种子重采本段（每次重摇 = 一次完整段采样时长）；"
+        + "回放段不参与，跨分辨率不测。"));
     seam.append(sgrid);
-    cwrap.append(kf, seam);
+    cwrap.append(kf, gate, seam);
     cont.append(cwrap);
     sec.append(cont);
     sec.append(el("div", "h3d-foot",
@@ -12464,7 +12487,7 @@ function openMasterPromptModal(prefill) {
     const bLoad = el("button", "h3d-btn", "从当前链载入");
     /* 从文件导入（与顶栏那个按钮同一个动作）：人在这里粘文本，agent 那边给文件，
      * 两条路进的是同一套解析与分配，写完的结果一模一样。 */
-    const bImport = el("button", "h3d-btn", "📥 导入 JSON");
+    const bImport = el("button", "h3d-btn", "📥 导入提示词JSON");
     bImport.title = "从文件导入外部 agent 输出的多段提示词 JSON（先预览再写入）";
     bImport.onclick = importMasterPromptJson;
     const bClear = el("button", "h3d-btn", "清空");

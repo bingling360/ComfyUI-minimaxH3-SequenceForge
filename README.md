@@ -643,7 +643,7 @@ Notes:
 
 A reference video is fed as **one whole clip**: the official `ref_video` input is a single tensor and there is no "segment N gets second X". So what the model sees is `frames / 24` seconds of reference for every segment that references it — a shorter segment truncates the reference, a longer one leaves the tail idling. "Align" therefore only means: give **every segment that references a video** the same duration as the reference, measured the way the model measures it.
 
-The ⏱ **对齐参考视频时间** button sits under **每段时长(秒) · 新段默认** in the right panel. In one click it (`refvideo.align_target` + `POST /h3chain/refvid_align`):
+The ⏱ **对齐动作迁移参考视频时间** button sits under **每段时长(秒) · 新段默认** in the right panel. In one click it (`refvideo.align_target` + `POST /h3chain/refvid_align`):
 
 1. probes the target clip (official `<Video 1>` = the first video in pool order);
 2. computes its presentation length exactly the way the render path does: source frames played at 24 fps, snapped **down** to the 17k+5 grid, capped at the trained bound (362 frames = 15.08 s);

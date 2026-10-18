@@ -1,4 +1,4 @@
-/* ⏱ 项目级「对齐参考视频时间」—— 端到端回归（node + jsdom，跑 shipped 源码）。
+/* ⏱ 项目级「对齐动作迁移参考视频时间」—— 端到端回归（node + jsdom，跑 shipped 源码）。
  *
  * 口径（2026-10-18 用户拍板）：**官方怎么喂就按多久对齐**，按钮**只写段时长**。
  * 所以这里不测"按钮长什么样"，只测它真的把值写到了哪：
@@ -157,7 +157,8 @@ function mkDs(extra) {
         const field = w.renderWidgetField(node, "每段时长");
         const btn = field.querySelector("button.h3d-alignbtn");
         ok(!!btn, "「每段时长」下方有对齐按钮（项目级时间入口旁边）");
-        ok(btn && btn.textContent.indexOf("对齐参考视频") >= 0, "按钮文案写明是对齐参考视频");
+        ok(btn && btn.textContent.indexOf("对齐动作迁移参考视频") >= 0,
+            "按钮文案写明是对齐动作迁移参考视频时间：" + (btn ? btn.textContent : "无按钮"));
         ok(btn && btn.title.indexOf("官方口径") >= 0 && btn.title.indexOf("只写段时长") >= 0,
             "悬停说明了口径（官方口径 · 只写段时长）");
         /* 段卡里不该再有第二个入口（用户明确要项目级） */

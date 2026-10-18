@@ -139,4 +139,4 @@ detailed_description: [Shot 1] <Subject 1> stops and looks back; the neon of <Su
 
 上面这套文本是给人**粘贴**用的。用户要的是**文件**（说「导出 JSON」「给我 json」「我要用导入按钮」）时，同一份内容按 `09-json-export.md` 写成 JSON —— 段级字段仍然是这三个，一个不多。
 
-两条路进的是**同一条写入逻辑**，只是入口不同：文本走「总提示词框」，文件走「📥 导入 JSON」。所以本文件里关于段头 / 三标签 / `@素材名` / 废弃标签的所有规则，在 JSON 里同样成立（`duration` ← `Duration`、`standalone` ← `Standalone`、`prompt` ← `Prompt`）。
+两条路进的是**同一条写入逻辑**，只是入口不同：文本走「总提示词框」，文件走「📥 导入提示词JSON」。所以本文件里关于段头 / 三标签 / `@素材名` / 废弃标签的所有规则，在 JSON 里同样成立（`duration` ← `Duration`、`standalone` ← `Standalone`、`prompt` ← `Prompt`）。

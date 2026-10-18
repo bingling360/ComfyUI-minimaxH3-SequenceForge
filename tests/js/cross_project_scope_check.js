@@ -161,6 +161,18 @@ function ok(cond, msg) {
         _vpackLoading: { scope: "ui" },
         /* 一次性标记（自动补拉只做一次）：见 h3_director.js 里的注释。 */
         _vpackTried: { scope: "ui" },
+        /* 切工作流不丢提示词（2026-10-18）：
+         *   · _activeNodeId  —— 导演台绑定哪个节点（画布态，与项目无关）
+         *   · _dsBroken      —— 当前节点状态解析失败的记录，下次解析成功即清
+         *   · promptFlushJob —— 发起时的 node+dir 快照，切项目/换图时清空
+         *   · _lastFlushSig  —— 落盘内容指纹，**含 dir**（`{ dir: target, ... }`），
+         *                       所以跨项目不会互相挡掉
+         *   · _restoreIgnored—— 「忽略恢复」的键 `<dir>|<nodeId>`，带项目目录 */
+        _activeNodeId: { scope: "ui" },
+        _dsBroken: { scope: "derived" },
+        promptFlushJob: { scope: "derived" },
+        _lastFlushSig: { scope: "dir", key: "dir: target," },
+        _restoreIgnored: { scope: "dir", key: '${dir || ""}|' },
     };
 
     const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");

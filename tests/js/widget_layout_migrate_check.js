@@ -118,13 +118,20 @@ t("判据：老 31 值存档（含已删的「一采编码」）→ 视为旧，
     assert.strictEqual(w.isCurrentWidgetLayout(old31), false, "老 31 值必须判为旧布局");
 });
 
-t("判据：被旧版改坏又被存下的 31 值存档（第 27 位是数字）也按当前处理", () => {
+t("判据：被旧版改坏又被存下的存档（第 27 位是数字）→ 仍是当前布局，只修这一位", () => {
     const broken = samplerOf(clone(w.H3_DEFAULT_WORKFLOW)).widgets_values.slice();
     broken[27] = 1.0;   // 旧版迁移层把「重摇上限」的 1 留在了导演台状态位
-    assert.strictEqual(w.isCurrentWidgetLayout(broken), true);
-    const graph = { nodes: [{ type: "H3SeamlessChainSampler", widgets_values: broken }] };
+    assert.strictEqual(w.isCurrentWidgetLayout(broken), true, "布局仍是当前的，不许整条重排");
+    const graph = { nodes: [{ type: "H3SeamlessChainSampler", widgets_values: broken, properties: {} }] };
     w.migrateGraphWidgets(graph);
-    assert.deepStrictEqual(graph.nodes[0].widgets_values, broken, "不该被再迁一次");
+    const out = graph.nodes[0].widgets_values;
+    assert.strictEqual(out.length, broken.length, "长度不许变");
+    let same = true;
+    for (let i = 0; i < broken.length; i += 1) if (i !== 27 && out[i] !== broken[i]) same = false;
+    assert.ok(same, "除第 27 位外逐位不变（不许因为状态位坏掉就整条重排）");
+    /* 2026-10-18 新契约：这一位要被**修成空**而不是留着数字 —— 留着数字会让
+     * getDs 静默回 defaultDs()，界面上就是"提示词凭空没了"且查无实据。 */
+    assert.strictEqual(out[27], "", "坏掉的状态位应被修成空串（不是数字、不是别的控件值）");
 });
 
 t("判据：35 值陈旧布局 / 极老数字首项 → 视为旧，需迁移", () => {

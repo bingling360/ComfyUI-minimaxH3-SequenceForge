@@ -287,8 +287,10 @@ const MODERN_LIVE = [{ id: 10, ports: [
     await t("源码守卫：载入钩子收意图 + 三处触发 + 按名字判定", () => {
         const i = DIR_SRC.indexOf("app.loadGraphData = function (data, ...args) {");
         assert.ok(i > 0, "loadGraphData 包装不见了（widget 迁移与连线修复都挂在它上面）");
-        /* 900 字符窗口（rev3.3 起钩子里多了 mergePropOutputIntents 一行，700 不够装） */
-        const body = DIR_SRC.slice(i, i + 900);
+        /* 1100 字符窗口（rev3.3 起钩子里多了 mergePropOutputIntents；2026-10-18 又加了
+         * 换图前落盘 flushBeforeGraphSwap —— 窗口必须跟着钩子一起长，否则守卫会因为
+         * "新加了一行" 而误报，那是守卫在惩罚做对的事） */
+        const body = DIR_SRC.slice(i, i + 1100);
         assert.ok(body.indexOf("migrateGraphWidgets(data)") >= 0, "widget 迁移层不该被挤掉");
         assert.ok(body.indexOf("pendingLinkIntents = savedLinkIntents(migrated)") >= 0,
             "载入钩子必须先把连线意图收下来");

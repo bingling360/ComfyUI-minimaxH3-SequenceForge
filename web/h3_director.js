@@ -1589,8 +1589,22 @@ function inputViewUrl(name) {
 
 /* ---------- 画布节点操作 ---------- */
 
+/* 画布上有多个导演台节点时的**绑定目标**：所有读写（提示词、落盘、刷新）只认它。
+ * 旧行为是「永远取第一个」——第二个节点上的提示词在界面上等于不存在，而且
+ * 落盘会写成第一个的目录。null = 还没绑过，按第一个兜底。 */
+let _activeNodeId = null;
+
+function h3Nodes() {
+    return (app.graph?._nodes || []).filter((n) => n && n.type === NODE_TYPE);
+}
+
 function findNode() {
     const nodes = app.graph?._nodes || [];
+    if (_activeNodeId != null) {
+        const pinned = nodes.find((n) => n && n.type === NODE_TYPE
+            && String(n.id) === String(_activeNodeId));
+        if (pinned) return pinned;
+    }
     return nodes.find((n) => n.type === NODE_TYPE) || null;
 }
 
@@ -1678,19 +1692,65 @@ const CUR_WIDGET_COUNT = 30;   // 当前 schema 控件值总数（仅供日志/�
 // 布局 31 → 30 值。删除点在 idx28，**其后只有 参考图像尺寸(29) / 响度对齐强度(30)**，
 // 前移到 28 / 29 —— 故 `wv[27]`（导演台状态）位置不变，形态判据仍然成立。
 
+/* ---- 「导演台状态」槽位校验（切工作流丢提示词的根因之一）----
+ * widgets_values 是**按位**存的，ds 恒在第 27 位。旧迁移层只要「长度 30 +
+ * 第 0 位是字符串」就认为整条布局正确，**从不检查第 27 位**；于是旧布局 / 被写坏的
+ * 存档会把 `1.0`（响度对齐强度）或 `"match"`（参考图像尺寸）顶进 ds 槽位。
+ * `getDs` 的 JSON.parse 失败后静默回 `defaultDs()` → 整链提示词"凭空消失"。
+ *
+ * 现在：ds 槽位**独立校验、独立修**，绝不因为这一位坏就整条重排（重排会顺手改掉
+ * 30 个参数，比丢提示词更糟）。找不到真身时置 "" 并留痕，交给顶栏横幅解释。 */
+const DS_SLOT = 27;
+const DS_SNAPSHOT_MAX = 512 * 1024;   // properties 快照上限（工作流体积兜底）
+
+/* 认"像导演台状态"的宽松判据：只要命中任意一个状态键就算。
+ * 不能用「必须有 prompts/segments」—— 一份还没写提示词的状态就是
+ * `{"mode":"文生视频"}`，那种也要认（老测试钉过这条）。 */
+const DS_KEYS = ["mode", "prompts", "segments", "first_frame", "end_frame", "last_frame",
+    "ref_images", "ref_assets", "inserts", "redo_segs", "upscale", "bridge",
+    "optimizer", "opt_hist"];
+
+/** 只认「能解析且像导演台状态」的字符串；数字 / 空串 / 别的控件值一律不认。 */
+function parseDsValue(v) {
+    if (typeof v !== "string") return null;
+    const s = v.trim();
+    if (!s || s[0] !== "{") return null;
+    try {
+        const o = JSON.parse(s);
+        if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+        return DS_KEYS.some((k) => Object.prototype.hasOwnProperty.call(o, k)) ? o : null;
+    } catch (e) { return null; }
+}
+
+/** 按优先级找真身：第 27 位 → properties 快照（按名字，不按位）→ 全数组倒扫。
+ *  倒扫是给「布局漂移但值还在数组里」的存档用的：只认字符串且必须能解析。 */
+function pickDsJson(wv, props) {
+    if (!Array.isArray(wv)) return "";
+    if (parseDsValue(wv[DS_SLOT])) return wv[DS_SLOT];
+    const snap = props && props.__h3_ds;
+    if (parseDsValue(snap)) return snap;
+    for (let i = wv.length - 1; i >= 0; i -= 1) {
+        if (i === DS_SLOT) continue;
+        if (parseDsValue(wv[i])) return wv[i];
+    }
+    return "";
+}
+
 /* 当前布局判据：长度精确等于当前值数，或第 0 位（宽高比）与第 27 位
  * （导演台状态）都是字符串。这两条能覆盖全部历史布局：
  *   当前 30 值 / 上一版 29 值 → true（29 值只缺末尾两个控件，ComfyUI 会用控件默认值
  *                              补齐 match / 1.0，恰是所需，无需重排）
  *   35 值陈旧布局 → 第 27 位是数字「重摇上限」→ false
  *   极老 25 值布局 → 第 0 位是数字「宽度」→ false
- * 刻意不比较长度：控件增删会让长度漂移，忘了同步常数就会误迁移正确工作流。 */
+ * 刻意不比较长度：控件增删会让长度漂移，忘了同步常数就会误迁移正确工作流。
+ * ⚠ 判据只回答「要不要整条重排」；ds 槽位是否有效由 pickDsJson 单独兜
+ *   （30 值布局里第 27 位是数字/空串时**不重排**，只修这一位）。 */
 function isCurrentWidgetLayout(wv) {
     if (!Array.isArray(wv)) return false;
-    // 长度恰好等于当前值数 → 必然逐位对齐（历史布局是 25 / 29 / 31 / 35，撞不上）。
-    // 这一条还兜住「已被旧版迁移层改坏、又被用户存进 ComfyUI 的工作流」：
-    // 那种存档长度仍是当前值数，但第 27 位是数字 1.0，靠形态判据会被再迁一次。
+    // 长度恰好等于当前值数 → 逐位对齐（历史布局是 25 / 29 / 31 / 35，撞不上）。
+    // 注意：这条只说"其它位对"，不代表第 27 位一定是合法 JSON —— 见 pickDsJson。
     if (wv.length === CUR_WIDGET_COUNT && typeof wv[0] === "string") return true;
+
     // ⚠ 上一版 31 值布局（含已删的「一采编码」）**长度与形态都像当前布局**，
     // 但多一位 → 必须交给迁移层砍掉 idx28，否则整体右移一位、参数全错。
     if (wv.length === V31_WIDGET_COUNT) return false;
@@ -1755,22 +1815,64 @@ function migrateGraphWidgets(graphData) {
         // 已是当前布局则跳过；否则（极老数字首项 / 35 值陈旧）统一迁移。
         // 判据看形态不看长度 —— 长度会随控件增删漂移，比错判更危险（详见上方说明）。
         if (isCurrentWidgetLayout(wv)) {
+            let out = wv;
+            let touched = false;
             // 「自定义」画幅已删（2026-09-27）：当前布局旧存档只换画布两槽
             // （宽高比/百万像素 ← 由存档宽高反推最近档位），其余位原样。
-            if (wv[0] !== "自定义") continue;
-            const [ar, mp] = nearestCanvasCombo(wv[2], wv[3]);
-            console.warn(`[h3-director] 旧存档「自定义」画幅 ${wv[2]}×${wv[3]} 已迁到最近档位`
-                + `「${ar} · ${mp}MP」（换算宽高与旧值可能差几个像素，指纹变化会整链重做）`);
-            n.widgets_values = wv.slice();
-            n.widgets_values[0] = ar;
-            n.widgets_values[1] = mp;
-            migrated += 1;
+            if (wv[0] === "自定义") {
+                const [ar, mp] = nearestCanvasCombo(wv[2], wv[3]);
+                console.warn(`[h3-director] 旧存档「自定义」画幅 ${wv[2]}×${wv[3]} 已迁到最近档位`
+                    + `「${ar} · ${mp}MP」（换算宽高与旧值可能差几个像素，指纹变化会整链重做）`);
+                out = out.slice();
+                out[0] = ar;
+                out[1] = mp;
+                touched = true;
+            }
+            /* ds 槽位**独立**校验：只修第 27 位，绝不因为这一位坏就整条重排。
+             * 判据用「能不能解析 + 像不像导演台状态」，而不是 typeof === "string"
+             * （空串、别的控件值都是字符串，但都不是状态）。 */
+            const dsFixed = pickDsJson(out, n.properties);
+            if (typeof out[DS_SLOT] !== "string" || out[DS_SLOT] !== dsFixed) {
+                if (out === wv) out = out.slice();
+                out[DS_SLOT] = dsFixed;
+                touched = true;
+                if (dsFixed) {
+                    const fromProp = parseDsValue(n.properties && n.properties.__h3_ds);
+                    console.warn("[h3-director] 「导演台状态」槽位不是有效 JSON，已按"
+                        + (fromProp ? "属性快照" : "数组内同形态值")
+                        + "回填（其余参数一位未动）");
+                } else {
+                    console.error("[h3-director] 「导演台状态」槽位无法恢复，已置空"
+                        + "（若有旧原文会在 properties.__h3_ds_raw 里）");
+                    try {
+                        n.properties = n.properties || {};
+                        n.properties.__h3_ds_missing = true;
+                    } catch (e) { /* 属性写不进不影响载入 */ }
+                }
+            }
+            if (touched) { n.widgets_values = out; migrated += 1; }
             continue;
         }
         try {
+            const original = wv;
             wv = remapOldWidgetValuesToCurrent(wv);
             if (wv[0] === "自定义") {
                 [wv[0], wv[1]] = nearestCanvasCombo(wv[2], wv[3]);
+            }
+            /* 旧布局重排后 ds 第 27 位必须过校验：重排只保证"其它位对上"，
+             * 不保证 tail 取到的就是状态（25/35 值布局的尾巴可能是数字）。
+             * 拿不到就按**原数组 + 属性快照**兜，最后才认空。 */
+            if (!parseDsValue(wv[DS_SLOT])) {
+                const dsRaw = pickDsJson(original, n.properties);
+                wv[DS_SLOT] = dsRaw;
+                if (!dsRaw) {
+                    console.error("[h3-director] 旧布局迁移后仍找不到「导演台状态」"
+                        + "（该存档可能本来就没有提示词）");
+                    try {
+                        n.properties = n.properties || {};
+                        n.properties.__h3_ds_missing = true;
+                    } catch (e) { /* 属性写不进不影响载入 */ }
+                }
             }
             n.widgets_values = wv;
             migrated += 1;
@@ -2365,9 +2467,12 @@ function defaultRefvid() {
     /* 出厂默认 = **完全透传**（on:false）= 今天的官方行为，一个字节不变。
        开起来后的默认口径 16:9 @ 0.98MP = 1344×768，恰好等于官方参考画布
        （短边 768 / 面积上限 768×1344），也就是"把官方隐式行为显式化"。 */
-    return { on: false, ar: "16:9", mp: 0.98, no_upscale: true, fit: "裁切填满",
-             resample: "lanczos", fps_norm: true, grid: "向下",
-             limit: "最长段", limit_s: 0.0, audio: true };
+    /* 🔴 只有这五项：**时间轴相关的四项（只缩不放 / 帧率归一 / 网格方向 / 时长上限）
+       已整体删除**（2026-10-18 用户：多余，按官方默认就行）。它们现在写死在
+       后端 `refvideo.plan` 里，与 `comfy_extras/nodes_minimax_h3.py` 逐条对齐：
+       只缩不放、不重定时（帧按 24fps 播）、向下砍 17k+5、截到本段帧数。 */
+    return { on: false, ar: "16:9", mp: 0.98, fit: "裁切填满",
+             resample: "lanczos", audio: true };
 }
 
 let _refvidCache = null;    // 后端 /h3chain/refvid 的 data（null = 还没取到）
@@ -2397,9 +2502,103 @@ function loadRefvid() {
 function refvidSummary() {
     const c = refvidCfg();
     if (!c.on) return "关闭 · 透传（与官方行为一致）";
+    /* 帧率归一/网格方向/时长上限 不再暴露（官方口径钉死），摘要里也就别提它们。 */
     return `${c.ar} @ ${Number(c.mp).toFixed(2)}MP · ${c.fit} · ${c.resample}`
-        + (c.fps_norm ? " · 24fps 归一" : " · 不做帧率归一")
         + (c.audio ? " · 参考音轨" : " · 不参考音轨");
+}
+
+/* ---- ⏱ 项目级「对齐参考视频时间」（**只改段时长，不改任何设置**）----
+ *
+ * 为什么是项目级：官方 `MiniMaxH3ReferenceToVideo` 的 ref_video 是一个**整段**张量，
+ * 没有「第 N 段取第几秒」这回事 —— 每个引用它的段看到的都是整条视频。模型眼里的
+ * 参考时长 = `frames / 24`；段比它短就截参考、比它长尾巴就空转。所以「对齐」=
+ * 把**每一段引用视频的段**设成同一个 `frames / 24`。
+ *
+ * 口径 = **官方怎么喂就按多久对齐**（2026-10-18 用户拍板，别再加花活）：
+ *   源帧原样按 24fps 用（30fps 素材放慢 25%，官方就这样）→ 向下砍 17k+5。
+ *   ⚠ 以前那版会顺手把设置改成"时钟完美"那一档（还带就近吸附补末帧），把 4.20s
+ *   的素材变成 4.46s。一个按钮替用户改设置就是花活 —— 现在只写段时长，
+ *   设置一个字节都不动。
+ *
+ * 真源全在后端 `refvideo.align_target`：前端只做「拿目标 → 让用户确认 → 写段时长」。
+ */
+async function alignRefVideoTime(node) {
+    const A = window.H3Api;
+    if (!node) { alert("画布上没找到 H3 链节点"); return; }
+    if (!A || !A.refvidAlign) {
+        alert("前端接口过旧（缺 refvidAlign）—— 请强制刷新页面（Ctrl+F5）后重试");
+        return;
+    }
+    const ds = getDs(node);
+    const pool = ds.ref_assets || [];
+    const videos = pool.filter((a) => a && (a.kind || "image") === "video");
+    if (!videos.length) {
+        alert("本项目素材池里还没有视频素材 —— 先在素材库上传 / 引用一个视频再对齐");
+        return;
+    }
+    /* 官方编号 <Video 1> = 池子顺序里第一个视频（引用顺序 = 池顺序，见 nodes._kind_tokens）。 */
+    const target = videos[0];
+    const key = refKeyOf(target);
+    const kindOfLabel = (l) => {
+        const a = pool.find((x) => refKeyOf(x) === l);
+        return a ? (KIND_LIST.includes(a.kind) ? a.kind : "image") : "image";
+    };
+    /* 目标段 = 引用了**任意**视频素材的段（读 seg.refs，由正文派生）。 */
+    const segs = ds.segments || [];
+    const hits = [];
+    segs.forEach((seg, i) => {
+        const refs = Array.isArray(seg && seg.refs) ? seg.refs : [];
+        if (refs.some((l) => kindOfLabel(l) === "video")) hits.push(i);
+    });
+    if (!hits.length) {
+        alert(`没有任何段引用视频素材 —— 先在段卡正文里写 @${key} 把「${key}」引进来再对齐`);
+        return;
+    }
+
+    /* 先把设置读到手再算：`refvidCfg()` 在缓存为空时回落到**出厂默认**，
+     * 而口径（是否重定时 / 网格方向）直接决定目标秒数。 */
+    await loadRefvid();
+    const cfg = refvidCfg();
+
+    const r = await A.refvidAlign({
+        dir: getDirValue(node) || "",
+        item: { label: key, file: String(target.file || ""),
+                asset_id: String(target.asset_id || "") },
+        refvid: cfg,
+        max_frames: maxSegmentFrames(node),
+    });
+    const b = r && r.body;
+    if (!b || !b.ok) throw new Error((b && b.message) || "接口不可用（后端未加载 refvideo_align）");
+    const t = b.data || {};
+    const info = t.info || {};
+    const fmt = (n) => (Number(n) || 0).toFixed(2);
+
+    const lines = [`把「参考视频时间」对齐到 video1「${key}」？`, ""];
+    lines.push(`源素材    ${info.width || "?"}×${info.height || "?"} @${info.fps ?? "?"}fps `
+        + `${fmt(info.duration_s)}s（${info.frames ?? "?"} 帧）`);
+    lines.push(`模型看到的  源帧按 24fps 直接播（官方口径：${info.fps ?? "?"}fps 素材`
+        + `放慢 ${info.fps ? fmt(24 / Number(info.fps)) : "?"}×）`
+        + ` → ${fmt(t.seconds)}s（${t.frames} 帧 · 向下对齐 17k+5）`);
+    for (const n of (t.notes || [])) lines.push("· " + n);
+    lines.push("");
+    lines.push(`将对齐 ${hits.length} 段（${hits.map((i) => `段 ${i + 1}`).join("、")}）：`
+        + `${t.frames} 帧 = ${fmt(t.seconds)}s`);
+    lines.push("其余段不动 —— 只改引用了视频的段。");
+    if (videos.length > 1) {
+        lines.push("");
+        lines.push(`⚠ 池里还有 ${videos.length - 1} 个视频素材：所有引用视频的段都按`
+            + `「${key}」对齐`);
+    }
+    lines.push("", "参考视频设置一个都不改（口径按当前设置算）。段时长立即写入，"
+        + "下一次渲染生效。");
+    if (!window.confirm(lines.join("\n"))) return;
+
+    try {
+        for (const i of hits) setSegmentSeconds(node, i, t.seconds);
+        scheduleRefresh(60);
+    } catch (e) {
+        alert("写入段时长失败：" + ((e && e.message) || e));
+    }
 }
 
 /* ---- 🗜 参考视频压缩（Spark-VPack 内联版；**全局机器级**，与 refvid 并列、分开存 vpack.json）----
@@ -2520,6 +2719,58 @@ function restoreSegField(raw) {
         /* 手动锚定（双轨时间线）：读档必须还原，否则"看着有锚、跑起来没锚"——与 frame_img 同款坑 */
         anchors: Array.isArray(raw.anchors) ? raw.anchors : [],
     };
+}
+
+/* 最近一次「导演台状态」解析失败（顶栏横幅 + 取证用；同一节点解析成功即清空）。
+ * 为什么必须留证：`getDs` 失败会回 `defaultDs()`，而 UI 下一次交互就 `setDs`
+ * 把控件值覆盖成默认 JSON —— 原文从此彻底消失，连"为什么空的"都查不出来。 */
+let _dsBroken = null;
+function dsBrokenInfo() { return _dsBroken; }
+
+/** manifest.prompts + seg_fields → 提示词文本 / 分段字段 / 插入段（全局槽位对齐）。
+ *  ★ **唯一口径**：`switchProject`（手动读档）与「恢复到画布」横幅共用这一份。
+ *  两处各写一遍必然漂移，而槽位错位正是"读档后第 3 段跑到第 2 段"的经典成因。 */
+function promptsFromManifest(mf) {
+    const off = mf && mf.has_prologue ? 1 : 0;
+    const plist = ((mf && mf.prompts) || []).slice(off);
+    const insByPos = {};
+    for (const x of ((mf && mf.inserts) || [])) {
+        if (!x || !x.file) continue;
+        const pos = Number(x.slot) - off + 1;
+        if (Number.isInteger(pos) && pos >= 1) insByPos[pos] = String(x.file);
+    }
+    const texts = [];
+    const segs = [];
+    const inserts = [];
+    const fields = Array.isArray(mf && mf.seg_fields) ? mf.seg_fields : [];
+    let pos = 0;
+    for (let j = 0; j < plist.length; j += 1) {
+        pos += 1;
+        if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); continue; }
+        if (String(plist[j]).startsWith("[插入视频]")) continue;   // 无 inserts 记录的残留占位
+        texts.push(String(plist[j] ?? ""));
+        segs.push(restoreSegField(fields[j + off]));
+    }
+    return { off, texts, segs, inserts, rows: plist.length };
+}
+
+/** 把项目存档的提示词装回节点（只写 prompts / segments / inserts，并按正文重算 refs）。
+ *  不碰素材池、链参数与运行进度 —— 那些各有自己的来源，顺手改会造出新的串味。 */
+function adoptManifestPrompts(node, mf) {
+    if (!node || !mf) return 0;
+    const p = promptsFromManifest(mf);
+    const ds = getDs(node);
+    ds.prompts = p.texts.length ? p.texts : [""];
+    ds.segments = p.segs.length ? p.segs
+        : Array.from({ length: ds.prompts.length }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
+    ds.inserts = p.inserts;
+    /* 正文是引用唯一真相：与读档/贴总提示词同一个函数（绝不另造一套） */
+    for (let i = 0; i < ds.prompts.length; i += 1) {
+        syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
+    }
+    setDs(node, ds);
+    schedulePromptFlush(node);   // 装回来即当前内容：顺手对齐一次，防下次切换又对不上
+    return ds.prompts.length;
 }
 
 function getDs(node) {
@@ -2702,6 +2953,8 @@ function getDs(node) {
             alpha: upNum(brRaw.alpha, 0.1, 0.0, 1.0),
             scope: BRIDGE_SCOPES.includes(brRaw.scope) ? brRaw.scope : "all",
         };
+        /* 走到这里说明整份归一化都成功了：同节点的旧损坏记录作废 */
+        if (_dsBroken && String(_dsBroken.nodeId) === String(node.id)) _dsBroken = null;
         return {
             mode: MODES.some(([m]) => m === raw.mode) ? raw.mode : MODE_DEFAULT,
             prompts,
@@ -2724,6 +2977,22 @@ function getDs(node) {
             opt_hist: (raw.opt_hist && typeof raw.opt_hist === "object") ? raw.opt_hist : null,
         };
     } catch (e) {
+        const rawTxt = (w && w.value) ? String(w.value) : "";
+        _dsBroken = {
+            nodeId: node.id, error: String((e && e.message) || e),
+            len: rawTxt.length, at: Date.now(),
+        };
+        /* 原文先塞进 properties：widget 下一次写回就没了，properties 不按位、
+         * 也不参与后端执行，是唯一不会被"归一化"冲掉的落点。 */
+        try {
+            node.properties = node.properties || {};
+            const old = node.properties.__h3_ds_raw;
+            if (!old || String(old).length < rawTxt.length) {
+                node.properties.__h3_ds_raw = rawTxt.slice(0, 512 * 1024);
+            }
+        } catch (_e) { /* 属性写不进不影响主流程 */ }
+        console.error("[h3-director] 导演台状态解析失败（原文已存 properties.__h3_ds_raw）："
+            + String((e && e.message) || e), `len=${rawTxt.length}`);
         return defaultDs();
     }
 }
@@ -2771,7 +3040,7 @@ function setPromptText(node, idx, text) {
     /* 正文是唯一真相：本段引用集合跟着正文里的 @别名 走（手删绿框/手打 @别名都同步） */
     syncRefsFromText(ds, idx, text);
     setDs(node, ds);
-    schedulePromptFlush();   // 编辑即落盘（防抖）：提示词的持久源=项目文件夹
+    schedulePromptFlush(node);   // 编辑即落盘（防抖）：提示词的持久源=项目文件夹
     return true;
 }
 
@@ -2783,7 +3052,7 @@ function addPromptSegment(node) {
     ds.segments.push(defaultSegment());
     setDs(node, ds);
     _selSeg = ds.prompts.length - 1;   // 新增即选中
-    schedulePromptFlush();
+    schedulePromptFlush(node);
     scheduleRefresh(60);
 }
 
@@ -2795,7 +3064,7 @@ function removePromptSegment(node, idx) {
     if (!ds.prompts.length) { ds.prompts = [""]; if (ds.segments) ds.segments = [defaultSegment()]; }
     setDs(node, ds);
     if (_selSeg >= ds.prompts.length) _selSeg = Math.max(0, ds.prompts.length - 1);
-    schedulePromptFlush();
+    schedulePromptFlush(node);
     scheduleRefresh(60);
 }
 
@@ -2925,7 +3194,7 @@ function applyPromptEdit(node, idx, editor) {
     ds.prompts[idx] = text;
     syncRefsFromText(ds, idx, text);
     setDs(node, ds);
-    schedulePromptFlush();
+    schedulePromptFlush(node);
     return true;
 }
 
@@ -3817,7 +4086,17 @@ async function loadDefaultWorkflow() {
         alert("配套工作流模板未加载：请确认插件 web/ 目录含 h3_default_workflow.js 并刷新页面");
         return;
     }
-    if (!confirm("将载入配套工作流并替换当前画布（未保存的画布修改会丢失），继续？")) return;
+    /* 模板自带的「导演台状态」是空的 —— 直接替换画布等于用模板盖掉用户刚写好的词。
+     * 所以先取旧节点的提示词/素材池/目录，载入后搬过去（用户意图是换工作流，不是清空）。
+     * 落盘由 loadGraphData 包装器里的 flushBeforeGraphSwap 负责，这里只管"搬"。 */
+    const oldNode = findNode();
+    const oldDs = oldNode ? getDs(oldNode) : null;
+    const oldDir = oldNode ? getDirValue(oldNode) : "";
+    const hasOld = !!(oldDs && (oldDs.prompts || []).some((t) => String(t).trim()));
+    const tip = hasOld
+        ? "当前提示词（" + (oldDs.prompts || []).filter((t) => String(t).trim()).length + " 段）会自动带过来"
+        : "未保存的画布修改会丢失";
+    if (!confirm(`将载入配套工作流并替换当前画布（${tip}），继续？`)) return;
     try {
         const p = app.loadGraphData(JSON.parse(JSON.stringify(window.H3_DEFAULT_WORKFLOW)));
         // 新版 ComfyUI 前端 loadGraphData 返回 Promise；极老旧前端返回 undefined，按成功降级处理
@@ -3830,7 +4109,25 @@ async function loadDefaultWorkflow() {
     await new Promise((r) => setTimeout(r, 150));
     const node = findNode();
     if (node && app.canvas?.centerOnNode) { try { app.canvas.centerOnNode(node); } catch (e) { /* 可选 */ } }
-    const ds = getDs(node);
+    let ds = getDs(node);
+    if (hasOld && node && !(ds.prompts || []).some((t) => String(t).trim())) {
+        const next = getDs(node);
+        next.prompts = oldDs.prompts.slice();
+        next.segments = (oldDs.segments || []).map((s) => ({ ...defaultSegment(), ...s }));
+        /* 素材池一起搬：正文里的 @别名 靠它解析，只搬文字会变成一堆悬空引用 */
+        next.ref_assets = (oldDs.ref_assets || []).slice();
+        next.ref_images = (oldDs.ref_images || []).slice();
+        next.inserts = (oldDs.inserts || []).slice();
+        for (let i = 0; i < next.prompts.length; i += 1) {
+            syncRefsFromText(next, i, String(next.prompts[i] ?? ""));
+        }
+        setDs(node, next);
+        /* 目录也带回来：提示词要有一个项目文件夹兜底，否则下一次切换又只能靠快照 */
+        if (oldDir) setDirValue(node, oldDir);
+        ds = getDs(node);
+        setLed("idle", `已带过来 ${ds.prompts.filter((t) => String(t).trim()).length} 段提示词`
+            + (oldDir ? `（项目 ${oldDir}）` : ""));
+    }
     syncMirrors(node, ds);
     scheduleRefresh(300);
 }
@@ -5012,7 +5309,7 @@ const OPT_PROVIDERS = {
  * ⛔ 这里原本还有第三件事：按后端名单把字段标成「接线中」（灰掉）或「跟随档位」。
  * 2026-09-23 连根删除：名单是**人工维护的**、必然说谎，而「未接线」那一态早已恒空。
  * 现在「这个键有没有用」由代码事实决定（有没有人读它，后端有 AST 测试守着），
- * 面板一律直接渲染；需要提示的地方用**字段属性 + 当前值**表达（见字段表的 `autoWhen`）。
+ * 面板一律直接渲染，没有判态/灰化分支（三态名单与 `autoWhen` 哨兵提示都已删除）。
  *
  * ═══ 分类轴 = 处理链阶段（2026-09-23 重构）═══
  *
@@ -5026,7 +5323,7 @@ const OPT_PROVIDERS = {
  * ⚠ 「全局分块」是**唯一不按处理链阶段**分的一级 —— 2026-09-27 由「一采采样」
  * 改名而来，因为里面的东西**一采二采都在用**，挂在「一采」名下会误导：
  *   · FFN / 注意力头分块：`nodes.py` 会把它们**同时装到一采模型和二采模型**上；
- *   · 块交换 / 显存预留：写的是进程级的 aimdo 预留，与阶段无关。
+ *   · 显存预留：写的是进程级的 aimdo 预留，与阶段无关。
  * 所以这里按「作用范围」命名，其余四个仍按阶段。
  * 二级用途：分块 / 注意力 / 权重流动 / 自救 …
  *
@@ -5082,34 +5379,17 @@ const H3_PERF_FIELDS = [
     { key: "attn_backend", label: "Attention 后端", kind: "sel", group: "全局分块 · 注意力",
       opts: [["auto", "跟随 ComfyUI（推荐）"], ["sdpa", "sdpa"], ["sage", "SageAttention"], ["flash", "FlashAttention"]],
       hint: "auto = 不动。Sage 在 30 系上有失败报告；环境里拿不到该后端时会保持现状而不是置空" },
-    { key: "blocks_swap_on", label: "块交换（Blockswap）", kind: "bool", group: "全局分块 · 权重流动",
-      hint: "★ 二采 OOM 时**先看下面那项「显存预留（GB，直接填）」** —— 那个更直观，"
-          + "也不必先开这个开关。本项管的是「把块换出去」：打开后按「交换块数」折算成"
-          + "显存预留交给 aimdo；两者写的是**同一个 aimdo 值**（`simple_vram_headroom`）。"
-          + "**它本身也是显存装不下时的活路**：让 block 权重在 GPU / CPU 之间流动起来。"
-          + "H3 = 50 个 double block，每块 ≈ 0.4GB —— 6GB 卡只放得下约 13 块，靠它才能跑起来。"
-          + "**它换的是显存、代价是时间**（每块每次前向都要来回搬一趟），装得下（≥24GB 卡）就别开。"
-          + "⚠ 本项接的是 **ComfyUI 官方**的块级流动（DynamicVRAM 的 vbar 换入 + 官方 block 循环里的预取队列），"
-          + "插件**不自己搬权重**：手工搬会与官方按需换入抢同一批参数、并打坏 LoRA 的权重账。"
-          + "开关的作用是把下面「交换块数」折算成**显存预留**交给 aimdo —— 抬高预留 = 逼官方把更多块换出去" },
-    { key: "blocks_to_swap", label: "　　交换块数（0–50）", kind: "num", enable: "blocks_swap_on",
-      autoWhen: -1, group: "全局分块 · 权重流动",
-      hint: "放出多少块到 CPU，等价于「多留出 N × 每块大小 的显存」。参考：16GB→19–25 块；12GB→31–38；8GB→44–50。"
-          + "-1 = 跟随档位（按本机**真实 UNET 体量**反解，只有渲染开始拿到模型时才算得准）。"
-          + "⚠ 会被**夹取**：预留不可能超过显存总量，超过「显存一半」的部分会被夹掉并在报告行里说明。"
-          + "⚠ 本项与下面的「显存预留」写的是**同一个 aimdo 值**，两者都填时**以「显存预留」为准**"
-          + "（理由：想留 1GB 得先自己乘块大小反算块数，没人算得出来）" },
-    { key: "vram_reserve_gb", label: "显存预留（GB，直接填）", kind: "num", step: 0.5,
+    { key: "vram_reserve_gb", label: "显存预留（GB）", kind: "num", step: 0.5,
       group: "全局分块 · 权重流动",
       hint: "★ **二采 OOM 时最该先动的一项**：直接按 GB 留出显存，**改完立即生效、不用重启**。"
-          + "0 = 不干预（默认）。建议：6GB 卡先给 **1**，还 OOM 再给 1.5。"
-          + "它写的是 aimdo 的 `simple_vram_headroom`（**进程级**那一项），也就是 `--reserve-vram` 多喂的"
-          + "那一处 —— 官方 docstring 明确它与 `--vram-headroom` 的**每设备** `extra_vram_headroom`"
-          + "**是两项独立预留**，所以两者**不互相替代、可以叠加**；本项胜在**运行时可写**。"
-          + "⚠ 与上面「交换块数」是**同一个值的两种单位**，两个都填时以本项为准。"
-          + "⚠ 会被**夹取**到「显存的一半」以内 —— 留太多会让权重只剩一点点地方、"
-          + "采样退化成每步全量重读，比 OOM 还慢。"
-          + "⚠ 官方还有一条 256MB 的**编译期地板**：填到 0.25 以下等于没填（不会更省）。"
+          + "0 = 不干预（默认）。小卡先给 **1**，还 OOM 再给 1.5。"
+          + "它写的是 aimdo 的 `simple_vram_headroom`（进程级），`--reserve-vram` 喂的也是这一处；"
+          + "与 `--vram-headroom` 的**每设备**预留是两项独立的量，不互相替代、可以叠加。"
+          + "⚠ **它只能救「权重占着显存」这一类**：aimdo 靠驱逐权重页兑现预留，"
+          + "torch 分配（激活 / VAE）只计数、从不被拒 → 尖峰 OOM 它挡不住。"
+          + "⚠ 抬高 = 权重每步重新从内存搬，越抬越慢；**降回去不会立刻归还显存**"
+          + "（要等下次加载模型），试完记得关回 0。"
+          + "⚠ 会被**夹取**到「显存的一半」以内；另有 256MB 编译期地板 —— 填 0.25 以下等于没填。"
           + "实际生效值在日志的 `[H3性能] 显存预留：…` 行里读回核验" },
     { key: "blocks_prefetch", label: "　　块级预取", kind: "bool", group: "全局分块 · 权重流动",
       hint: "提前把下一块搬上来，用搬运的空闲时间盖住一部分开销（**本项独立生效，不受总开关影响**"
@@ -5321,7 +5601,7 @@ async function openPerfSettings() {
          * 空对象解析出来就是一份完整默认副本（perf.parse_state 的既有语义，
          * 不需要新接口）。成功后关掉重开：面板按 GET 回来的默认值重建。 */
         if (!window.confirm("把性能优化恢复为默认设置？\n\n"
-            + "手工调过的每一项（块交换 / 分块 / 编码器 / 显存守卫等）都会回到默认值，"
+            + "手工调过的每一项（显存预留 / 分块 / 编码器 / 显存守卫等）都会回到默认值，"
             + "立即应用并写入 perf.json。")) return;
         reset.disabled = true;
         reset.textContent = "恢复中…";
@@ -5370,94 +5650,28 @@ async function openPerfSettings() {
      * 机器到底有没有在块级流动」必须如实摆出来 —— 有 DynamicVRAM 的机器上它本来
      * 就在跑，用户不需要勾任何开关；没 DynamicVRAM 的机器则要靠 ComfyUI 自己的按
      * 模块流动。两者都不是本插件提供的，不能让人以为是。 */
-    const bsAp = (info.applied || {}).blockswap;
-    if (bsAp) {
-        const _bsGb = (v) => (v == null ? "?" : Number(v).toFixed(2) + "GB");
+    const hrAp = (info.applied || {}).headroom;
+    if (hrAp) {
+        const _hrGb = (v) => (v == null ? "?" : Number(v).toFixed(2) + "GB");
         diag.append(el("pre", null,
-            (bsAp.path === "aimdo"
+            (hrAp.path === "aimdo"
                 ? "块级权重流动：DynamicVRAM 在线（官方块级预取 + vbar 换入），当前显存预留 "
-                  + _bsGb(bsAp.headroom_gb)
+                  + _hrGb(hrAp.headroom_gb)
                 : "块级权重流动：本机无 DynamicVRAM → 装不下时由 ComfyUI 自己按模块流动（粒度≈block）")
-            + (bsAp.note ? "\n" + bsAp.note : "")));
+            /* 只在真设了预留时补一句 —— 默认 0 时那句「已恢复基线」是纯噪音 */
+            + (hrAp.reserve_gb > 0 && hrAp.note ? "\n" + hrAp.note : "")));
     }
-    /* 启动参数体检（**只读**，2026-09-27 加）。
-     *
-     * 为什么不做成开关：`--vram-headroom` 的落点是 aimdo `init_devices()` 的
-     * **每设备**预留 —— 进程一起来就定死。aimdo 公开的预留 API 只有两个：
-     * `init_devices()`（启动，每设备）与 `set_simple_vram_headroom()`（运行时可写，
-     * **进程级** simple budget）；前者**没有**运行时可写的入口。所以
-     * 「勾一下 = `--vram-headroom 1`」做不到，硬做就是骗人（写了不生效的开关
-     * 比不给更糟，见 perf.py 里那批 ⛔ 注释）。
-     *
-     * 但「留出余量」这件事**运行时可做** —— `--reserve-vram` 多喂的那一处
-     * aimdo simple_vram_headroom 有 setter，面板的「块交换 → 交换块数」接的
-     * 就是它。所以这里给三样：① 如实摆出启动参数现状；② 一行可直接粘的命令；
-     * ③ 标明哪一项**有运行时等价旋钮**（后端 runtime_ok）—— 想不重启就留余量，
-     * 去改块交换，不必加启动参数。 */
-    const la = info.launch_args;
-    if (la && Array.isArray(la.items) && la.items.length) {
-        diag.append(el("div", "h3d-setsec-title", "启动参数（只读）"));
-        const lines = la.items.map((it) => (it.missing ? "缺 " : "   ")
-            + it.flag + "　现在：" + it.current
-            + (it.missing ? "　建议：" + (it.value || "加上") : ""));
-        diag.append(el("pre", null, escapeHtml(lines.join("\n"))));
-        if (la.note) diag.append(el("div", "h3d-perf-hint", mdBold(la.note)));
-        if (Array.isArray(la.cmdline_flags) && la.cmdline_flags.length) {
-            /* ★ 主：仅 flags —— 直接粘到 ComfyUI Desktop 的「启动参数」输入框。
-             * 之前的 cmdline 是「python main.py --flags」整行，Desktop 那个框只吃
-             * flags（没有 `python` 也没有 `main.py`），用户粘不进去 —— 现在多
-             * 一个 `args` 字段专门给这块用，cmdline 保留给终端用户。 */
-            const argsHint = el("div", "h3d-perf-args-hint",
-                "★ 复制下面这一行 → 粘到 ComfyUI Desktop 顶部「启动参数」输入框 → 重启。");
-            diag.append(argsHint);
-            diag.append(el("pre", null, escapeHtml(la.args || "")));
-            const cpArgs = el("button", "h3d-btn", "复制启动参数");
-            const doneArgs = (ok) => {
-                cpArgs.textContent = ok ? "已复制" : "复制失败，请手动选中";
-                setTimeout(() => { cpArgs.textContent = "复制启动参数"; }, 1600);
-            };
-            cpArgs.onclick = () => {
-                try {
-                    navigator.clipboard.writeText(la.args || "").then(
-                        () => doneArgs(true), () => doneArgs(false));
-                } catch (e) { doneArgs(false); }
-            };
-            diag.append(cpArgs);
-            /* 兜底：完整命令行（终端启动用） */
-            const full = foldSection("perf-launch-cmdline", false,
-                "<summary>终端启动用（完整命令）</summary>");
-            full.append(el("pre", null, escapeHtml(la.cmdline || "")));
-            const cpFull = el("button", "h3d-btn", "复制完整命令");
-            const doneFull = (ok) => {
-                cpFull.textContent = ok ? "已复制" : "复制失败，请手动选中";
-                setTimeout(() => { cpFull.textContent = "复制完整命令"; }, 1600);
-            };
-            cpFull.onclick = () => {
-                try {
-                    navigator.clipboard.writeText(la.cmdline || "").then(
-                        () => doneFull(true), () => doneFull(false));
-                } catch (e) { doneFull(false); }
-            };
-            full.append(cpFull);
-            diag.append(full);
-        }
-        const det = foldSection("perf-launch-args", false,
-            "<summary>这几项分别是什么 / 为什么不能运行时改</summary>");
-        /* ★ 头部一行说明本机口径（2026-09-27 加）：VRAM 多少、kitchen 装没装，
-         * 让用户知道建议是按本机卡片大小算的，不是模板套出来的。 */
-        if (la.vram_gb || la.kitchen_ok === false) {
-            const bits = [];
-            if (la.vram_gb) bits.push("本机 VRAM " + la.vram_gb + "GB");
-            if (la.kitchen_ok === false) bits.push("comfy_kitchen 未装");
-            det.append(el("div", "h3d-perf-hint", "★ 判定口径："
-                + (bits.length ? bits.join(" · ") + " · " : "")
-                + "建议是按本机卡片大小算的"));
-        }
-        for (const it of la.items) {
-            det.append(el("div", "h3d-perf-hint", mdBold(it.flag + "：" + it.why
-                + (it.runtime_ok ? "　→ 本项**有运行时等价旋钮**，见「块交换」" : ""))));
-        }
-        diag.append(det);
+    /* 启动参数体检**搬走了**（2026-10-18 用户反馈：那段「缺 X / 现在 Y / 建议 Z」
+     * 加一整段解释太占位置，而且和「显存预留」讲的是同一件事，容易看反）。
+     * 它现在挂在「📖 启动命令速查」弹窗顶部（本机现状 + 一行可粘贴的 flags），
+     * 与它该待的地方一致：启动参数是「重启用」的，不是「运行中调」的。
+     * 这里只留一行指路，免得用户以为功能没了。 */
+    if (info.launch_args && info.launch_args.items) {
+        const _miss = (info.launch_args.missing || []).length;
+        diag.append(el("div", "h3d-perf-hint", mdBold(
+            "启动参数（`--vram-headroom` 等，**启动时**定死、面板改不了）"
+            + (_miss ? "：本机有 " + _miss + " 项可加" : "")
+            + " —— 现成的可粘贴命令在顶栏「📖 启动命令」里。")));
     }
     body.append(diag);
 
@@ -5502,15 +5716,10 @@ async function openPerfSettings() {
             for (const f of sub.fields) {
                 const row = el("div", "h3d-perf-row");
                 const top = el("div", "h3d-perf-top");
-                /* 「跟随档位」按**当前值**提示，不再依赖后端名单：字段表里标了
-                 * `autoWhen` 的项，值等于那个哨兵（如 blocks_to_swap 的 -1）时在
-                 * label 后加一句 —— 这样提示永远与用户眼前的值一致，不会过期。 */
-                const lab = el("label", null, "");
-                const syncFollow = () => {
-                    const fl = f.autoWhen != null
-                        && Number(draft[f.key]) === Number(f.autoWhen);
-                    lab.textContent = f.label + (fl ? " · 跟随档位" : "");
-                };
+                /* label 就是字段表里的原文，不再有「跟随档位」后缀 —— 那套 `autoWhen`
+                 * 哨兵提示只服务过 `blocks_to_swap = -1`，2026-10-18 随块数旋钮一起删除
+                 * （没有消费端的机制不留，见 perf.py 里那批 ⛔ 注释）。 */
+                const lab = el("label", null, f.label);
                 let ctl;
                 if (f.kind === "tri") {
                     ctl = document.createElement("select");
@@ -5561,10 +5770,7 @@ async function openPerfSettings() {
                         }
                     };
                 } else if (f.kind === "num") {
-                    ctl.onchange = () => {
-                        draft[f.key] = Number(ctl.value) || 0;
-                        syncFollow();     // 数值一改，「跟随档位」提示跟着变
-                    };
+                    ctl.onchange = () => { draft[f.key] = Number(ctl.value) || 0; };
                 } else {
                     ctl.onchange = () => { draft[f.key] = ctl.value; };
                 }
@@ -5579,7 +5785,6 @@ async function openPerfSettings() {
                     row.dataset.h3perfShowKey = f.showWhen.key;
                     row.dataset.h3perfShowVals = (f.showWhen.values || []).join("\u0001");
                 }
-                syncFollow();
                 top.append(lab, ctl);
                 row.append(top);
                 if (f.hint) {
@@ -5640,14 +5845,17 @@ async function openPerfSettings() {
                 + " · 成片=" + fmt(ap.final_mode)
                 + " · 帧精度=" + fmt(ap.frames_dtype)
                 + " · OOM自救=" + fmt(ap.oom_autoretry)
-                /* ⚠ 这里是**块交换自己的三种情形**（开 / 关 / 待渲染生效），与已删的
-                 * 面板三态名单无关：面板打开或保存时拿不到 UNET 体量 → 算不出目标、
-                 * 本次不写（见 perf.apply_blockswap 的守卫），此时说「关」是假话 ——
+                /* ⚠ 这里是**显存预留自己的三种情形**（已生效 / 关 / 待渲染生效），与已删的
+                 * 面板三态名单无关：面板打开或保存时拿不到显存体量 → 算不出夹取口径、
+                 * 本次不写（见 perf.apply_vram_reserve 的守卫），此时说「关」是假话 ——
                  * 它其实是「等渲染时按真实体量生效」。 */
-                + " · 块交换=" + (ap.blockswap
-                    ? (ap.blockswap.applied
-                        ? (ap.blockswap.blocks + "块/" + ap.blockswap.path)
-                        : (ap.blockswap.on ? "待渲染生效" : "关"))
+                + " · 显存预留=" + (ap.headroom
+                    ? (ap.headroom.applied
+                        ? (ap.headroom.reserve_gb > 0
+                            ? (ap.headroom.headroom_gb == null ? "?"
+                                : Number(ap.headroom.headroom_gb).toFixed(2) + "GB")
+                            : "关")
+                        : (ap.headroom.on ? "待渲染生效" : "关"))
                     : "关")
                 + "\n（其余项为下一次渲染生效）";
             save.textContent = "✓ 已应用";
@@ -5679,8 +5887,10 @@ async function openRefVideoSettings(node) {
     overlay.append(dialog);
     dialog.append(el("div", "h3d-opt-title", "🎬 参考视频缩放 · 素材归一"));
     dialog.append(el("div", "h3d-opt-sub",
-        "上传的视频素材在执行生成前自动<b>缩放</b>到目标画布、<b>重定时到 24fps</b>、"
-        + "对齐 H3 的 <b>17k+5 帧网格</b>，音轨与画面同一时间窗（也可不参考音轨）。"
+        "上传的视频素材在执行生成前自动<b>缩放到目标画布</b>（缩放口径与官方参考画布一致："
+        + "只缩不放、短边 768、面积上限 768×1344），音轨裁成与画面同一段源区间（也可不参考音轨）。"
+        + "<br>时间轴<b>一律按官方口径</b>，没有开关：帧原样按 <b>24fps</b> 播（30fps 素材自然放慢）、"
+        + "向下砍到 <b>17k+5 帧网格</b>、截到本链最长段。"
         + "<b>机器级设置、全局生效、跨项目共用</b>，存 &lt;user&gt;/minimax_h3/refvid.json。"
         + "只作用于「参考视频引用」，锚 / 序章 / 参考图不受影响。"
         + "面板末尾还有 <b>🗜 参考视频压缩（Spark-VPack）</b>：抽掉参考视频 latent 的"
@@ -5809,13 +6019,7 @@ async function openRefVideoSettings(node) {
         mpSel.onchange = () => { _mpOn(); paintWH(); };
     }
 
-    /* ③ 只缩不放 */
-    mkRow("只缩不放", mkCheck("no_upscale"),
-        "源像素面积小于目标时不放大（官方对参考视频本来就是这个口径，"
-        + "`nodes_minimax_h3.py` 的 `if vw * vh < cw * ch` 那条回退）。"
-        + "关掉它会把小素材放大到目标画布 —— 多花时间且不增加信息。");
-
-    /* ④ 适配方式 */
+    /* ④ 适配方式（「只缩不放」已按官方口径钉死，不再给控件） */
     mkRow("宽高比对不上时的适配", mkSelect("fit", meta.fits || ["裁切填满"]),
         "**裁切填满** = cover-crop（官方 `_resize(..., \"center\")` 同语义，会切掉多出来的边）；"
         + "**补黑边** = letterbox（不丢画面，四周补黑）；**拉伸** = 直接把画面压到目标比例"
@@ -5826,41 +6030,8 @@ async function openRefVideoSettings(node) {
         "lanczos（默认，官方 `_resize` 用的就是它）/ bicubic / bilinear / area / nearest-exact。"
         + "缩小时 lanczos 与 area 最稳；nearest-exact 只适合像素画。");
 
-    /* ⑥ fps 归一 */
-    mkRow("帧率归一（重定时到 24fps）", mkCheck("fps_norm"),
-        "官方把帧序列**当 24fps 用**（Qwen 侧按 2fps 抽帧、时间戳写 i/2）。"
-        + "30fps 素材因此整体放慢 25%、再被截掉尾巴 —— 音画必然对不上。"
-        + "开启后按时间轴取 `round(i × 源fps ÷ 24)` 号源帧，**输出时长与源时长一致**。"
-        + "关掉 = 源帧原样按 24fps 解释（会变速），一般不该关。");
-
-    /* ⑦ 网格对齐 */
-    mkRow("17k+5 网格对齐方向", mkSelect("grid", meta.grids || ["向下"]),
-        "**向下** = 官方行为（`while n % 17 != 5: n -= 1`，最多砍 16 帧 = 0.67s，绝不补帧）；"
-        + "**就近** = 上下都行（可能补到 0.67s 的重复末帧）；**向上** = 一定补足。"
-        + "对齐结果与原始时长的差异会写在试算表里。");
-
-    /* ⑧ 时长上限 */
-    const limitNum = document.createElement("input");
-    limitNum.type = "number";
-    limitNum.min = "0"; limitNum.max = "60"; limitNum.step = "0.1";
-    limitNum.value = String(draft.limit_s || 0);
-    limitNum.disabled = draft.limit !== "自定义";
-    limitNum.oninput = () => { draft.limit_s = Number(limitNum.value) || 0; };
-    const limitSel = mkSelect("limit", meta.limits || ["不限"]);
-    limitSel.onchange = () => {
-        draft.limit = limitSel.value;
-        limitNum.disabled = draft.limit !== "自定义";
-    };
-    const limitCtl = el("div", "h3d-refvid-pair");
-    limitCtl.append(limitSel, limitNum);
-    mkRow("时长上限", limitCtl,
-        "**最长段**（默认）：按本链最长的一段截 —— 官方 `frames[:frame_count]` 决定"
-        + "超出的帧根本进不了模型，留着只按目标画布占内存（1344×768×124 帧 ≈ 1.5GB）；"
-        + "**不限**：整条素材都归一；**自定义**：按秒截。"
-        + "⚠ 不论选哪一档，后端都有一条**独立硬上限**（最长段 ×1.5 + 一格，下限 124 帧；"
-        + "拿不到段长时 362 帧）—— 它只在报告里说明，不静默吞掉素材。");
-
-    /* ⑨ 音轨 */
+    /* ⑨ 音轨（帧率归一 / 网格方向 / 时长上限 三项已删：全部按官方口径钉死，
+     *   见 draft 构造处那段注释 —— 参考视频不需要这些旋钮） */
     mkRow("参考视频音频", mkCheck("audio"),
         "勾上 = 视频音轨作为 `<Audio j>` 参考（官方口径；素材无音轨也占一个音频号）。"
         + "取消 = **音轨不注入也不占号**，等价于「视频参考只接图像接口」——"
@@ -6011,8 +6182,10 @@ async function openRefVideoSettings(node) {
 
 /* 📖 启动命令速查弹窗（顶栏入口，与 ⚡ 性能优化 同级）。
  *
- * 为什么单独一个弹窗：17 个分区、140+ 条命令，每条都要带「为什么要这样」——
- * 右栏那种窄折叠装不下，塞进去等于把说明吞掉（与性能优化同一个理由）。
+ * 2026-10-18 用户砍过一次：原先 17 分区 148 条 + 每条一段解释，原话是
+ * 「别加那么多没用的命令说明，专门挑一批常用且有用的」→ 现在只有 3 节 12 条。
+ * 顶上另挂一块「本机现状（只读）」：从 ⚡ 性能优化 搬过来的启动参数体检，
+ * 给出本机缺哪项 + 一行可粘贴的 flags（文案与数据仍来自后端，前端不写死命令）。
  *
  * 内容来自后端 `launch_ref.py`（**单一真源**），与 `docs/ComfyUI启动命令速查.txt`
  * 同源生成 —— 前端**不硬编码任何命令**，改数据两处一起变。
@@ -6029,9 +6202,9 @@ async function openLaunchRef() {
     overlay.append(dialog);
     dialog.append(el("div", "h3d-opt-title", "📖 ComfyUI 启动命令速查"));
     dialog.append(el("div", "h3d-opt-sub",
-        "启动参数 + Linux 部署（后台运行 / 开机自启 / 端口与防火墙 / 反向代理 / "
-        + "Docker / 云平台）——<b>每条都能单独复制</b>。"
-        + "数据源在后端 launch_ref.py，与仓库里 docs 下那份 txt 同源。"));
+        "只收常用的：最小启动 / 远程访问 / 显存自救 / Linux 后台运行——"
+        + "<b>每条都能单独复制</b>。数据源在后端 launch_ref.py，"
+        + "与仓库里 docs 下那份 txt 同源。"));
     const body = el("div", "h3d-perf-body");
     const foot = el("div", "h3d-perf-foot");
     dialog.append(body, foot);
@@ -6098,7 +6271,15 @@ async function openLaunchRef() {
         return b;
     };
 
-    /* 顶部目录：17 个分区一屏放不下，先给个跳转条。
+    /* 本机现状（只读）—— 从 ⚡ 性能优化 弹窗**搬过来的**（2026-10-18）。
+     * 为什么搬：那段「缺 X / 现在 Y / 建议 Z」+ 一整段解释放在性能弹窗里，
+     * ① 占三四屏、② 与「显存预留」讲的是同一件事容易看反、③ 它压根不是运行时旋钮。
+     * 放到这里才顺：启动参数就是「重启前先抄一行」的东西。
+     * 数据仍来自后端 perf.launch_args_report（单一真源），前端不写死任何 flag。 */
+    const nowBox = el("div", "h3d-perf-diag h3d-lref-now");
+    body.append(nowBox);
+
+    /* 顶部目录：分区再多也能跳，先给个跳转条。
      * 用锚点 + scrollIntoView，不引入路由。 */
     const toc = el("div", "h3d-lref-toc");
     toc.append(el("span", "h3d-lref-toc-h", "跳转："));
@@ -6126,6 +6307,49 @@ async function openLaunchRef() {
             + " 后面的参数</b>，只列要加的部分；标「完整命令」的行可直接跑。"
             + (ref.base_example
                 ? "<br>完整写法示例：" + escapeHtml(ref.base_example) : "")));
+    }
+
+    /* 填「本机现状」：接口没了就整块不出现（不摆空框）。 */
+    const fillNow = (la) => {
+        const box = nowBox;
+        box.append(el("div", "h3d-setsec-title", "本机现状（只读）"));
+        const scope = [];
+        if (la.vram_gb) scope.push("本机 VRAM " + la.vram_gb + "GB");
+        if (la.kitchen_ok === false) scope.push("comfy_kitchen 未装");
+        const cur = la.items.map((it) => (it.missing ? "缺 " : "   ") + it.flag
+            + "　现在：" + it.current
+            + (it.missing && it.value ? "　建议：" + it.value : "")).join("\n");
+        box.append(el("pre", null, escapeHtml(cur)));
+        if (la.args) {
+            box.append(el("div", "h3d-perf-args-hint",
+                "★ 复制下面这一行 → 粘到 ComfyUI Desktop 顶部「启动参数」输入框 → 重启。"));
+            box.append(el("pre", null, escapeHtml(la.args)));
+            box.append(makeCopy(la.args, "复制启动参数"));
+            if (la.cmdline) {
+                const full = foldSection("lref-launch-cmdline", false,
+                    "<summary>终端启动用（完整命令）</summary>");
+                full.append(el("pre", null, escapeHtml(la.cmdline)));
+                full.append(makeCopy(la.cmdline, "复制完整命令"));
+                box.append(full);
+            }
+        }
+        /* why 收进折叠层：需要时看，不需要时别挡路（用户反馈的就是「太占位置」） */
+        const why = foldSection("lref-launch-why", false,
+            "<summary>这几项分别是什么（" + (scope.length ? escapeHtml(scope.join(" · "))
+                + " · " : "") + "判定按本机卡片大小算）</summary>");
+        for (const it of la.items) {
+            why.append(el("div", "h3d-perf-hint", mdBold(it.flag + "：" + it.why
+                + (it.runtime_ok ? "　→ 本项**有运行时等价旋钮**，见「性能优化 → 显存预留（GB）」" : ""))));
+        }
+        box.append(why);
+    };
+    if (A.perfGet) {
+        A.perfGet().then((r) => {
+            const info = (r || {}).body;
+            if (info && info.launch_args && Array.isArray(info.launch_args.items)) {
+                fillNow(info.launch_args);
+            }
+        }).catch(() => { /* 拿不到就不显示这块，速查本体不受影响 */ });
     }
 
     for (const sec of ref.sections) {
@@ -7246,6 +7470,8 @@ async function deleteProject(dir) {
  *  丢分段字段（场景/角色/声音框清空）的修复正依赖这里先存后切。
  *  项目目录/manifest 不存在（未新建未跑过的指纹目录）→ 404 静默跳过；
  *  失败仅 console 警告，绝不阻断切换流程。 */
+/* 上一次**成功**落盘的内容指纹（含 dir）：相同就不再发请求，见函数内注释 */
+let _lastFlushSig = "";
 async function flushPrompts(node, dir) {
     node = node || findNode();
     if (!node) return false;
@@ -7278,14 +7504,20 @@ async function flushPrompts(node, dir) {
             end: String(s.frame_img.end || "").trim().replace(/\\/g, "/"),
         } : undefined,
     } : null);
+    const body = JSON.stringify({ dir: target, prompts: (ds.prompts || []).map(String), segments });
+    /* 内容指纹：换图钩子 / 切项目会把落盘调用变密，而 save_prompts 每次都
+     * `revision += 1`。同一份内容重复写没有任何收益，只会让版本号空涨、并可能
+     * 撞上别处的乐观锁 —— 与上次**成功**写入逐字节相同就跳过。 */
+    if (body === _lastFlushSig) return true;
     try {
         const r = await api.fetchApi("/h3chain/save_prompts", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ dir: target, prompts: (ds.prompts || []).map(String), segments }),
+            body,
         });
-        if (r.status === 404) return false;   // 无 manifest 的目录：跳过不报错
+        if (r.status === 404) { _lastFlushSig = ""; return false; }   // 无 manifest 的目录：跳过不报错，且不许记住指纹
         if (!r.ok) { console.warn("[h3-director] save_prompts HTTP", r.status); return false; }
+        _lastFlushSig = body;
         return true;
     } catch (e) {
         console.warn("[h3-director] save_prompts failed:", e);
@@ -7294,9 +7526,46 @@ async function flushPrompts(node, dir) {
 }
 
 let promptFlushTimer = 0;
-function schedulePromptFlush() {
+/* 发起时的 node + dir 快照。**绝不能 1.5s 后再 findNode()**：
+ * 那 1.5s 里用户完全可能切了工作流 / 换了画布上的节点，于是「旧内容」会按
+ * 「新节点的存档目录」写过去 —— 同名项目会把磁盘上唯一那份兜底冲成空
+ * （切工作流丢分段提示词最伤的一条路径）。 */
+let promptFlushJob = null;
+function schedulePromptFlush(node) {
+    const n = node || findNode();
+    if (!n) return;
+    promptFlushJob = { node: n, dir: getDirValue(n) };
     clearTimeout(promptFlushTimer);
-    promptFlushTimer = setTimeout(() => { flushPrompts(); }, 1500);
+    promptFlushTimer = setTimeout(() => {
+        const job = promptFlushJob;
+        promptFlushJob = null;
+        if (job) flushPrompts(job.node, job.dir);
+    }, 1500);
+}
+
+/** 换图（`app.loadGraphData`）**之前**把这一拍里的东西落定：
+ *  ① 350ms 窗口内的键盘输入，先刷进旧节点的控件（否则 DOM 一换就没了）；
+ *  ② 旧节点若有「存档目录」，立刻按**旧节点 + 旧目录**落盘
+ *     （`flushPrompts` 的 body 在第一个 await 之前就已序列化完成，换图污染不到它）；
+ *  ③ 作废所有挂起的 350ms / 1.5s 任务 —— 它们捕获的 gen 已过期，
+ *     且 job 已清空，绝不会拿旧内容去写新目录。
+ *  首次页面载入时画布没有 H3 节点 → 纯 no-op。 */
+function flushBeforeGraphSwap() {
+    const oldNode = findNode();
+    if (!oldNode) return null;
+    try { flushPendingEdits(); } catch (e) {
+        console.warn("[h3-director] 换图前刷写输入失败：", e);
+    }
+    const oldDir = getDirValue(oldNode);
+    if (oldDir) {
+        try { flushPrompts(oldNode, oldDir); } catch (e) {
+            console.warn("[h3-director] 换图前落盘失败：", e);
+        }
+    }
+    _uiGen += 1;                     // 作废窗口内的 350ms 写回
+    clearTimeout(promptFlushTimer);  // 作废 1.5s 批量落盘（已在上面显式落过）
+    promptFlushJob = null;
+    return oldNode;
 }
 
 /** 读档：切换「存档目录」+ 载入该项目的提示词进导演台状态（后端续跑校验共享参数）。
@@ -7310,6 +7579,7 @@ async function switchProject(dir) {
     const stale = () => myGen !== _uiGen;
     flushPendingEdits();                                   // 按键先进旧项目，一个不丢
     clearTimeout(promptFlushTimer);                        // 取消挂起的批量防抖（已同步刷过）
+    promptFlushJob = null;                                 // 挂起的 job 一并作废（改由下面显式落盘）
     const oldDir = getDirValue(node);
     if (oldDir && oldDir !== dir) {
         try { await flushPrompts(node, oldDir); } catch (e) {
@@ -7326,38 +7596,15 @@ async function switchProject(dir) {
     if (stale()) return;
     const mf = r.ok ? (r.data?.manifest || null) : null;
     if (mf) {
-        const off = mf.has_prologue ? 1 : 0;
-        const plist = (mf.prompts || []).slice(off);
-        if (plist.length || mf.total) {
+        /* 提示词/分段字段/插入段的归一只有一份实现（promptsFromManifest）：
+         * 「恢复到画布」横幅走的是同一个函数，两处不会漂移。 */
+        const p = promptsFromManifest(mf);
+        if (p.rows || mf.total) {
             const ds = getDs(node);
-            /* 重建提示词段与插入段：prompts 行按全局槽位对齐，插入槽是
-             * 「[插入视频] 文件名」占位行——跳过并按 manifest.inserts
-             * （slot → 链位 pos = slot + 1 - off）还原 ds.inserts */
-            const insByPos = {};
-            for (const x of (mf.inserts || [])) {
-                if (x && x.file) {
-                    const pos = Number(x.slot) - off + 1;
-                    if (Number.isInteger(pos) && pos >= 1) insByPos[pos] = String(x.file);
-                }
-            }
-            const texts = [];
-            const segs = [];
-            const inserts = [];
-            /* seg_fields 按全局槽位对齐（序章/插入槽 null）：plist[j] 的全局槽位
-             * = j + off——还原本项目的分段字段（场景/角色/环境音/配乐等），
-             * 不再沿用切走前项目的旧值（切回即丢正是本修复目标） */
-            const fields = Array.isArray(mf.seg_fields) ? mf.seg_fields : [];
-            let pos = 0;
-            for (let j = 0; j < plist.length; j++) {
-                pos += 1;
-                if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); continue; }
-                if (String(plist[j]).startsWith("[插入视频]")) continue;   // 无 inserts 记录的残留占位
-                texts.push(String(plist[j] ?? ""));
-                segs.push(restoreSegField(fields[j + off]));
-            }
-            ds.prompts = texts;
-            ds.segments = segs.length ? segs : Array.from({ length: texts.length }, () => defaultSegment());
-            ds.inserts = inserts;
+            ds.prompts = p.texts;
+            ds.segments = p.segs.length ? p.segs
+                : Array.from({ length: p.texts.length }, () => defaultSegment());
+            ds.inserts = p.inserts;
             /* 资产库按项目绑定：池子以本项目 manifest["assets"] + asset_links 为准
              * （上传/入库/调入时已同步登记），切项目即换池，不再跨项目共享。
              * 与 hydratePool 共用同一构造函数 —— 两处口径不同就会出现「切了项目
@@ -7640,40 +7887,13 @@ async function collectData() {
         ({ plan, drafts, ds } = planFromDs(node));
     }
     if (!plan || !plan.length) {
+        /* 有节点时 plan **恒 ≥1 段**（`getDs` 至少给一个空段），所以这里只可能是
+         * 「画布上没有导演台节点」。旧版此处有一段「采纳存档提示词进导演台状态」，
+         * 判据 `!plan.length` 永远不成立 —— 是死代码（2026-10-18 删除）。
+         * 那个职能现在由顶栏「恢复到画布」横幅承担：restoreCandidate / adoptManifestPrompts
+         * 只在**用户点确认**时写回，绝不自动复活用户可能刚清空的内容。 */
         const total = state.total ?? (mf && mf.total) ?? 0;
-        if (total && node) {
-            // 采纳存档提示词进导演台状态：卡片可编辑（此前回退成只读历史段，导致无法输入）
-            // 插入槽占位行（[插入视频] 文件名）跳过，ds.inserts 按 manifest.inserts 重建
-            const dsAdopt = getDs(node);
-            const off = mf && mf.has_prologue ? 1 : 0;
-            const insByPos = {};
-            for (const x of ((mf && mf.inserts) || [])) {
-                if (x && x.file) {
-                    const p = Number(x.slot) - off + 1;
-                    if (Number.isInteger(p) && p >= 1) insByPos[p] = String(x.file);
-                }
-            }
-            const texts = [];
-            const segs = [];
-            const inserts = [];
-            const fields = Array.isArray(mf?.seg_fields) ? mf.seg_fields : [];
-            let pos = 0;
-            let j = 0;
-            for (const row of (mf && mf.prompts || []).slice(off)) {
-                pos += 1;
-                if (insByPos[pos]) { inserts.push({ pos, file: insByPos[pos] }); j += 1; continue; }
-                if (String(row).startsWith("[插入视频]")) { j += 1; continue; }
-                texts.push(String(row ?? ""));
-                segs.push(restoreSegField(fields[j + off]));
-                j += 1;
-            }
-            dsAdopt.prompts = texts;
-            dsAdopt.segments = segs.length ? segs
-                : Array.from({ length: texts.length }, (_v, i) => dsAdopt.segments?.[i] ?? defaultSegment());
-            dsAdopt.inserts = inserts;
-            setDs(node, dsAdopt);
-            ({ plan, drafts, ds } = planFromDs(node));
-        } else if (total) {
+        if (total) {
             plan = Array.from({ length: total }, (_v, i) => {
                 const ins = ((mf && mf.inserts) || []).find((x) => x.slot === i);
                 const row = String(((mf && mf.prompts) || [])[i] || "");
@@ -7717,6 +7937,89 @@ function paintChainNotice(state) {
     const txt = chainNoticeText(state);
     box.textContent = txt;
     box.style.display = txt ? "" : "none";
+}
+
+/* ---- 恢复 / 损坏横幅 ----
+ * 两件事共用一条横幅（都在"提示词没了"这个场景里出现，分两条只会互相挤）：
+ *   ① 状态解析失败：先保住原文（getDs 已写 properties.__h3_ds_raw），给「导出原文」；
+ *   ② 画布空、项目存档有：给「恢复到画布 / 忽略」——**绝不自动写回**，
+ *      因为"空"也可能是用户刚手清空，自动复活就是反向 bug。 */
+const _restoreIgnored = new Set();
+function restoreKey(node, dir) { return `${dir || ""}|${node && node.id != null ? node.id : ""}`; }
+
+/** 「可恢复」判据（纯函数，测试直接打）。返回要拿来恢复的 manifest，否则 null。 */
+function restoreCandidate(node, mf, dir) {
+    if (!node || !mf) return null;
+    const ds = getDs(node);
+    if ((ds.prompts || []).some((t) => String(t).trim())) return null;   // 画布有内容：不打扰
+    if (!((mf.prompts || []).some((t) => String(t).trim()))) return null; // 存档也空：没得恢复
+    if (_restoreIgnored.has(restoreKey(node, dir))) return null;
+    return mf;
+}
+
+/** 把 properties 里留的原文导出成文件（浏览器端下载，不经过后端）。 */
+function exportBrokenDs(node) {
+    const raw = node && node.properties && node.properties.__h3_ds_raw;
+    if (!raw) { alert("没有保留到原文（properties.__h3_ds_raw 为空）"); return; }
+    try {
+        const blob = new Blob([String(raw)], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `h3-ds-broken-${node.id != null ? node.id : "node"}.json`;
+        document.body.append(a);
+        a.click();
+        setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch (e) { /* 忽略 */ } a.remove(); }, 1000);
+    } catch (e) {
+        alert(`导出失败：${e}`);
+    }
+}
+
+function paintRecover(data) {
+    const z = desk && desk.zones;
+    if (!z || !z.recover) return;
+    const box = z.recover;
+    const { node, mf, state } = data || {};
+    const dir = (state && state.dir) || (node ? getDirValue(node) : "") || "";
+
+    /* ① 解析失败优先：先把"为什么空"讲清楚，并给出原文出口 */
+    const brk = dsBrokenInfo();
+    if (brk && node && String(brk.nodeId) === String(node.id)) {
+        box.replaceChildren();
+        box.append(el("span", null,
+            `⚠ 导演台状态解析失败（${(brk.len / 1024).toFixed(1)}KB 原文已保留，未丢失）——`
+            + "本份工作流的分段提示词读不出来，原文在 properties.__h3_ds_raw。"));
+        const b = el("button", "h3d-btn", "导出原文");
+        b.onclick = () => exportBrokenDs(node);
+        box.append(b);
+        box.style.display = "";
+        return;
+    }
+
+    /* ② 画布空 + 存档有 → 一键恢复 */
+    const cand = restoreCandidate(node, mf, dir);
+    if (!cand) {
+        box.replaceChildren();
+        box.style.display = "none";
+        return;
+    }
+    const n = (cand.prompts || []).filter((t) => String(t).trim()).length;
+    box.replaceChildren();
+    box.append(el("span", null,
+        `本项目存档有 ${n} 段提示词，当前画布为空 —— 多半是切工作流时没带过来。`));
+    const yes = el("button", "h3d-btn h3d-btn-cyan", "恢复到画布");
+    yes.onclick = () => {
+        const k = adoptManifestPrompts(node, cand);
+        setLed("idle", `已从项目存档恢复 ${k} 段提示词`);
+        scheduleRefresh(60);
+    };
+    const no = el("button", "h3d-btn", "忽略");
+    no.onclick = () => {
+        _restoreIgnored.add(restoreKey(node, dir));
+        box.replaceChildren();
+        box.style.display = "none";
+    };
+    box.append(yes, no);
+    box.style.display = "";
 }
 
 function segMediaHtml(state, mf, idx) {
@@ -7917,6 +8220,10 @@ function injectStyles() {
     .h3d-close:hover{filter:brightness(1.2)}
     .h3d-banner{display:none;padding:9px 18px;border-bottom:1px solid #8a4a3f;background:#3a2620;color:#ffc9b8;font-size:12px;line-height:1.6}
     .h3d-notice{display:none;padding:8px 18px;border-bottom:1px solid #8a7a3f;background:#38320f;color:#ffe9a8;font-size:12px;line-height:1.6;cursor:default}
+    /* 恢复/损坏横幅：默认靠 inline style.display:none 隐藏（这条规则不写 display，
+       否则 :="" 会落回这里的 none，永远显示不出来） */
+    .h3d-recover{padding:8px 18px;border-bottom:1px solid #8a4b3f;background:#3a2119;color:#ffd9cf;font-size:12px;line-height:1.7;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .h3d-recover .h3d-btn{padding:3px 10px;font-size:12px}
     .h3d-stage{min-height:0;display:grid;grid-template-columns:minmax(255px,300px) minmax(400px,1fr) minmax(255px,300px);gap:1px;background:var(--h3d-line)}
     .h3d-col{min-width:0;min-height:0;background:var(--h3d-panel);overflow:auto}
     .h3d-sechead{position:sticky;top:0;z-index:3;padding:14px 16px 10px;background:#22272eee;backdrop-filter:blur(8px);border-bottom:1px solid #3f4854}
@@ -8133,6 +8440,8 @@ function injectStyles() {
     .h3d-lref-title{color:var(--h3d-bone);font-size:12.5px;font-weight:600;line-height:1.5}
     /* 节头那句「参数都加在 python main.py 后面」（2026-09-27 加：去掉每条重复的基础命令）。
      * 只印一次，放在正文开头 —— 逐节印会重复 11 遍。 */
+    .h3d-lref-now{margin:0 0 10px}
+    .h3d-lref-now pre{margin:2px 0 6px}
     .h3d-lref-base{padding:9px 11px;margin:0 0 10px;border:1px solid #37332b;border-radius:8px;background:#181712;font-size:11.5px;line-height:1.7;color:#9fd3b4}
     .h3d-lref-head{display:flex;align-items:center;gap:8px}
     .h3d-lref-head>.h3d-lref-title{flex:1 1 auto;min-width:0}
@@ -8366,6 +8675,8 @@ function injectStyles() {
     .h3d-seedrow input::-webkit-outer-spin-button,.h3d-seedrow input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
     .h3d-seedrow input[type=number]{-moz-appearance:textfield;appearance:textfield}
     .h3d-seedrow .h3d-btn{padding:4px 8px;flex:none}
+    /* 「每段时长」下方那行项目级对齐按钮：占满整格、不与 58px 的数字框抢宽度 */
+    .h3d-alignbtn{width:100%;margin-top:5px;padding:4px 6px;font-size:11px}
     .h3d-psec .h3d-foot,.h3d-asec .h3d-foot,.h3d-projsec .h3d-foot{padding:0 16px 14px}
 
     /* ---- 新建项目模态 ---- */
@@ -8595,7 +8906,7 @@ function openDesk() {
      * 控件值错位/出现怪值时用它兜底（按控件名落值，不依赖位置，天然修错位）。 */
     const resetAllBtn = el("button", "h3d-btn", "↺ 全局重置");
     resetAllBtn.title = "全部生成参数一键恢复默认：链参数（画布控件）+ 语义桥 + 二采放大"
-        + " + 性能优化（块交换 / 分块 / 编码器 / 显存守卫等）。"
+        + " + 性能优化（显存预留 / 分块 / 编码器 / 显存守卫等）。"
         + "版本更新导致参数错位 / 改乱了想回头时用。\n"
         + "不含 AI 优化设置、每段提示词与锚定。";
     resetAllBtn.onclick = () => resetAllParams(findNode());
@@ -8657,8 +8968,21 @@ function openDesk() {
      * 无从判断是没数据还是代码挂了。这里把区名与错误一行摆到顶栏。 */
     const zoneErr = el("span", "h3d-zoneerr", "");
     zoneErr.style.display = "none";
+    /* 多节点绑定指示：画布上有 >1 个导演台节点时才出现（单节点时整块不占位）。
+     * 点一下循环切换 —— 不做下拉是因为顶栏已经很挤，而"多节点"本身是少数场景。 */
+    const nodeChip = el("button", "h3d-btn", "");
+    nodeChip.style.display = "none";
+    nodeChip.title = "画布上有多个导演台节点：点击切换绑定（提示词读写与落盘只走绑定的那个）";
+    nodeChip.onclick = () => {
+        const list = h3Nodes();
+        if (list.length < 2) return;
+        const cur = list.findIndex((n) => String(n.id) === String((findNode() || {}).id));
+        _activeNodeId = list[(cur + 1) % list.length].id;
+        setLed("idle", `导演台已绑定节点 #${_activeNodeId}（共 ${list.length} 个）`);
+        scheduleRefresh(60);
+    };
     right.append(fixFocus, refreshBtn, resetAllBtn, optBtn, perfBtn, cmdRefBtn,
-                 vramBtn, ledWrap, sub, zoneErr, close);
+                 vramBtn, ledWrap, nodeChip, sub, zoneErr, close);
     topbar.append(left, right);
 
     /* 诊断横幅：项目存档接口未注册时显示（/h3chain/ping 探测失败） */
@@ -8671,6 +8995,11 @@ function openDesk() {
      * 报告抽屉默认是收起的，容易漏看 —— 顶栏再亮一条，点它展开报告。 */
     const notice = el("div", "h3d-notice");
     notice.style.display = "none";
+
+    /* 恢复 / 损坏横幅（2026-10-18）：与上面那条链提示分开 —— 链提示是自动消失的
+     * 业务提示，这条要用户点一下才走（「恢复到画布」/「忽略」/「导出原文」）。 */
+    const recover = el("div", "h3d-recover");
+    recover.style.display = "none";
 
     /* 主舞台三栏（侧栏各含两个固定分区，渲染器只填充分区内容） */
     const stage = el("div", "h3d-stage");
@@ -8720,7 +9049,7 @@ function openDesk() {
     const run = el("button", "h3d-btn h3d-btn-cta h3d-run", "▶ 开始生成");
     footer.append(footInfo, stop, run);
 
-    page.append(topbar, banner, notice, stage, footer);
+    page.append(topbar, banner, notice, recover, stage, footer);
     document.body.append(page);
     page.focus();
 
@@ -8732,7 +9061,7 @@ function openDesk() {
             lProj, lHist,
             rParams, rBridge, rUpscale,
             footInfo, run, stop,
-            zoneErr, notice,
+            zoneErr, notice, recover, nodeChip,
         },
         cardsSig: "",
         histSig: "",
@@ -8823,6 +9152,17 @@ function paintZoneErrs() {
     z.zoneErr.style.display = "";
 }
 
+/** 多节点绑定指示：只有 >1 个 H3 节点时露头（单节点时零占位）。 */
+function paintNodeChip() {
+    const z = desk && desk.zones;
+    if (!z || !z.nodeChip) return;
+    const list = h3Nodes();
+    if (list.length < 2) { z.nodeChip.style.display = "none"; return; }
+    const cur = findNode();
+    z.nodeChip.textContent = `🎬 节点 #${cur ? cur.id : "?"} · 共 ${list.length}`;
+    z.nodeChip.style.display = "";
+}
+
 function updateDesk(data) {
     if (!desk) return;
     const { node, state, mf, plan, drafts } = data;
@@ -8833,7 +9173,9 @@ function updateDesk(data) {
     const dirName = state?.dir || (node ? getDirValue(node) : "") || "无当前链";
     z.project.textContent = `项目 · ${dirName}`;
     paintLeds();
+    paintNodeChip();           // 多节点时提示当前绑定哪个（写入只走它）
     paintChainNotice(state);   // 分辨率不一致这类「只提示不报错」的链提示，顶栏亮一条
+    paintRecover(data);        // 状态损坏（留证+导出）/ 画布空但项目有存档（一键恢复）
 
     /* 左栏：项目与链（含「素材库」入口，见 renderV2Section）+ 成片（左栏底部） */
     runZone("项目与链", () => renderLeftColumn(z.lProj, data));
@@ -10714,6 +11056,7 @@ function renderWidgetField(node, name, labelOverride) {
         return field;
     }
     const opts = w.options && Array.isArray(w.options.values) ? w.options.values : null;
+    let extra = null;    // 控件下方单独占一行的附加按钮（时长那一格的对齐按钮）
     if (opts) {
         const sel = document.createElement("select");
         sel.className = "h3d-select";
@@ -10745,6 +11088,23 @@ function renderWidgetField(node, name, labelOverride) {
             inp.min = inp.min || 0.1;   // 控件 options 未下发时兜底
             inp.max = inp.max || 2.0;
         }
+        if (name === W_DUR) {
+            /* 项目级时间入口旁边的对齐按钮：把「每段时长」这条时间轴一次性钉到
+             * 参考视频上（只改引用了视频的段，见 alignRefVideoTime）。
+             * 单独占一行 —— 塞进 58px 宽的数字行会把输入框挤成一条缝。 */
+            const alignBtn = el("button", "h3d-btn h3d-alignbtn", "⏱ 对齐参考视频时间");
+            alignBtn.type = "button";
+            alignBtn.title = "项目级：按**当前参考视频设置**算出 video1 在模型眼里有多长"
+                + "（出厂 = 官方口径：帧按 24fps 播，网格向下吸附），"
+                + "再把**每一段引用视频的段**设成同一个时长。\n"
+                + "只写段时长，参考视频设置一个都不改。";
+            alignBtn.onclick = () => {
+                alignRefVideoTime(node).catch((e) => {
+                    alert("对齐失败：" + ((e && e.message) || e));
+                });
+            };
+            extra = alignBtn;
+        }
         if (name === W_SEED) {
             const dice = el("button", "h3d-btn", "🎲");
             dice.title = "随机种子";
@@ -10757,6 +11117,7 @@ function renderWidgetField(node, name, labelOverride) {
             row.append(dice);
         }
         field.append(row);
+        if (extra) field.append(extra);
     }
     return field;
 }
@@ -10851,7 +11212,7 @@ async function resetAllParams(node) {
         + "· 链参数（画布控件：分辨率 / 时长 / 种子 / 采样器 / 关键帧 / 检测重摇）\n"
         + "· 语义桥（关闭 / BUNNY V2 / 0.1 / 全量过桥）\n"
         + "· 二采放大（关闭 / 1.4 倍 / 0.35 去噪 / 精化 4 步）\n"
-        + "· 性能优化（机器级：块交换 / 分块 / 编码器 / 显存守卫等）\n"
+        + "· 性能优化（机器级：显存预留 / 分块 / 编码器 / 显存守卫等）\n"
         + "· 参考视频缩放（机器级：关闭 = 透传）\n\n"
         + "以上默认值与新版默认工作流同源。\n"
         + "不含：AI 优化设置、每段提示词与锚定。\n"
@@ -12698,6 +13059,29 @@ function paintDeskNode(node) {
  * 按钮：serialize:false 必须设——按钮没有业务值，混进 widgets_values 会把
  * 30 值布局搅成 31 值（位次形态判据虽然撞不上，但后端按位取值会多读一个空位）。
  * 点击行为与左侧栏迷你卡/悬浮球同源（openDesk）。 */
+
+/** 导演台状态的「按名字」快照（写进 properties，随工作流保存）。
+ *  - 只在能正常解析时出快照：当前控件已损坏时**返回空**，绝不用默认值把上一次
+ *    的好快照盖掉 —— 那份快照往往就是唯一的救命稻草。
+ *  - 超过 DS_SNAPSHOT_MAX 直接放弃：工作流体积不能被一份提示词拖爆
+ *    （项目 manifest 仍是完整备份，这里只是防「布局认错」的第二道保险）。 */
+function safeDsSnapshot(node) {
+    if (!node) return "";      // 没有节点就没有"这份状态"，绝不能拿默认值充数
+    try {
+        if (_dsBroken && String(_dsBroken.nodeId) === String(node.id)) return "";
+        const v = JSON.stringify(getDs(node));
+        if (!v || v === "{}") return "";
+        if (v.length > DS_SNAPSHOT_MAX) {
+            console.warn(`[h3-director] 导演台状态 ${(v.length / 1024).toFixed(0)}KB 超过快照上限`
+                + `（${(DS_SNAPSHOT_MAX / 1024).toFixed(0)}KB），本份工作流不带 properties 兜底`);
+            return "";
+        }
+        return v;
+    } catch (e) {
+        return "";
+    }
+}
+
 function mountDeskButton(node) {
     if (!node) return;
     // 隐藏部分**可重复执行**：某些前端时序里控件晚于 nodeCreated 创建，漏网的
@@ -12743,6 +13127,14 @@ app.registerExtension({
                     const d = o || (o = {});
                     d.properties = d.properties || {};
                     d.properties.__h3_out_intents = captureLiveOutputIntents(this);
+                    /* 导演台状态也按**名字**存一份：widgets_values 是按位的，
+                     * 迁移层认错布局就整份没了。properties 不按位、不参与后端
+                     * 执行，是这里唯一稳的通道（与 __h3_out_intents 同一个理由）。 */
+                    const snap = safeDsSnapshot(this);
+                    if (snap) {
+                        d.properties.__h3_ds = snap;
+                        d.properties.__h3_ds_ver = H3D_VER;
+                    }
                 } catch (e) { /* 快照失败不影响正常存档 */ }
                 return r;
             };
@@ -12753,6 +13145,7 @@ app.registerExtension({
      * 新建时主动补一刷，mini 卡与参数/二采区随之恢复可用 */
     loadedGraphNode(node) {
         if (node && node.type === NODE_TYPE) {
+            if (_activeNodeId == null) _activeNodeId = node.id;   // 首次出现即绑定（多节点时可点 chip 切）
             mountDeskButton(node);   // 载入路径兜底：某些前端版本建控件晚于 nodeCreated
             scheduleRefresh(250);
         }
@@ -12763,6 +13156,7 @@ app.registerExtension({
     },
     nodeCreated(node) {
         if (node && node.type === NODE_TYPE) {
+            if (_activeNodeId == null) _activeNodeId = node.id;
             mountDeskButton(node);   // 画布节点只留「打开导演台」按钮，参数全在导演台
             scheduleRefresh(250);
         }
@@ -12779,6 +13173,9 @@ app.registerExtension({
         if (typeof app.loadGraphData === "function") {
             const origLoadGraphData = app.loadGraphData.bind(app);
             app.loadGraphData = function (data, ...args) {
+                // ★ 换图前先落定：输入刷进旧控件、旧图按旧目录落盘、挂起任务作废。
+                // 必须放在 migrate 之前——此刻 findNode() 还是旧图，换完就没对象了。
+                flushBeforeGraphSwap();
                 const migrated = migrateGraphWidgets(data);
                 pendingLinkIntents = savedLinkIntents(migrated);
                 pendingOutputIntents = savedOutputIntents(migrated);

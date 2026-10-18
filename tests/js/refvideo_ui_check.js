@@ -112,10 +112,14 @@ function mkDs(extra) {
             "复用 ⚡ 性能优化同一套外壳（opt-dialog + perf-dialog）");
         const rows = [...ov.querySelectorAll(".h3d-perf-row")];
         const rowOf = (t) => rows.find((r) => r.textContent.indexOf(t) >= 0);
-        for (const t of ["启用参考视频归一", "目标画布", "只缩不放", "宽高比对不上时的适配",
-                         "重采样方式", "帧率归一", "17k+5 网格对齐方向", "时长上限",
-                         "参考视频音频", "素材实测"]) {
+        for (const t of ["启用参考视频归一", "目标画布", "宽高比对不上时的适配",
+                         "重采样方式", "参考视频音频", "素材实测"]) {
             ok(!!rowOf(t), "弹窗有「" + t + "」行");
+        }
+        /* 2026-10-18 用户：这几项多余，按官方默认就行 —— 控件必须真的消失，
+         * 而不是被 disabled（留着灰控件等于留一个"为什么不能改"的疑问）。 */
+        for (const t of ["只缩不放", "帧率归一", "17k+5 网格对齐方向", "时长上限"]) {
+            ok(!rowOf(t), "「" + t + "」控件已删除（官方口径钉死）");
         }
         ok(rows.every((r) => r.querySelector(".h3d-perf-hint")), "每行都带说明（两行式，不被吞掉）");
 

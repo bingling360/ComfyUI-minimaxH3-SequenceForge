@@ -22,7 +22,7 @@
  *   ④ 开关两件套：带 enable 的字段由它绑定的开关控灰
  *   ⑤ 按值显隐：带 showWhen 的字段（crf / cq）跟随宿主下拉切换，且可逆
  *   ⑥ 说明真的展开：hint 里的 **强调** 渲染成 <b>，不能露出字面星号
- *   ⑦ 保存契约：改动攒草稿，点「保存并应用」才 POST；未接线名单已空（块交换接线后）
+ *   ⑦ 保存契约：改动攒草稿，点「保存并应用」才 POST；未接线名单已空（全部已接线）
  *   ⑧ 右栏不得再有已迁走的性能控件（时序分块 / 强制卸载 / 编码档位）
  *
  * 用法：node tests/js/perf_modal_check.js
@@ -123,7 +123,7 @@ async function t(name, fn) {
 
     await t("★ 分块归「全局分块」：一采二采共用，不许再挂「一采采样」名下", () => {
         /* 2026-09-27 用户拍板：FFN / 注意力头分块在 nodes.py 里会**同时装到一采模型
-         * 和二采模型**上（nodes.py:2156 / 2183 / 2201 / 2208），块交换与显存预留写的
+         * 和二采模型**上（nodes.py:2156 / 2183 / 2201 / 2208），显存预留写的
          * 又是**进程级**的 aimdo 值 —— 挂在「一采采样」名下会让人以为二采不生效。
          * 所以这一组改按**作用范围**命名。本条同时钉住旧名不许回来。 */
         assert.ok(HEADS.indexOf("全局分块") >= 0,
@@ -142,16 +142,21 @@ async function t(name, fn) {
             "attn_head_on 的 group 还是 " + GROUP_OF("attn_head_on"));
     });
 
-    await t("★ 「显存预留（GB）」与块交换同组，且是**独立项**（不绑总开关）", () => {
-        /* 它与 blocks_to_swap 写的是**同一个 aimdo 值**（两种单位）→ 必须同组，
-         * 否则用户看不出两者的关系与优先级。
-         * 但它必须**独立于 blocks_swap_on** —— 绑上去会让「只想留余量」的用户
-         * 被迫顺带改掉权重流动行为，那不是他要的（后端 apply_blockswap 同此口径）。 */
+    await t("★ 「显存预留（GB）」是权重流动组**唯一**的旋钮（块数两件套不许回潮）", () => {
+        /* 2026-10-18 用户拍板：`blocks_swap_on` / `blocks_to_swap` 与「显存预留」
+         * 写的是**同一个 aimdo 值**，只是单位不同 —— 两个都留等于让用户猜该动哪个。
+         * 现在只留按 GB 填的那一项，块数那套已从后端到前端连根删除。
+         * 所以这里既验「留下的在」，也验「删掉的不许回来」。 */
         assert.ok(FIELD_KEYS.indexOf("vram_reserve_gb") >= 0,
             "字段表里没有 vram_reserve_gb");
-        assert.strictEqual(GROUP_OF("vram_reserve_gb"), GROUP_OF("blocks_to_swap"),
-            "显存预留该与「交换块数」同组：" + GROUP_OF("vram_reserve_gb")
-            + " vs " + GROUP_OF("blocks_to_swap"));
+        assert.strictEqual(GROUP_OF("vram_reserve_gb"), "全局分块 · 权重流动",
+            "显存预留的 group 变了：" + GROUP_OF("vram_reserve_gb"));
+        for (const gone of ["blocks_swap_on", "blocks_to_swap"]) {
+            assert.strictEqual(FIELD_KEYS.indexOf(gone), -1,
+                gone + " 又回到字段表了 —— 它与「显存预留」是同一个值，只留一个");
+            assert.ok(fs.readFileSync(path.join(ROOT, "perf.py"), "utf8").indexOf('"' + gone + '"') < 0,
+                "perf.py 里又出现 " + gone + " —— 后端也已删除");
+        }
         assert.ok(!ENABLE_PAIRS.some((p) => p[0] === "vram_reserve_gb"),
             "显存预留不该绑任何总开关（它独立生效）");
     });
@@ -219,13 +224,13 @@ async function t(name, fn) {
                     ok: true,
                     data: { ff_chunk_tokens: 4096, oom_autoretry: true, encoder: "h264_nvenc",
                             x264_crf: 20, nvenc_cq: 18, encode_hq: false,
-                            blocks_to_swap: 25, blocks_prefetch: true },
+                            vram_reserve_gb: 1.5, blocks_prefetch: true },
                     /* 三态名单（wired / unwired / profile_driven）已随机制一起删除，
                      * 接口不再回它们 —— 桩数据里也不该再出现（见上面的回潮守卫）。 */
-                    /* 块交换的现状（后端 probe，前端只显示）：面板诊断区读它 */
-                    applied: { blockswap: { on: false, path: "aimdo", blocks: 0,
-                        applied: true, headroom_gb: 0.0, clamped: false,
-                        note: "关闭 → 已恢复进程启动时的预留（0.00GB）" } },
+                    /* 显存预留的现状（后端 probe，前端只显示）：面板诊断区读它 */
+                    applied: { headroom: { on: true, path: "aimdo", reserve_gb: 1.5,
+                        applied: true, headroom_gb: 1.5, clamped: false,
+                        note: "显存预留 +1.50GB；aimdo 预留现为 1.50GB（读回核验）" } },
                     report: "[H3性能] 显存 24.0GB / 内存 64GB / swap 0.0GB\n档位：balanced",
                     upcast: { effective: false, cli_force_upcast: 0, cli_dont_upcast: 1 },
                     /* 启动参数体检（2026-09-27 加）：桩里必须给，否则那块 UI
@@ -244,7 +249,7 @@ async function t(name, fn) {
                               runtime_ok: false, why: "关掉约 5% 耗时。" },
                             { flag: "--reserve-vram", value: "1", current: "未给",
                               tier: "alt", missing: false, runtime_ok: true,
-                              why: "面板「块交换 → 交换块数」接的就是它。" },
+                              why: "面板「显存预留（GB）」接的就是它。" },
                         ],
                         missing: ["--vram-headroom", "--use-ck-attention", "--disable-comfy-compiler"],
                         cmdline_flags: ["--vram-headroom", "--use-ck-attention"],
@@ -326,44 +331,25 @@ async function t(name, fn) {
         }
     });
 
-    await t("★ 启动参数体检：复制的是「仅 flags」（桌面 GUI 用），完整命令另收一层", () => {
-        /* 2026-09-27 修的真问题：原来的复制按钮给的是 `python main.py --flags` 整行，
-         * 而 ComfyUI Desktop 顶部那个「启动参数」框只吃 flags（没有 python、没有
-         * main.py）→ 用户根本粘不进去。所以现在主按钮复制 `args`，
-         * 完整命令收进折叠层给终端用户。 */
-        const hint = overlay.querySelector(".h3d-perf-args-hint");
-        assert.ok(hint, "缺「复制到哪」的提示");
-        assert.ok(hint.textContent.indexOf("启动参数") >= 0
-            && hint.textContent.indexOf("Desktop") >= 0,
-            "提示必须说清粘到哪里：" + hint.textContent);
-        const pres = [...overlay.querySelectorAll(".h3d-perf-diag pre")]
-            .map((p) => p.textContent);
-        assert.ok(pres.indexOf("--vram-headroom 1 --use-ck-attention") >= 0,
-            "主区该摆仅 flags 的那行，实际 " + JSON.stringify(pres));
-        /* ⚠ 不能断言「全局不许出现 main.py」—— 完整命令**本来就含** main.py，
-         * 它只是被收进折叠层。要验的是「哪一行在折叠层里」。
-         * ⚠ 也不能只按「含 --vram-headroom 且不在 details 里」筛 —— 上面那行
-         * 「缺 X / 现在 Y / 建议 Z」的状态清单同样是 `<pre>`。所以按**整行相等**判。 */
-        const fullPres = [...overlay.querySelectorAll("details pre")]
-            .filter((p) => p.textContent.indexOf("main.py") >= 0);
-        assert.strictEqual(fullPres.length, 1,
-            "完整命令该有且只有一条、且在折叠层里，实际 " + fullPres.length);
-        const bare = [...overlay.querySelectorAll("pre")]
-            .filter((p) => !p.closest("details"))
-            .map((p) => p.textContent);
-        assert.strictEqual(bare.filter(
-            (t) => t === "--vram-headroom 1 --use-ck-attention").length, 1,
-            "主区该有且只有一条「仅 flags」的可复制行，实际 " + JSON.stringify(bare));
-        /* 主按钮文案要指向「启动参数」，不是含糊的「启动命令」 */
+    await t("★ 启动参数体检已搬走：性能弹窗里不许再摆那一坨，只留一行指路", () => {
+        /* 2026-10-18 用户原话：「这些启动参数的描述也太占位置了，而且容易误导人，
+         * 干脆不要得了，或者你挪到启动命令速查里面得了」。
+         * → 整块（复制按钮 / 完整命令折叠 / 逐项 why）搬到 📖 启动命令速查，
+         *   这里只留一句「去那边看」，并且**不许**把复制按钮留在性能弹窗。 */
+        const diag = overlay.querySelector(".h3d-perf-diag");
+        assert.ok(diag, "缺诊断区");
+        assert.strictEqual(overlay.querySelector(".h3d-perf-args-hint"), null,
+            "「复制下面这一行」的提示还在性能弹窗里");
         const btns = [...overlay.querySelectorAll(".h3d-perf-diag .h3d-btn")]
             .map((b) => b.textContent);
-        assert.ok(btns.indexOf("复制启动参数") >= 0,
-            "缺「复制启动参数」按钮，实际 " + JSON.stringify(btns));
-        assert.ok(btns.indexOf("复制完整命令") >= 0,
-            "缺「复制完整命令」按钮，实际 " + JSON.stringify(btns));
-        /* 判定口径要写出来（本机 VRAM 多少）—— 让用户知道建议不是模板套的 */
-        assert.ok(overlay.textContent.indexOf("本机 VRAM 6GB") >= 0,
-            "该说明「判定口径：本机 VRAM 6GB」");
+        assert.deepStrictEqual(btns, [],
+            "性能弹窗里还留着启动参数的复制按钮：" + JSON.stringify(btns));
+        /* 指路那一行必须在，且要指出去处 —— 否则用户以为功能删了 */
+        const txt = diag.textContent;
+        assert.ok(txt.indexOf("启动参数") >= 0 && txt.indexOf("启动命令") >= 0,
+            "缺「去启动命令速查看」的指路行：" + txt.slice(-120));
+        /* 逐项 why 不该再出现（那是最占位置的部分） */
+        assert.ok(txt.indexOf("注意力头分块的收益") < 0, "逐项 why 又被搬回性能弹窗了");
     });
 
     await t("一级阶段带「N 项」计数，二级用途齐全且默认展开", () => {
@@ -422,7 +408,7 @@ async function t(name, fn) {
          * 不能让用户以为「勾了开关才会有块级流动」。 */
         assert.ok(txt.indexOf("块级权重流动：") >= 0, "缺块级流动现状");
         assert.ok(txt.indexOf("DynamicVRAM 在线") >= 0, "该说明 DynamicVRAM 在线");
-        assert.ok(txt.indexOf("0.00GB") >= 0, "该带上当前显存预留读数");
+        assert.ok(txt.indexOf("1.50GB") >= 0, "该带上当前显存预留读数");
     });
 
     await t("全表不出现「接线中」徽章（三态机制已删，不该有任何一行灰着）", () => {
@@ -435,59 +421,32 @@ async function t(name, fn) {
          * 上面已有专门用例）。这里只钉「有过一整套灰化机制」这件事已经消失。 */
         const alive = rows.find((r) => r.textContent.indexOf("主干采样 OOM 自救") >= 0);
         assert.ok(alive && !alive.querySelector("input").disabled, "普通项被误灰");
-        const master = rows.find((r) => r.textContent.indexOf(labelOf("blocks_swap_on")) >= 0);
-        assert.ok(master, "找不到块交换总开关行");
-        assert.strictEqual(master.querySelector("input").disabled, false, "总开关不该是灰的");
+        const pf = rows.find((r) => r.textContent.indexOf(labelOf("blocks_prefetch")) >= 0);
+        assert.ok(pf, "找不到块级预取行");
+        assert.strictEqual(pf.querySelector("input").disabled, false, "普通项不该是灰的");
     });
 
-    /* ★ 「跟随档位」现在按**当前值**提示（字段表的 `autoWhen`），不再依赖后端名单 ——
-     * 名单已被删除（人工维护的名单必然说谎）。这条钉两个方向：具体值不提示、
-     * 哨兵值提示、且改回具体值提示要消失（可逆、且不用重开弹窗）。 */
-    await t("「跟随档位」提示跟随数值本身（哨兵 -1 才显示，改回去就消失）", () => {
+    /* 2026-10-18：`autoWhen`（「跟随档位」哨兵提示）只服务过 `blocks_to_swap = -1`，
+     * 随块数旋钮一起删除。留着这条**反向**守卫，防止有人把它当「通用机制」加回来
+     * （没有字段消费它的机制 = 死代码，本项目对此有明文纪律）。 */
+    await t("「跟随档位」/ autoWhen 机制不许回潮（唯一的消费者已删除）", () => {
+        /* 查**代码用法**而不是字面词：注释里留着「为什么删掉它」的历史说明是有价值的，
+         * 真要拦的是「字段表里又写 autoWhen」与「渲染时又读 f.autoWhen」。 */
+        assert.strictEqual(SRC.indexOf("autoWhen:"), -1,
+            "字段表里又写了 autoWhen —— 没有任何字段消费它，别把死机制加回来");
+        assert.strictEqual(SRC.indexOf("f.autoWhen"), -1,
+            "渲染逻辑又在读 autoWhen —— 该机制已随 blocks_to_swap 删除");
         const rows = [...overlay.querySelectorAll(".h3d-perf-row")];
-        const row = rows.find((r) => r.textContent.indexOf(labelOf("blocks_to_swap")) >= 0);
-        assert.ok(row, "找不到「交换块数」行");
-        const lab = row.querySelector(".h3d-perf-top label");
-        const input = row.querySelector("input");
-        assert.ok(lab && input, "行结构变了");
-        // 桩数据给的是 25（具体块数）→ 不提示
-        assert.ok(lab.textContent.indexOf("跟随档位") < 0,
-            "25 是具体块数，不该标「跟随档位」：" + lab.textContent);
-        // 改成 -1（哨兵）→ 当场提示
-        input.value = "-1";
-        input.dispatchEvent(new w.Event("change"));
-        assert.ok(lab.textContent.indexOf("跟随档位") >= 0,
-            "-1 是「跟随档位」哨兵，label 该跟着值提示：" + lab.textContent);
-        // 再改回桩里的原值（25）→ 提示消失，且后面的用例仍能读到「不清零」的原值
-        input.value = "25";
-        input.dispatchEvent(new w.Event("change"));
-        assert.ok(lab.textContent.indexOf("跟随档位") < 0,
-            "改回具体块数后提示该消失：" + lab.textContent);
+        for (const r of rows) {
+            const lab = r.querySelector(".h3d-perf-top label");
+            if (lab) assert.ok(lab.textContent.indexOf("跟随档位") < 0,
+                "label 又带上「跟随档位」：" + lab.textContent);
+        }
     });
 
-    await t("块交换两件套：总开关默认关 → 交换块数灰；拨开后当场亮（不清零）", () => {
-        /* 块交换接线后，它是**普通的两件套**了（不再是「未接线、整组灰」）。
-         * 验的仍是「开关一动、名下参数跟着亮/灰」这条契约。 */
-        const rows = [...overlay.querySelectorAll(".h3d-perf-row")];
-        const master = rows.find((r) => r.textContent.indexOf(labelOf("blocks_swap_on")) >= 0);
-        assert.ok(master, "找不到块交换总开关行");
-        const mc = master.querySelector("input");
-        assert.strictEqual(mc.disabled, false, "已接线的总开关该可点");
-        const sub = rows.find((r) => r.textContent.indexOf(labelOf("blocks_to_swap")) >= 0);
-        assert.ok(sub, "找不到交换块数行");
-        const sc = sub.querySelector("input");
-        assert.strictEqual(mc.checked, false, "总开关默认该是关的");
-        assert.strictEqual(sc.disabled, true, "总开关关着时子参数该灰");
-        assert.strictEqual(sc.value, "25", "子参数该显示桩里的值（不清零）");
-        mc.checked = true;
-        mc.dispatchEvent(new w.Event("change"));
-        assert.strictEqual(sc.disabled, false, "总开关开后子参数该亮");
-        assert.strictEqual(sc.value, "25", "拨开开关不该改数值");
-    });
-
-    await t("块级预取是独立项：不受块交换总开关影响，默认开", () => {
-        /* 为什么必须独立：官方那套块级流动不管我们的总开关开不开都在跑，
-         * 预取是它的 lookahead —— 把它挂到总开关下会让用户以为「不开块交换就没预取」。 */
+    await t("块级预取是独立项：不绑任何总开关，默认开", () => {
+        /* 为什么必须独立：官方那套块级流动不管面板怎么设都在跑，预取是它的
+         * lookahead —— 挂到别的开关下会让用户以为「不开那个就没预取」。 */
         const rows = [...overlay.querySelectorAll(".h3d-perf-row")];
         const pf = rows.find((r) => r.textContent.indexOf(labelOf("blocks_prefetch")) >= 0);
         assert.ok(pf, "找不到块级预取行");

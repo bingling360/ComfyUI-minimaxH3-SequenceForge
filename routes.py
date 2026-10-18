@@ -105,6 +105,7 @@ ROUTES = [
     ("GET", "/h3chain/refvid"),
     ("POST", "/h3chain/refvid"),
     ("POST", "/h3chain/refvid_plan"),
+    ("POST", "/h3chain/refvid_align"),
     ("GET", "/h3chain/vpack"),
     ("POST", "/h3chain/vpack"),
     ("GET", "/h3chain/launch_ref"),
@@ -2031,8 +2032,6 @@ def add_routes(routes):
             "mp_options": list(refvideo.MP_OPTIONS),
             "fits": list(refvideo.FITS),
             "resamples": list(refvideo.RESAMPLES),
-            "grids": list(refvideo.GRIDS),
-            "limits": list(refvideo.LIMITS),
             "path": refvideo.settings_path(),
         })
 
@@ -2149,6 +2148,60 @@ def add_routes(routes):
                           "src_dur", "crop", "no_upscale_hit")},
             })
         return web.json_response({"ok": True, "rows": rows})
+
+    async def refvid_align(request):
+        """参考视频**对齐目标**（只读探测 + 只读设置，不落任何盘）：一条引用的视频
+        -> 模型实际会看到的参考时长（帧数 / 秒数）。
+
+        与 `refvid_plan` 的分工：
+          · plan  = 「按当前设置，这条素材会变成什么样」（试算表用，一条素材一行）
+          · align = 「模型看到它有多久 —— 段时长就该设成多少」（对齐按钮用）
+        口径 = 官方怎么喂就按多久算：源帧原样按 24fps 播 → 向下砍 17k+5。
+        **本接口不改设置**，也不算第二套口径。
+
+        体 {dir?, item:{label?, file?, asset_id?}, refvid?, max_frames?}
+        -> {ok, data:{label, path, info, frames, seconds, notes[], report[]}}
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        item = data.get("item")
+        if not isinstance(item, dict):
+            return _err("缺少 item 对象", code="BAD_REQUEST", status=400)
+        cfg = refvideo.parse_state(data.get("refvid") or refvideo.load_settings())
+        try:
+            from . import checkpoint as _ckpt
+        except ImportError:
+            import checkpoint as _ckpt
+        from . import asset_store
+
+        name = projects.safe_name(str(data.get("dir") or ""))
+        proot = os.path.join(_ckpt.projects_root(), name) if name else None
+        try:
+            libroot = asset_store.try_library_root()
+        except Exception:
+            libroot = None
+        label = str(item.get("label") or item.get("file") or item.get("asset_id") or "")
+        src = _refvid_src_path(item, proot, libroot)
+        if not src:
+            return _err(f"找不到素材文件「{label}」（项目资产 / 全局库 / input 都未命中）",
+                        code="NOT_FOUND", status=404)
+        try:
+            from . import media as _media
+        except ImportError:
+            import media as _media
+        try:
+            info = await asyncio.get_event_loop().run_in_executor(
+                None, _media.probe_media, src)
+            t = refvideo.align_target(info, cfg, label)
+        except Exception as e:
+            return _err(f"{type(e).__name__}: {e}", code="ALIGN_FAILED", status=400)
+        return web.json_response({"ok": True, "data": {
+            "label": label, "path": src, "info": info,
+            "frames": t["frames"], "seconds": t["seconds"],
+            "notes": t["notes"], "report": t["report"],
+        }})
 
     async def lib_status(request):
         dir_name = str(request.query.get("dir") or "")
@@ -3157,6 +3210,7 @@ def add_routes(routes):
         ("GET", "/h3chain/refvid", refvid_get),
         ("POST", "/h3chain/refvid", refvid_set),
         ("POST", "/h3chain/refvid_plan", refvid_plan),
+        ("POST", "/h3chain/refvid_align", refvid_align),
         ("GET", "/h3chain/vpack", vpack_get),
         ("POST", "/h3chain/vpack", vpack_set),
         ("GET", "/h3chain/launch_ref", launch_ref_get),

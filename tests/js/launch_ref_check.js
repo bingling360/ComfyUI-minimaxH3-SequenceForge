@@ -254,6 +254,71 @@ async function t(name, fn) {
         assert.ok(st.indexOf("核对") >= 0, "状态行该说明参数已核对：" + st);
     });
 
+    /* ★ 2026-10-18 搬过来的「本机现状（只读）」（原在 ⚡ 性能优化 弹窗里）。
+     * 搬家的理由与验收点：① 这一块必须在**速查**里出现（不然等于删了功能）；
+     * ② 复制按钮给的是**后端算出来的 flags**，不是前端拼的；③ 逐项 why 收在折叠层
+     * （用户抱怨的就是「描述太占位置」）。 */
+    await t("★ 本机现状（只读）：缺哪项 + 一行可粘贴 flags + why 收在折叠层", async () => {
+        const ARGS = "--vram-headroom 1 --use-ck-attention";
+        const r3 = load({ H3Api: {
+            async launchRef() { return { body: { ok: true, data: REF } }; },
+            async perfGet() { return { body: { ok: true, data: {},
+                applied: {}, report: "",
+                launch_args: {
+                    items: [
+                        { flag: "--vram-headroom", value: "1", current: "未给（默认 0）",
+                          tier: "primary", missing: true, runtime_ok: false,
+                          why: "WHY-ALPHA 让 aimdo 多留 1GB。" },
+                        { flag: "--reserve-vram", value: "1", current: "未给",
+                          tier: "alt", missing: false, runtime_ok: true,
+                          why: "WHY-BRAVO 运行时可写的那一项。" },
+                    ],
+                    missing: ["--vram-headroom"],
+                    args: ARGS,
+                    cmdline: "python main.py " + ARGS,
+                    vram_gb: 6.0, kitchen_ok: true,
+                    note: "NOTE-CHARLIE",
+                } } };
+            },
+        } });
+        await r3.w.openLaunchRef();
+        const box = r3.w.document.querySelector(".h3d-lref-overlay");
+        const now = box.querySelector(".h3d-lref-now");
+        assert.ok(now, "速查弹窗里没有「本机现状」那块");
+        const txt = now.textContent;
+        assert.ok(txt.indexOf("本机现状") >= 0, "缺标题");
+        assert.ok(txt.indexOf("--vram-headroom") >= 0 && txt.indexOf("未给（默认 0）") >= 0,
+            "该摆出每项的现状：" + txt.slice(0, 120));
+        /* 主区必须有那行可粘贴的 flags；完整命令收在折叠层 */
+        const bare = [...now.querySelectorAll("pre")]
+            .filter((p) => !p.closest("details")).map((p) => p.textContent);
+        assert.ok(bare.indexOf(ARGS) >= 0, "主区没有可粘贴的 flags 行：" + JSON.stringify(bare));
+        assert.ok(bare.filter((t) => t.indexOf("main.py") >= 0).length === 0,
+            "完整命令不该摆在外面");
+        /* why 全部收在折叠的 details 里（默认收起） */
+        const why = [...now.querySelectorAll("details")]
+            .find((d) => d.querySelector("summary").textContent.indexOf("这几项") >= 0);
+        assert.ok(why, "缺「这几项分别是什么」的折叠层");
+        assert.strictEqual(why.open, false, "why 默认不该展开（那正是用户说的占位置）");
+        assert.ok(why.textContent.indexOf("WHY-ALPHA") >= 0, "why 内容丢了");
+        assert.ok(why.textContent.indexOf("显存预留") >= 0,
+            "runtime_ok 那项该指向面板的「显存预留」");
+        /* 复制按钮：复制的是后端给的 args */
+        const copied2 = [];
+        Object.defineProperty(r3.w.navigator, "clipboard", {
+            configurable: true,
+            value: { writeText: async (x) => { copied2.push(String(x)); } },
+        });
+        const btn = [...now.querySelectorAll(".h3d-btn")]
+            .find((b) => b.textContent === "复制启动参数");
+        assert.ok(btn, "缺「复制启动参数」按钮");
+        btn.dispatchEvent(new r3.w.Event("click"));
+        await new Promise((r) => setTimeout(r, 0));
+        assert.deepStrictEqual(copied2, [ARGS], "复制内容不对：" + JSON.stringify(copied2));
+        /* Esc 关掉，别影响后面的用例 */
+        box.dispatchEvent(new r3.w.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+
     await t("接口不可用时不白屏，给出可读提示", async () => {
         const r2 = load({ H3Api: {} });
         await r2.w.openLaunchRef();

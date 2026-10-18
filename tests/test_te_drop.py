@@ -23,10 +23,13 @@ ComfyUI 里从未存在的 `unload_model_and_clips`，异常又被 `except` 吞�
 代价是每段首次编码多一次回载 + 重 patch（约 45s）。
 当初「默认强制开」是为了救云端内存，该理由已被这条实测推翻。
 
+⚠ 2026-10-18：`te_drop_after_cond` **这个 perf 键已删除** —— 卸载收敛成
+`unload_everywhere` 一个开关后，全仓再没有读取方（tests/test_perf_settings.py::
+test_no_key_in_default_perf_is_unread 就是这么红的）。所以本文只保留**机制侧**
+（cond 出口丢 TE 这件事本身还在，只是由 `unload_everywhere` 驱动），
+不再断言那个键与它的三态解析。
+
 钉住：
-  1) perf 键存在、**默认 True（2026-10-12 起强制开，不再随 OS 分档）**、
-     类型表收 bool 与字面量 "auto"；
-  2) te_drop_after_cond_enabled 的解析矩阵（显式值 / auto 按 OS / 乱串回落 auto）；
   3) 代理只在 miss 丢、hit 不丢；
   4) 丢的动作真调 `unload_model_and_clones` 且传的是 clip.patcher；
   5) comfy 环境缺失时静默吞（缓存层任何情况下不该成为崩溃源）；
@@ -74,47 +77,6 @@ def _proxy(drop_after_encode, cap=32):
 
 def _enc(p, text="你好"):
     return p.encode_from_tokens_scheduled(p.tokenize(text))
-
-
-# ── 1) perf 键声明 ──
-
-def test_perf_key_declared():
-    # 2026-10-12 起出厂默认改**强制开**（True，不再随 OS 分档）；"auto" 仍是合法取值
-    assert perf.DEFAULT_PERF.get("te_drop_after_cond") is True
-    t = perf.PERF_TYPES.get("te_drop_after_cond")
-    assert t is not None and bool in t and "auto" in t
-
-
-# ── 2) 解析矩阵 ──
-
-def test_enabled_explicit(monkeypatch):
-    assert perf.te_drop_after_cond_enabled(True) is True
-    assert perf.te_drop_after_cond_enabled(False) is False
-    assert perf.te_drop_after_cond_enabled("true") is True
-    assert perf.te_drop_after_cond_enabled("OFF") is False
-    # 显式值优先于 OS：Windows 上写 true 也开
-    monkeypatch.setattr(platform(), "system", lambda: "Windows")
-    assert perf.te_drop_after_cond_enabled(True) is True
-
-
-def test_enabled_auto_by_os(monkeypatch):
-    monkeypatch.setattr(platform(), "system", lambda: "Linux")
-    assert perf.te_drop_after_cond_enabled("auto") is True
-    assert perf.te_drop_after_cond_enabled(None) is True
-    monkeypatch.setattr(platform(), "system", lambda: "Windows")
-    assert perf.te_drop_after_cond_enabled("auto") is False
-    assert perf.te_drop_after_cond_enabled(None) is False
-
-
-def test_enabled_garbage_falls_back_to_auto(monkeypatch):
-    monkeypatch.setattr(platform(), "system", lambda: "Linux")
-    # 乱串不是合法布尔 → 走 auto 分支（Linux → 开）
-    assert perf.te_drop_after_cond_enabled("随手写的") is True
-
-
-def platform():
-    import platform
-    return platform
 
 
 # ── 3) 代理只在 miss 丢 ──

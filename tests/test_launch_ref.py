@@ -77,29 +77,33 @@ def test_titles_are_numbered_and_unique():
         assert circled[i] in t, f"第 {i + 1} 个分区标题缺序号：{t}"
 
 
-def test_linux_coverage():
-    """★ Linux 那几节必须真的存在且够厚 —— 这是用户明确要的重点。
+def test_scope_is_deliberately_small():
+    """★ 这份速查是**刻意压小**的，不许再长回「148 条什么都塞」的样子。
 
-    写这条是因为「Linux 部分写详细点」很容易在后续重构里被顺手删掉
-    （比如有人觉得「systemd 跟 ComfyUI 无关」）。
+    2026-10-18 用户原话：「别加那么多没用的命令说明，专门挑一批常用且有用的命令
+    出来保留就行了，其它给我从前端删掉」→ 从 17 节 148 条砍到 3 节 12 条。
+    （同一天删的还有 systemd / 防火墙 / nginx / Docker / 云平台那几大节 ——
+    它们原先由 `test_linux_coverage` 保护，那条守卫随需求一起作废。）
+
+    这里钉上限而不是钉具体条数：加一条两条常用命令不该让测试红，但"又堆成手册"
+    必须红。要突破上限，先想清楚是不是又走回老路。
     """
-    ids = {s["id"] for s in L.SECTIONS}
-    for need in ("linux-bg", "linux-systemd", "linux-port", "linux-proxy",
-                 "linux-docker", "cloud"):
-        assert need in ids, f"缺 Linux/云平台分区：{need}"
-    by = {s["id"]: s for s in L.SECTIONS}
-    # 开机自启 / 端口 这两节是用户点名要的，条数不能太少
-    assert len(by["linux-systemd"]["entries"]) >= 8
-    assert len(by["linux-port"]["entries"]) >= 10
-    # 关键词抽查：systemd 必须给出 unit 文件本体与 enable 命令
-    sysd = "\n".join(e["cmd"] for e in by["linux-systemd"]["entries"])
-    for kw in ("[Unit]", "ExecStart=", "WantedBy=multi-user.target",
-               "systemctl enable", "journalctl"):
-        assert kw in sysd, f"systemd 那节缺关键内容：{kw}"
-    # 端口那节必须覆盖三种防火墙
-    port = "\n".join(e["cmd"] for e in by["linux-port"]["entries"])
-    for kw in ("ufw", "firewall-cmd", "iptables", "ss -lntp"):
-        assert kw in port, f"端口那节缺：{kw}"
+    n_sec = len(L.SECTIONS)
+    n_entry = sum(len(s["entries"]) for s in L.SECTIONS)
+    assert n_sec <= 4, f"分区又涨回 {n_sec} 个 —— 这份东西只该有 3~4 节"
+    assert n_entry <= 20, f"条目又涨回 {n_entry} 条 —— 只留日常真会用的"
+    # 每条命令的说明要短：用户抱怨的正是「说明太长、还容易误导」
+    for s in L.SECTIONS:
+        for e in s["entries"]:
+            assert len(L._plain(e["why"])) <= 80, (
+                f"{s['id']} / {e['title']} 的 why 有 {len(L._plain(e['why']))} 字，"
+                "超过 80 字就是又开始写文章了")
+            assert len(L._plain(e.get("note") or "")) <= 120, (
+                f"{s['id']} / {e['title']} 的 note 太长")
+    # 只留三节该覆盖的场景：本机 / 远程、显存自救、Linux 后台
+    ids = [s["id"] for s in L.SECTIONS]
+    for need in ("basic", "vram", "linux-bg"):
+        assert need in ids, f"缺关键分区 {need}（现在 {ids}）"
 
 
 # ---------------------------------------------------------------- 参数真实性
@@ -208,7 +212,7 @@ def test_entry_cmd_strips_the_redundant_base():
                 full += 1
             else:
                 stripped += 1
-    assert stripped > 60, f"剥出来只有 {stripped} 条？剥的规则坏了"
+    assert stripped >= 6, f"剥出来只有 {stripped} 条？剥的规则坏了"
     assert full > 0, "一条完整命令都没有？external 分区应该全是"
 
 

@@ -619,14 +619,15 @@ See [`docs/HyperFlow适配与自定义Sigmas.md`](docs/HyperFlow适配与自定�
 
 Reference videos (`<Video k>`) can be normalized before they reach the model. The entry sits at the bottom-left of the console, directly under **🗂 Asset library**, and opens a dialog modelled on **⚡ Performance settings**: machine-level, global, stored in `<user>/minimax_h3/refvid.json`, shared across projects.
 
-Why it exists — the official `MiniMaxH3ReferenceToVideo` already does two of these implicitly and does not do the other two at all:
+The timeline is **not configurable** — it follows the official node exactly (2026-10-18: the four timeline knobs were deleted outright, "多余，按官方默认就行"). What remains configurable is only how the picture is scaled, plus two independent switches (reference audio, Spark-VPack compression).
 
-| Step | Official behaviour | With this module |
+| Step | Official `MiniMaxH3ReferenceToVideo` | This module |
 |---|---|---|
-| Canvas | `adapt_canvas()`: 768 short edge, 768×1344 area cap, 32-aligned, downscale only | explicit **aspect ratio × megapixels** (the same Resolution Selector math as the chain canvas); the default `16:9 @ 0.98MP` = 1344×768 is exactly the official reference canvas |
-| Frame grid | `frames[:frame_count]`, then `while n % 17 != 5: n -= 1` (up to 16 frames cut) | explicit direction: **down** (official) / nearest / up |
-| Frame rate | **none** — frames are treated as 24 fps (Qwen samples at 2 fps, timestamps `i / 2`), so a 30 fps clip plays 25% slower and is then truncated | retimed to 24 fps along the time axis (`round(i × src_fps ÷ 24)`), duration preserved |
-| Soundtrack | **none** — the whole track is encoded while the picture gets truncated | cut to the same time window; or switch **Reference video audio** off (the video then contributes picture only, i.e. the equivalent of an image-only reference) |
+| Canvas | `adapt_canvas()`: 768 short edge, 768×1344 area cap, 32-aligned, downscale only | explicit **aspect ratio × megapixels** (the same Resolution Selector math as the chain canvas); the default `16:9 @ 0.98MP` = 1344×768 is exactly the official reference canvas. *No upscale* is hard-wired to the official `if vw*vh < cw*ch` fallback |
+| Frame rate | **none** — frames are treated as 24 fps (Qwen samples at 2 fps, timestamps `i / 2`), so a 30 fps clip plays 25% slower | **identical**: frames are passed through untouched, no retiming, no dropped frames, no padded tail |
+| Frame grid | `frames[:frame_count]`, then `while n % 17 != 5: n -= 1` (up to 16 frames cut) | **identical**, down only |
+| Duration | `frames[:frame_count]` (capped at the segment length) | **identical**: capped at the longest segment of the chain, plus an independent memory guard (1.5× longest segment + one grid step, floor 124 frames; 362 when the segment length is unknown) |
+| Soundtrack | **none** — the whole track is encoded while the picture gets truncated | cut to the same **source** time window the picture uses (`frames / src_fps`); or switch **Reference video audio** off (picture-only reference, equivalent to an image-only reference) |
 
 Fit modes for mismatched aspect ratios: **crop to fill** (official `_resize(..., "center")`), **letterbox**, **stretch** (official `"disabled"`). Resampling: `lanczos` (default, as in the official node), `bicubic`, `bilinear`, `area`, `nearest-exact`.
 
@@ -637,6 +638,19 @@ Notes:
 - **🔎 Try it** runs `probe` + `plan` server-side without decoding anything and prints `original fps/size/duration → processed frames/size/duration` per clip.
 - Reference videos are decoded through a **frame window** (only up to the last frame that will actually be used) and downscaled immediately, instead of decoding the whole clip at full resolution as float32 (1080p/30fps/10s ≈ 7.4 GB resident).
 - Turning **Reference video audio** off changes the `<Audio j>` numbering of independent audio references, so the reference-bar token map follows it (backend `nodes._kind_tokens` / `asset_store.compile_refs` / frontend `paintAll` share one rule).
+
+### Project-level time alignment (⏱ button)
+
+A reference video is fed as **one whole clip**: the official `ref_video` input is a single tensor and there is no "segment N gets second X". So what the model sees is `frames / 24` seconds of reference for every segment that references it — a shorter segment truncates the reference, a longer one leaves the tail idling. "Align" therefore only means: give **every segment that references a video** the same duration as the reference, measured the way the model measures it.
+
+The ⏱ **对齐参考视频时间** button sits under **每段时长(秒) · 新段默认** in the right panel. In one click it (`refvideo.align_target` + `POST /h3chain/refvid_align`):
+
+1. probes the target clip (official `<Video 1>` = the first video in pool order);
+2. computes its presentation length exactly the way the render path does: source frames played at 24 fps, snapped **down** to the 17k+5 grid, capped at the trained bound (362 frames = 15.08 s);
+3. writes `frames / 24` into every segment that references a video — segments without a video reference are untouched;
+4. **changes no settings at all** (an earlier draft flipped the master switch / retiming / grid to make the clocks "perfect", which turned a 4.20 s clip into 4.46 s by padding 7 duplicated frames; that was rejected and the knobs are gone).
+
+The confirmation dialog shows the source numbers, what the model will actually see, and the segment list. Cancel writes nothing.
 
 ---
 
@@ -749,7 +763,7 @@ Runtime output (not in the repo): cuts / segments / archives live in `ComfyUI/ou
 
 All routes are registered under both the root path and `/api`. Groups:
 
-- **Diagnostics / status:** `ping`, `busy`, `perf`, `refvid`, `refvid_plan`, `launch_ref`, `vram_cleanup`, `grid_spec`
+- **Diagnostics / status:** `ping`, `busy`, `perf`, `refvid`, `refvid_plan`, `refvid_align`, `launch_ref`, `vram_cleanup`, `grid_spec`
 - **Projects:** `projects`, `project`, `create_project`, `save_prompts`, `delete_project`, `delete_file`, `merge`, `upscale_reset`, `redo_cancel`, `latent_slice`, `latent_delete`, `trim`, `probe`, `move_media`, `split_av`
 - **Models / config:** `upscale_models`, `bridge_models`, `vae_files`
 - **Prompt optimization:** `optimize`, `optimize_stream`, `optimize_multi`, `optimize_multi_stream`, `expand`, `expand_multi`, `expand_validate`, `expand_optimize`, `expand_optimize_stream`

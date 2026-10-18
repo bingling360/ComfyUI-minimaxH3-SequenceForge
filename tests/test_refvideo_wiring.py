@@ -196,5 +196,72 @@ def test_refvid_plan_resolver_is_read_only_and_never_raises():
 
 def test_frontend_api_surface():
     src = _src(os.path.join("web", "h3_api.js"))
-    for k in ("refvidGet:", "refvidSet:", "refvidPlan:"):
+    for k in ("refvidGet:", "refvidSet:", "refvidPlan:", "refvidAlign:"):
         assert k in src, k
+
+
+def _slice(src, marker, size):
+    """从 marker 起切 size 字符（**含嵌套 def**）。
+
+    `_fn` 会在下一个 `\\n    def ` 处截断，遇到带嵌套函数的实现（align_target
+    里的 `_fix`、前端里的内联 fn）就只剩个函数头——所以这类实现单独用这个。
+    """
+    i = src.index(marker)
+    return src[i:i + size]
+
+
+def _jsslice(src, name, size):
+    return _slice(src, "function " + name + "(", size)
+
+
+# ------------------------------------------------ ⑧ 项目级「对齐参考视频时间」
+
+def test_align_target_is_read_only_and_reuses_one_grid_table():
+    """对齐**只算不改**：真源同一张 snap_grid 表 + plan 复核，绝不改设置。"""
+    src = _src("refvideo.py")
+    assert "TRAINED_MAX_FRAMES = 362" in src, "训练上限只许有一个数（官方 tooltip 124-362）"
+    body = _slice(src, "def align_target(", 6000)
+    assert "snap_grid(" in body, "目标帧数必须走 snap_grid（与 plan 同一张表）"
+    assert "plan(info, c, frames, label)" in body, \
+        "必须用 plan 复核「写下去的秒数」==「实际归一出来的帧数」（按实际生效的口径）"
+    # 那四项时间轴开关已经连根删除，对齐更不许"修设置"
+    assert "_fix(" not in body, "对齐不许改任何设置项"
+    for k in ("no_upscale", "fps_norm", "grid", "limit"):
+        assert f'"{k}"' not in body, f"align_target 不许再碰已删除的 {k}"
+
+
+def test_align_route_registered_both_ways():
+    src = _src("routes.py")
+    assert src.count('"/h3chain/refvid_align"') == 2, "ROUTES 与 handler 映射各一条"
+    assert "async def refvid_align(" in src
+    assert '("POST", "/h3chain/refvid_align", refvid_align),' in src
+    body = _slice(src, "async def refvid_align(", 4000)
+    assert "refvideo.align_target(" in body
+    # 只读：本接口不落任何盘（设置也不落、段时长由前端写）
+    assert "save_settings" not in body
+    assert "refvidSet" not in body
+
+
+def test_align_button_hangs_off_the_duration_field():
+    """按钮挂在「每段时长」那一格（项目级时间入口），不在段卡里逐段点。"""
+    src = _src(os.path.join("web", "h3_director.js"))
+    body = _jsslice(src, "renderWidgetField", 5000)
+    i = body.index("if (name === W_DUR) {")
+    seg = body[i:i + 1200]
+    assert "alignRefVideoTime(node)" in seg, "对齐按钮必须调用 alignRefVideoTime"
+    assert "extra = alignBtn" in seg, "按钮要单独占一行（否则 58px 的数字框被挤成缝）"
+    assert "field.append(extra)" in body
+
+
+def test_align_only_writes_segment_seconds():
+    """对齐 = 只写段时长。**不落设置、不自己算帧数**（2026-10-18 用户口径）。"""
+    body = _jsslice(_src(os.path.join("web", "h3_director.js")), "alignRefVideoTime", 6000)
+    # 目标段 = 引用了**任意**视频素材的段（不是只有第一段、也不是只 video1）
+    assert 'kindOfLabel(l) === "video"' in body
+    assert "for (const i of hits) setSegmentSeconds(node, i, t.seconds)" in body
+    # 设置一个字节都不许动（上一版顺手改 fps_norm/grid，用户明确否掉）
+    assert "refvidSet" not in body, "对齐不许改参考视频设置"
+    # 前端不自己算帧数/秒数（算两份必然有一天不一致）
+    assert "snapFrames(" not in body and "* 24" not in body
+    # 用户必须在确认框里看到「模型看到多长 / 按哪一档算的」
+    assert "window.confirm" in body and "t.notes" in body

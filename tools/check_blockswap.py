@@ -1,9 +1,11 @@
-"""块交换接线的真环境验证（真 comfy + 真 aimdo，独立 runner，退出码即结论）。
+"""显存预留接线的真环境验证（真 comfy + 真 aimdo，独立 runner，退出码即结论）。
 
-为什么必须有这个脚本：块交换**没有自己的搬权重代码** —— 机制在 ComfyUI 那边
+为什么必须有这个脚本：本插件**没有自己的搬权重代码** —— 机制在 ComfyUI 那边
 （DynamicVRAM 的 vbar 换入 + `comfy/ldm/minimax/model.py:751-765` 的块级预取队列）。
 本插件只做两件可验证的事：
-  ① `blocks_to_swap` → aimdo 的**显存预留**（`set_simple_vram_headroom`）
+  ① `vram_reserve_gb`（面板「显存预留」）→ aimdo 的 `set_simple_vram_headroom`
+     （⚠ 2026-10-18 起 `blocks_swap_on` / `blocks_to_swap` 已删除：它们写的是同一个
+     aimdo 值，只是换成块数单位，且要加载模型才反解得出）
   ② `blocks_prefetch` → 官方预取队列的开关（包 DiT 的 `_forward` 钉
      `transformer_options["prefetch_dynamic_vbars"]`）
 前者能在这台机器上**真调真读回**（不需要加载 20GB 模型），所以有真实证据；后者用
@@ -19,7 +21,7 @@
 ★ 为什么这里要自己复刻 main.py 那两步：`comfy.memory_management.aimdo_enabled` 与
 `CoreModelPatcher = ModelPatcherDynamic` **只有 main.py 会设**（`main.py:300-301`），
 独立进程里默认为 False/ModelPatcher —— 不设就会把「有 aimdo 的机器」误判成 legacy。
-这就是探测函数 `probe_blockswap()` 的前提，先讲清楚再断言。
+这就是探测函数 `probe_weight_flow()` 的前提，先讲清楚再断言。
 """
 
 import os
@@ -82,22 +84,22 @@ class _FakeModel:
 
 print("块交换接线验证（真 comfy / 真 aimdo）")
 
-# ---------------- ① 纯函数：换算与夹取 ----------------
-print("\n① 纯函数：N 块 → 显存预留")
-r = perf.blockswap_headroom(10, 20.0, 32.0)
-_assert(abs(r["extra_gb"] - 4.0) < 1e-9 and r["blocks_eff"] == 10 and not r["clamped"],
-        "10 块 × (20GB/50) = 4.00GB，不触发夹取")
-n6 = perf.suggest_blocks(20.0, 6.0)
-r6 = perf.blockswap_headroom(n6, 20.0, 6.0)
+# ---------------- ① 纯函数：夹取与地板 ----------------
+print("\n① 纯函数：GB → 额外预留（夹取 / 未探明 / 地板）")
+r = perf.reserve_headroom(1.0, 32.0, 0.0)
+_assert(abs(r["extra_gb"] - 1.0) < 1e-9 and not r["clamped"],
+        "32GB 卡留 1GB：原值照写、不夹")
+r6 = perf.reserve_headroom(5.0, 6.0, 0.0)
 _assert(r6["clamped"] and r6["extra_gb"] <= 6.0 * perf.BLOCKSWAP_HEADROOM_CAP + 1e-9,
-        f"6GB 卡：suggest_blocks={n6} 块被夹到 {r6['blocks_eff']} 块"
-        f"（{r6['extra_gb']:.2f}GB ≤ 显存一半）")
-_assert("未探明" in perf.blockswap_headroom(25, None, 16.0)["note"],
-        "体量未知 → 明确「未探明」，不编数字")
+        f"6GB 卡要 5GB → 夹到 {r6['extra_gb']:.2f}GB（≤ 显存一半）")
+_assert("未探明" in perf.reserve_headroom(1.0, None, 0.0)["note"],
+        "显存体量未知 → 明确「未探明」，不编数字")
+_assert("地板" in perf.reserve_headroom(0.1, 16.0, 0.0)["note"],
+        "填到 256MB 以下 → 说明实际按地板算（不会更省）")
 
 # ---------------- ② main.py 之前 / 之后，探测怎么说 ----------------
 print("\n② 探测：aimdo 未初始化 vs 已初始化")
-before = perf.probe_blockswap()
+before = perf.probe_weight_flow()
 _assert(before["aimdo"] is False and before["path"] == "legacy",
         "未初始化时如实报 legacy（aimdo_enabled 只有 main.py 会设）")
 
@@ -118,14 +120,14 @@ mem.aimdo_enabled = True
 mp.CoreModelPatcher = mp.ModelPatcherDynamic
 
 perf._BS_BASELINE.clear()              # 基线必须在「已初始化」之后读一次
-base = perf._blockswap_baseline()
+base = perf._reserve_baseline()
 _assert(base["aimdo_gb"] is not None,
         f"读到 aimdo 预留基线 {base['aimdo_gb']}GB（读回接口可用）")
-st = perf.probe_blockswap()
+st = perf.probe_weight_flow()
 _assert(st["path"] == "aimdo" and st["headroom_gb"] is not None,
         f"初始化后判为 aimdo 路径（streams={st['streams']}、"
         f"non_blocking={st['non_blocking']}、pinned={st['pinned_gb']}GB）")
-_assert("DynamicVRAM 在线" in perf.blockswap_line(st, st["headroom_gb"]),
+_assert("DynamicVRAM 在线" in perf.weight_flow_line(st, st["headroom_gb"]),
         "状态行含「DynamicVRAM 在线」")
 
 # ---------------- ③ 真设真读回（本脚本的核心证据） ----------------
@@ -137,25 +139,23 @@ got2 = perf._set_aimdo_headroom(base["aimdo_gb"])
 _assert(got2 is not None and abs(got2 - base["aimdo_gb"]) < 1e-6,
         f"还原到基线 {base['aimdo_gb']}GB → 读回 {got2}GB")
 
-# ---------------- ④ apply_blockswap 端到端（真写进程状态） ----------------
-print("\n④ apply_blockswap：开 → 抬预留；关 → 恢复基线")
-hw = {"unet_gb": 20.0, "vram_total_gb": 32.0}
-out_on = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10}, hw)
-want = base["aimdo_gb"] + 4.0
-_assert(out_on["applied"] is True and out_on["blocks"] == 10,
-        f"开：applied={out_on['applied']}、{out_on['blocks']} 块、"
-        f"预留应到 {want:.2f}GB")
+# ---------------- ④ apply_vram_reserve 端到端（真写进程状态） ----------------
+print("\n④ apply_vram_reserve：设 1GB → 抬预留；设回 0 → 恢复基线")
+hw = {"vram_total_gb": 32.0}
+out_on = perf.apply_vram_reserve({"vram_reserve_gb": 1.0}, hw)
+want = base["aimdo_gb"] + 1.0
+_assert(out_on["applied"] is True and out_on["on"] is True,
+        f"设 1GB：applied={out_on['applied']}、预留应到 {want:.2f}GB")
 _assert(abs(out_on["headroom_gb"] - want) < 1e-6,
-        f"读回核验：{out_on['headroom_gb']}GB == 基线 + 4.00GB")
+        f"读回核验：{out_on['headroom_gb']}GB == 基线 + 1.00GB")
 _assert(abs(ctl.get_simple_vram_headroom() / GB - want) < 1e-6,
         "直接问 aimdo 原生接口，值一致（不是只更新了我们自己的变量）")
-out_off = perf.apply_blockswap({"blocks_swap_on": False, "blocks_to_swap": 10}, hw)
+out_off = perf.apply_vram_reserve({"vram_reserve_gb": 0}, hw)
 _assert(out_off["applied"] is True
         and abs(out_off["headroom_gb"] - base["aimdo_gb"]) < 1e-6,
-        f"关：预留已恢复基线（{out_off['headroom_gb']}GB）")
-_assert("恢复" in out_off["note"], "关的说明里写清「已恢复」，别让用户以为还开着")
-out_unk = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10},
-                               {"vram_total_gb": 32.0})
+        f"设回 0：预留已恢复基线（{out_off['headroom_gb']}GB）")
+_assert("恢复" in out_off["note"], "设回 0 的说明里写清「已恢复」，别让用户以为还开着")
+out_unk = perf.apply_vram_reserve({"vram_reserve_gb": 1.0}, {})
 _assert(out_unk["applied"] is False and abs(ctl.get_simple_vram_headroom() / GB
                                            - base["aimdo_gb"]) < 1e-6,
         "★ 体量未知时**不写**（面板打开那种场景：读接口不许改进程状态）")

@@ -230,6 +230,10 @@
     refvidSet: (refvid) => _json("POST", "/h3chain/refvid", { refvid: refvid || {} }),
     /* 试算（只读）：素材 -> 探针 + 归一方案报告，跑之前就能看到「会变成什么」 */
     refvidPlan: (payload) => _json("POST", "/h3chain/refvid_plan", payload || {}),
+    /* 项目级「对齐参考视频时间」（只读）：源视频 -> 归一后帧数/秒数 + 修正后的设置表。
+     * 与 refvidPlan 的差别是**问法**：plan 问「按现在设置会变成什么」，
+     * align 问「要让归一后时长 == 源时长，设置和段时长该是什么」。 */
+    refvidAlign: (payload) => _json("POST", "/h3chain/refvid_align", payload || {}),
     /* ---- 参考视频压缩（Spark-VPack 内联版；全局，跨项目；与 refvid 分开存）----
      * 真源在后端 vpack.py：DEFAULT_VPACK / parse_state / COMPRESSION_PROFILES。
      * 档位表由 GET 下发（每 5 个 latent token 一块的抽帧口径只有一份），

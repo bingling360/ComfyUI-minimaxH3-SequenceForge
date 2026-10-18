@@ -65,150 +65,94 @@ def test_default_is_official_reference_canvas():
     assert w * h == rv.MAX_PIXELS
 
 
-def test_default_limit_is_longest_segment_not_unbounded():
-    """出厂「时长上限」必须是「最长段」：不限会让超长素材按目标画布白占内存。"""
-    assert rv.DEFAULT_REFVID["limit"] == "最长段"
+def test_defaults_are_official_and_timeline_knobs_are_gone():
+    """出厂只有 5 个键。时间轴那四项（只缩不放 / 帧率归一 / 网格方向 / 时长上限）
+    2026-10-18 连根删除，不是隐藏控件 —— 所以它们**不是契约键**。"""
     assert rv.DEFAULT_REFVID["on"] is False
+    for k in ("no_upscale", "fps_norm", "grid", "limit", "limit_s"):
+        assert k not in rv.DEFAULT_REFVID, k
+    assert not hasattr(rv, "GRIDS") and not hasattr(rv, "LIMITS")
 
 
-# ---------------------------------------------------------------- 网格
+# ---------------------------------------------------------------- 网格（只剩向下）
 
-@pytest.mark.parametrize("n,down,near,up", [
-    (124, 124, 124, 124),   # 5s@24fps 本来就在网格上
-    (72, 56, 73, 73),       # 3.00s → 2.33s / 3.04s
-    (130, 124, 124, 141),
-    (240, 226, 243, 243),
-    (5, 5, 5, 5),
-    (4, 5, 5, 5),
+@pytest.mark.parametrize("n,want", [
+    (124, 124),     # 5s@24fps 本来就在网格上
+    (72, 56),       # 3.00s → 2.33s
+    (130, 124),
+    (240, 226),
+    (126, 124),     # 用户那条 1280×720@30fps 4.20s 的 126 帧
+    (5, 5), (4, 5),
 ])
-def test_snap_grid(n, down, near, up):
-    assert rv.snap_grid(n, "向下") == down
-    assert rv.snap_grid(n, "就近") == near
-    assert rv.snap_grid(n, "向上") == up
+def test_snap_grid_snaps_down(n, want):
+    assert rv.snap_grid(n) == want
 
 
-def test_snap_grid_down_is_official_behaviour():
-    """官方 `while n % 17 != 5: n -= 1` == 向下档；且永不补帧。"""
+def test_snap_grid_matches_official_loop():
+    """逐字对齐官方 `while n % 17 != 5: n -= 1`，且永不补帧。"""
     for n in range(5, 400):
-        got = rv.snap_grid(n, "向下")
-        assert got <= n and got % 17 == 5
+        want = n
+        while want % 17 != 5:
+            want -= 1
+        assert rv.snap_grid(n) == want
+        assert rv.snap_grid(n) <= n
 
 
-# ---------------------------------------------------------------- 归一方案
+# ---------------------------------------------------------------- 归一方案（官方单一路径）
 
-def test_plan_retimes_30fps_to_24fps_keeping_duration():
-    """30fps 素材必须**按时间轴**抽帧：输出时长 == 源时长（误差 ≤ 一格网格）。
+def test_plan_keeps_source_frames_then_snaps_down():
+    """官方口径：帧原样保留（30fps 素材按 24fps 播 = 放慢 25%）→ 向下砍 17k+5。
 
-    这是本模块存在的首要理由：官方把帧当 24fps 用 → 30fps 素材整体放慢 25%。
+    150 帧 @30fps（5.00s）→ 141 帧（5.88s）。
     """
-    cfg = rv.parse_state({"on": True, "grid": "就近"})
-    p = rv.plan(_info(fps=30.0, dur=5.0, frames=150), cfg, 124, "素材")
+    p = rv.plan(_info(fps=30.0, dur=5.0, frames=150), rv.parse_state({"on": True}), 0, "素材")
     assert p["src_fps"] == 30.0
-    assert p["out_frames"] == 124                      # 120 → 就近对齐到 124
-    assert abs(p["out_frames"] / rv.FPS - 5.0) <= 0.7  # 时长保住（网格粒度内）
-    # 抽帧表 = round(i × 30 / 24)，单调不减（.5 走 Python banker's：round(2.5)=2）
-    assert p["src_idx"][:5] == [0, 1, 2, 4, 5]
-    assert p["src_idx"] == sorted(p["src_idx"])
-    assert p["src_end"] == max(p["src_idx"]) + 1
-    assert (p["w"], p["h"]) == (1344, 768)
-    assert p["a_start"] == 0.0 and abs(p["a_end"] - p["out_frames"] / 24.0) < 1e-9
-    assert any("17k+5" in x for x in p["report"])
+    assert p["out_frames"] == 141
+    assert p["src_idx"] == list(range(141)), "不抽帧、不重定时：源帧号与输出一一对应"
+    assert p["src_end"] == 141
+    assert abs(p["out_frames"] - 141) == 0 and p["out_frames"] <= 150, "只向下砍，9 帧以内"
+    assert p["out_frames"] / rv.FPS > 150 / 30.0, "按 24fps 播 → 比源时长长（官方放慢 25%）"
+    assert any("向下对齐 17k+5" in x for x in p["report"])
 
 
-def test_plan_no_fps_norm_keeps_source_frames_and_warns():
-    cfg = rv.parse_state({"on": True, "fps_norm": False, "grid": "向下"})
-    p = rv.plan(_info(fps=30.0, dur=4.0, frames=120), cfg, 124, "素材")
-    assert p["src_idx"] == list(range(120)) or p["out_frames"] == len(p["src_idx"])
-    assert any("fps 归一" in x for x in p["report"])
+def test_plan_audio_window_uses_source_seconds():
+    """音轨窗按**源**时长（out / src_fps）—— 音轨是真实时间，不跟着 24fps 放慢。"""
+    p = rv.plan(_info(fps=30.0, dur=5.0, frames=150), rv.parse_state({"on": True}), 0, "素材")
+    assert p["a_start"] == 0.0
+    assert p["a_end"] == pytest.approx(p["out_frames"] / 30.0)
+    assert abs(p["a_end"] - p["out_frames"] / rv.FPS) > 0.5
 
 
-def test_plan_24fps_source_still_snaps_down_by_default():
-    """24fps 源也要走网格：120 帧 → 向下对齐 107（官方同样砍）。
+def test_plan_low_fps_source_is_not_halved():
+    """12fps/6s（72 帧）：闸门 362 帧换算成源秒要除以 **12**，不能把帧砍半。
 
-    ⚠ 这是**向下档的既定代价**（官方 `while n % 17 != 5: n -= 1` 同款），
-    所以报告里必须写明「120 → 107，5.00s → 4.46s」；要保住时长就换「就近/向上」。
+    这是旧版恒除以 24 留下的真 bug（72 帧被算成只取 28 帧）。
     """
-    cfg = rv.parse_state({"on": True, "grid": "向下"})
-    p = rv.plan(_info(fps=24.0, dur=5.0, frames=120), cfg, 124, "素材")
-    assert p["out_frames"] == 107
-    assert p["src_idx"] == list(range(107))
-    assert any("120 → 107" in x for x in p["report"])
-    near = rv.plan(_info(fps=24.0, dur=5.0, frames=120),
-                   rv.parse_state({"on": True, "grid": "就近"}), 124, "素材")
-    assert near["out_frames"] == 124
+    p = rv.plan(_info(fps=12.0, dur=6.0, frames=72), rv.parse_state({"on": True}), 0, "素材")
+    assert p["out_frames"] == 56
+    assert p["src_idx"] == list(range(56))
 
 
-def test_plan_low_fps_source_repeats_frames_not_truncates():
-    """源 12fps：每帧在 24fps 时间轴上重复两次，**时长不变**（绝不去重砍半）。
-
-    去重是个真实的坑：一旦去重，5s 素材会变成 2.25s（放快一倍）。
-    """
-    cfg = rv.parse_state({"on": True, "grid": "向下"})
-    p = rv.plan(_info(fps=12.0, dur=5.0, frames=60), cfg, 0, "素材")
-    assert p["out_frames"] == 107
-    assert len(p["src_idx"]) == 107
-    assert p["src_idx"][:5] == [0, 0, 1, 2, 2]      # round(i/2) 的 banker's 语义
-    assert max(p["src_idx"]) <= 59
-    assert any("重复" in x for x in p["report"])
-
-
-def test_plan_tail_padding_is_reported():
-    """源不够长 + 就近/向上 → 尾部重复末帧补网格，必须报告（不是静默）。"""
-    cfg = rv.parse_state({"on": True, "grid": "就近"})
-    p = rv.plan(_info(fps=30.0, dur=5.0, frames=150), cfg, 124, "素材")
-    assert p["out_frames"] == 124
-    assert p["src_idx"][-1] == 149
-    assert any("重复末帧" in x for x in p["report"])
-
-
-def test_plan_no_upscale_falls_back_to_source_size():
-    """只缩不放：源比目标小 → 回落到源尺寸的 32 对齐（官方 :322-324 同款）。"""
-    cfg = rv.parse_state({"on": True, "no_upscale": True})
-    p = rv.plan(_info(fps=24.0, dur=2.0, w=640, h=360), cfg, 124, "小素材")
-    assert p["no_upscale_hit"] is True
-    assert (p["w"], p["h"]) == (640, 352)
-    assert any("只缩不放" in x for x in p["report"])
-
-
-def test_plan_upscale_when_switch_off():
-    cfg = rv.parse_state({"on": True, "no_upscale": False})
-    p = rv.plan(_info(fps=24.0, dur=2.0, w=640, h=360), cfg, 124, "小素材")
-    assert p["no_upscale_hit"] is False
-    assert (p["w"], p["h"]) == (1344, 768)
-
-
-def test_plan_limit_longest_segment_caps_frames():
-    cfg = rv.parse_state({"on": True, "limit": "最长段", "grid": "向下"})
-    p = rv.plan(_info(fps=24.0, dur=10.0, frames=240), cfg, 124, "长素材")
+def test_plan_caps_at_longest_segment():
+    """截到本链最长段 = 官方 `frames[:frame_count]`（多余的帧根本进不了模型）。"""
+    p = rv.plan(_info(fps=24.0, dur=10.0, frames=240), rv.parse_state({"on": True}), 124, "长素材")
     assert p["out_frames"] <= 124
-    assert any("截取前" in x for x in p["report"])
+    assert any("最长段" in x for x in p["report"])
 
 
-def test_plan_hard_guard_bounds_memory_even_with_limit_off():
-    """「不限」也不能无界：模型只会用到 frame_count 帧，多归一 = 白占内存。
-
-    1344×768 float32 × 124 帧 ≈ 1.5GB，所以闸门必须独立于用户设置存在。
-    """
-    cfg = rv.parse_state({"on": True, "limit": "不限", "grid": "向下"})
-    p = rv.plan(_info(fps=24.0, dur=30.0, frames=720), cfg, 124, "超长素材")
-    assert p["out_frames"] <= int(124 * 1.5) + 17 + 17   # 闸门 + 一格网格
-    assert any("硬上限" in x for x in p["report"])
-    assert any("只会用到前 124 帧" in x for x in p["report"])
-
-
-def test_plan_guard_uses_trained_bound_without_segment_info():
-    """拿不到段长（max_seg_frames=0）时按官方训练上限 362 帧兜底。"""
-    cfg = rv.parse_state({"on": True, "limit": "不限", "grid": "向下"})
-    p = rv.plan(_info(fps=24.0, dur=60.0, frames=1440), cfg, 0, "无段长")
+def test_plan_guard_bounds_memory_without_segment_info():
+    """拿不到段长时按官方训练上限 362 帧兜底（~15s）。"""
+    p = rv.plan(_info(fps=24.0, dur=60.0, frames=1440), rv.parse_state({"on": True}), 0, "无段长")
     assert p["out_frames"] <= 362
     assert any("362" in x for x in p["report"])
 
 
-def test_plan_reports_素材长于本段():
-    cfg = rv.parse_state({"on": True, "limit": "不限", "grid": "向下"})
-    p = rv.plan(_info(fps=24.0, dur=10.0, frames=240), cfg, 124, "长素材")
-    assert p["out_frames"] > 124
-    assert any("只会用到前 124 帧" in x for x in p["report"])
+def test_plan_no_upscale_falls_back_to_source_size():
+    """只缩不放（写死）= 官方 `if vw*vh < cw*ch` 那条回退。"""
+    p = rv.plan(_info(fps=24.0, dur=2.0, w=640, h=360), rv.parse_state({"on": True}), 124, "小素材")
+    assert p["no_upscale_hit"] is True
+    assert (p["w"], p["h"]) == (640, 352)
+    assert any("只缩不放" in x for x in p["report"])
 
 
 def test_plan_fit_modes():
@@ -222,7 +166,7 @@ def test_plan_audio_flag_is_reported_not_applied():
     """plan 只回报音频口径；真正「注不注入音轨」由调用方按同一个开关决定。"""
     on = rv.plan(_info(), rv.parse_state({"on": True, "audio": True}), 0, "素材")
     off = rv.plan(_info(), rv.parse_state({"on": True, "audio": False}), 0, "素材")
-    assert any("音轨同步裁" in x for x in on["report"])
+    assert any("音轨同窗" in x for x in on["report"])
     assert any("音轨不参与参考" in x for x in off["report"])
     assert on["out_frames"] == off["out_frames"]
 
@@ -250,27 +194,28 @@ def test_parse_state_defaults_and_no_mutation():
 
 
 def test_parse_state_drops_unknown_and_clamps():
-    out = rv.parse_state({"mp": 99, "ar": "不存在", "fit": "乱填", "grid": 7,
-                          "limit_s": -5, "音偏置": 1, "on": "yes"})
+    out = rv.parse_state({"mp": 99, "ar": "不存在", "fit": "乱填",
+                          "音偏置": 1, "on": "yes"})
     assert out["mp"] == 2.0
     assert out["ar"] == rv.DEFAULT_AR
     assert out["fit"] == rv.DEFAULT_REFVID["fit"]
-    assert out["grid"] == rv.DEFAULT_REFVID["grid"]
-    assert out["limit_s"] == 0.0
     assert out["on"] is False
     assert "音偏置" not in out
 
 
 def test_parse_state_keeps_valid_values():
-    out = rv.parse_state({"on": True, "ar": "9:16", "mp": 0.5, "no_upscale": False,
-                          "fit": "补黑边", "resample": "area", "fps_norm": False,
-                          "grid": "就近", "limit": "自定义", "limit_s": 3.5,
-                          "audio": False})
+    out = rv.parse_state({"on": True, "ar": "9:16", "mp": 0.5,
+                          "fit": "补黑边", "resample": "area", "audio": False})
     assert out["on"] is True and out["ar"] == "9:16" and out["mp"] == 0.5
-    assert out["no_upscale"] is False and out["fit"] == "补黑边"
-    assert out["resample"] == "area" and out["fps_norm"] is False
-    assert out["grid"] == "就近" and out["limit"] == "自定义"
-    assert out["limit_s"] == 3.5 and out["audio"] is False
+    assert out["fit"] == "补黑边" and out["resample"] == "area" and out["audio"] is False
+
+
+def test_parse_state_ignores_deleted_timeline_keys():
+    """旧 refvid.json 里还带着那四个键 → 直接丢弃，不许影响行为。"""
+    out = rv.parse_state({"on": True, "no_upscale": False, "fps_norm": True,
+                          "grid": "就近", "limit": "不限", "limit_s": 9.0})
+    for k in ("no_upscale", "fps_norm", "grid", "limit", "limit_s"):
+        assert k not in out, k
 
 
 # ---------------------------------------------------------------- 指纹
@@ -281,10 +226,8 @@ def test_signature_is_stable_and_ignores_master_switch():
     b = rv.signature(rv.parse_state({"on": True}))
     assert a == b
     base = rv.signature(rv.parse_state({"on": True}))
-    for k, v in (("ar", "9:16"), ("mp", 0.5), ("no_upscale", False),
-                 ("fit", "拉伸"), ("resample", "area"), ("fps_norm", False),
-                 ("grid", "就近"), ("limit", "自定义"), ("limit_s", 3.0),
-                 ("audio", False)):
+    for k, v in (("ar", "9:16"), ("mp", 0.5), ("fit", "拉伸"),
+                 ("resample", "area"), ("audio", False)):
         assert rv.signature(rv.parse_state({"on": True, k: v})) != base, k
 
 

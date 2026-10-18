@@ -2701,27 +2701,22 @@ class H3SeamlessChainSampler(io.ComfyNode):
                               "这是每段一次全卸腾挪的根因", flush=True)
                     except Exception:
                         pass
-                print(f"[H3性能] {perf.blockswap_line(perf.probe_blockswap(), None)}",
+                print(f"[H3性能] {perf.weight_flow_line(perf.probe_weight_flow(), None)}",
                       flush=True)
-                # 块交换：把面板那三项接到**官方**的块级权重流动上（本插件不自己搬
-                # 权重 —— 理由与证据见 perf.apply_blockswap）。放在这里是因为**只有
-                # 拿到模型才算得出 UNET 真实体量**，`blocks_to_swap=-1`（跟随档位）
-                # 才能按 suggest_blocks 反解出真块数；面板打开那次拿不到体量，会
-                # 明确「不干预」而不是瞎设一个值。模型侧的预取开关在下面与 FFN /
-                # 头分块一起装。
-                _bs = perf.apply_blockswap(_pf, _hw)
-                _bs_note = ""
-                # ⚠ 条件是 `on or reserve_gb`，不能只写 `on`（2026-09-27 修）：
-                # 「显存预留（直接填 GB）」**独立于块交换开关** —— 只写 `on` 会让
-                # 这个新旋钮生效时**日志完全静默**，用户改了看不到任何反馈。
-                if _bs["on"] or _bs.get("reserve_gb"):
-                    _bs_note = _bs["note"]
-                    _tag = "显存预留" if _bs.get("reserve_gb") else "块交换"
-                    print(f"[H3性能] {_tag}：{_bs_note}", flush=True)
+                # 显存预留：面板那一项接到**官方**的块级权重流动上（本插件不自己搬
+                # 权重 —— 理由与证据见 perf.apply_vram_reserve）。放在这里是因为
+                # 渲染前才拿得到 hw（显存总量），算夹取口径要靠它；面板打开那次
+                # 拿不到就明确「不干预」，不会瞎设一个值。
+                # 模型侧的预取开关在下面与 FFN / 头分块一起装。
+                _hr_state = perf.apply_vram_reserve(_pf, _hw)
+                _hr_note = ""
+                if _hr_state["on"]:
+                    _hr_note = _hr_state["note"]
+                    print(f"[H3性能] 显存预留：{_hr_note}", flush=True)
                 # 落盘：被 OOM kill 时 stdout 可能一起没了，JSONL 是唯一留存
                 perf.emit({"kind": "overview", "line": _line,
                            "guard": _guard_msg, "headroom": _hr_msg,
-                           "budget": _bd_line, "hw": _hw, "blockswap": _bs_note})
+                           "budget": _bd_line, "hw": _hw, "vram_reserve": _hr_note})
             except Exception:
                 pass
         if up_cfg:
@@ -2813,7 +2808,7 @@ class H3SeamlessChainSampler(io.ComfyNode):
                         report.append(f"性能：二采模型同样装上注意力头分块（{_ah_k2} 个 attn）")
             except Exception:
                 pass
-        # 块交换的**模型侧**那半边：官方块级预取的开关。总闸是
+        # 显存预留的**模型侧**那半边：官方块级预取的开关。总闸是
         # `transformer_options["prefetch_dynamic_vbars"]`（官方每次前向按
         # patcher.is_dynamic() 写下的），预取深度由队列结构写死为「提前 1 块」→
         # 只能是开关，见 upscale.install_block_prefetch。

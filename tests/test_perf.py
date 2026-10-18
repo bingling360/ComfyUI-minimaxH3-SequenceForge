@@ -112,33 +112,6 @@ def test_resolve_profile_unknown_falls_to_custom():
     assert perf.resolve_profile({"vram_total_gb": 16.0}) == perf.PROFILE_CUSTOM
 
 
-# ---- 块交换建议（§5.2）----
-
-@pytest.mark.parametrize("vram,expected", [
-    (32.0, 0),     # 装得下 → 不开
-    (16.0, 25),    # 计划给 19–25，本式命中 25
-    (12.0, 32),    # 计划 31–38
-    (8.0, 40),     # 计划 44–50，本式偏保守（换块太多会把 PCIe 压成瓶颈）
-])
-def test_suggest_blocks_hits_plan_table(vram, expected):
-    assert perf.suggest_blocks(26.0, vram) == expected
-
-
-def test_suggest_blocks_never_exceeds_block_count():
-    """显存极小（乃至 0 / 负）时钳到 [0, 50]，不返回荒谬值。"""
-    assert perf.suggest_blocks(26.0, 0.5) == perf.H3_DOUBLE_BLOCK_COUNT
-    assert perf.suggest_blocks(26.0, 0.0) == 0
-    assert perf.suggest_blocks(0.0, 16.0) == 0
-
-
-def test_suggest_blocks_scales_with_unet_size():
-    """同样 16GB 卡，UNET 越大要换出的块越多（不是写死的 25）。"""
-    small = perf.suggest_blocks(13.0, 16.0)   # 半大 UNET：16GB 装得下
-    big = perf.suggest_blocks(52.0, 16.0)     # 双倍 UNET
-    assert small == 0
-    assert big > 25
-
-
 # ---- 落盘守卫（§3.3）----
 
 def test_offload_guard_ok_when_ram_plus_swap_covers_need():
@@ -183,17 +156,17 @@ def test_offload_guard_ratio_is_configurable():
 def test_resolve_perf_cloud_matches_plan_table():
     p = perf.resolve_perf("auto", CLOUD)
     assert p["profile"] == perf.PROFILE_CLOUD
-    assert p["blocks_to_swap"] == 0
+    assert p["vram_reserve_gb"] == 0.0
     # blocks_prefetch 不在档位表里（官方默认即开，场景 A 全常驻时它本来就是空转）
     assert p["blocks_prefetch"] is True
-    # 档位表瘦身（2026-09-23）：原本 8 项，6 项零消费端 + 1 项旋钮空转都被删除，
-    # 现在场景 A 与 B 的唯一差异就是上面那条「逼不逼官方换块」。
+    # 档位表已全空（2026-10-18 随块数旋钮删掉最后一项）→ A/B 两档的差异只剩
+    # `profile` 本身与按档位解析的 `auto` 字段，不再有「逼不逼官方换块」这种值。
 
 
 def test_resolve_perf_local_matches_plan_table():
     p = perf.resolve_perf("auto", LOCAL)
     assert p["profile"] == perf.PROFILE_LOCAL
-    assert p["blocks_to_swap"] == 25
+    assert p["vram_reserve_gb"] == 0.0     # 档位不再自动抬预留（挡住了激活尖峰，见 DEFAULT_PERF）
     assert p["blocks_prefetch"] is True
 
 
@@ -205,25 +178,25 @@ def test_resolve_perf_returns_full_contract():
 
 def test_resolve_perf_overrides_win():
     """用户逐项覆盖必须压过场景表（计划 §7：这张表是建议值，不是强制值）。"""
-    p = perf.resolve_perf("auto", CLOUD, {"blocks_to_swap": 10,
+    p = perf.resolve_perf("auto", CLOUD, {"vram_reserve_gb": 1.5,
                                           "ff_chunk_tokens": 2048})
-    assert p["blocks_to_swap"] == 10
+    assert p["vram_reserve_gb"] == 1.5
     assert p["ff_chunk_tokens"] == 2048
     assert p["blocks_prefetch"] is True     # 未覆盖的仍走 DEFAULT_PERF
 
 
 def test_resolve_perf_ignores_unknown_and_none():
     """未知键与 None 一律忽略（None 不能把字段刷成空）。"""
-    p = perf.resolve_perf("auto", CLOUD, {"nonsense": 1, "blocks_to_swap": None})
+    p = perf.resolve_perf("auto", CLOUD, {"nonsense": 1, "vram_reserve_gb": None})
     assert "nonsense" not in p
-    assert p["blocks_to_swap"] == 0
+    assert p["vram_reserve_gb"] == 0.0
 
 
 def test_resolve_perf_unknown_profile_is_custom():
     """非 auto 且不在 PROFILES 里 → custom（沿用默认，等用户自己填）。"""
     p = perf.resolve_perf("weird", CLOUD)
     assert p["profile"] == perf.PROFILE_CUSTOM
-    assert p["blocks_to_swap"] == perf.DEFAULT_PERF["blocks_to_swap"]
+    assert p["vram_reserve_gb"] == perf.DEFAULT_PERF["vram_reserve_gb"]
 
 
 def test_resolve_perf_auto_without_hw_is_custom():
@@ -234,9 +207,9 @@ def test_resolve_perf_auto_without_hw_is_custom():
 def test_resolve_perf_does_not_mutate_defaults():
     """多次解析不得污染 DEFAULT_PERF / PROFILE_TABLE（否则一次调用全局中毒）。"""
     before = dict(perf.DEFAULT_PERF)
-    perf.resolve_perf("auto", LOCAL, {"blocks_to_swap": 7})
+    perf.resolve_perf("auto", LOCAL, {"vram_reserve_gb": 2.0})
     assert perf.DEFAULT_PERF == before
-    assert perf.PROFILE_TABLE[perf.PROFILE_LOCAL]["blocks_to_swap"] == 25
+    assert perf.PROFILE_TABLE[perf.PROFILE_LOCAL] == {}, "档位表不该被解析过程写进东西"
 
 
 def test_resolve_auto_follows_profile():
@@ -267,17 +240,17 @@ def test_parse_state_accepts_float_for_numeric_field():
 
 def test_parse_state_normalizes_integral_float_to_int():
     """JSON 里的 8.0 就是 8（避免 8.0 一路带到需要 int 的地方）。"""
-    out = perf.parse_state({"x264_crf": 8.0, "blocks_to_swap": 12.0})
+    out = perf.parse_state({"x264_crf": 8.0, "ff_chunk_tokens": 16384.0})
     assert out["x264_crf"] == 8 and isinstance(out["x264_crf"], int)
-    assert out["blocks_to_swap"] == 12 and isinstance(out["blocks_to_swap"], int)
+    assert out["ff_chunk_tokens"] == 16384 and isinstance(out["ff_chunk_tokens"], int)
 
 
 def test_parse_state_rejects_wrong_types():
     """类型不对 → 丢弃该项回落到默认，不做猜测式强转。"""
     d = perf.DEFAULT_PERF
-    out = perf.parse_state({"blocks_to_swap": "x", "profile": 5,
+    out = perf.parse_state({"ff_chunk_tokens": "x", "profile": 5,
                             "blocks_prefetch": 0, "encode_hq": "yes"})
-    assert out["blocks_to_swap"] == d["blocks_to_swap"]
+    assert out["ff_chunk_tokens"] == d["ff_chunk_tokens"]
     assert out["profile"] == d["profile"]
     assert out["blocks_prefetch"] == d["blocks_prefetch"]   # 0 不是 bool → 丢弃回落
     assert out["encode_hq"] == d["encode_hq"]
@@ -290,9 +263,9 @@ def test_parse_state_keeps_false():
 
 
 def test_parse_state_drops_unknown_keys_and_none():
-    out = perf.parse_state({"nonsense": 1, "blocks_to_swap": None})
+    out = perf.parse_state({"nonsense": 1, "vram_reserve_gb": None})
     assert "nonsense" not in out
-    assert out["blocks_to_swap"] == perf.DEFAULT_PERF["blocks_to_swap"]
+    assert out["vram_reserve_gb"] == perf.DEFAULT_PERF["vram_reserve_gb"]
 
 
 def test_parse_state_bad_input_returns_defaults():
@@ -304,8 +277,8 @@ def test_parse_state_bad_input_returns_defaults():
 def test_parse_state_does_not_mutate_defaults():
     """返回的是副本：解析结果写回后不得改到 DEFAULT_PERF 本体。"""
     before = dict(perf.DEFAULT_PERF)
-    out = perf.parse_state({"blocks_to_swap": 12})
-    out["blocks_to_swap"] = 99
+    out = perf.parse_state({"vram_reserve_gb": 1.5})
+    out["vram_reserve_gb"] = 99
     assert perf.DEFAULT_PERF == before
 
 
@@ -979,14 +952,18 @@ def test_launch_args_report_detects_already_given_flag():
 
 def test_launch_args_report_reserve_vram_is_the_runtime_equivalent():
     """★ `--reserve-vram` 必须标成 runtime_ok=True —— 它是唯一「有运行时等价旋钮」
-    的那一项（面板的「块交换」写的就是同一个 aimdo simple_vram_headroom）。
-    这条是给用户指路用的，标错方向就把人引到「重启」上去了。"""
+    的那一项（面板的「显存预留（GB）」写的就是同一个 aimdo simple_vram_headroom）。
+    这条是给用户指路用的，标错方向就把人引到「重启」上去了。
+
+    ⚠ 2026-10-18：指路文案从「块交换 → 交换块数」改成「显存预留（GB）」——
+    块数那套旋钮已删除，这里跟着改，别再指到一个不存在的地方。
+    """
     r = perf.launch_args_report(policy=_POL_DEFAULT, table={}, argv=["main.py"])
     by = {i["flag"]: i for i in r["items"]}
     assert by["--reserve-vram"]["runtime_ok"] is True
     assert by["--vram-headroom"]["runtime_ok"] is False
     assert by["--disable-comfy-compiler"]["runtime_ok"] is False
-    assert "块交换" in by["--reserve-vram"]["why"]
+    assert "显存预留" in by["--reserve-vram"]["why"]
     assert "必须重启" in by["--vram-headroom"]["why"]
 
 
@@ -1107,8 +1084,8 @@ def test_run_id_stable_within_process():
 #   * upscale_temporal_chunk / upscale_chunk_frames / upscale_overlap
 #   * refine_temporal_on / refine_temporal_chunk / refine_temporal_overlap
 #   * refine_tile_on / refine_tile / refine_tile_overlap / refine_tile_feather
-#   * blocks_swap_on / blocks_to_swap（`blocks_prefetch` 不在此列 —— 它独立生效，
-#     不受总开关管，见 perf.DEFAULT_PERF 里块交换那段注释）
+#   * （`blocks_prefetch` 不在此列 —— 它独立生效，不受任何总开关管，见
+#     perf.DEFAULT_PERF 里权重流动那段注释）
 # 开关默认关（大显存机器不该被默默改行为），参数默认给非零的建议值（用户开开关
 # 就有合理值，不必先想「该填多少」）。
 #
@@ -1118,7 +1095,7 @@ def test_run_id_stable_within_process():
 
 CHUNK_SWITCHES = (
     "ff_chunk_on", "attn_head_on",
-    "refine_temporal_on", "refine_tile_on", "blocks_swap_on",
+    "refine_temporal_on", "refine_tile_on",
 )
 
 CHUNK_PAIRS = (
@@ -1127,7 +1104,6 @@ CHUNK_PAIRS = (
     ("upscale_temporal_chunk", ("upscale_chunk_frames", "upscale_overlap")),
     ("refine_temporal_on", ("refine_temporal_chunk", "refine_temporal_overlap")),
     ("refine_tile_on", ("refine_tile", "refine_tile_overlap", "refine_tile_feather")),
-    ("blocks_swap_on", ("blocks_to_swap",)),
 )
 
 
@@ -1173,9 +1149,6 @@ def test_chunk_param_defaults_are_sane():
     assert d["refine_temporal_overlap"] == 8     # 至少 8 latent token
     assert d["refine_tile"] == "2x1"             # 横向 2 条（总开关仍默认关）
     assert d["refine_tile_overlap"] == 32 and d["refine_tile_feather"] == 16
-    # blocks_to_swap = -1 是「跟随档位」哨兵，不是 0 —— 0 会被读成「真的一块都不换」
-    # 从而覆盖掉档位表按显存算出来的建议值（16GB→25 等）。见 resolve_perf。
-    assert d["blocks_to_swap"] == -1
     # blocks_prefetch 默认 True = **官方默认即开、默认不干预**（关掉才包一层；
     # 官方预取深度写死 1 块，所以它只能是 bool）
     assert d["blocks_prefetch"] is True
@@ -1208,20 +1181,11 @@ def test_profile_table_keys_are_real_and_known():
     union = set()
     for tbl in perf.PROFILE_TABLE.values():
         union |= set(tbl)
-    # 瘦身到只剩 `blocks_to_swap` 之后，这里也真的只剩一项 —— 但"有内容"仍要验，
-    # 否则三张表全空时上面那条会「通过」而其实什么都没烤到。
-    assert len(union) >= 1, f"档位表并集太小：{sorted(union)}"
+    # ⚠ 2026-10-18 起三张档位表**全空**（最后一项 blocks_to_swap 已删），所以这里
+    # 不再要求「并集非空」—— 没有档位专属值就是没有，别为了填而填。这条只剩
+    # 「万一有人加回来，键必须是真键」这一半。
     unknown = union - set(perf.DEFAULT_PERF)
     assert not unknown, f"档位表里有 DEFAULT_PERF 里没有的键：{sorted(unknown)}"
-
-
-def test_blocks_to_swap_minus_one_is_the_follow_profile_sentinel():
-    """`blocks_to_swap = -1` = 「跟随档位」（**不是** 0 —— 0 会被读成「一块都不换」）。
-
-    面板的「跟随档位」提示现在**按这个值**显示（前端字段表的 `autoWhen: -1`），
-    不再依赖后端名单 —— 名单已随三态机制删除。
-    """
-    assert perf.DEFAULT_PERF["blocks_to_swap"] == -1
 
 
 def test_three_state_lists_are_gone_for_good():
@@ -1543,63 +1507,18 @@ def test_split_divides_evenly_remainder_first():
         assert max(lens) - min(lens) <= 1
         assert lens == sorted(lens, reverse=True)
 
-# ============================================================ 块交换（接线到官方机制）
+# ============================================================ 显存预留（接线到官方机制）
 #
-# 这一组的定位：块交换**没有自己的搬权重代码**（机制在 ComfyUI 那边：DynamicVRAM 的
-# vbar 换入 + 官方 block 循环里的预取队列）。本插件只做两件事：
-#   ① 把「放出 N 块」折算成 aimdo 的**显存预留**（blocks_to_swap → headroom）
+# 这一组的定位：本插件**没有自己的搬权重代码**（机制在 ComfyUI 那边：DynamicVRAM 的
+# vbar 换入 + 官方 block 循环里的预取队列）。我们只做两件事：
+#   ① 把面板那一项「显存预留（GB）」写到 aimdo 的 `simple_vram_headroom`
 #   ② 给模型装/拆官方预取队列的开关（blocks_prefetch → transformer_options）
-# 所以这里测的是**换算与写入纪律**，不是「搬了几块」——后者由 tools/check_blockswap.py
+# 所以这里测的是**写入纪律**，不是「搬了几块」——后者由 tools/check_blockswap.py
 # 在真 torch/aimdo 环境里验。
-
-def test_blockswap_headroom_math():
-    """N 块 → 额外预留：块大小 = UNET/50（H3_DOUBLE_BLOCK_COUNT）。"""
-    r = perf.blockswap_headroom(0, 20.0, 40.0)
-    assert r["extra_gb"] == 0.0 and r["blocks_eff"] == 0 and not r["clamped"]
-    # 20GB UNET → 每块 0.4GB；10 块 = 4GB；32GB 卡的「一半」= 16GB，不触发夹取
-    r = perf.blockswap_headroom(10, 20.0, 32.0)
-    assert abs(r["extra_gb"] - 4.0) < 1e-9
-    assert r["blocks_eff"] == 10 and r["clamped"] is False
-    assert "0.40GB" in r["note"]
-
-
-def test_blockswap_headroom_clamps_to_half_vram():
-    """★ 6GB 卡上 `suggest_blocks` 会给 40+ 块 ≈ 16GB > 显存总量 → 必须夹住并如实说明。
-
-    不夹的后果是「预留比卡还大」这种无意义设置；静默夹的后果是用户以为自己填的 41
-    生效了。所以既要夹、又要在 note 里说清被夹到几块。
-    """
-    n = perf.suggest_blocks(20.0, 6.0)
-    assert n >= 40, f"6GB 卡上该建议换出 40+ 块，实际 {n}"
-    r = perf.blockswap_headroom(n, 20.0, 6.0)
-    assert r["clamped"] is True
-    assert r["extra_gb"] <= 6.0 * perf.BLOCKSWAP_HEADROOM_CAP + 1e-9
-    assert 0 < r["blocks_eff"] < n
-    assert "夹" in r["note"] and "⚠" in r["note"]
-
-
-def test_blockswap_headroom_unknown_sizes_never_guesses():
-    """体量没探明（面板打开时还没加载模型）→ 明确「不干预」，**不编数字**。"""
-    for n in (5, 41):
-        r = perf.blockswap_headroom(n, None, 16.0)
-        assert r["extra_gb"] == 0.0 and r["blocks_eff"] == 0
-        assert "未探明" in r["note"]
-        r2 = perf.blockswap_headroom(n, 20.0, None)
-        assert r2["extra_gb"] == 0.0 and "未探明" in r2["note"]
-
-
-def test_blockswap_headroom_bad_block_count():
-    """脏输入不该抛，也不该算出负数预留。"""
-    for bad in (None, "x", -3):
-        r = perf.blockswap_headroom(bad, 20.0, 32.0)
-        assert r["extra_gb"] == 0.0 and r["blocks_eff"] == 0
-
-
-# ---- 显存预留：直接给 GB（2026-09-27 加）----
 #
-# 与 `blockswap_headroom` 是**同一个 aimdo 值**的两种单位：块数 × 块大小 = GB。
-# 之所以要这一项：用户真实的诉求单位是 GB（「给二采留 1GB 余量」），而块数得自己
-# 乘块大小反算（6GB 卡上块大小 ≈ 0.42GB，想留 1GB 得填 3 块 —— 没人算得出来）。
+# ⚠ 2026-10-18：`blocks_swap_on` / `blocks_to_swap` 已删除 —— 它们与「显存预留」
+#   写的是同一个 aimdo 值，只是换成块数单位，且要加载模型才反解得出。整套块数换算
+#   （suggest_blocks / blockswap_headroom / H3_DOUBLE_BLOCK_COUNT）随之删除。
 
 def test_reserve_headroom_math():
     """不夹取时就是原值；0 / 未探明 → 不干预（**不编数字**）。"""
@@ -1610,6 +1529,13 @@ def test_reserve_headroom_math():
     assert r["extra_gb"] == 0.0 and "不额外预留" in r["note"]
     r = perf.reserve_headroom(1.0, None, 0.0)
     assert r["extra_gb"] == 0.0 and "未探明" in r["note"]
+
+
+def test_reserve_headroom_below_aimdo_floor_is_reported():
+    """★ 256MB 编译期地板要说出来 —— 填 0.1 不会更省，只是让人以为自己在调。"""
+    r = perf.reserve_headroom(0.1, 16.0, 0.0)
+    assert abs(r["extra_gb"] - 0.1) < 1e-9        # 我们照写
+    assert "地板" in r["note"] and "0.25" in r["note"]
 
 
 def test_reserve_headroom_clamps_to_half_vram():
@@ -1634,30 +1560,30 @@ def test_reserve_headroom_bad_input_never_raises():
         assert r["extra_gb"] == 0.0 and r["clamped"] is False
 
 
-def test_blockswap_baseline_is_read_once():
+def test_reserve_baseline_is_read_once():
     """★ 基线只读一次：第二次读到的可能已被我们自己改过，用它当基线会让
-    「关掉开关 = 恢复原样」变成「关掉开关 = 保持我上次设的值」。"""
+    「设回 0 = 恢复原样」变成「设回 0 = 保持我上次设的值」。"""
     saved = dict(perf._BS_BASELINE)
     try:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update({"aimdo_gb": 1.5, "extra_gb": 0.4})
-        assert perf._blockswap_baseline() == {"aimdo_gb": 1.5, "extra_gb": 0.4}
+        assert perf._reserve_baseline() == {"aimdo_gb": 1.5, "extra_gb": 0.4}
         # 就算环境变了，缓存命中就不再重读
         perf._BS_BASELINE["aimdo_gb"] = 9.0
-        assert perf._blockswap_baseline()["aimdo_gb"] == 9.0
+        assert perf._reserve_baseline()["aimdo_gb"] == 9.0
     finally:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update(saved)
 
 
-def test_probe_blockswap_shape():
+def test_probe_weight_flow_shape():
     """探测结果字段齐全；path ∈ {aimdo, legacy, None}。
 
     None = **没跑在 ComfyUI 进程里**（import 不到 comfy）→ 如实报「探不到」，不硬编一个
     path。本用例在 managed python 下跑（无 comfy / 无 torch），所以这里必然是 None ——
     这条同时钉住 perf.py 全模块的前提「量不到给 None，绝不抛」。
     """
-    st = perf.probe_blockswap()
+    st = perf.probe_weight_flow()
     assert set(st) == {"aimdo", "dynamic", "streams", "non_blocking",
                        "pinned_gb", "headroom_gb", "path"}
     assert st["path"] in (None, "aimdo", "legacy")
@@ -1665,31 +1591,30 @@ def test_probe_blockswap_shape():
         assert st["path"] is None, "探不到 aimdo 时不该硬报一个 path"
 
 
-def test_blockswap_line_states():
-    assert "DynamicVRAM 在线" in perf.blockswap_line({"path": "aimdo"}, 1.25)
-    assert "1.25GB" in perf.blockswap_line({"path": "aimdo"}, 1.25)
-    assert "?" in perf.blockswap_line({"path": "aimdo"}, None)
-    assert "无 DynamicVRAM" in perf.blockswap_line({"path": "legacy"}, None)
+def test_weight_flow_line_states():
+    assert "DynamicVRAM 在线" in perf.weight_flow_line({"path": "aimdo"}, 1.25)
+    assert "1.25GB" in perf.weight_flow_line({"path": "aimdo"}, 1.25)
+    assert "?" in perf.weight_flow_line({"path": "aimdo"}, None)
+    assert "无 DynamicVRAM" in perf.weight_flow_line({"path": "legacy"}, None)
 
 
-def test_apply_blockswap_unknown_size_does_not_touch(monkeypatch):
+def test_apply_reserve_unknown_vram_does_not_touch(monkeypatch):
     """★★ **读接口不许改进程状态**。
 
-    面板打开会走 `perf_get → apply_runtime → apply_blockswap`，而那时拿不到模型体量。
-    若此时按「extra=0」照写，就会把上一次渲染设好的预留**悄悄抹掉** —— 一个 GET
-    请求不该有副作用。所以这里钉死：算不出目标 → 一次 `_set_*` 都不许调。
+    面板打开会走 `perf_get → apply_runtime → apply_vram_reserve`，而那时拿不到显存
+    体量（夹取口径算不出来）。若此时按「extra=0」照写，就会把上一次渲染设好的预留
+    **悄悄抹掉** —— 一个 GET 请求不该有副作用。
     """
     calls = []
     monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: calls.append(gb) or 7.0)
     monkeypatch.setattr(perf, "_set_extra_reserved", lambda gb: calls.append(gb) or 0.6)
-    monkeypatch.setattr(perf, "probe_blockswap",
+    monkeypatch.setattr(perf, "probe_weight_flow",
                         lambda: {"path": "aimdo", "headroom_gb": 7.0})
     saved = dict(perf._BS_BASELINE)
     try:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update({"aimdo_gb": 7.0, "extra_gb": 0.6})
-        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 25},
-                                   {"vram_total_gb": 16.0})
+        out = perf.apply_vram_reserve({"vram_reserve_gb": 1.0}, {})
         assert calls == [], f"体量未知却写了预留：{calls}"
         assert out["applied"] is False and "未探明" in out["note"]
     finally:
@@ -1697,178 +1622,61 @@ def test_apply_blockswap_unknown_size_does_not_touch(monkeypatch):
         perf._BS_BASELINE.update(saved)
 
 
-def test_apply_blockswap_aimdo_applies_and_restores(monkeypatch):
-    """开 → 预留抬到 baseline + N×块大小；关 → **恢复 baseline**（不是保持在 N 块）。"""
+def test_apply_reserve_aimdo_applies_and_restores(monkeypatch):
+    """设 1GB → 预留抬到 baseline + 1；设回 0 → **恢复 baseline**（读回核验）。"""
     seen = []
     monkeypatch.setattr(perf, "_set_aimdo_headroom",
                         lambda gb: (seen.append(gb), round(gb, 3))[1])
-    monkeypatch.setattr(perf, "probe_blockswap",
+    monkeypatch.setattr(perf, "probe_weight_flow",
                         lambda: {"path": "aimdo", "headroom_gb": 0.0})
     saved = dict(perf._BS_BASELINE)
     try:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update({"aimdo_gb": 0.5, "extra_gb": 0.6})
-        hw = {"unet_gb": 20.0, "vram_total_gb": 32.0}
-        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10}, hw)
-        assert out["applied"] is True and out["blocks"] == 10
-        assert abs(seen[-1] - 4.5) < 1e-9, seen          # 0.5 基线 + 4.0
-        assert abs(out["headroom_gb"] - 4.5) < 1e-9      # 读回核验后的值
-        out2 = perf.apply_blockswap({"blocks_swap_on": False, "blocks_to_swap": 10}, hw)
+        hw = {"vram_total_gb": 32.0}
+        out = perf.apply_vram_reserve({"vram_reserve_gb": 1.0}, hw)
+        assert out["applied"] is True and out["on"] is True
+        assert abs(seen[-1] - 1.5) < 1e-9, seen          # 0.5 基线 + 1.0
+        assert abs(out["headroom_gb"] - 1.5) < 1e-9      # 读回核验后的值
+        out2 = perf.apply_vram_reserve({"vram_reserve_gb": 0}, hw)
         assert abs(seen[-1] - 0.5) < 1e-9, seen
-        assert "恢复" in out2["note"]
+        assert out2["on"] is False and "恢复" in out2["note"]
     finally:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update(saved)
 
 
-def test_apply_blockswap_follows_profile_sentinel(monkeypatch):
-    """`blocks_to_swap = -1` = 跟随档位 → 用 suggest_blocks 按**真实体量**反解。"""
-    monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: round(gb, 3))
-    monkeypatch.setattr(perf, "probe_blockswap",
-                        lambda: {"path": "aimdo", "headroom_gb": 0.0})
-    saved = dict(perf._BS_BASELINE)
-    try:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update({"aimdo_gb": 0.0, "extra_gb": 0.0})
-        hw = {"unet_gb": 20.0, "vram_total_gb": 16.0}
-        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": -1}, hw)
-        assert out["blocks"] == perf.suggest_blocks(20.0, 16.0)
-        assert out["blocks"] > 0
-    finally:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update(saved)
-
-
-def test_apply_blockswap_legacy_path(monkeypatch):
+def test_apply_reserve_legacy_path(monkeypatch):
     """没有 DynamicVRAM 时退化为 ComfyUI 的 EXTRA_RESERVED_VRAM（同一条语义）。"""
     seen = []
     monkeypatch.setattr(perf, "_set_extra_reserved",
                         lambda gb: (seen.append(gb), round(gb, 3))[1])
-    monkeypatch.setattr(perf, "probe_blockswap",
+    monkeypatch.setattr(perf, "probe_weight_flow",
                         lambda: {"path": "legacy", "headroom_gb": None})
     saved = dict(perf._BS_BASELINE)
     try:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update({"aimdo_gb": None, "extra_gb": 0.6})
-        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 5},
-                                   {"unet_gb": 20.0, "vram_total_gb": 32.0})
+        out = perf.apply_vram_reserve({"vram_reserve_gb": 1.0}, {"vram_total_gb": 16.0})
         assert out["path"] == "legacy" and out["applied"] is True
-        assert abs(seen[-1] - (0.6 + 2.0)) < 1e-9, seen
+        assert abs(seen[-1] - 1.6) < 1e-9, seen
         assert "legacy" in out["note"] and "DynamicVRAM" in out["note"]
     finally:
         perf._BS_BASELINE.clear()
         perf._BS_BASELINE.update(saved)
 
 
-def test_apply_blockswap_reserve_gb_wins_over_blocks(monkeypatch):
-    """★★ 「显存预留」优先于「交换块数」—— 两者写的是同一个 aimdo 值。
-
-    优先级必须写死且可验证：想留 1GB 得先自己乘块大小反算块数（块大小 ≈ 0.42GB），
-    没人算得出来，所以「直接填 GB」这一项赢，且必须在 note 里说明块数未参与 ——
-    不然用户会以为两个值叠加了。
-    """
-    seen = []
-    monkeypatch.setattr(perf, "_set_aimdo_headroom",
-                        lambda gb: (seen.append(gb), round(gb, 3))[1])
-    monkeypatch.setattr(perf, "probe_blockswap",
-                        lambda: {"path": "aimdo", "headroom_gb": 0.0})
-    saved = dict(perf._BS_BASELINE)
-    try:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update({"aimdo_gb": 0.5, "extra_gb": 0.6})
-        hw = {"unet_gb": 20.0, "vram_total_gb": 16.0}
-        # 两项都填 → 按 GB 走，块数不参与
-        out = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10,
-                                    "vram_reserve_gb": 1.0}, hw)
-        assert out["reserve_gb"] == 1.0
-        assert abs(seen[-1] - 1.5) < 1e-9, seen      # 0.5 基线 + 1.0
-        assert out["blocks"] == 0, "按 GB 算时块数该归零"
-        assert "未参与" in out["note"]
-        # 只填块数 → 旧行为**逐字不变**（回归保护）
-        seen.clear()
-        out2 = perf.apply_blockswap({"blocks_swap_on": True, "blocks_to_swap": 10}, hw)
-        assert out2["reserve_gb"] == 0.0
-        assert abs(seen[-1] - 4.5) < 1e-9, seen      # 0.5 + 10 × 0.4
-        assert out2["blocks"] == 10
-    finally:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update(saved)
-
-
-def test_apply_blockswap_reserve_gb_is_independent_of_switch(monkeypatch):
-    """★ 「显存预留」**不依赖** `blocks_swap_on`。
-
-    两个开关是两件事：`blocks_swap_on` 管「把块换出去」（改变权重流动行为），
-    `vram_reserve_gb` 管「留出余量」。若把后者挂在前者名下，用户想留 1GB 还得
-    先开块交换 —— 那会顺带改掉他不想要的东西。
-    """
-    monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: round(gb, 3))
-    monkeypatch.setattr(perf, "probe_blockswap",
-                        lambda: {"path": "aimdo", "headroom_gb": 0.0})
-    saved = dict(perf._BS_BASELINE)
-    try:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update({"aimdo_gb": 0.5, "extra_gb": 0.6})
-        out = perf.apply_blockswap({"blocks_swap_on": False, "blocks_to_swap": 10,
-                                    "vram_reserve_gb": 1.0},
-                                   {"unet_gb": 20.0, "vram_total_gb": 16.0})
-        assert out["applied"] is True
-        assert abs(out["headroom_gb"] - 1.5) < 1e-9
-        assert "预留" in out["note"]
-        assert "关闭" not in out["note"], "给了预留就不该再报「已恢复基线」"
-    finally:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update(saved)
-
-
-def test_apply_blockswap_reserve_gb_unknown_vram_does_not_touch(monkeypatch):
-    """预留也一样：显存体量没探明 → 一次 `_set_*` 都不许调（读接口无副作用）。"""
-    calls = []
-    monkeypatch.setattr(perf, "_set_aimdo_headroom", lambda gb: calls.append(gb) or 7.0)
-    monkeypatch.setattr(perf, "probe_blockswap",
-                        lambda: {"path": "aimdo", "headroom_gb": 7.0})
-    saved = dict(perf._BS_BASELINE)
-    try:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update({"aimdo_gb": 7.0, "extra_gb": 0.6})
-        out = perf.apply_blockswap({"vram_reserve_gb": 1.0}, {})
-        assert calls == [], f"体量未知却写了预留：{calls}"
-        assert out["applied"] is False and "未探明" in out["note"]
-    finally:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update(saved)
-
-
-def test_apply_blockswap_legacy_reserve_gb(monkeypatch):
-    """legacy 路径（无 DynamicVRAM）同样支持「直接给 GB」。"""
-    seen = []
-    monkeypatch.setattr(perf, "_set_extra_reserved",
-                        lambda gb: (seen.append(gb), round(gb, 3))[1])
-    monkeypatch.setattr(perf, "probe_blockswap",
-                        lambda: {"path": "legacy", "headroom_gb": None})
-    saved = dict(perf._BS_BASELINE)
-    try:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update({"aimdo_gb": None, "extra_gb": 0.6})
-        out = perf.apply_blockswap({"vram_reserve_gb": 1.0}, {"vram_total_gb": 16.0})
-        assert out["applied"] is True and abs(seen[-1] - 1.6) < 1e-9
-        assert "预留" in out["note"]
-    finally:
-        perf._BS_BASELINE.clear()
-        perf._BS_BASELINE.update(saved)
-
-
-def test_apply_blockswap_keys_are_stable():
+def test_apply_reserve_keys_are_stable():
     """返回结构是接口（前端诊断区与 nodes 报告都按它读），键名不许漂。
 
-    `reserve_gb` 是 2026-09-27 随「显存预留（直接填 GB）」加的：它与 `blocks` 并列，
-    表示**这次实际按哪个口径算的**（`reserve_gb > 0` 时 `blocks` 归零）。
+    `blocks` 随块数旋钮一起删了；`on` 保留（= 这次是否真给了预留），
+    前端诊断区按它决定要不要把 note 印出来。
     """
     saved = dict(perf._BS_BASELINE)
     try:
         perf._BS_BASELINE.clear()
-        out = perf.apply_blockswap({}, None)
-        assert set(out) == {"on", "path", "blocks", "reserve_gb", "extra_gb",
+        out = perf.apply_vram_reserve({}, None)
+        assert set(out) == {"on", "path", "reserve_gb", "extra_gb",
                             "clamped", "headroom_gb", "applied", "note"}
     finally:
         perf._BS_BASELINE.clear()

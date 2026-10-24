@@ -1299,9 +1299,9 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 io.Float.Input("每段时长", default=8.0, min=0.5, max=15.0, step=0.1,
                                tooltip="每段可见时长（秒）@24fps，内部自动吸附 H3 的 17k+5 帧网格："
                                        "8.0s→192帧、5.0s→124帧。全链默认值，导演台每段可单独覆盖"),
-                io.Combo.Input("引导帧数", options=["关闭", "1", "5", "22", "39", "56"], default="22",
+                io.Combo.Input("引导帧数", options=["关闭", "5", "22", "39", "56"], default="22",
                                tooltip="段间引导重叠桥：钉入下段头部的上段尾帧数。越大衔接越顺、越慢越吃显存。"
-                                       "1=单帧锚（官方同款，只钉上段末尾稳住身份，衔接弱但几乎不烧显存）；"
+                                       "5=最短桥（H3 最小锚定粒度是 2 个 token = 5 帧，再小无法表达）；"
                                        "关闭=段间不自动引用上段（硬切，各段独立采样），"
                                        "响度对齐仍生效；各段锚定里的显式段首锚不受影响"),
                 io.Int.Input("种子", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
@@ -2231,7 +2231,16 @@ class H3SeamlessChainSampler(io.ComfyNode):
                     return 0, False, False
                 if ctx <= 0:   # 引导帧数=关闭：不自动引用上段（显式头锚已在上方优先）
                     return 0, False, False
-                return grid.snap_window_down(ctx), True, True
+                # 旧存档的「引导帧数=1」抬到 5（2026-10-24）：UI 已去掉「1」档，
+                # 但老存档/manifest 里可能还存着它。snap_window_down(1) 返回 1，
+                # 而 H3 最小锚定粒度是 2 个 token = 5 帧（video_latent_t(1)=2、
+                # latent_t_to_frames(2)=5）。裁 1 帧却钉 5 帧 → 剩下 4 帧上段锚定
+                # 画面被当成本段内容导出（接缝回声约 0.17s）。抬到 5 让 skip_f
+                # 与锚定区帧数一致，语义等价于「5」。
+                _w = grid.snap_window_down(ctx)
+                if 0 < _w < grid.MIN_WINDOW_FRAMES:
+                    _w = grid.MIN_WINDOW_FRAMES
+                return _w, True, True
             _av = _a["branches"]["av"]
             return _a["window"], _av in ("both", "video"), _av in ("both", "audio")
         def _takes_bridge(pi):
@@ -4224,8 +4233,26 @@ class H3SeamlessChainSampler(io.ComfyNode):
             # 落在本段输出末尾之后——ctx=56 时每个接缝跳过 15 帧（0.6s）内容。
             # 门控回退时向下对齐（不回吐坏帧），否则向上（不丢内容，每段至多多留几帧）
             end_t = frames_to_latent_t(skip_f + vis_len, up=(seg_lengths[i] - vis_len) == 0)
+            # 桥锚相位吸附（2026-10-24）：把 end_t 拉到 ≡2 (mod 5)，等价于让
+            # 「skip_f + vis_len」落回 17k+5 网格。
+            # 为什么必须：锚定区 token 数恒 ≡2 (mod 5)（video_latent_t(17k+5)=5k+2），
+            # 正文若也取 17k+5，其 token 数同样 ≡2，两者相加 ≡4 —— 于是从末端往回数
+            # vt 个 token 的起点落在周期中间（相位 2），抽来的帧数序列
+            # （如 4,4,4,1,4,4,4 = 25 帧）与本段 token 0..vt-1（恒为 1,4,4,4,4,1,4
+            # = 22 帧）**逐个错位**：上一段"装 4 帧的 token"被塞进本段"装 1 帧的位置"，
+            # 潜表示语义错位、接缝节奏约快 13.6%。实测默认配置（ctx=22/段长124）
+            # 恒为相位 2、覆盖 25 帧，15 档实际段长无一例外。
+            # 向下吸附（不向上）：与门控回退同向，宁可少留几帧也不回吐尾部；
+            # 且 17k+5 减到最近的 17m+5 恰好使 vis_len 落 17n（22+119=141=17×8+5）。
+            # 保护：吸附后剩余不足 5 帧就不吸（极端短段/深度回退），保持原行为。
+            _ph = grid.align_phase_down(end_t)
+            if _ph != end_t and latent_t_to_frames(_ph) - skip_f >= 5:
+                end_t = _ph
             vis_len = latent_t_to_frames(end_t) - skip_f
             frames = frames[skip_f:skip_f + vis_len]
+            if skip_f > 0:
+                lines.append(f"段{gi + 1} 桥锚：裁头 {skip_f} 帧 · 导出 {vis_len} 帧 · "
+                             f"末端 token {end_t}（≡{end_t % 5} mod 5）")
             wav_total = wav.shape[-1]
             skip_s = round(wav_total * skip_f / sampled_fc)
             take_s = round(wav_total * vis_len / sampled_fc)

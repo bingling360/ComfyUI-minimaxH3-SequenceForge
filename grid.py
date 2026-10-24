@@ -54,6 +54,31 @@ def frames_to_latent_t(frames, up=True):
     return t
 
 
+def align_phase_down(token_t):
+    """token 末端向下吸附到 ≡2 (mod 5)。
+
+    桥锚抽取的硬前提：从 end_t 往回数 vt 个 token，起点必须落在周期边界
+    （序号 % 5 == 0）。因为本段 token 0 恒为 1 帧（FRAME_PER_TOKEN[0]），
+    抽来的第一个 token 也必须是 1 帧的，否则「装 4 帧的潜表示」会被塞进
+    「装 1 帧的位置」，逐个 token 语义错位。
+
+    起点 ≡ end_t - vt，而 vt = video_latent_t(17k+5) = 5k+2 ≡ 2，
+    故 end_t ≡ 2 (mod 5) 时起点 ≡ 0。等价说法：latent_t_to_frames(end_t)
+    落回 17k+5 网格（锚定区与正文各为 17k+5 时，两者相加 ≡4 会错位）。
+
+    只向下吸附：与门控回退同向（宁可少留几帧，不回吐尾部）。
+    """
+    t = int(token_t)
+    if t <= 0:
+        return t
+    return t - ((t - 2) % 5)
+
+
+def anchor_start_token(end_t, vt):
+    """桥锚窗口的起点 token 下标（供报告/测试断言相位用）。"""
+    return int(end_t) - int(vt)
+
+
 def audio_tokens_for_frames(frames):
     """像素帧数 -> 音频 latent token 数（1 视频帧 = FRAME_RESCALE 个音频 latent 帧）。"""
     return round(frames * FRAME_RESCALE)

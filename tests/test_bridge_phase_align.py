@@ -110,3 +110,34 @@ def test_ctx1_head_and_anchor_agree():
     assert r["skip_f"] == 5
     assert sum(r["dst"]) == 5
     assert r["src"] == r["dst"]
+
+
+@pytest.mark.parametrize("seg", REAL_LENS)
+def test_no_anchor_keeps_vis_len(seg):
+    """无锚点（skip_f=0）时不需要吸附。
+
+    段长本身已落 17k+5 → `frames_to_latent_t` 直接给出 ≡2 的 token 数，
+    `align_phase_down` 应当是恒等变换，导出帧数一分不少。
+
+    这条是「有锚点才需要 17n」的对照面：锚定区把 token 数从 5k+2 推到 5k+4，
+    才需要正文补成 17n；没有锚定区时正文自己就是 17k+5。
+    """
+    end_t = grid.frames_to_latent_t(seg, up=True)
+    assert end_t % 5 == 2, f"无锚点时 end_t 应自动 ≡2: {seg}->{end_t}"
+    assert grid.align_phase_down(end_t) == end_t, f"无锚点不该触发吸附: {seg}"
+    assert grid.latent_t_to_frames(end_t) == seg, f"无锚点时导出帧数应精确等于段长: {seg}"
+
+
+def test_no_anchor_short_seg():
+    """最小段长（5 帧）无锚点也安全。"""
+    end_t = grid.frames_to_latent_t(5, up=True)
+    assert end_t == 2 and end_t % 5 == 2
+    assert grid.align_phase_down(end_t) == end_t
+
+
+def test_anchor_requires_body_be_17_multiple():
+    """有锚点时，导出帧数必须落 17n（不是 17k+5）——这是「有锚点才是 17n」的断言。"""
+    for ctx in (5, 22, 39, 56):
+        for seg in (124, 141, 158):
+            r = _simulate(ctx, seg)
+            assert r["vis_len"] % 17 == 0, f"ctx={ctx} seg={seg} -> {r['vis_len']}"

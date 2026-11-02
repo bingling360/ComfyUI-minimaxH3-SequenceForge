@@ -1313,7 +1313,7 @@ function buildRefBar(RB) {
                 c.append(txt);
                 c.dataset.thumbSig = thumbSig(a);        // 记签名：换类别/换文件时好重建
             };
-            const paintChip = (rec, n, token) => {
+            const paintChip = (rec, n, token, taken) => {
                 const { c, a, roles } = rec;
                 c.classList.toggle("on", n > 0);
                 /* 标识签名变了（库里换类别/换文件）→ 重建标识；签名没变则一次都不碰
@@ -1335,38 +1335,51 @@ function buildRefBar(RB) {
                 if (rec.sel) {
                     const kd = KIND_LIST.includes(a.kind) ? a.kind : "image";
                     const cap = KIND_CAPS[kd] || 9;
-                    let proj = {}, own = {}, skip = new Set();
+                    let proj = {}, own = {};
                     try {
                         const dsNow = getDs(node);
                         proj = cleanRefDefs(dsNow.ref_defs);
                         const sg = (dsNow.segments || [])[segIdx] || {};
                         own = cleanRefDefs(sg.ref_defs);
-                        skip = refSkipOf(dsNow, segIdx);
                     } catch (e) { /* 只读模式：保持空 */ }
-                    const sig = `${kd}:${cap}:${proj[key] ? 1 : 0}`;
+                    /* 本段每个号当前归谁（taken[kd][号] = 素材名）——
+                     * **一个号只能归一个素材**：已被别人占的号在下拉里标灰不可选，
+                     * 否则两张图能同时显示 P1（实跑却是一个 P1、一个 P4）。 */
+                    const occ = (taken && taken[kd]) || {};
+                    const sig = `${kd}:${cap}:${proj[key] ? 1 : 0}:`
+                        + Object.entries(occ).map(([no, who]) => `${no}=${who}`).join(".");
                     if (rec.sel.dataset.sig !== sig) {
                         const prefix = { image: "P", video: "V", audio: "A" }[kd] || "P";
-                        /* 只有两态：**不用** / **P1…P9**。
-                         * 以前第一项叫「自动」，用户第一反应是"自动是什么鬼" ——
-                         * 素材要么挂上（有号）、要么不挂（不用），没有第三种状态。
-                         * 选号 = 引用 + 固定该号；选「不用」= 取消本段引用。 */
-                        const opts = [["不用", ""]];
-                        for (let i = 1; i <= cap; i++) opts.push([`${prefix}${i}`, String(i)]);
-                        rec.sel.replaceChildren(...opts.map(([t, v]) => new Option(t, v)));
+                        /* 只有两态：**不用** / **P1…P9**。没有「自动」这个中间态：
+                         * 素材要么挂上（有号）、要么不挂（不用）。 */
+                        const rows = [["不用", "", false]];
+                        for (let i = 1; i <= cap; i++) {
+                            const owner = occ[i];
+                            rows.push([`${prefix}${i}`, String(i), !!owner && owner !== key]);
+                        }
+                        rec.sel.replaceChildren(...rows.map(([t, v, dis]) => {
+                            const o = new Option(dis ? `${t} · 已占用` : t, v);
+                            if (dis) o.disabled = true;
+                            return o;
+                        }));
                         rec.sel.dataset.sig = sig;
                     }
-                    /* 值 = 本段当前生效的号（段级定义 > 项目定义 > 按顺序排到的号）；
-                     * 没引用就是「不用」。 */
+                    /* ★ 值显示**实跑号**，不是定义值：定义 P1 但本段 P1 已被别的素材
+                     * 占住时，它实跑是 P4 —— 显示定义值就会出现"两个 P1"的错觉。
+                     * 原始定义放在 title 里。 */
                     const effM = /^<\w+\s+(\d+)>$/.exec(String(token || ""));
                     const effN = effM ? Number(effM[1]) : 0;
-                    rec.sel.value = n > 0 ? String(own[key] || proj[key] || effN || 1) : "";
+                    rec.sel.value = n > 0 ? String(effN || own[key] || proj[key] || 1) : "";
                     /* 点亮 = 这个号是人定的（段级或项目定义），不是按顺序排出来的 */
                     rec.sel.classList.toggle("def", n > 0 && !!(own[key] || proj[key]));
-                    const src = own[key] ? "本段定义" : (proj[key] ? "项目定义" : "自动编号");
-                    rec.sel.title = `「${key}」的官方编号（${src}）`
-                        + (token ? ` · 实跑 ${token}` : "") + "\n"
-                        + "选 P1 = 引用它并固定成 <Picture 1>：正文里不写 @ 也生效。\n"
-                        + "选「自动」= 按出现顺序排；还没引用的素材，选号后会自动引用。";
+                    const src = own[key] ? `本段定义 P${own[key]}`
+                        : (proj[key] ? `项目定义 P${proj[key]}` : "按顺序排");
+                    rec.sel.title = `「${key}」：${src}`
+                        + (effN ? ` · 实跑 <${kd === "image" ? "Picture" : (kd === "video" ? "Video" : "Audio")} ${effN}>` : "")
+                        + (own[key] && effN && effN !== Number(own[key])
+                            ? "\n（原本定的号被本段别的素材占了，已顺延 —— 想改回来先把那个素材换号）" : "")
+                        + "\n选 P1 = 引用它并固定成 <Picture 1>：正文里不写 @ 也生效。\n"
+                        + "已被别的素材占用的号会标灰；选「不用」= 取消本段引用。";
                 }
                 c.title = `${KIND_NAME[a.kind] || ""}「${lbl}」${roles}：`
                     + (n > 0
@@ -1432,6 +1445,10 @@ function buildRefBar(RB) {
                 const cnt = { image: 0, video: 0, audio: 0 };   // 素材个数（卡官方 9/3/3 上限）
                 const ord = { image: 0, video: 0, audio: 0 };   // 官方 token 序号
                 const tokens = {};
+                /* 号 -> 素材：**同一个号在一段里只能归一个素材**。chip 下拉要用它把
+                 * 已被占用的号标灰，否则用户能把两张图都设成 P1（界面上两个 P1，
+                 * 实跑却是一个 P1 一个 P4 —— 就是用户报的那个"奇怪情况"）。 */
+                const taken = { image: {}, video: {}, audio: {} };
                 const uniq = [...new Set(refs)];                // 编号按素材，不看重复
                 const hitOf = (l) => live.find((x) => refKeyOf(x) === l)
                     || pool.find((x) => refKeyOf(x) === l);
@@ -1457,10 +1474,11 @@ function buildRefBar(RB) {
                     cnt[k] += 1;
                     ord[k] = (ord[k] || 0) + 1;
                     tokens[l] = String(TOK_FMT[k] || TOK_FMT.image).replace("{}", ord[k]);
+                    if (taken[k]) taken[k][ord[k]] = l;
                 }
                 for (const rec of chips) {
                     const n = refs.filter((x) => x === refKeyOf(rec.a)).length;
-                    paintChip(rec, n, tokens[refKeyOf(rec.a)]);
+                    paintChip(rec, n, tokens[refKeyOf(rec.a)], taken);
                     /* ✕ 常驻显示（未引用时置灰）：以前"有引用才出现"，
                      * 用户想取消时找不到 —— 就是"点不了了"的来源。 */
                     rec.minus.classList.toggle("off", n <= 0);
@@ -1741,6 +1759,9 @@ function openProjRefDefsDialog(node, onChange) {
          * 用户要的是"把这张图定义成 Picture 5"这种指定能力的编号空间，
          * 池里只有 4 张图不代表不能定义第 5 个号（真挂了超限后端会报 E_MEDIA_LIMIT）。 */
         const capOf = (kd) => (KIND_CAPS[kd] || 9);
+        /* 号 -> 素材：项目定义内部也**不许两个素材抢同一个号**（同段实跑会打架） */
+        const takenProj = {};
+        for (const [k, v] of Object.entries(proj)) takenProj[v] = k;
         const head = el("div", "h3d-defrow h3d-defhead");
         head.append(el("span", "h3d-defthumb"), el("span", "h3d-defname", "素材"),
             el("span", "h3d-defkind", "类型"), el("span", "h3d-defcol", "全项目编号"));
@@ -1765,7 +1786,13 @@ function openProjRefDefsDialog(node, onChange) {
             const sel = document.createElement("select");
             sel.className = "h3d-defsel";
             sel.append(new Option("不定义", ""));
-            for (let i = 1; i <= cap; i++) sel.append(new Option(`${prefix}${i}`, String(i)));
+            for (let i = 1; i <= cap; i++) {
+                const owner = takenProj[i];
+                const busy = owner && owner !== key;
+                const o = new Option(busy ? `${prefix}${i} · 已占用` : `${prefix}${i}`, String(i));
+                if (busy) o.disabled = true;
+                sel.append(o);
+            }
             sel.value = proj[key] ? String(proj[key]) : "";
             sel.onchange = () => {
                 const v = String(sel.value || "");

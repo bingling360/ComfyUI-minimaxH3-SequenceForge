@@ -279,6 +279,12 @@ ok(!!node, "findNode() 拿不到节点");
     ok(!(st3.segments[0].ref_skip || []).includes("猫.png"),
         "设号后应撤销「本段排除」：" + JSON.stringify(st3.segments[0].ref_skip));
     ok((st3.segments[0].refs || []).includes("猫.png"), "设号后应重新引用");
+
+    /* 一个号只能归一个素材：已占用的号必须在选项里禁用；
+     * 下拉显示的必须是**实跑号**（否则"定义 P1 但被占"会显示成两个 P1）。 */
+    ok(/if \(dis\) o\.disabled = true;/.test(src), "已被占用的编号必须禁用（同段不能重复）");
+    ok(/rec\.sel\.value = n > 0 \? String\(effN \|\| own\[key\] \|\| proj\[key\] \|\| 1\) : ""/.test(src),
+        "编号下拉必须显示实跑号（不是定义值），否则会出现两个 P1");
 }
 
 const real = (errors || []).filter((e) => !/Not implemented|jsdom/i.test(String(e)));

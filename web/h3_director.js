@@ -1283,15 +1283,40 @@ function buildRefBar(RB) {
             refbar.append(el("label", "", RB.title || "引用素材"));
             const counter = el("span", "h3d-secs-hint", "");
             refbar.append(counter);        // 计数先入位：chips 一律插在它前面（syncChips 用）
-            /* 素材定义入口（2026-11-02）：就近挂在引用条上 —— 定义与引用是同一件事的
-             * 两面（定义 = 强制引用 + 指定编号），分开放反而要在两处来回看。
-             * chips 都 insertBefore(counter)，所以这颗按钮永远在条尾，不挤占素材位。 */
-            const bDefs = el("button", "h3d-btn h3d-chipdef", "⌗ 定义");
+            /* 「应用到所有段」（2026-11-02 v3）：项目定义**唯一**的用途就是省事的批量接口 ——
+             * 某张场景图每段都要用，在这一段把号调好，一键铺到全项目（含以后新增的段），
+             * 不用逐段再设一遍。它不是第二套编号体系，只是把本段这套抄给所有段。
+             * 左键 = 用本段这份定义合并进项目定义；右键 = 清空项目定义。 */
+            const bDefs = el("button", "h3d-btn h3d-chipdef", "📌 应用到所有段");
             bDefs.type = "button";
-            bDefs.title = "给素材指定官方编号（Picture 1 / Video 2 …）：定义过的素材"
-                + "正文里不写 @ 也会挂上。段级优先于项目级。";
+            bDefs.title = "把本段设好的编号铺到所有段落（含以后新增的）\n"
+                + "场景图这种每段都要用的素材，设一次就够了。\n右键 = 清空全项目定义。";
             bDefs.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
-            bDefs.onclick = () => openRefDefsDialog(node, segIdx, () => scheduleRefresh(120));
+            bDefs.onclick = () => {
+                let own = {};
+                try {
+                    const ds = getDs(node);
+                    own = cleanRefDefs(((ds.segments || [])[segIdx] || {}).ref_defs);
+                } catch (e) { own = {}; }
+                if (!Object.keys(own).length) {
+                    setLed("idle", "本段还没有编号 —— 先在素材右侧的下拉里选 P1 / P2…");
+                    return;
+                }
+                applyProjRefDefs(node, own);
+                setLed("done", `已铺到所有段：${Object.entries(own)
+                    .map(([k, v]) => `${k} → P${v}`).join("、")}`);
+                RB.repaint();
+                scheduleRefresh(120);
+            };
+            bDefs.oncontextmenu = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!confirm("清空全项目定义？（各段自己设的编号不受影响）")) return;
+                clearProjRefDefs(node);
+                setLed("done", "已清空全项目定义");
+                RB.repaint();
+                scheduleRefresh(120);
+            };
             refbar.append(bDefs);
             /* 素材池取**活**的节点状态（上传/改名/删除素材后 chips 与别名表立即跟上），
              * 建卡快照 pool 只作回落 —— 快照会一直停在建卡那一刻。 */
@@ -1329,25 +1354,39 @@ function buildRefBar(RB) {
                     || c.appendChild(Object.assign(document.createElement("span"),
                         { className: "h3d-chipbtn-text" }));
                 txt.textContent = `${lbl}${roles}`;
-                /* 编号徽标（2026-11-02）：P2 / V1 / A1。编号按本段动态算，素材定义
-                 * 会改它 —— 把它显示在 chip 上，"我定义的 Picture 1 到底落成几号"
-                 * 不用再靠映射条去对。定义过的加 .def（实心）：号是人定的，不是排出来的。 */
-                let noEl = c.querySelector(":scope > .h3d-chipno");
-                if (!noEl) {
-                    noEl = document.createElement("span");
-                    noEl.className = "h3d-chipno";
-                    c.append(noEl);
+                /* 编号下拉（2026-11-02 v3）：**定义就在引用条上，不再另开一套面板**。
+                 * 值 = 本段生效的号（段级优先，其次项目级）；选号即"引用 + 固定编号"，
+                 * 所以 chip 当场变绿、编号当场出现 —— 用户看到的只有一套系统。
+                 * 选项只在签名变化时重建：下拉正开着重建会被关掉。 */
+                if (rec.sel) {
+                    const kd = KIND_LIST.includes(a.kind) ? a.kind : "image";
+                    const cap = KIND_CAPS[kd] || 9;
+                    let proj = {}, own = {}, skip = new Set();
+                    try {
+                        const dsNow = getDs(node);
+                        proj = cleanRefDefs(dsNow.ref_defs);
+                        const sg = (dsNow.segments || [])[segIdx] || {};
+                        own = cleanRefDefs(sg.ref_defs);
+                        skip = refSkipOf(dsNow, segIdx);
+                    } catch (e) { /* 只读模式：保持空 */ }
+                    const sig = `${kd}:${cap}:${proj[key] ? 1 : 0}`;
+                    if (rec.sel.dataset.sig !== sig) {
+                        const prefix = { image: "P", video: "V", audio: "A" }[kd] || "P";
+                        const opts = [["自动", ""]];
+                        for (let i = 1; i <= cap; i++) opts.push([`${prefix}${i}`, String(i)]);
+                        if (proj[key]) opts.push(["本段不用", "skip"]);
+                        rec.sel.replaceChildren(...opts.map(([t, v]) => new Option(t, v)));
+                        rec.sel.dataset.sig = sig;
+                    }
+                    rec.sel.value = skip.has(key) ? "skip" : String(own[key] || proj[key] || "");
+                    /* 选了号（本段或项目）就点亮，一眼分出"人定的"和"排出来的" */
+                    rec.sel.classList.toggle("def", !skip.has(key) && !!(own[key] || proj[key]));
+                    const src = own[key] ? "本段定义" : (proj[key] ? "项目定义" : "自动编号");
+                    rec.sel.title = `「${key}」的官方编号（${src}）`
+                        + (token ? ` · 实跑 ${token}` : "") + "\n"
+                        + "选 P1 = 引用它并固定成 <Picture 1>：正文里不写 @ 也生效。\n"
+                        + "选「自动」= 按出现顺序排；还没引用的素材，选号后会自动引用。";
                 }
-                const tokM = /^<(\w+)\s+(\d+)>$/.exec(String(token || ""));
-                const noTxt = tokM ? `${tokM[1][0].toUpperCase()}${tokM[2]}` : "";
-                noEl.textContent = noTxt;
-                noEl.style.display = noTxt ? "" : "none";
-                let defN;
-                try { defN = refDefsOf(getDs(node), segIdx)[key]; } catch (e) { defN = undefined; }
-                noEl.classList.toggle("def", !!defN);
-                noEl.title = defN
-                    ? `本段把「${key}」定义为第 ${defN} 个${KIND_NAME[a.kind] || "素材"}`
-                    : "";
                 c.title = `${KIND_NAME[a.kind] || ""}「${lbl}」${roles}：`
                     + (n > 0
                         ? `本段已引用${token ? `（正文里每个 @${key} 都会编译成 ${token}）` : ""}`
@@ -1366,10 +1405,11 @@ function buildRefBar(RB) {
                 const joined = arr.map((x) => refKeyOf(x)).join("\u0001");
                 if (joined === chipKeys) return;       // 池没变：chips DOM 原样留用
                 chipKeys = joined;
-                for (const rec of chips.splice(0)) { rec.c.remove(); rec.minus.remove(); }
+                for (const rec of chips.splice(0)) { rec.c.remove(); rec.sel.remove(); rec.minus.remove(); }
                 for (const a of arr) {
                     const rec = mkChip(a);
                     refbar.insertBefore(rec.c, counter);
+                    refbar.insertBefore(rec.sel, counter);
                     refbar.insertBefore(rec.minus, counter);
                     chips.push(rec);
                 }
@@ -1469,11 +1509,11 @@ function buildRefBar(RB) {
                 }
                 /* 整条转绿 = "本段挂了素材"的一眼判据（chip 一多，逐个找太慢） */
                 refbar.classList.toggle("on", nAsset > 0);
-                /* 定义徽标：没定义的段不显示数字（0 条时按钮就是「⌗ 定义」） */
+                /* 按钮亮 = 这个项目已经铺过定义（一眼看出"这套编号是全项目共享的"） */
                 try {
-                    const nDef = Object.keys(refDefsOf(getDs(node), segIdx)).length;
-                    bDefs.textContent = nDef ? `⌗ 定义 ${nDef}` : "⌗ 定义";
-                    bDefs.classList.toggle("on", nDef > 0);
+                    const nd = Object.keys(cleanRefDefs(getDs(node).ref_defs)).length;
+                    bDefs.textContent = nd ? `📌 全项目 ${nd}` : "📌 应用到所有段";
+                    bDefs.classList.toggle("on", nd > 0);
                 } catch (e) { /* 只读模式 */ }
                 paintRefMap(refs, tokens, live);
             };
@@ -1504,6 +1544,31 @@ function buildRefBar(RB) {
                 minus.type = "button";
                 minus.title = `取消本段对「${key}」的全部引用（正文里的绿框一起清掉；`
                     + `只想取消某一处，用正文里那个绿框自带的 ✕）`;
+                /* 编号下拉（2026-11-02 v3）：**定义就是引用条的一部分，不是第二套系统**。
+                 * 选 P1 = 引用「${key}」并固定成 <Picture 1>（正文不写 @ 也生效）；
+                 * 选「自动」= 不单独定义（跟随项目 / 按出现顺序）；
+                 * 选「本段不用」= 把这条项目定义在本段排除掉。
+                 * 未引用的素材也能选 —— 选了号就等于引用它（定义即引用，chip 当场变绿）。 */
+                const sel = document.createElement("select");
+                sel.className = "h3d-chipsel";
+                sel.dataset.ref = key;
+                sel.addEventListener("mousedown", (e) => e.stopPropagation());
+                sel.addEventListener("click", (e) => e.stopPropagation());
+                sel.onchange = () => {
+                    const v = String(sel.value || "");
+                    if (v === "skip") {
+                        setSegRefDef(node, segIdx, key, null);
+                        setSegRefSkip(node, segIdx, key, true);
+                    } else if (v === "") {
+                        setSegRefDef(node, segIdx, key, null);
+                        setSegRefSkip(node, segIdx, key, false);
+                    } else {
+                        setSegRefSkip(node, segIdx, key, false);
+                        setSegRefDef(node, segIdx, key, Number(v));
+                    }
+                    RB.repaint();
+                    scheduleRefresh(120);
+                };
                 c.addEventListener("mousedown", guard(() => {
                     if (RB.gate && !canAddRef(node, segIdx, key)) return;
                     if (!ed) return;                       // 没有可写正文（只读/无节点）
@@ -1526,6 +1591,19 @@ function buildRefBar(RB) {
                             + "要取消请到素材调度里移除");
                         return;
                     }
+                    /* 项目定义挂上的：✕ 在正文里清不掉（下次 sync 又会加回来），
+                     * 用户要的其实是「本段不用这条项目定义」→ 写进 ref_skip，
+                     * 其它段照旧（这就是"段级优先"在引用条上的入口）。 */
+                    let inProj = false;
+                    try { inProj = !!cleanRefDefs(getDs(node).ref_defs)[key]; } catch (e) { inProj = false; }
+                    if (inProj) {
+                        if (ed) { ed.removeTag(key); RB.commit(ed); }
+                        setSegRefSkip(node, segIdx, key, true);
+                        RB.repaint();
+                        scheduleRefresh(240);
+                        setLed("done", `本段已排除「${key}」（项目定义在其它段照旧生效）`);
+                        return;
+                    }
                     if (ed) {
                         ed.removeTag(key);              // 正文里所有该绿框一次清掉
                         RB.commit(ed);
@@ -1541,7 +1619,7 @@ function buildRefBar(RB) {
                     e.stopPropagation();
                     try { clearAll(); } catch (err) { console.error(err); }
                 });
-                return { c, minus, a, roles };
+                return { c, sel, minus, a, roles };
             };
             refbar.append(mapBox);
             paintAll();
@@ -1607,123 +1685,31 @@ function setProjRefDef(node, key, n) {
     setDs(node, ds);
 }
 
-/** 素材定义面板（引用条上的「⌗ 定义」）：一张表同时管本段与项目。
- *  为什么放一起：两边是同一个编号空间（段级覆盖项目级），分两个入口必然出现
- *  「我在项目里设了 1，这段怎么显示 3」的困惑 —— 同屏才能一眼看出覆盖关系。 */
-function openRefDefsDialog(node, segIdx, onChange) {
-    const overlay = el("div", "h3d-overlay");
-    const dialog = el("div", "h3d-dialog h3d-dialog-defs");
-    dialog.append(el("h3", "", `⌗ 素材定义 · 第 ${segIdx + 1} 段`));
-    dialog.append(el("p", "h3d-lead",
-        "定义 = <b>引用 + 固定编号</b>：定义过的素材会作为参考素材送进模型，"
-        + "并占住 <code>Picture 1</code> / <code>Video 2</code> 这类官方编号 —— "
-        + "<b>正文里一次 @ 都不写也生效</b>（后端会补最小引用声明），"
-        + "所以正文可以直接写 <code>&lt;Picture 1&gt;</code>，不必写素材名。"
-        + "「项目定义」对<b>所有段落</b>生效（含以后新增的）；「本段覆盖」只改这一段，"
-        + "可以换号，也可以排除掉某条项目定义。"
-        + "号是<b>参考素材内部</b>的序号 —— 首尾帧锚由后端固定排最前，不占这里的号。"));
-    const box = el("div", "h3d-defbox");
-    const row = el("div", "h3d-dialog-row");
-    const bClose = el("button", "h3d-btn h3d-btn-cta", "关闭");
-    row.append(bClose);
-    dialog.append(box, row);
-    overlay.append(dialog);
-    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
-    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
-    document.body.append(overlay);
-
-    const fire = () => { try { onChange && onChange(); } catch (e) { /* 面板已关 */ } };
-    const mkSel = (opts, val) => {
-        const s = document.createElement("select");
-        s.className = "h3d-defsel";
-        for (const [t, v] of opts) s.append(new Option(t, v));
-        s.value = val;
-        return s;
-    };
-    const paint = () => {
-        const ds = getDs(node);
-        const pool = ds.ref_assets || [];
-        const seg = (ds.segments || [])[segIdx] || {};
-        const proj = cleanRefDefs(ds.ref_defs);
-        const own = cleanRefDefs(seg.ref_defs);
-        const skip = refSkipOf(ds, segIdx);
-        const refsNow = Array.isArray(seg.refs) ? seg.refs : [];
-        box.replaceChildren();
-        if (!pool.length) {
-            box.append(el("div", "h3d-defempty", "项目里还没有素材 —— 先在素材库里调入或上传。"));
-            return;
-        }
-        /* 表头与数据行共用同一套 grid（列宽见 .h3d-defrow）：缩略图 / 名字 / 类型 /
-         * 项目定义 / 本段覆盖。**列全部池素材**——定义本身就会让素材被引用，
-         * 所以"本段还没引用"不该成为定义的门槛（以前的版本正是这么挡的）。 */
-        const head = el("div", "h3d-defrow h3d-defhead");
-        head.append(el("span", "h3d-defthumb"), el("span", "h3d-defname", "素材"),
-            el("span", "h3d-defkind", "类型"),
-            el("span", "h3d-defcol", "项目定义（全项目引用 + 编号）"),
-            el("span", "h3d-defcol", "本段覆盖"));
-        box.append(head);
-
-        const kindOfPool = (a) => (KIND_LIST.includes(a.kind) ? a.kind : "image");
-        const kindCount = (kd) => pool.filter((a) => kindOfPool(a) === kd).length;
-        const seen = new Set();
-        for (const a of pool) {
-            const key = refKeyOf(a);
-            if (!key || seen.has(key)) continue;
-            seen.add(key);
-            const kd = kindOfPool(a);
-            const maxN = Math.max(1, kindCount(kd));
-            const r = el("div", "h3d-defrow");
-            /* 缩略图：与引用条同一个 buildAssetThumb（图片=缩略图、视频=首帧、
-             * 音频=音符图标）—— 一张表里全是文件名的话，"Picture 1 是哪张"根本认不出。 */
-            const th = el("span", "h3d-defthumb");
-            try { th.append(buildAssetThumb(getDirValue(node), a)); } catch (e) { /* 无图留空 */ }
-            r.append(th);
-            const nm = el("span", "h3d-defname");
-            nm.textContent = key;
-            nm.title = key;
-            r.append(nm, el("span", "h3d-defkind", KIND_NAME[kd] || ""));
-
-            /* 项目定义：不定义 / 1..N。选几号 = **全项目引用它并固定这个号**。 */
-            const pOpts = [["不定义", ""]];
-            for (let i = 1; i <= maxN; i++) pOpts.push([String(i), String(i)]);
-            const selP = mkSel(pOpts, proj[key] ? String(proj[key]) : "");
-            selP.className = "h3d-defsel h3d-defsel-p";
-            selP.title = `全项目默认：引用「${key}」并固定成第 ${proj[key] || "?"} 个${KIND_NAME[kd] || ""}`;
-            selP.onchange = () => {
-                const v = String(selP.value || "");
-                setProjRefDef(node, key, v === "" ? null : Number(v));
-                paint(); fire();
-            };
-            r.append(selP);
-
-            /* 本段覆盖：自动跟随 / 本段排除 / 1..N（段级定义同样 = 引用 + 编号） */
-            const sOpts = [["自动跟随", ""]];
-            if (proj[key]) sOpts.push(["本段排除", "skip"]);
-            for (let i = 1; i <= maxN; i++) sOpts.push([String(i), String(i)]);
-            const selS = mkSel(sOpts, skip.has(key) ? "skip" : (own[key] ? String(own[key]) : ""));
-            selS.className = "h3d-defsel h3d-defsel-s";
-            selS.title = `本段：引用「${key}」并固定编号（覆盖项目定义）`;
-            selS.onchange = () => {
-                const v = String(selS.value || "");
-                if (v === "skip") { setSegRefDef(node, segIdx, key, null); setSegRefSkip(node, segIdx, key, true); }
-                else if (v === "") { setSegRefDef(node, segIdx, key, null); setSegRefSkip(node, segIdx, key, false); }
-                else { setSegRefSkip(node, segIdx, key, false); setSegRefDef(node, segIdx, key, Number(v)); }
-                paint(); fire();
-            };
-            r.append(selS);
-            /* 灰一点 = 本段不会挂它（既没定义、正文里也没有）。定义了立刻变正常色 ——
-             * 这就是"定义即引用"在列表里的可见反馈。 */
-            const live = refsNow.includes(key) || (proj[key] && !skip.has(key)) || own[key];
-            r.classList.toggle("off", !live);
-            box.append(r);
-        }
-        box.append(el("div", "h3d-defnote",
-            `本段当前会挂 ${new Set(refsNow.filter(Boolean)).size} 个素材 · `
-            + "号超过本段该类型素材数时会自动回落（不会产生悬空的 &lt;Picture N&gt;）"));
-    };
-    bClose.onclick = () => { fire(); overlay.remove(); };
-    paint();
+/** 批量铺项目定义（引用条上的「📌 应用到所有段」）：一次合并 + 一次全链重算。
+ *  项目定义的全部意义就是**省事的批量接口** —— 某张场景图每段都要用，
+ *  在第一段调好号以后一键铺开，不必逐段再设一遍（不是第二套编号体系）。 */
+function applyProjRefDefs(node, defs) {
+    const ds = getDs(node);
+    const merged = { ...cleanRefDefs(ds.ref_defs), ...cleanRefDefs(defs) };
+    if (Object.keys(merged).length) ds.ref_defs = merged; else delete ds.ref_defs;
+    const cnt = (ds.prompts || []).length;
+    for (let i = 0; i < cnt; i++) syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
+    setDs(node, ds);
 }
+
+/** 清空项目定义（右键「📌 应用到所有段」）：各段残留的「本段不用」一并清掉，
+ *  否则下次再铺同名定义时，旧段会莫名其妙地排除它。 */
+function clearProjRefDefs(node) {
+    const ds = getDs(node);
+    delete ds.ref_defs;
+    for (const sg of (ds.segments || [])) {
+        if (sg && Array.isArray(sg.ref_skip)) delete sg.ref_skip;
+    }
+    const cnt = (ds.prompts || []).length;
+    for (let i = 0; i < cnt; i++) syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
+    setDs(node, ds);
+}
+
 /** 正文 → 本段引用集合（正文是唯一真相）：按首次出现顺序，允许重复计数。
  *  与后端 compile_refs / _find_refs 同口径（`@标签`，负向后顾防 a@b.com）。 */
 function refsFromText(text, pool) {
@@ -9250,37 +9236,23 @@ function injectStyles() {
     .h3d-refchip.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
     .h3d-refchip .h3d-thumb{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
     .h3d-refchip.on .h3d-thumb{outline-color:#2f6e57}
-    /* ---- 素材定义（2026-11-02）：chip 编号徽标 + 定义面板 ---- */
-    .h3d-chipno{flex:none;margin-left:2px;padding:0 4px;border-radius:4px;background:#10161a;border:1px solid #3a352c;color:#7fa8c8;font:10.5px/1.6 ui-monospace,Consolas,monospace}
-    .h3d-chipno.def{background:#12291f;border-color:#2f6e57;color:#7fe0b0}
+    /* ---- 素材定义（2026-11-02 v3）：编号下拉 + 「应用到所有段」 ----
+     * 定义就是引用的一部分：编号下拉直接长在 chip 旁边，选号 = 引用 + 固定号。
+     * 不再有独立面板（那会变成两套系统，用户得在两个地方对同一件事）。 */
+    .h3d-chipsel{flex:none;height:23px;border:1px solid #3a352c;border-radius:5px;background:#10161a;color:#a8c8e0;font:11px/1.4 ui-monospace,Consolas,monospace;padding:0 2px;outline:none;cursor:pointer}
+    .h3d-chipsel:hover{border-color:#46604f}
+    .h3d-chipsel:focus{border-color:#a8d8bd}
+    /* 点亮 = 这个号是人定的（不是按顺序排出来的） */
+    .h3d-chipsel.def{background:#12291f;border-color:#2f6e57;color:#7fe0b0}
     .h3d-chipdef{flex:none;margin-left:auto;padding:3px 9px;font-size:11.5px}
     .h3d-chipdef.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
-    .h3d-defbox{max-height:min(74vh,760px);overflow:auto;display:flex;flex-direction:column;gap:2px;margin:6px 0 2px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;padding:8px 10px}
-    /* 一张表管两级（项目引用+编号 / 本段覆盖）。宽一点、行高一点，带缩略图 ——
-     * 全是文件名的一张表，根本认不出「Picture 1 是哪张」。 */
-    .h3d-dialog-defs{width:min(1000px,calc(100vw - 28px))}
-    .h3d-defrow{display:grid;grid-template-columns:38px minmax(120px,1fr) 54px 172px 140px;gap:9px;align-items:center;padding:4px 3px;border-radius:6px;font-size:12px}
-    .h3d-defrow:hover{background:#26231d}
-    .h3d-defrow.off{opacity:.5}
-    .h3d-defhead{color:var(--h3d-muted);font-size:11px;border-bottom:1px solid #3a352c;padding-bottom:6px;margin-bottom:3px}
-    .h3d-defhead:hover{background:none}
-    .h3d-defthumb{width:38px;height:38px;display:flex;align-items:center;justify-content:center;flex:none}
-    .h3d-defthumb img{width:38px;height:38px;border-radius:7px;object-fit:cover;background:#0d0c0a;outline:1px solid #3a352c;outline-offset:-1px}
-    .h3d-defthumb .h3d-kindmark{font-size:16px}
-    .h3d-defname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--h3d-bone)}
-    .h3d-defkind{color:var(--h3d-muted);font-size:11px}
-    .h3d-defcol{color:var(--h3d-muted);font-size:11px;line-height:1.35}
-    .h3d-defsel{width:100%;border:1px solid #3a352c;border-radius:5px;background:#10161a;color:var(--h3d-bone);padding:3px 4px;font-size:11.5px;outline:none}
-    .h3d-defsel:focus{border-color:#a8d8bd}
-    .h3d-defnote{margin-top:7px;padding-top:6px;border-top:1px dashed #3a352c;color:var(--h3d-muted);font-size:11px;line-height:1.5}
-    .h3d-defempty{color:var(--h3d-muted);font-size:11.5px;padding:4px 0}
-    .h3d-chipbtn{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 3px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit;max-width:240px}
+    .h3d-chipbtn{display:inline-flex;align-items:center;gap:6px;padding:3px 11px 3px 4px;border:1px solid #3a352c;border-radius:12px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11.5px;font-family:inherit;max-width:270px}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
-    /* chip 首位的标识：缩略图 18x18 圆角块（图 / 视频首帧），音频是音符图标。 */
-    .h3d-chipbtn>.h3d-thumb{width:18px;height:18px;border-radius:7px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
+    /* chip 首位的标识：缩略图 22x22 圆角块（图 / 视频首帧），音频是音符图标。 */
+    .h3d-chipbtn>.h3d-thumb{width:22px;height:22px;border-radius:8px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
     .h3d-chipbtn.on>.h3d-thumb{outline-color:#2f6e57}
-    .h3d-chipbtn>.h3d-kindmark{font-size:14px;line-height:1;flex:none;padding:0 1px}
+    .h3d-chipbtn>.h3d-kindmark{font-size:15px;line-height:1;flex:none;padding:0 1px}
     .h3d-chipbtn-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
     .h3d-chipminus{padding:2px 6px;margin-left:-3px;border:1px solid #3a352c;border-radius:9px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;line-height:1;font-family:inherit}
     .h3d-chipminus:hover{border-color:#9a4144;color:#f0a0a4}

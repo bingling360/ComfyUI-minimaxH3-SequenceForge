@@ -187,41 +187,31 @@ ok(!!node, "findNode() 拿不到节点");
     ok((st2.segments[0].ref_skip || []).includes("狗.png"), "段级「不用」没落库");
 }
 
-/* ---------- 14. 定义面板：列全部池素材（未引用也能定义 = 定义即引用） ---------- */
+/* ---------- 14. 定义入口长在引用条上（不再另开面板） ---------- */
 {
-    const ds = mkDs();          // 两段都还没有任何引用
-    const n4 = harness.mkNode(ds);
-    w.app.graph._nodes = [n4];
-    w.openRefDefsDialog(n4, 0, () => {});
-    const box = w.document.querySelector(".h3d-defbox");
-    ok(!!box, "素材定义面板没打开（缺 .h3d-defbox）");
-    const rows = box ? [...box.querySelectorAll(".h3d-defrow:not(.h3d-defhead)")] : [];
-    ok(rows.length === POOL.length,
-        `面板应列出全部 ${POOL.length} 个池素材（本段未引用也要能定义），实际 ${rows.length} 行`);
-    ok(rows.every((r) => r.querySelector(".h3d-defthumb")), "每行都该有缩略图位");
-    const sels = box ? [...box.querySelectorAll(".h3d-defsel-s")] : [];
-    ok(sels.length === POOL.length, `每行都该有「本段」选择器，实际 ${sels.length}`);
+    const fs = require("fs");
+    const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");
+    ok(/h3d-chipsel/.test(src), "引用条 chip 旁应有编号下拉（.h3d-chipsel）");
+    ok(!/openRefDefsDialog/.test(src), "独立的定义面板应已删除（定义 = 引用条的一部分）");
+    ok(/📌 应用到所有段/.test(src), "缺少「应用到所有段」按钮");
 
-    /* 直接在面板里给「猫」定义第 1 号：本段从没引用过它，也必须立刻挂上 */
-    if (sels.length) {
-        sels[0].value = "1";
-        sels[0].onchange();
-        const st = w.getDs(n4);
-        ok((st.segments[0].refs || []).includes("猫.png"),
-            "未引用的素材定义后必须自动进入 refs（定义 = 引用）："
-            + JSON.stringify(st.segments[0].refs));
-        ok((st.segments[0].ref_defs || {})["猫.png"] === 1, "段级定义没落库");
-    }
-    /* 再定义「狗」= 2 → refs 顺序应变成 [猫, 狗]（编号靠顺序） */
-    const box2 = w.document.querySelector(".h3d-defbox");
-    const sels2 = box2 ? [...box2.querySelectorAll(".h3d-defsel-s")] : [];
-    if (sels2.length > 1) {
-        sels2[1].value = "2";
-        sels2[1].onchange();
-        const st2 = w.getDs(n4);
-        ok((st2.segments[0].refs || []).join(",") === "猫.png,狗.png",
-            "两个定义应排出 [猫, 狗]：" + JSON.stringify(st2.segments[0].refs));
-    }
+    /* 「应用到所有段」= 把本段这套号铺进项目定义（项目定义唯一的意义就是这个批量接口） */
+    const ds = mkDs();
+    const n5 = harness.mkNode(ds);
+    w.app.graph._nodes = [n5];
+    w.setSegRefDef(n5, 0, "猫.png", 1);
+    const st0 = w.getDs(n5);
+    ok((st0.segments[0].refs || []).includes("猫.png"), "段定义后应立刻进 refs");
+    w.applyProjRefDefs(n5, st0.segments[0].ref_defs);
+    const st1 = w.getDs(n5);
+    ok(st1.ref_defs && st1.ref_defs["猫.png"] === 1, "「应用到所有段」没写进项目定义");
+    ok((st1.segments[1].refs || []).includes("猫.png"), "第 2 段应自动获得该项目定义");
+    /* 右键清空：项目定义消失，段级定义不受影响 */
+    w.clearProjRefDefs(n5);
+    const st2 = w.getDs(n5);
+    ok(Object.keys(st2.ref_defs || {}).length === 0, "清空项目定义失败");
+    ok(!(st2.segments[1].refs || []).includes("猫.png"), "清空后第 2 段不该再有它");
+    ok((st2.segments[0].ref_defs || {})["猫.png"] === 1, "清空项目定义不该动段级定义");
 }
 
 const real = (errors || []).filter((e) => !/Not implemented|jsdom/i.test(String(e)));

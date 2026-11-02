@@ -55,7 +55,7 @@ The rules are not newly written; they are extracted from the live implementation
 | Expansion            | `tools/h3_prompt_expander/screenplay.py` + `prompts/system_screenplay.md` / `system_outline.md`                                              |
 | Optimization         | `optimizer.optimize_once` / `build_system_prompt` + `prompt/*.txt` (the **two official English texts** are copied verbatim into `06-rules/`) |
 | Master-prompt format | `web/h3_director.js`'s `parseMasterPrompt` / `mpRenderState` / `refsFromText`                                                                |
-| JSON import          | `web/h3_director.js`'s `parseMasterPromptJson` → `openMasterPromptJsonPreview` → `applyMasterPromptParsed` (**shared with the text channel**) |
+| JSON import          | `web/h3_director.js`'s `parseMasterPromptJson` → `openMasterPromptJsonPreview` → `applyMasterPromptParsed` (**shared with the text channel**; `index` = **target** segment no., so one file can replace the whole chain, append segments 4-6, or overwrite a single segment) |
 | Reference-image flow | New (the original project had no such step)                                                                                                  |
 
 ## Verification

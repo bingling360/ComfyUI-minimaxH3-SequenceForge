@@ -340,20 +340,32 @@ def test_master_prompt_single_box_modal():
     # ⚠ 断言要打在**真正做分配的那个函数**上：`applyMasterPrompt` 后来瘦成了
     # 「解析 + 交给 applyMasterPromptParsed」的两行壳（JSON 导入共用同一条链路），
     # 钉在外壳上会因为「实现搬家」红掉，而不是因为语义变了。
-    alloc = _fn_block(d, "function applyMasterPromptParsed(node, p)")
+    alloc = _fn_block(d, "function applyMasterPromptParsed(node, p, opt)")
     assert "syncRefsFromText(ds, i," in alloc, "seg.refs 必须由正文派生，不能另写一套"
     assert "s.refs !== undefined" not in alloc, "「参考：」标签应已停用"
     assert "base.scene_prompt" not in alloc, "旧四框字段不该再写回"
-    # 写回仍是「解析并分配」那一条链路
-    assert "applyMasterPrompt(node, text)" in block
+    # 写回仍是「解析并分配」那一条链路（2026-11-02 起多带一个写入位置：opt.start）
+    assert "applyMasterPrompt(node, text, wt.opt())" in block
     assert "解析并分配" in block
+    # ④ 区间写入：一条内容可以只写进链的某几段（续写 4-6 段 / 只覆盖第 2 段）
+    #    判据是**只有一个开关 opt.start**，不是又长出一套"追加/覆盖"分支。
+    assert "function mpWriteIntent(" in d, "段号推断（mpWriteIntent）不见了"
+    assert "function mkWriteTarget(" in d, "写入位置控件（mkWriteTarget）不见了"
+    assert d.count("mkWriteTarget(node, segs") >= 2, "JSON 预览与总提示词框应共用同一个写入位置控件"
+    assert "const hasStart = !!(opt && opt.start !== undefined" in alloc, \
+        "区间写入的开关必须只看 opt.start（undefined = 整体替换）"
+    assert "for (const i of touched) syncRefsFromText" in alloc, \
+        "区间写入只该重算被写到的段（touched）"
+    assert "ds.prompts = p.segs.map(" not in alloc, \
+        "写入器不该再无条件整链替换：区间模式下未提及的段要原样保留"
     # 单框渲染器：只写 Segment 头 / Duration / Standalone / Prompt，且一律英文
-    assert "function mpRenderState(state)" in d
+    assert "function mpRenderState(state, startAt)" in d
     assert "function exportMasterPrompt(node)" in d
     assert 'rows.push(`Duration: ${seg.seconds}`)' in d
     assert '`Standalone: ${seg.unlink ? "yes" : "no"}`' in d
     assert 'rows.push(main ? `Prompt:\\n${main}` : "Prompt:")' in d
-    assert '`[Segment ${i + 1}]`' in d
+    # 段头从 base 编起（默认 1；区间写入的"在总提示词框里查看"传起点）
+    assert "`[Segment ${base + i}]`" in d
     # 中文段头只作为**只读兼容**留在解析正则里，渲染器不再产出
     assert "【段${i + 1}】" not in d, "渲染器不该再写中文段头"
 

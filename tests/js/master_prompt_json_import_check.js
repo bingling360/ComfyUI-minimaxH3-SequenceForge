@@ -37,6 +37,24 @@ const JSON_OK = JSON.stringify({
     ],
 });
 
+/* 「已有 1-3 段，再导入 4-6 段」的典型文件：index 是**目标段号**，不是"文件里的第几条"。
+ * 这条用例是 2026-11-02 那次改动的核心 —— 以前 index 只用来排序，排完就丢，
+ * 导入只能整链替换，想续写只能先把 1-3 段也塞进同一个文件里。 */
+const JSON_TAIL = JSON.stringify({
+    title: "雨夜市场 · 续三场",
+    segments: [
+        { index: 4, duration: 6, prompt: "integrated_multimodal_description: [Shot 1] 第四段：她走进门。" },
+        { index: 5, duration: 7, prompt: "integrated_multimodal_description: [Shot 1] 第五段：门内的灯。" },
+        { index: 6, duration: 7, prompt: "integrated_multimodal_description: [Shot 1] 第六段：她坐下。" },
+    ],
+});
+
+/* 「只导入第 2 段覆盖原第 2 段」：一份单段文件 + 目标段号。 */
+const JSON_ONE = JSON.stringify({
+    segments: [{ index: 2, duration: 9, standalone: true,
+        prompt: "integrated_multimodal_description: [Shot 1] 覆盖版第二段。" }],
+});
+
 const mkDs = () => ({
     prompts: ["旧的段一", "旧的段二", "旧的段三"],
     segments: [{ seconds: 5 }, { seconds: 5 }, { seconds: 5 }],
@@ -76,9 +94,11 @@ ok(/mpJsonBtn\.onclick\s*=\s*importMasterPromptJson/.test(src), "「导入 JSON�
     ok(now.prompts.length === 3 && now.prompts[0] === "旧的段一", "预览阶段就把链改了");
 
     /* ---------- 3. 写入：走的是同一条写入路径 ---------- */
+    /* 默认档 = 整体替换（这份 JSON 的段号从 1 起）→ 按钮写「整体替换为 2 段」；
+     * 段号从 4 起时会变成「写入第 4–6 段」（见第 5 节）。 */
     const btn = [...w.document.querySelectorAll("button")]
-        .find((b) => String(b.textContent || "").trim() === "写入 2 段");
-    ok(!!btn, "找不到「写入 2 段」按钮："
+        .find((b) => String(b.textContent || "").trim() === "整体替换为 2 段");
+    ok(!!btn, "找不到「整体替换为 2 段」按钮："
         + JSON.stringify([...w.document.querySelectorAll("button")].map((b) => b.textContent)));
     if (btn) {
         btn.onclick();
@@ -143,8 +163,138 @@ ok(/mpJsonBtn\.onclick\s*=\s*importMasterPromptJson/.test(src), "「导入 JSON�
     ok(now.prompts.length === 3 && now.prompts[0] === "旧的段一", "失败时不该动链");
 }
 
+/* ---------- 5. 续写：段号从 4 起 → 默认落在第 4 段，前 3 段一字不动 ---------- */
+{
+    const ds = mkDs();
+    const { w } = harness.load({ node: harness.mkNode(ds) });
+    const node = w.findNode();
+    const p = w.parseMasterPromptJson(JSON_TAIL);
+    ok(p.ok === true, "续写文件解析失败：" + JSON.stringify(p && p.error));
+    ok(p.segs.map((s) => s.idx).join(",") === "4,5,6",
+        "index 应作为**目标段号**带出来：" + JSON.stringify(p.segs.map((s) => s.idx)));
+
+    w.openMasterPromptJsonPreview(node, p, "tail.json");
+    const radios = [...w.document.querySelectorAll(".h3d-mpwrite input[type=radio]")];
+    ok(radios.length === 2, `写入位置应有 2 个选项，实际 ${radios.length}`);
+    ok(radios[1] && radios[1].checked === true, "段号从 4 起 → 默认档应是「从第 4 段起写入」");
+    const num = w.document.querySelector(".h3d-mpwrite-n");
+    ok(num && Number(num.value) === 4, "起点没预填成 4：" + (num && num.value));
+    const sum = String((w.document.querySelector(".h3d-mpwrite-sum") || {}).textContent || "");
+    ok(sum.indexOf("写入后共 6 段") >= 0, "摘要没说清「写入后共 6 段」：" + sum);
+    /* 名单里的段号得跟着写入位置走：第 1 条是**目标第 4 段**，不是"第 1 条" */
+    const labs = [...w.document.querySelectorAll(".h3d-jrow b")].map((b) => b.textContent);
+    ok(labs.join("|") === "段 4|段 5|段 6", "预览段号应跟着写入位置走：" + labs.join("|"));
+    /* 预览阶段仍不动链 */
+    ok(JSON.parse(node.widgets[0].value).prompts.length === 3, "预览阶段就动了链");
+
+    const btn = [...w.document.querySelectorAll("button")]
+        .find((b) => String(b.textContent || "").trim() === "写入第 4–6 段");
+    ok(!!btn, "按钮应写成「写入第 4–6 段」："
+        + JSON.stringify([...w.document.querySelectorAll("button")].map((b) => b.textContent)));
+    if (btn) {
+        btn.onclick();
+        const after = JSON.parse(node.widgets[0].value);
+        ok(after.prompts.length === 6, `续写后应共 6 段，实际 ${after.prompts.length}`);
+        ok(after.prompts[0] === "旧的段一" && after.prompts[2] === "旧的段三",
+            "前 3 段必须原样保留：" + JSON.stringify(after.prompts));
+        ok(String(after.prompts[3]).indexOf("第四段") > 0, "第 4 段正文没写进去");
+        ok(String(after.prompts[5]).indexOf("第六段") > 0, "第 6 段正文没写进去");
+        ok(Number(after.segments[3].seconds) === 6 && Number(after.segments[5].seconds) === 7,
+            "新增段的时长没写进去：" + JSON.stringify(after.segments.map((s) => s.seconds)));
+    }
+}
+
+/* ---------- 6. 单段覆盖：只写第 2 段，段数不变，该段的帧锚不许被冲掉 ---------- */
+{
+    const ds = mkDs();
+    ds.segments[1].frame_img = { first: "锚.png" };   // 段级运行参数（JSON 里没有这条通道）
+    const { w } = harness.load({ node: harness.mkNode(ds) });
+    const node = w.findNode();
+    const p = w.parseMasterPromptJson(JSON_ONE);
+    ok(p.ok === true && p.segs.length === 1, "单段文件应解析出 1 段");
+    ok(p.segs[0].idx === 2, "单段 index=2 没带出来：" + p.segs[0].idx);
+
+    w.openMasterPromptJsonPreview(node, p, "one.json");
+    const num = w.document.querySelector(".h3d-mpwrite-n");
+    ok(num && Number(num.value) === 2, "单段 index=2 → 起点应是 2：" + (num && num.value));
+    const btn = [...w.document.querySelectorAll("button")]
+        .find((b) => String(b.textContent || "").trim() === "写入第 2 段");
+    ok(!!btn, "按钮应写成「写入第 2 段」："
+        + JSON.stringify([...w.document.querySelectorAll("button")].map((b) => b.textContent)));
+    if (btn) {
+        btn.onclick();
+        const after = JSON.parse(node.widgets[0].value);
+        ok(after.prompts.length === 3, `覆盖单段后段数应不变（3），实际 ${after.prompts.length}`);
+        ok(String(after.prompts[1]).indexOf("覆盖版第二段") > 0, "第 2 段没被覆盖");
+        ok(after.prompts[0] === "旧的段一" && after.prompts[2] === "旧的段三",
+            "第 1 / 3 段不该动：" + JSON.stringify(after.prompts));
+        ok(Number(after.segments[1].seconds) === 9, "覆盖段的时长应更新：" + after.segments[1].seconds);
+        ok(after.segments[1].unlink === true, "覆盖段的 standalone 应更新");
+        ok(after.segments[1].frame_img && after.segments[1].frame_img.first === "锚.png",
+            "覆盖段自己的帧锚必须保留（JSON 没有这条通道，不能被顺手清掉）："
+            + JSON.stringify(after.segments[1]));
+    }
+}
+
+/* ---------- 7. 手动改档：同一份续写文件也能整链替换（历史口径仍在） ---------- */
+{
+    const ds = mkDs();
+    const { w } = harness.load({ node: harness.mkNode(ds) });
+    const node = w.findNode();
+    const p = w.parseMasterPromptJson(JSON_TAIL);
+    w.openMasterPromptJsonPreview(node, p, "tail.json");
+    const radios = [...w.document.querySelectorAll(".h3d-mpwrite input[type=radio]")];
+    radios[0].onchange();                     // 切到「整体替换」
+    const btn = [...w.document.querySelectorAll("button")]
+        .find((b) => String(b.textContent || "").trim() === "整体替换为 3 段");
+    ok(!!btn, "切到整体替换后按钮文案没跟上："
+        + JSON.stringify([...w.document.querySelectorAll("button")].map((b) => b.textContent)));
+    if (btn) {
+        btn.onclick();
+        const after = JSON.parse(node.widgets[0].value);
+        ok(after.prompts.length === 3, `整体替换后应 3 段，实际 ${after.prompts.length}`);
+        ok(String(after.prompts[0]).indexOf("第四段") > 0,
+            "整体替换应把这份内容的第 1 条放链首：" + String(after.prompts[0]).slice(0, 40));
+    }
+}
+
+/* ---------- 8. 追加到末尾 / 中间补空段 ---------- */
+{
+    const ds = mkDs();
+    const { w } = harness.load({ node: harness.mkNode(ds) });
+    const node = w.findNode();
+    const p = w.parseMasterPromptJson(JSON_ONE);
+    w.openMasterPromptJsonPreview(node, p, "one.json");
+    const bTail = [...w.document.querySelectorAll("button")]
+        .find((b) => String(b.textContent || "").trim() === "追加到末尾");
+    ok(!!bTail, "找不到「追加到末尾」："
+        + JSON.stringify([...w.document.querySelectorAll("button")].map((b) => b.textContent)));
+    if (bTail) {
+        bTail.onclick();
+        const num = w.document.querySelector(".h3d-mpwrite-n");
+        ok(Number(num.value) === 4, "追加到末尾应把起点推到 现有 3 段 + 1 = 4：" + num.value);
+        /* 手填 6：第 4-5 段没有内容 → 补空段（不是把第 4 段挤掉） */
+        num.value = "6";
+        num.dispatchEvent(new w.Event("input"));
+        const sum = String(w.document.querySelector(".h3d-mpwrite-sum").textContent || "");
+        ok(sum.indexOf("补 2 个空段") >= 0, "从第 6 段起写、现有 3 段 → 应提示补 2 个空段：" + sum);
+        const btn = [...w.document.querySelectorAll("button")]
+            .find((b) => String(b.textContent || "").trim() === "写入第 6 段");
+        ok(!!btn, "找不到「写入第 6 段」按钮");
+        if (btn) {
+            btn.onclick();
+            const after = JSON.parse(node.widgets[0].value);
+            ok(after.prompts.length === 6, `应补到 6 段，实际 ${after.prompts.length}`);
+            ok(after.prompts[3] === "" && after.prompts[4] === "",
+                "第 4/5 段应是空段：" + JSON.stringify(after.prompts));
+            ok(after.prompts[0] === "旧的段一", "第 1 段不该动");
+            ok(String(after.prompts[5]).indexOf("覆盖版第二段") > 0, "第 6 段没写进去");
+        }
+    }
+}
+
 if (fails.length) {
     console.error("FAIL:\n - " + fails.join("\n - "));
     process.exit(1);
 }
-console.log("OK: JSON 导入 = 预览 → 同一条写入路径（与文本通道同构）");
+console.log("OK: JSON 导入 = 预览 → 同一条写入路径（可整链替换 / 可续写 / 可单段覆盖）");

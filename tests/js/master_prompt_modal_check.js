@@ -76,7 +76,10 @@ ok(!labels.some((t) => t.indexOf("AI") >= 0), "工作台里不该再有 AI 入�
 ok(!dialog.querySelector(".h3d-mpset"), "顶部「模式 / 缺省时长 / AI 设置」行应已撤下");
 ok(!dialog.querySelector(".h3d-mprefs"), "「参考素材（AI 可见）」chips 行应已撤下");
 ok(dialog.querySelectorAll("select").length === 0, "不该再有模式下拉");
-ok(dialog.querySelectorAll('input[type="number"]').length === 0, "不该再有缺省时长输入");
+/* 写入起点那个数字框是**唯一**允许的 number 输入（2026-11-02 加的「写入位置」）；
+ * 顶部「缺省时长」那套仍然不许回来。 */
+ok(dialog.querySelectorAll('input[type="number"]:not(.h3d-mpwrite-n)').length === 0,
+    "不该再有缺省时长输入");
 
 /* 5. 手动载入：出现两段，只写 时长 / 独立镜头 / 提示词 */
 const bLoad = [...dialog.querySelectorAll("button")]
@@ -90,6 +93,31 @@ ok(ta.value.indexOf("Standalone: yes") >= 0, "Standalone（跳过引用上段）
 ok(ta.value.indexOf("Prompt:") >= 0, "正文应带 Prompt: 标签（导出口径）");
 for (const dead of ["意图：", "剧本：", "参考：", "场景：", "角色：", "环境音：", "配乐："]) {
     ok(ta.value.indexOf(dead) < 0, `载入不该再写「${dead}」标签`);
+}
+
+/* 6. 写入位置：文本通道也能续写 —— 预填 [Segment 3] 起的文本，默认档就落在第 3 段
+ *    （与 JSON 通道同一个 mkWriteTarget、同一条写入路径：段号是**目标段号**）。 */
+{
+    /* 上一个工作台还开着时 overlay 守卫会直接 return，先收掉再开新的 */
+    w.document.querySelectorAll(".h3d-overlay").forEach((o) => o.remove());
+    const node = w.findNode();
+    w.openMasterPromptModal("[Segment 3]\nDuration: 6\nPrompt:\n"
+        + "integrated_multimodal_description: [Shot 1] 第三段：夜里她推开门。\n\n[END]");
+    const d2 = w.document.querySelector(".h3d-dialog-full");
+    ok(!!d2, "第二次打开工作台失败");
+    const num = d2 && d2.querySelector(".h3d-mpwrite-n");
+    ok(num && Number(num.value) === 3, "预填 [Segment 3] → 起点应自动是 3：" + (num && num.value));
+    const btn = d2 && [...d2.querySelectorAll("button")]
+        .find((b) => String(b.textContent || "").trim() === "写入第 3 段");
+    ok(!!btn, "工作台按钮应写成「写入第 3 段」：" + (d2 && JSON.stringify(
+        [...d2.querySelectorAll("button")].map((b) => b.textContent))));
+    if (btn) {
+        btn.onclick();
+        const after = JSON.parse(node.widgets[0].value);
+        ok(after.prompts.length === 3, `文本续写后应 3 段，实际 ${after.prompts.length}`);
+        ok(String(after.prompts[0]).indexOf("雨夜窄巷") > 0, "第 1 段不该动：" + String(after.prompts[0]).slice(0, 30));
+        ok(String(after.prompts[2]).indexOf("推开门") > 0, "第 3 段没写进去");
+    }
 }
 
 const real = (errors || []).filter((e) => !/Not implemented|jsdom/i.test(String(e)));

@@ -3516,6 +3516,13 @@ function parseMasterPrompt(text) {
             const n = hm[1] !== undefined ? Number(hm[1])
                 : (hm[2] !== undefined ? Number(hm[2])
                     : (hm[3] !== undefined ? Number(hm[3]) : 0));
+            /* 段号**留下来**（2026-11-02）：以前只拿它比一句"顺序不一致"就扔掉，
+             * 于是「从第 4 段起写入」这种续写需求在文本通道里根本表达不出来。
+             * 现在 cur.idx 是**目标段号**（见 mpWriteIntent / applyMasterPromptParsed）：
+             * `[Segment 4]` 开头的三行 = 要写第 4-6 段，不是"从 1 开始的第二份稿子"。
+             * 只是顺序提示仍在：段号与出现顺序不一致时按**出现顺序**排列，
+             * 段号只决定写入起点，不重排数组（避免 [5][4] 这种写法把正文顺序也换掉）。 */
+            if (n) cur.idx = n;
             if (n && n !== out.segs.length) {
                 out.notes.push(`段头序号 ${n} 与出现顺序（第 ${out.segs.length} 段）不一致，已按出现顺序排列`);
             }
@@ -3749,8 +3756,13 @@ function parseMasterPromptJson(raw) {
         out.notes.push("段序号（index）与数组顺序不一致，已按 index 重排");
     }
     const badEmpty = [], badDur = [], badSolo = [];
-    out.segs = ordered.map(({ it }, i) => {
+    out.segs = ordered.map(({ n, it }, i) => {
         const seg = newMasterSeg();
+        /* 段号**带出去**（2026-11-02）：index 以前只用来排序，排完就丢，于是
+         * 「这份文件写的是第 4-6 段」这条信息在写入时已经不存在了，导入只能整链替换。
+         * 现在它是**目标段号**：seg.idx 由 mpWriteIntent 读，决定从第几段起写。
+         * 没写 index 时按数组顺序补 1..N —— 起点 1 = 整体替换，与历史行为一致。 */
+        seg.idx = n;
         const body = mpjPromptOf(it);
         seg.main = body === undefined ? "" : body;
         if (body === undefined) badEmpty.push(String(i + 1));
@@ -3789,12 +3801,18 @@ function parseMasterPromptJson(raw) {
  *  ★ 一律英文（与正文同为英文）：`[Segment N]` / `Duration:` / `Standalone: yes|no`
  *  / `Prompt:` / `[END]`。中文旧标签仍可解析（只读兼容，见 parseMasterPrompt）。
  *  注意：**不再写 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本 / 参考**——这些层
- *  已经没有 UI 承载，写进文本只会在下次贴回时触发"已忽略"提示。 */
-function mpRenderState(state) {
+ *  已经没有 UI 承载，写进文本只会在下次贴回时触发"已忽略"提示。
+ *  startAt：段头从第几段编起（默认 1）。只有「JSON 导入 → 在总提示词框里查看」
+ *  会传非 1 的值：区间模式下把第 4–6 段渲染成 `[Segment 4]`…，贴回来时
+ *  parseMasterPrompt 才能认出「这是要写第 4 段起」（段号是目标段号，不只是装饰）。
+ *  导出（exportMasterPrompt）永远不传 = 从 1 开始，导出的就是整链。 */
+function mpRenderState(state, startAt) {
+    const base0 = Number(startAt);
+    const base = Number.isFinite(base0) && base0 > 0 ? Math.floor(base0) : 1;
     const blocks = [];
     for (let i = 0; i < state.length; i++) {
         const seg = state[i] || {};
-        const rows = [`[Segment ${i + 1}]`];
+        const rows = [`[Segment ${base + i}]`];
         if (Number.isFinite(Number(seg.seconds)) && Number(seg.seconds) > 0) rows.push(`Duration: ${seg.seconds}`);
         /* Standalone 是**两态显式值**，yes / no 都要写出来：
          * 以前只在 `seg.unlink` 为真时写 `Standalone: yes`，false 一侧干脆不写 ——
@@ -3831,27 +3849,64 @@ function exportMasterPrompt(node) {
     }));
 }
 
-/** 解析并分配到当前链：prompts 重排为 N 段，segments 同步伸缩（既有段保留未提及字段），
- *  插入视频段（inserts）不动。**只赋三样**：提示词 / 时长 / 独立镜头。
- *  资产引用不在这里赋值——它跟段卡是同一套口径：**正文是唯一真相**，
- *  seg.refs 由正文里的 @素材名 序列派生（syncRefsFromText），没有第二份清单。
- *  返回解析结果供界面提示。 */
-function applyMasterPrompt(node, text) {
-    return applyMasterPromptParsed(node, parseMasterPrompt(text));
+/** 解析并分配到当前链（文本通道的壳）。`opt.start` 的含义见 applyMasterPromptParsed。 */
+function applyMasterPrompt(node, text, opt) {
+    return applyMasterPromptParsed(node, parseMasterPrompt(text), opt);
+}
+
+let _mpwSeq = 0;              // 写入位置控件的序号（radio 组名必须唯一，见 mkWriteTarget）
+const MPW_MAX_START = 999;    // 起点上限：挡住误填 99999 → 一次补出十万个空段
+
+/** 这份内容「想从第几段起写」—— 只做推断，不替用户拍板（面板上两个单选随时可改）。
+ *  判据：**每段都有段号**，且最小值 > 1 → 从该段起（续写 / 覆盖）。
+ *  否则起点 = 1（= 整体替换，历史行为）。
+ *  为什么要求"每段都有"：缺一个段号就说明这份文件不是按目标段号编的（可能只是
+ *  顺手写了个 index），据此猜起点多半会写错位置；宁可保守回落到整体替换。 */
+function mpWriteIntent(segs) {
+    const arr = Array.isArray(segs) ? segs : [];
+    if (!arr.length) return { start: 1, byIndex: false };
+    const nums = [];
+    for (const s of arr) {
+        const n = Number(s && s.idx);
+        if (!Number.isFinite(n) || n < 1) return { start: 1, byIndex: false };
+        nums.push(Math.floor(n));
+    }
+    const min = Math.min(...nums);
+    return min > 1 ? { start: min, byIndex: true } : { start: 1, byIndex: false };
 }
 
 /** 分配**已解析**的结果到当前链（文本与 JSON 两条通道的唯一写入口）。
  *  为什么拆成"解析"与"写入"两步：JSON 通道若先渲染成文本再解析一遍，正文里任何
  *  长得像 `[Segment N]` 的行都会当场把一段劈成两段（文本解析器见到段头就开新段，
  *  这是它应有的行为）。JSON 已经是结构化的，直接进这里就不会被二次解析走样。
- *  两条通道共用这一份写入逻辑，"文本粘贴"与"JSON 导入"才不会给出两套结果。 */
-function applyMasterPromptParsed(node, p) {
+ *  两条通道共用这一份写入逻辑，"文本粘贴"与"JSON 导入"才不会给出两套结果。
+ *
+ *  opt.start —— **写入起点**（1-based），决定这段内容落在链的哪几段上：
+ *   · 不给（undefined）= 整体替换：段数跟着这份内容走（多的段被砍）。历史口径不变。
+ *   · 给了         = 区间写入：第 start … start+N-1 段逐段覆盖；超出当前段数就
+ *                    追加，中间不够用空段补齐，**区间之外的段一字不动**。
+ *  这就是"已有 1-3 段，再导入 4-6 段"和"只导入第 2 段覆盖原第 2 段"两条需求：
+ *  它们是同一个动作（区间写入）落在不同起点上的两个特例，不是两套代码。
+ *  未写入段的 segments 用浅拷贝原样带过去 —— 帧锚 / 时长 / 双按钮都是段级运行
+ *  参数，这份内容里没有对应字段，不能因为"顺便写了一段"就被重置。 */
+function applyMasterPromptParsed(node, p, opt) {
     if (!p || !Array.isArray(p.segs) || !p.segs.length) return p || { segs: [], notes: [] };
     const ds = getDs(node);
-    const old = Array.isArray(ds.segments) ? ds.segments : [];
-    ds.prompts = p.segs.map((s) => (s.main === undefined ? "" : s.main));
-    ds.segments = p.segs.map((s, i) => {
-        const base = (i < old.length && old[i] && typeof old[i] === "object") ? { ...old[i] } : defaultSegment();
+    const oldP = Array.isArray(ds.prompts) ? ds.prompts.slice() : [];
+    const old = Array.isArray(ds.segments) ? ds.segments.slice() : [];
+    const hasStart = !!(opt && opt.start !== undefined && opt.start !== null);
+    /* 上限 999：控件已经夹过一次，这里是**写入器的兜底**（任何调用方都不该
+     * 因为一个手滑的 99999 把链补出十万个空段）。 */
+    const start = hasStart
+        ? Math.min(MPW_MAX_START, Math.max(1, Math.floor(Number(opt.start) || 1)))
+        : 1;
+    const count = p.segs.length;
+    const total = hasStart ? Math.max(oldP.length, old.length, start - 1 + count) : count;
+    const oldLen = Math.max(oldP.length, old.length);
+    const keepSeg = (i) => (i < old.length && old[i] && typeof old[i] === "object")
+        ? { ...old[i] } : defaultSegment();
+    const writeSeg = (s, i) => {
+        const base = keepSeg(i);
         /* 场景 / 角色 / 环境音 / 配乐 / 意图 / 剧本 / 参考 一律不写回：
          * parseMasterPrompt 已把它们标记为只读并丢弃，这里再赋值只会让
          * "已忽略"变成"忽略了一半"（提示有了、字段也写了）。 */
@@ -3861,7 +3916,26 @@ function applyMasterPromptParsed(node, p) {
             base.auto_ref = s.unlink ? false : true;
         }
         return base;
-    });
+    };
+    /* touched = 这次真正写到的段。官方标签归位 / 引用派生 / 对齐行清理**只对它们跑**：
+     * 区间写入时若遍历全链，会把用户没碰的段也过一遍（幂等但没必要，而且
+     * 一旦哪天这几步带上副作用，就会变成"导入第 4 段顺手改了第 1 段"）。 */
+    const touched = [];
+    const prompts = [], segs = [];
+    for (let i = 0; i < total; i++) {
+        const k = i - (start - 1);
+        if (k >= 0 && k < count) {
+            const s = p.segs[k];
+            prompts.push(s.main === undefined ? "" : s.main);
+            segs.push(writeSeg(s, i));
+            touched.push(i);
+        } else {
+            prompts.push(String(oldP[i] ?? ""));
+            segs.push(keepSeg(i));
+        }
+    }
+    ds.prompts = prompts;
+    ds.segments = segs;
     /* 引用派生必须在 ds.prompts / ds.segments 都就位之后：refsFromText 按"本段正文
      * 里的 @素材名 出现序列"出结果，与段卡提示词框**逐字同一条函数** —— 这里若另写
      * 一套（旧版的「参考：」标签），就会出现"总提示词框挂上的素材和段卡不是一回事"。 */
@@ -3873,17 +3947,137 @@ function applyMasterPromptParsed(node, p) {
     const HPm = (typeof window !== "undefined" && window.H3Prompts) || {};
     if (typeof HPm.officialToMarks === "function") {
         const poolNow = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
-        ds.prompts = ds.prompts.map((t) => HPm.officialToMarks(String(t ?? ""), [], poolNow));
+        for (const i of touched) {
+            ds.prompts[i] = HPm.officialToMarks(String(ds.prompts[i] ?? ""), [], poolNow);
+        }
     }
-    for (let i = 0; i < ds.prompts.length; i++) {
-        syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
-    }
+    for (const i of touched) syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
     setDs(node, ds);
     /* 提示词是整段替换进来的（AI 优化产物只有官方三/六字段），对齐指令不会跟着来：
      * 按每段的首尾帧锚补回去，否则贴一次总提示词就把全链的首尾帧锚冲掉。
      * 没有锚的段 resync 内部直接返回，不会打扰手写文本。 */
-    for (let i = 0; i < ds.prompts.length; i++) stripAlignmentLines(node, i);
+    for (const i of touched) stripAlignmentLines(node, i);
+    /* 写回摘要（给界面报"写了几段、链现在几段、有没有砍/补"）：挂在 p 上返回，
+     * 面板与 LED 都读它，避免各自再算一遍算出两个数。 */
+    p.applied = {
+        mode: hasStart ? "at" : "all",
+        start, count, total, oldLen,
+        added: hasStart ? Math.max(0, start - 1 + count - oldLen) : Math.max(0, count - oldLen),
+        dropped: hasStart ? 0 : Math.max(0, oldLen - count),
+    };
     return p;
+}
+
+/* ---- 写入位置控件（JSON 预览面板与总提示词框共用） ----
+ * 它管的是「这份内容落在链的哪几段上」：一个模式 + 一个起点。
+ *   · 整体替换   → 写入器不给 start（段数跟着这份内容走，多的段被砍）
+ *   · 从第 N 段起 → 给 start（第 N…N+M-1 段覆盖，其余段一字不动）
+ * 默认档由 mpWriteIntent 按段号推断（JSON 写的是第 4-6 段就落在第 4 段起），
+ * 但**只作预填**：用户碰过之后不再跟随 —— 文本框是一边打字一边重解析的，
+ * 自动跟随会把刚填好的起点冲掉。两个面板共用它，两条通道的写入口径才不会分叉。 */
+function mkWriteTarget(node, segs, onChange) {
+    const curLen = () => {
+        try {
+            const ds = getDs(node);
+            return Array.isArray(ds.prompts) ? ds.prompts.length : 0;
+        } catch (e) { return 0; }
+    };
+    let curSegs = Array.isArray(segs) ? segs : [];
+    const first = mpWriteIntent(curSegs);
+    let mode = first.byIndex ? "at" : "all";
+    let at = first.byIndex ? first.start : curLen() + 1;
+    let manual = false;              // 用户碰过 → 不再自动跟随解析结果
+    const box = el("div", "h3d-mpwrite");
+    const rowEl = el("div", "h3d-mpwrite-row");
+    rowEl.append(el("b", "", "写入位置"));
+    /* radio 的 name 必须**每个控件独立**：从总提示词框里发起 JSON 导入时页面上
+     * 同时存在两个写入位置控件，同名 radio 会互斥（点新的把旧的取消选中），
+     * 回到工作台就看见两个都没选 —— 内部状态其实没变，纯视觉错乱。 */
+    const radioName = `h3d-mpwrite-mode-${++_mpwSeq}`;
+    const rAll = document.createElement("input");
+    rAll.type = "radio"; rAll.name = radioName;
+    const labAll = el("label", "");
+    labAll.append(rAll, document.createTextNode("整体替换"));
+    const rAt = document.createElement("input");
+    rAt.type = "radio"; rAt.name = radioName;
+    const numAt = document.createElement("input");
+    numAt.type = "number"; numAt.min = "1"; numAt.max = String(MPW_MAX_START); numAt.step = "1";
+    numAt.className = "h3d-mpwrite-n";
+    const labAt = el("label", "");
+    labAt.append(rAt, document.createTextNode("从第"), numAt, document.createTextNode("段起写入"));
+    const bTail = el("button", "h3d-btn", "追加到末尾");
+    bTail.type = "button";
+    rowEl.append(labAll, labAt, bTail);
+    const sum = el("div", "h3d-mpwrite-sum", "");
+    box.append(rowEl, sum);
+
+    const notify = () => { try { onChange && onChange(); } catch (e) { /* 面板已关 */ } };
+    const paintSum = () => {
+        const n = curSegs.length;
+        const cur = curLen();
+        rAll.checked = mode === "all";
+        rAt.checked = mode === "at";
+        numAt.disabled = mode !== "at";
+        /* 只在没焦点时回写数字框：正打字的人不该被自己的输入改光标位置。 */
+        if (document.activeElement !== numAt) numAt.value = String(at);
+        bTail.title = `从现有第 ${cur + 1} 段起写入（现有 ${cur} 段原样不动）`;
+        if (!n) {
+            sum.textContent = "还没解析出段落（写成 [Segment N] 分段后才算得出写在哪）";
+            return;
+        }
+        if (mode === "all") {
+            sum.innerHTML = `整链替换：现有 <b>${cur}</b> 段 → <b>${n}</b> 段`
+                + (cur > n ? `，第 ${n + 1}–${cur} 段会被删除` : "")
+                + (cur < n ? `，多出的 ${n - cur} 段是新增` : "");
+        } else {
+            const total = Math.max(cur, at - 1 + n);
+            const gap = Math.max(0, at - 1 - cur);
+            sum.innerHTML = `写入第 <b>${at}${n > 1 ? `–${at + n - 1}` : ""}</b> 段（共 ${n} 段）`
+                + ` · 其余 <b>${total - n}</b> 段不动 · 写入后共 <b>${total}</b> 段`
+                + (gap ? ` · 中间补 ${gap} 个空段` : "");
+        }
+    };
+    rAll.onchange = () => { mode = "all"; manual = true; paintSum(); notify(); };
+    rAt.onchange = () => { mode = "at"; manual = true; paintSum(); notify(); };
+    numAt.addEventListener("input", () => {
+        at = Math.min(MPW_MAX_START, Math.max(1, Math.floor(Number(numAt.value) || 1)));
+        manual = true;
+        paintSum();
+        notify();
+    });
+    /* 失焦时把夹过的值回写（输入"0"时框里还显示 0，但实际起点是 1 —— 得让它自己说清）。 */
+    numAt.addEventListener("blur", () => {
+        numAt.value = String(at);
+        notify();
+    });
+    /* 「追加到末尾」= 把起点推到现有段数之后：这是"续写 4-6 段"最常用的一档，
+     * 但它只是**填好起点**，不是第二条写入路径（opt 仍然是 {start}）。 */
+    bTail.onclick = () => {
+        at = curLen() + 1;
+        mode = "at";
+        manual = true;
+        paintSum();
+        notify();
+    };
+    const api = {
+        el: box,
+        /** 传给 applyMasterPromptParsed 的第三参：undefined = 整体替换。 */
+        opt: () => (mode === "at" ? { start: at } : undefined),
+        start: () => (mode === "at" ? at : undefined),
+        count: () => curSegs.length,
+        /** 内容变了（文本通道边打字边重解析）：没人碰过就重新预填，碰过就只更新摘要。 */
+        refresh: (next) => {
+            curSegs = Array.isArray(next) ? next : [];
+            if (!manual) {
+                const it = mpWriteIntent(curSegs);
+                mode = it.byIndex ? "at" : "all";
+                at = it.byIndex ? it.start : curLen() + 1;
+            }
+            paintSum();
+        },
+    };
+    paintSum();
+    return api;
 }
 
 /* ---- 潜空间放大二采：状态读写（ds.upscale，主循环内逐段渲染：采样定稿后、段落盘前） ---- */
@@ -8798,6 +8992,18 @@ function injectStyles() {
     .h3d-jrow b{flex:none;color:var(--h3d-bone);font-weight:600}
     .h3d-jrow span{color:var(--h3d-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .h3d-jrow.empty span{color:#e89090}
+    /* ---- 写入位置（导入 / 粘贴时可续写、可只覆盖某段） ---- */
+    .h3d-mpwrite{display:flex;flex-direction:column;gap:5px;margin:2px 0 10px;padding:8px 10px;border:1px solid #3a352c;border-radius:8px;background:#1b1f20}
+    .h3d-mpwrite-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--h3d-bone)}
+    .h3d-mpwrite-row>b{color:var(--h3d-cyan);font-weight:700}
+    .h3d-mpwrite-row label{display:flex;gap:5px;align-items:center;cursor:pointer;color:var(--h3d-muted)}
+    .h3d-mpwrite-row input[type=radio]{accent-color:#2f6e57;margin:0}
+    .h3d-mpwrite-row .h3d-btn{margin:0;padding:3px 9px;font-size:11.5px}
+    .h3d-mpwrite-n{width:62px;border:1px solid #3a352c;border-radius:5px;background:#10161a;color:var(--h3d-bone);padding:2px 6px;font:12px ui-monospace,Consolas,monospace;outline:none}
+    .h3d-mpwrite-n:focus{border-color:#a8d8bd}
+    .h3d-mpwrite-n:disabled{opacity:.4}
+    .h3d-mpwrite-sum{color:var(--h3d-muted);font-size:11.5px;line-height:1.5}
+    .h3d-mpwrite-sum b{color:var(--h3d-cyan);font-weight:600}
 
     /* ---- 总提示词工作台入口（纯分段流水线，见 openMasterPromptModal） ----
      * 单框可拖右下角伸缩（resize 挂在 wrapper 上，wrapper 内部编辑器
@@ -12608,7 +12814,12 @@ function openMasterPromptModal(prefill) {
     const cancel = el("button", "h3d-btn", "取消");
     const ok = el("button", "h3d-btn h3d-btn-cta", "解析并分配");
     row.append(bLoad, bImport, bClear, cancel, ok);
-    dialog.append(stack, info, err, row);
+    /* 写入位置（与 JSON 预览面板**共用** mkWriteTarget）：默认档按段号推断 ——
+     * 预填的是 `[Segment 4]` 起的文本，打开就是「从第 4 段起写入」；粘一整份从
+     * `[Segment 1]` 起的新稿，则是整体替换。两条通道同一条规则、同一个控件。 */
+    const segs0 = prefill ? (parseMasterPrompt(String(prefill)).segs || []) : [];
+    const wt = mkWriteTarget(node, segs0);
+    dialog.append(stack, wt.el, info, err, row);
     overlay.append(dialog);
     overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
     overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
@@ -12617,8 +12828,18 @@ function openMasterPromptModal(prefill) {
 
     const paint = () => {
         const text = String(ta.value ?? "");
-        if (!text.trim()) { info.textContent = ""; err.textContent = ""; return null; }
+        if (!text.trim()) {
+            wt.refresh([]);
+            ok.textContent = "解析并分配";
+            info.textContent = ""; err.textContent = ""; return null;
+        }
         const p = parseMasterPrompt(text);
+        /* 写入位置跟着内容重算（用户没手动改过才跟随）：段号从 4 起 → 自动切到
+         * 「从第 4 段起」。然后按钮把目标段写出来，省得"解析并分配"点下去才发现写错位置。 */
+        wt.refresh(p.segs);
+        const st = wt.start();
+        ok.textContent = st === undefined ? "解析并分配"
+            : `写入第 ${st}${p.segs.length > 1 ? `–${st + p.segs.length - 1}` : ""} 段`;
         const cntMain = p.segs.filter((s) => String(s.main ?? "").trim()).length;
         const total = p.segs.reduce((a, s) => a + (Number(s.seconds) || 0), 0);
         const nUnlink = p.segs.filter((s) => s.unlink === true).length;
@@ -12659,10 +12880,14 @@ function openMasterPromptModal(prefill) {
     const submit = () => {
         const text = String(ta.value ?? "");
         if (!text.trim()) { err.textContent = "内容为空"; return; }
-        const p = applyMasterPrompt(node, text);
+        /* 写入位置由控件决定：undefined = 整体替换（历史口径），{start} = 区间写入。 */
+        const p = applyMasterPrompt(node, text, wt.opt());
         if (!p.segs.length) { err.textContent = "未识别到任何段落"; return; }
         flushPrompts(node);                       // 同步项目 manifest 底稿
-        setLed("done", `总提示词已分配到 ${p.segs.length} 段`);
+        const ap = p.applied || {};
+        setLed("done", ap.mode === "at"
+            ? `总提示词已写入第 ${ap.start}–${ap.start + ap.count - 1} 段（链上共 ${ap.total} 段）`
+            : `总提示词已分配到 ${ap.count || p.segs.length} 段`);
         overlay.remove();
         scheduleRefresh(60);
         if (p.notes.length) alert("注意：\n- " + p.notes.join("\n- "));
@@ -12723,9 +12948,14 @@ function openMasterPromptJsonPreview(node, p, fileName) {
     dialog.append(el("h3", "", `📥 导入多段提示词${p.title ? ` · ${escapeHtml(p.title)}` : ""}`));
     const lead = el("p", "h3d-lead",
         (name ? `文件 <b>${escapeHtml(name)}</b>：` : "")
-        + `识别到 <b>${segs.length}</b> 段。写入会把当前链的提示词<b>整链替换</b>`
-        + "（段数跟着这份 JSON 走；已生成的段落文件不受影响）。素材引用照旧由正文里的 "
-        + "<code>@素材名</code> 派生，不在这里另填。");
+        + `识别到 <b>${segs.length}</b> 段。这 ${segs.length} 段可以<b>整链替换</b>，`
+        + "也可以只写进链的某几段（续写第 4–6 段 / 只覆盖第 2 段）——"
+        + "位置在下面「<b>写入位置</b>」里选。已生成的段落文件不受影响。"
+        + "素材引用照旧由正文里的 <code>@素材名</code> 派生，不在这里另填。");
+    let syncOk = () => { /* 建好按钮后接管（写入位置变化要改按钮文案） */ };
+    /* 默认档按 JSON 的段号推断：index 从 4 起 → 落在第 4 段起；从 1 起 → 整链替换。
+     * 用户随时能在这一行改（改了就不再跟着推断走）。 */
+    const wt = mkWriteTarget(node, segs, () => syncOk());
     const info = el("div", "h3d-mpinfo", "");
     const list = el("div", "h3d-jprev");
     const err = el("div", "h3d-err", "");
@@ -12735,7 +12965,7 @@ function openMasterPromptJsonPreview(node, p, fileName) {
     const cancel = el("button", "h3d-btn", "取消");
     const ok = el("button", "h3d-btn h3d-btn-cta", `写入 ${segs.length} 段`);
     row.append(bView, cancel, ok);
-    dialog.append(lead, info, list, err, row);
+    dialog.append(lead, wt.el, info, list, err, row);
     overlay.append(dialog);
     overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
     overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
@@ -12749,6 +12979,9 @@ function openMasterPromptJsonPreview(node, p, fileName) {
     info.innerHTML = `识别 <b>${segs.length}</b> 段 · 总时长 <b>${Math.round(total)}s</b>`
         + (nSolo ? ` · 独立镜头 <b>${nSolo}</b>` : "")
         + (nRef ? ` · 素材引用 <b>${nRef}</b> 处` : "");
+    /* 段号跟着「写入位置」走：区间模式下第 1 条是**目标第 4 段**，不是"第 1 条"——
+     * 名单里写成 段 1 / 段 2 会让人以为要写到链头去。 */
+    const labs = [];
     segs.forEach((s, i) => {
         const body = String(s.main ?? "");
         const first = body.split(/\r\n|\r|\n/).find((l) => l.trim()) || "";
@@ -12756,7 +12989,9 @@ function openMasterPromptJsonPreview(node, p, fileName) {
         const sec = Number(s.seconds) > 0 ? `${s.seconds}s` : "时长不动";
         const solo = s.unlink === true ? "独立镜头"
             : (s.unlink === false ? "连续接上段" : "接续不变");
-        r.append(el("b", "", `段 ${i + 1}`));
+        const lab = el("b", "", `段 ${i + 1}`);
+        labs.push(lab);
+        r.append(lab);
         r.append(el("span", "", `${sec} · ${solo} · `
             + (first ? escapeHtml(first.slice(0, 90)) : "（这段没有正文）")));
         r.title = body.slice(0, 400);
@@ -12764,13 +12999,30 @@ function openMasterPromptJsonPreview(node, p, fileName) {
     });
     err.textContent = (p.notes || []).length ? "⚠ " + p.notes.join("；") : "";
 
+    syncOk = () => {
+        const st = wt.start();
+        const n = segs.length;
+        labs.forEach((lab, i) => { lab.textContent = `段 ${st === undefined ? i + 1 : st + i}`; });
+        ok.textContent = st === undefined
+            ? `整体替换为 ${n} 段`
+            : `写入第 ${st}${n > 1 ? `–${st + n - 1}` : ""} 段`;
+    };
+    syncOk();
+
     const close = () => overlay.remove();
     cancel.onclick = close;
-    bView.onclick = () => { close(); openMasterPromptModal(mpRenderState(segs)); };
+    bView.onclick = () => {
+        close();
+        /* 带上起点：区间模式下预填的是 [Segment 4] 起，而不是假装这份内容是第 1 段。 */
+        openMasterPromptModal(mpRenderState(segs, wt.start()));
+    };
     ok.onclick = () => {
-        const r = applyMasterPromptParsed(node, p);
+        const r = applyMasterPromptParsed(node, p, wt.opt());
         flushPrompts(node);                       // 同步项目 manifest 底稿
-        setLed("done", `JSON 已分配到 ${segs.length} 段`);
+        const ap = (r && r.applied) || {};
+        setLed("done", ap.mode === "at"
+            ? `JSON 已写入第 ${ap.start}–${ap.start + ap.count - 1} 段（链上共 ${ap.total} 段）`
+            : `JSON 已整链替换为 ${ap.count || segs.length} 段`);
         /* 底下可能还压着总提示词框（从框里发起的导入），一起收掉 */
         document.querySelectorAll(".h3d-overlay").forEach((o) => o.remove());
         scheduleRefresh(60);

@@ -173,6 +173,9 @@ function ok(cond, msg) {
         promptFlushJob: { scope: "derived" },
         _lastFlushSig: { scope: "dir", key: "dir: target," },
         _restoreIgnored: { scope: "dir", key: '${dir || ""}|' },
+        /* 写入位置控件的自增序号（2026-11-02）：只用来给 radio 组名编号，
+         * 免得两个面板的 radio 同名互斥。纯 DOM 层，与项目数据无关。 */
+        _mpwSeq: { scope: "ui" },
     };
 
     const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");

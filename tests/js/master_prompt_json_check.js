@@ -212,8 +212,16 @@ const P = (json) => run("parseMasterPromptJson(" + JSON.stringify(json) + ")");
     check("按 index 重排", p.ok && p.segs[0].main === "A" && p.segs[1].main === "B",
         JSON.stringify(p.segs.map((s) => s.main)));
     check("重排要提示", p.notes.some((n) => n.indexOf("重排") >= 0), JSON.stringify(p.notes));
+    /* index 是**目标段号**（2026-11-02）：以前只拿来排序、排完就丢，导入只能整链替换。
+     * 现在要带出去给 mkWriteTarget / applyMasterPromptParsed 决定"写到第几段"。 */
+    check("段号带出来（目标段号）", p.segs[0].idx === 1 && p.segs[1].idx === 2,
+        JSON.stringify(p.segs.map((s) => s.idx)));
     const q = P(JSON.stringify({ segments: [{ index: 1, prompt: "A" }, { index: 2, prompt: "B" }] }));
     check("顺序本来就是对的 → 不吭声", (q.notes || []).length === 0, JSON.stringify(q.notes));
+    /* 不写 index = 按数组顺序补 1..N：起点 1 → 整体替换（历史行为，不是"什么都不写"） */
+    const r0 = P(JSON.stringify({ segments: [{ prompt: "A" }, { prompt: "B" }] }));
+    check("没写 index → 段号按数组顺序补 1..N", r0.segs[0].idx === 1 && r0.segs[1].idx === 2,
+        JSON.stringify(r0.segs.map((s) => s.idx)));
 }
 
 /* ---------- 9. 坏输入一律报错，绝不静默写空段 ---------- */

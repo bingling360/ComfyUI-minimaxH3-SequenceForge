@@ -1348,7 +1348,13 @@ function buildRefBar(RB) {
                     const occ = (taken && taken[kd]) || {};
                     const sig = `${kd}:${cap}:${proj[key] ? 1 : 0}:`
                         + Object.entries(occ).map(([no, who]) => `${no}=${who}`).join(".");
-                    if (rec.sel.dataset.sig !== sig) {
+                    /* ⚠ 下拉正被操作时**一律别碰它**：点开 select 会让提示词框失焦 →
+                     * 触发 commit → 引用集合重算 → 这里的 sig 变 → replaceChildren
+                     * 重建选项 → 浏览器把展开的下拉**收回去**（用户报的"一拉定义栏
+                     * 就缩回去"）。同理也别改 value（会跳选中项）。
+                     * 交互结束（blur）时补一次重绘，状态自然对齐。 */
+                    const busy = document.activeElement === rec.sel;
+                    if (rec.sel.dataset.sig !== sig && !busy) {
                         const prefix = { image: "P", video: "V", audio: "A" }[kd] || "P";
                         /* 只有两态：**不用** / **P1…P9**。没有「自动」这个中间态：
                          * 素材要么挂上（有号）、要么不挂（不用）。 */
@@ -1369,7 +1375,7 @@ function buildRefBar(RB) {
                      * 原始定义放在 title 里。 */
                     const effM = /^<\w+\s+(\d+)>$/.exec(String(token || ""));
                     const effN = effM ? Number(effM[1]) : 0;
-                    rec.sel.value = n > 0 ? String(effN || own[key] || proj[key] || 1) : "";
+                    if (!busy) rec.sel.value = n > 0 ? String(effN || own[key] || proj[key] || 1) : "";
                     /* 点亮 = 这个号是人定的（段级或项目定义），不是按顺序排出来的 */
                     rec.sel.classList.toggle("def", n > 0 && !!(own[key] || proj[key]));
                     const src = own[key] ? `本段定义 P${own[key]}`
@@ -1557,6 +1563,11 @@ function buildRefBar(RB) {
                 sel.dataset.ref = key;
                 sel.addEventListener("mousedown", (e) => e.stopPropagation());
                 sel.addEventListener("click", (e) => e.stopPropagation());
+                /* 交互结束补一次重绘：paintChip 在 busy 时故意什么都不改（见那边注释），
+                 * 松手/失焦之后必须让显示回到真实状态。 */
+                sel.addEventListener("blur", () => {
+                    try { RB.repaint(); scheduleRefresh(120); } catch (e) { /* 面板已关 */ }
+                });
                 sel.onchange = () => {
                     const v = String(sel.value || "");
                     if (v === "") {
@@ -1959,28 +1970,45 @@ function orderBySlots(keys, defs, segDefs, pool) {
     });
 }
 
-/** 本段有效引用 = 正文派生 ∪ 项目定义 ∪ 段定义，再按槽位号重排。
+/** 本段有效引用 = 正文派生 ∪ 段级定义 ∪ 项目定义，再按槽位号重排。
  *
- *  为什么要把"项目定义"并进来：用户要的是「定义某张图是 picture 1，则所有段落
- *  都自动引用它」—— 自动引用 = 进 seg.refs，后端才会真的把图传进去、并给它
- *  分配 <Picture k>。正文里没有 @ 也能挂上，靠的就是这一步。
- *  `seg.ref_skip` 只挡项目定义（正文里显式 @ 过 = 用户明确要它，不挡）。 */
+ *  ★ 优先级（从高到低）：**正文 / 段级定义 > 项目定义**。项目定义是"最弱"的
+ *  一层 —— 任何矛盾都让它整条不生效（该素材在本段干脆不引用），**不做顺延**：
+ *   · 素材本身已被正文或段级定义引用 → 项目那条只当"确认"，号以段级为准；
+ *   · 项目定义的号 ≤ 本段该类已占数量（说明那个位置已经被别人坐着）→ 整条跳过。
+ *  这条规则是用户拍板的（2026-11-03）：项目定义只是"省得逐段设"的批量默认，
+ *  它没有资格挤走段落里已经排好的东西。 */
 function refsForSegment(ds, idx, textRefs) {
     const seg = ((ds && ds.segments) || [])[idx] || {};
     const pool = (ds && ds.ref_assets) || [];
     const proj = cleanRefDefs(ds && ds.ref_defs);
     const own = cleanRefDefs(seg.ref_defs);
     const skip = refSkipOf(ds, idx);
-    const defs = { ...proj, ...own };
-    const out = [];
-    const push = (k) => {
-        const key = String(k || "").trim();
-        if (key && !out.includes(key)) out.push(key);
+    /* 1) 基础集合 = 正文 ∪ 段级定义：这两者先排好、先占号 */
+    const base = [];
+    const pushBase = (k) => {
+        const s = String(k || "").trim();
+        if (s && !base.includes(s)) base.push(s);
     };
-    for (const k of (textRefs || [])) push(k);                 // 正文是第一位（跳不过 skip）
-    for (const k of Object.keys(proj)) if (!skip.has(k)) push(k);
-    for (const k of Object.keys(own)) push(k);                 // 段定义 = 显式要它
-    return orderBySlots(out, defs, own, pool);
+    for (const k of (textRefs || [])) pushBase(k);
+    for (const k of Object.keys(own)) pushBase(k);
+    const baseOrdered = orderBySlots(base, own, own, pool);
+    /* 2) 基础集合按类型各自占掉了几个号 */
+    const used = { image: 0, video: 0, audio: 0 };
+    for (const k of baseOrdered) {
+        const kd = refKindOf(pool, k);
+        used[kd] = (used[kd] || 0) + 1;
+    }
+    /* 3) 项目定义：号被占 / 已被引用 / 被排除 → 一律不参与 */
+    const extra = [];
+    for (const [k, n] of Object.entries(proj)) {
+        if (!k || skip.has(k) || base.includes(k)) continue;
+        const kd = refKindOf(pool, k);
+        if (Math.floor(Number(n)) <= (used[kd] || 0)) continue;
+        extra.push(k);
+    }
+    if (!extra.length) return baseOrdered;
+    return orderBySlots([...baseOrdered, ...extra], { ...proj, ...own }, own, pool);
 }
 
 /** 段引用同步（ds 内联改）：正文里的 @别名 序列 + 素材定义 → seg.refs */

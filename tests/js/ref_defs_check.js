@@ -287,6 +287,28 @@ ok(!!node, "findNode() 拿不到节点");
         "编号下拉必须显示实跑号（不是定义值），否则会出现两个 P1");
 }
 
+/* ---------- 16. 项目定义优先级最低：撞号整条不生效（不顺延） ---------- */
+{
+    const ds = mkDs();
+    ds.ref_defs = { "猫.png": 1 };                 // 项目：猫 = P1
+    ds.segments[0].ref_defs = { "狗.png": 1 };     // 段级：狗 = P1（占住那个位置）
+    ok(w.refsForSegment(ds, 0, []).join(",") === "狗.png",
+        "项目定义的号被段落占了 → 该素材本段不引用：" + w.refsForSegment(ds, 0, []).join(","));
+
+    const ds2 = mkDs();
+    ds2.ref_defs = { "猫.png": 2 };                // 项目：猫 = P2（空位）
+    ds2.segments[0].ref_defs = { "狗.png": 1 };
+    ok(w.refsForSegment(ds2, 0, []).join(",") === "狗.png,猫.png",
+        "号还是空位时项目定义照常生效：" + w.refsForSegment(ds2, 0, []).join(","));
+
+    /* 同一个素材：段级号优先，项目定义不改它的号（素材仍引用） */
+    const ds3 = mkDs();
+    ds3.ref_defs = { "猫.png": 1 };
+    ds3.segments[0].ref_defs = { "猫.png": 2 };
+    ok(w.refsForSegment(ds3, 0, []).join(",") === "猫.png",
+        "同一素材段级优先、不该重复：" + w.refsForSegment(ds3, 0, []).join(","));
+}
+
 const real = (errors || []).filter((e) => !/Not implemented|jsdom/i.test(String(e)));
 ok(real.length === 0, "运行时报错：" + JSON.stringify(real));
 

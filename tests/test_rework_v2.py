@@ -604,3 +604,33 @@ def test_segment_tabs_and_optimizer_ui():
     for sym in ["optProgressStart", "optCallStream", "rebuildThinking",
                 "optModelCaps", "optCapsLoad", "思考强度", "h3d-opt-prog"]:
         assert sym in d, sym
+
+
+# ---- 素材定义（2026-11-02） ----
+def test_ref_defs_persist(projects):
+    """项目级 ref_defs 与段级 ref_defs/ref_skip 都要落盘。
+
+    少了它们，切一次项目 / 读一次档，用户设的 Picture 1/2/3 就全部退回
+    「按出现顺序自动」—— 界面上看着还是那些图，编号却悄悄变了。
+    """
+    m = projects.create_project("t_refdefs")
+    m2 = projects.save_prompts("t_refdefs", ["p1", "p2"], [
+        {"seconds": 5, "refs": ["猫.png"], "ref_defs": {"猫.png": 2, "狗.png": 0},
+         "ref_skip": ["景.mp4"]},
+        {"seconds": 5, "refs": [], "ref_skip": []},
+    ], base_revision=m["revision"], ref_defs={"猫.png": 1, "坏": -3, "": 2})
+    assert m2["ref_defs"] == {"猫.png": 1}
+    seg0 = m2["seg_fields"][0]
+    assert seg0["ref_defs"] == {"猫.png": 2}      # 0 号不是有效槽位，被洗掉
+    assert seg0["ref_skip"] == ["景.mp4"]
+    # 空 dict = 显式清空（用户把项目定义全删了，必须真删，否则切回来又冒出来）
+    m3 = projects.save_prompts("t_refdefs", ["p1"], None, ref_defs={})
+    assert "ref_defs" not in m3
+
+
+def test_ref_defs_copy_on_project_copy(projects):
+    """项目级定义是**内容**不是进度：复制项目要带走，否则新项目编号全变自动。"""
+    projects.create_project("t_refsrc")
+    projects.save_prompts("t_refsrc", ["p1"], None, ref_defs={"猫.png": 3})
+    m = projects.create_project("t_refdst", copy_from="t_refsrc")
+    assert m.get("ref_defs") == {"猫.png": 3}

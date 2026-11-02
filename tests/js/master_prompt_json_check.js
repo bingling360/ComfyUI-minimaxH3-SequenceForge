@@ -58,6 +58,7 @@ const parts = [
     extractConst("MPJ_LIST_KEYS"), extractConst("MPJ_TEXT_KEYS"),
     extractConst("MPJ_PROMPT_KEYS"), extractConst("MPJ_DUR_KEYS"),
     extractConst("MPJ_SOLO_KEYS"), extractConst("MPJ_IDX_KEYS"),
+    extractConst("MPJ_DEFS_KEYS"),
     extractConst("MPJ_FIELD_ORDER"),
     extractFn("mpjKeys"), extractFn("mpjPick"), extractFn("mpjSeconds"),
     extractFn("mpjStandalone"), extractFn("mpjPromptOf"),

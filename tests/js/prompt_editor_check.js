@@ -89,6 +89,14 @@ const code = [
     extractFn("refInfoMapOf"),
     extractFn("migrateRefsToFullNames"),
     extractFn("refsFromText"),
+    /* 素材定义（段级 / 项目级）：syncRefsFromText 现在走 refsForSegment，
+     * 这几个依赖必须一起抽出来，否则运行时是 ReferenceError 而不是断言失败。 */
+    extractFn("cleanRefDefs"),
+    extractFn("refDefsOf"),
+    extractFn("refSkipOf"),
+    extractFn("refKindOf"),
+    extractFn("orderBySlots"),
+    extractFn("refsForSegment"),
     extractFn("createPromptEditor"),
     extractFn("syncRefsFromText"),
     extractFn("refCount"),

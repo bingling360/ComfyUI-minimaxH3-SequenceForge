@@ -434,7 +434,8 @@ def add_routes(routes):
         try:
             manifest = projects.save_prompts(
                 str(data.get("dir") or ""), data.get("prompts"),
-                data.get("segments"), data.get("base_revision"))
+                data.get("segments"), data.get("base_revision"),
+                data.get("ref_defs"))
         except ValueError as e:
             msg = str(e)
             if msg.startswith("REVISION_CONFLICT"):

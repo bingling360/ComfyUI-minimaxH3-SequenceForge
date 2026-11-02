@@ -359,7 +359,10 @@ def test_master_prompt_single_box_modal():
     assert "ds.prompts = p.segs.map(" not in alloc, \
         "写入器不该再无条件整链替换：区间模式下未提及的段要原样保留"
     # 单框渲染器：只写 Segment 头 / Duration / Standalone / Prompt，且一律英文
-    assert "function mpRenderState(state, startAt)" in d
+    assert "function mpRenderState(state, startAt, pool)" in d
+    # 素材定义（2026-11-02）：Define 行是导出的一部分 —— 不带上的话「导出→贴回」
+    # 定义全丢，用户眼里的自定义编号又变回自动。
+    assert "Define: ${tok} ${n} = ${key}" in d
     assert "function exportMasterPrompt(node)" in d
     assert 'rows.push(`Duration: ${seg.seconds}`)' in d
     assert '`Standalone: ${seg.unlink ? "yes" : "no"}`' in d

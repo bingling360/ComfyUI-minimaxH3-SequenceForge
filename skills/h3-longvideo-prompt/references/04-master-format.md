@@ -142,6 +142,39 @@ detailed_description: [Shot 1] <Subject 1> stops and looks back; the neon of <Su
 - **视频** → 每个参考视频一条 `<Video N>` 定义行（`<Video N> is the content defined by <Video N>, the reference video "xxx.mp4".`），正文里后续用 `<Video N>` 指代。
 - **音频** → 每个参考音频一条 `<Audio N>` 定义行；保留标记用 `fully_copy` / `partially_copy` / `reference` / `weak_reference`（**音频专用**，别跟可见内容的 `fully_preserved` 那套混）。
 
+## 素材定义：`Define:` 行（可选写法，替代正文里的 `@素材名`）
+
+默认写法是正文里写 `@素材名`，编号按出现顺序自动排。**也可以显式定义编号**，正文里直接写官方标签：
+
+```
+[Segment 1]
+Duration: 10
+Standalone: no
+Define: Picture 1 = 猫.png
+Define: Picture 2 = 雨夜窄巷.png
+Define: Video 1 = 参考运镜.mp4
+
+Prompt:
+integrated_multimodal_description: [Shot 1] <Picture 1> stands at the mouth of <Picture 2>, neon dragging across the wet ground. <Video 1> drives the handheld sway.
+```
+
+规则：
+
+- **位置固定在 `Standalone:` 之后、`Prompt:` 之前**。写在 `Prompt:` 之后就进了正文块，那一行只会变成给模型看的字面量（不会被当定义，也不会报错——最坑的一种失败）。
+- **只认 `Picture` / `Video` / `Audio` + 序号**。`Subject` 不行：它是「可复用内容」的概念（角色/场景），不对应某个素材文件。
+- **号是「参考素材内部」的序号**，按类型各自从 1 数。**首尾帧锚不占这里的号** —— 有首帧锚的段，`Define: Picture 1` 实跑是 `<Picture 2>`（后端把帧锚强制排最前，这是官方的对齐语义）。
+- **定义 = 强制引用**：定义过的素材，正文里一次 `@` 都不写也会被挂上、并占住那个号。
+- **号要连续可用**：定义 3 而本段只有 2 张图 → 该条被忽略、回落成自动，**不会产生悬空号**（正文里写 `<Picture 3>` 而只传了两张图是实跑错误）。
+- 可以只定义一部分，其余素材仍按出现顺序自动补位。
+
+什么时候用它：
+
+- 多图段里要把某张图**固定**成官方示例里的 `Picture 1`（验收方按号对图）；
+- 素材名很长，正文里要重复写很多次 —— 定义一次，正文只写 `<Picture 1>`；
+- 素材**不进正文**但要挂上（整张图当风格/构图锚，正文不提它）。
+
+不需要固定编号时**别用**：`@素材名` 更短，而且素材改名时池子会统一迁移引用；`Define:` 行里的名字是死文本，改名后要手动跟着改。
+
 ## 其他会踩的坑
 
 | 症状          | 原因                                                                         |
@@ -153,6 +186,8 @@ detailed_description: [Shot 1] <Subject 1> stops and looks back; the neon of <Su
 | 正文里冒出 `@女主` | Ref2VA 模式下 `@` 写进了 `detailed_description`（应只出现在 `subject_definitions` 定义行） |
 | 想续写却把整链替换了  | 段头从 `[Segment 1]` 写起 = 整链替换。续写要把段号写成「现有段数 +1」起（已有 3 段 → `[Segment 4]`）    |
 | 续写后段数不对     | 档位还停在「整体替换」：这份只有 2 段，链就剩 2 段。切「从第 N 段起写入」或「追加到末尾」                          |
+| Define 行没生效   | 写在 `Prompt:` 之后了 —— 它必须和 `Duration` / `Standalone` 一起写在正文之前                        |
+| Define 的号对不上  | 该段有首帧/尾帧锚：帧锚固定占 `<Picture 1>`（和 2），定义号是参考素材内部的第几个，不是最终官方号                    |
 
 段级标签是**单行元数据**：写完它就归位了，紧跟其后的裸正文归 `Prompt`，不会被并进别的字段。
 

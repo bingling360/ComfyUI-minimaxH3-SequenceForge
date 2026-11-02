@@ -1048,6 +1048,30 @@ def _clean_seg_field(raw) -> dict | None:
     fr = raw.get("frame_refs")
     out["frame_refs"] = [str(x) for x in fr if isinstance(x, (str, int))][:4] \
         if isinstance(fr, list) else None
+    # 素材定义（2026-11-02）：{引用名: 槽位号} / 「本段不用」名单。
+    # 段级定义优先于项目级（见前端 refsForSegment）：落盘丢了它，切回项目时
+    # 编号会全部退回"按顺序自动"，用户眼里的自定义号就白设了。
+    rd = raw.get("ref_defs")
+    if isinstance(rd, dict):
+        keep_defs = {}
+        for k, v in list(rd.items())[:64]:
+            ks = str(k or "").strip()[:256]
+            if not ks:
+                continue
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n >= 1:
+                keep_defs[ks] = n
+        if keep_defs:
+            out["ref_defs"] = keep_defs
+    rs = raw.get("ref_skip")
+    if isinstance(rs, list):
+        keep_skip = [str(x)[:256] for x in rs
+                     if isinstance(x, (str, int)) and str(x).strip()][:64]
+        if keep_skip:
+            out["ref_skip"] = keep_skip
     # M3：每段 latent 保存策略透存 {mode: all|range|tail|off, start_f, end_f, tail_f,
     # split_av, save_seg, save_all}；latent 引用策略 {on, frames, video, audio}
     # （null=跟随全局，默认尾部 N 帧钉下段首）。
@@ -1765,7 +1789,7 @@ def repair_assets(name: str):
             "revision": int(manifest.get("revision") or 1)}
 
 
-def save_prompts(name: str, prompts, segments=None, base_revision=None):
+def save_prompts(name: str, prompts, segments=None, base_revision=None, ref_defs=None):
     """把导演台当前提示词组回写进项目 manifest（提示词的持久源=项目文件夹）。
 
     只更新 prompts / seg_fields / total / updated_at / revision（及 done 超界钳制），不动
@@ -1814,6 +1838,26 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
             fields.append(seg_meta[si])
             si += 1
     manifest["prompts"] = rows
+    # 项目级素材定义（2026-11-02）：{引用名: 槽位号} —— 全项目 + 之后新增的段都吃它。
+    # 段级 ref_defs 同名时优先（见前端 refsForSegment）。传 None = 不动（老调用方），
+    # 传空 dict = 显式清空（用户把项目定义全删了，得真删，不然切回来又冒出来）。
+    if ref_defs is not None:
+        keep = {}
+        if isinstance(ref_defs, dict):
+            for k, v in list(ref_defs.items())[:256]:
+                ks = str(k or "").strip()[:256]
+                if not ks:
+                    continue
+                try:
+                    n = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if n >= 1:
+                    keep[ks] = n
+        if keep:
+            manifest["ref_defs"] = keep
+        else:
+            manifest.pop("ref_defs", None)
     # 全空（无任何分段字段）不写键：旧 manifest 结构零变化，体积零增长
     if any(x is not None for x in fields):
         manifest["seg_fields"] = fields
@@ -1855,7 +1899,10 @@ def save_prompts(name: str, prompts, segments=None, base_revision=None):
 # 钉住了。params 留空则由首跑按**当前画布值**写入，正是"新项目用新参数"该有的
 # 语义；想沿用旧参数请用「恢复项目上次参数」按钮显式套一次。
 _COPY_CONTENT_KEYS = ("prompts", "seg_fields", "inserts", "assets", "asset_links",
-                      "has_prologue", "upscale", "total")
+                      "has_prologue", "upscale", "total",
+                      # 项目级素材定义是**内容**（不是进度）：复制项目要带走，
+                      # 否则新项目里所有自定义编号一次全部退回自动。
+                      "ref_defs")
 
 
 def _seg_latent_files(manifest):

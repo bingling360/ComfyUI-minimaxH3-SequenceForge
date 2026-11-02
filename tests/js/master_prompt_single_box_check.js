@@ -53,6 +53,8 @@ const parts = [
     extractConst("MP_BODY_KEYS"),
     extractFn("mpReflow"), extractFn("newMasterSeg"),
     extractFn("parseMasterPrompt"), extractFn("mpRenderState"),
+    /* mpRenderState 现在会渲染 Define 行（素材定义），这两个是它的依赖 */
+    extractFn("cleanRefDefs"), extractFn("refKindOf"),
 ].join("\n");
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { runScripts: "outside-only" });

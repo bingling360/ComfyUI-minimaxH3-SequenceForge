@@ -1283,6 +1283,16 @@ function buildRefBar(RB) {
             refbar.append(el("label", "", RB.title || "引用素材"));
             const counter = el("span", "h3d-secs-hint", "");
             refbar.append(counter);        // 计数先入位：chips 一律插在它前面（syncChips 用）
+            /* 素材定义入口（2026-11-02）：就近挂在引用条上 —— 定义与引用是同一件事的
+             * 两面（定义 = 强制引用 + 指定编号），分开放反而要在两处来回看。
+             * chips 都 insertBefore(counter)，所以这颗按钮永远在条尾，不挤占素材位。 */
+            const bDefs = el("button", "h3d-btn h3d-chipdef", "⌗ 定义");
+            bDefs.type = "button";
+            bDefs.title = "给素材指定官方编号（Picture 1 / Video 2 …）：定义过的素材"
+                + "正文里不写 @ 也会挂上。段级优先于项目级。";
+            bDefs.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+            bDefs.onclick = () => openRefDefsDialog(node, segIdx, () => scheduleRefresh(120));
+            refbar.append(bDefs);
             /* 素材池取**活**的节点状态（上传/改名/删除素材后 chips 与别名表立即跟上），
              * 建卡快照 pool 只作回落 —— 快照会一直停在建卡那一刻。 */
             /* 官方 tag 预览：按「本段勾选顺序」对三类各自独立编号（与后端
@@ -1319,6 +1329,25 @@ function buildRefBar(RB) {
                     || c.appendChild(Object.assign(document.createElement("span"),
                         { className: "h3d-chipbtn-text" }));
                 txt.textContent = `${lbl}${roles}`;
+                /* 编号徽标（2026-11-02）：P2 / V1 / A1。编号按本段动态算，素材定义
+                 * 会改它 —— 把它显示在 chip 上，"我定义的 Picture 1 到底落成几号"
+                 * 不用再靠映射条去对。定义过的加 .def（实心）：号是人定的，不是排出来的。 */
+                let noEl = c.querySelector(":scope > .h3d-chipno");
+                if (!noEl) {
+                    noEl = document.createElement("span");
+                    noEl.className = "h3d-chipno";
+                    c.append(noEl);
+                }
+                const tokM = /^<(\w+)\s+(\d+)>$/.exec(String(token || ""));
+                const noTxt = tokM ? `${tokM[1][0].toUpperCase()}${tokM[2]}` : "";
+                noEl.textContent = noTxt;
+                noEl.style.display = noTxt ? "" : "none";
+                let defN;
+                try { defN = refDefsOf(getDs(node), segIdx)[key]; } catch (e) { defN = undefined; }
+                noEl.classList.toggle("def", !!defN);
+                noEl.title = defN
+                    ? `本段把「${key}」定义为第 ${defN} 个${KIND_NAME[a.kind] || "素材"}`
+                    : "";
                 c.title = `${KIND_NAME[a.kind] || ""}「${lbl}」${roles}：`
                     + (n > 0
                         ? `本段已引用${token ? `（正文里每个 @${key} 都会编译成 ${token}）` : ""}`
@@ -1440,6 +1469,12 @@ function buildRefBar(RB) {
                 }
                 /* 整条转绿 = "本段挂了素材"的一眼判据（chip 一多，逐个找太慢） */
                 refbar.classList.toggle("on", nAsset > 0);
+                /* 定义徽标：没定义的段不显示数字（0 条时按钮就是「⌗ 定义」） */
+                try {
+                    const nDef = Object.keys(refDefsOf(getDs(node), segIdx)).length;
+                    bDefs.textContent = nDef ? `⌗ 定义 ${nDef}` : "⌗ 定义";
+                    bDefs.classList.toggle("on", nDef > 0);
+                } catch (e) { /* 只读模式 */ }
                 paintRefMap(refs, tokens, live);
             };
             /* 用 mousedown 而不是 click：① 卡片重绘可能夹在 mousedown/click
@@ -1515,6 +1550,169 @@ function buildRefBar(RB) {
             if (RB.showFrames) refbar.append(mkFrameBtns(node, segIdx, () => scheduleRefresh(240)));
             return { el: refbar, paint: paintAll };
 }
+
+/* ---------- 素材定义：写入口（段级 / 项目级） ----------
+ * 三个 set 都只做一件事：改字段 → 重算 refs（定义改变引用集合与顺序）→ 落 ds。
+ * **不另开写路径**：refs 仍然只有 refsForSegment 一个算法，段卡 / 后端 / 导出
+ * 看到的都是同一份。 */
+/** 重算一段的 refs 并落盘。
+ *  `dsArg` 必须是**调用方已经改好的那份 ds**：以前这里自己再 getDs 一次，
+ *  getDs 每次解析 widget 都是新对象 → 调用方刚写进 seg 的定义当场被旧副本覆盖
+ *  （表现：面板里选完编号，一刷新又变回「自动」）。 */
+function resyncRefsAt(node, idx, dsArg) {
+    const ds = dsArg || getDs(node);
+    const i = Math.max(0, Math.floor(Number(idx) || 0));
+    syncRefsFromText(ds, i, String((ds.prompts || [])[i] ?? ""));
+    setDs(node, ds);
+    return ds;
+}
+
+/** 段级定义。n = null → 删除该定义（回到「跟随项目 / 自动」）。 */
+function setSegRefDef(node, segIdx, key, n) {
+    const ds = getDs(node);
+    const seg = (ds.segments || [])[segIdx];
+    if (!seg || !key) return;
+    const defs = cleanRefDefs(seg.ref_defs);
+    const num = Math.floor(Number(n));
+    if (n === null || n === undefined || !Number.isFinite(num) || num < 1) delete defs[key];
+    else defs[key] = num;
+    if (Object.keys(defs).length) seg.ref_defs = defs; else delete seg.ref_defs;
+    resyncRefsAt(node, segIdx, ds);
+}
+
+/** 段级「不用」（只对项目定义生效；正文里显式 @ 过的不受它影响）。 */
+function setSegRefSkip(node, segIdx, key, on) {
+    const ds = getDs(node);
+    const seg = (ds.segments || [])[segIdx];
+    if (!seg || !key) return;
+    const arr = new Set((Array.isArray(seg.ref_skip) ? seg.ref_skip : []).map(String));
+    if (on) arr.add(key); else arr.delete(key);
+    if (arr.size) seg.ref_skip = [...arr]; else delete seg.ref_skip;
+    resyncRefsAt(node, segIdx, ds);
+}
+
+/** 项目级定义（影响所有段落 + 之后新增的段）。n = null → 取消该条项目定义。 */
+function setProjRefDef(node, key, n) {
+    const ds = getDs(node);
+    if (!ds || !key) return;
+    const defs = cleanRefDefs(ds.ref_defs);
+    const num = Math.floor(Number(n));
+    if (n === null || n === undefined || !Number.isFinite(num) || num < 1) delete defs[key];
+    else defs[key] = num;
+    if (Object.keys(defs).length) ds.ref_defs = defs; else delete ds.ref_defs;
+    /* 项目定义动的是**每一段**的引用集合与编号 → 全链重算（未受影响的段
+     * syncRefsFromText 内部会直接返回，不产生无谓写入）。 */
+    const cnt = (ds.prompts || []).length;
+    for (let i = 0; i < cnt; i++) syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
+    setDs(node, ds);
+}
+
+/** 素材定义面板（引用条上的「⌗ 定义」）：一张表同时管本段与项目。
+ *  为什么放一起：两边是同一个编号空间（段级覆盖项目级），分两个入口必然出现
+ *  「我在项目里设了 1，这段怎么显示 3」的困惑 —— 同屏才能一眼看出覆盖关系。 */
+function openRefDefsDialog(node, segIdx, onChange) {
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog h3d-dialog-wide");
+    dialog.append(el("h3", "", `⌗ 素材定义 · 第 ${segIdx + 1} 段`));
+    dialog.append(el("p", "h3d-lead",
+        "定义 = 给素材指定官方编号（<code>Picture 1</code> / <code>Video 2</code> …）。"
+        + "定义过的素材<b>正文里不写 @ 也会挂上</b>，编号也按定义排。"
+        + "号是<b>参考素材内部</b>的序号 —— 首尾帧锚由后端固定排最前，不占这里的号，"
+        + "所以有首帧锚的段，参考素材实跑从 <code>&lt;Picture 2&gt;</code> 开始。"
+        + "本段优先于项目：项目定义影响所有段落（含以后新增的），本段可以改号或「不用」。"));
+    const box = el("div", "h3d-defbox");
+    const row = el("div", "h3d-dialog-row");
+    const bClose = el("button", "h3d-btn h3d-btn-cta", "关闭");
+    row.append(bClose);
+    dialog.append(box, row);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+    document.body.append(overlay);
+
+    const fire = () => { try { onChange && onChange(); } catch (e) { /* 面板已关 */ } };
+    const mkSel = (opts, val) => {
+        const s = document.createElement("select");
+        s.className = "h3d-defsel";
+        for (const [t, v] of opts) s.append(new Option(t, v));
+        s.value = val;
+        return s;
+    };
+    const paint = () => {
+        const ds = getDs(node);
+        const pool = ds.ref_assets || [];
+        const seg = (ds.segments || [])[segIdx] || {};
+        const proj = cleanRefDefs(ds.ref_defs);
+        const own = cleanRefDefs(seg.ref_defs);
+        const skip = refSkipOf(ds, segIdx);
+        const cur = Array.isArray(seg.refs) ? seg.refs : [];
+        box.replaceChildren();
+        /* 本段候选 = 已引用 + 段定义 + 项目定义（都是"本段会出现"的素材） */
+        const segKeys = [];
+        for (const k of [...cur, ...Object.keys(own), ...Object.keys(proj)]) {
+            if (k && !segKeys.includes(k)) segKeys.push(k);
+        }
+        const maxOf = (kd) => Math.max(1, segKeys.filter((k) => refKindOf(pool, k) === kd).length);
+
+        box.append(el("div", "h3d-defcap", "本段（优先）"));
+        if (!segKeys.length) {
+            box.append(el("div", "h3d-defempty", "本段还没有任何素材 —— 先在引用条上点素材引用它，再来定义。"));
+        }
+        for (const key of segKeys) {
+            const kd = refKindOf(pool, key);
+            const r = el("div", "h3d-defrow");
+            const nm = el("span", "h3d-defname");
+            nm.textContent = key;
+            r.append(nm, el("span", "h3d-defkind", KIND_NAME[kd] || ""));
+            const maxN = maxOf(kd);
+            const opts = [["自动", ""]];
+            /* 「不用」只对项目定义有意义：没定义就没什么可"不用"的 */
+            if (proj[key]) opts.push(["不用", "skip"]);
+            for (let i = 1; i <= maxN; i++) opts.push([String(i), String(i)]);
+            const val = skip.has(key) ? "skip" : (own[key] ? String(own[key]) : "");
+            const sel = mkSel(opts, val);
+            sel.onchange = () => {
+                const v = String(sel.value || "");
+                if (v === "skip") { setSegRefDef(node, segIdx, key, null); setSegRefSkip(node, segIdx, key, true); }
+                else if (v === "") { setSegRefDef(node, segIdx, key, null); setSegRefSkip(node, segIdx, key, false); }
+                else { setSegRefSkip(node, segIdx, key, false); setSegRefDef(node, segIdx, key, Number(v)); }
+                paint(); fire();
+            };
+            r.append(sel);
+            if (proj[key]) r.append(el("span", "h3d-defhint", `项目 ${proj[key]}`));
+            box.append(r);
+        }
+
+        box.append(el("div", "h3d-defcap", "项目定义（影响所有段落，含以后新增的）"));
+        if (!pool.length) {
+            box.append(el("div", "h3d-defempty", "项目里还没有素材。"));
+        }
+        const poolKeys = pool.map((a) => refKeyOf(a)).filter(Boolean);
+        for (const key of poolKeys) {
+            const kd = refKindOf(pool, key);
+            const r = el("div", "h3d-defrow");
+            const nm = el("span", "h3d-defname");
+            nm.textContent = key;
+            r.append(nm, el("span", "h3d-defkind", KIND_NAME[kd] || ""));
+            const maxN = Math.max(1, poolKeys.filter((k) => refKindOf(pool, k) === kd).length);
+            const opts = [["不定义", ""]];
+            for (let i = 1; i <= maxN; i++) opts.push([String(i), String(i)]);
+            const sel = mkSel(opts, proj[key] ? String(proj[key]) : "");
+            sel.onchange = () => {
+                const v = String(sel.value || "");
+                setProjRefDef(node, key, v === "" ? null : Number(v));
+                paint(); fire();
+            };
+            r.append(sel);
+            const own2 = own[key];
+            if (own2) r.append(el("span", "h3d-defhint", `本段覆盖为 ${own2}`));
+            else if (skip.has(key)) r.append(el("span", "h3d-defhint bad", "本段不用"));
+            box.append(r);
+        }
+    };
+    bClose.onclick = () => { fire(); overlay.remove(); };
+    paint();
+}
 /** 正文 → 本段引用集合（正文是唯一真相）：按首次出现顺序，允许重复计数。
  *  与后端 compile_refs / _find_refs 同口径（`@标签`，负向后顾防 a@b.com）。 */
 function refsFromText(text, pool) {
@@ -1535,11 +1733,130 @@ function refsFromText(text, pool) {
     return out;
 }
 
-/** 段引用同步（ds 内联改）：正文里的 @别名 序列 → seg.refs */
+/* ---------- 素材定义（段级 / 项目级） ----------
+ * 需求（2026-11-02）：给素材指定官方引用编号（Picture 1 / Video 2 …），并且
+ * **正文里不写 @ 也能挂上**。三处存储：
+ *   · seg.ref_defs = { "<引用名>": 槽位号 }   —— 本段定义（优先）
+ *   · seg.ref_skip = ["<引用名>", …]         —— 本段不用某条项目定义
+ *   · ds.ref_defs  = { "<引用名>": 槽位号 }   —— 项目定义（全项目 + 之后新增段）
+ *
+ * ★ 槽位号是**参考素材内部**的序号（按 kind 独立，1-based），**不含首尾帧锚**。
+ *   为什么不取绝对官方号：帧锚由后端强制前置（nodes.py `order = [anchors] + rest`），
+ *   有首帧锚的段参考素材从 <Picture 2> 起。取绝对值的话「项目定义 猫=1」在无锚段
+ *   是 P1、在有锚段必然撞号；取槽位号则两边语义一致，实跑号由现有编号算法
+ *   自然算出（前端 v2RefsFromSchedule / 后端 _kind_tokens 一行都不用改）。
+ *
+ * ★ 实现口径：定义**不改编号算法，只改 refs 的顺序与集合**。后端按 refs 顺序
+ *   逐类累加编号，所以"把 A 排到图片序列第 3 位"就等于"A 是 <Picture 3>"。
+ *   这条设计让后端三个编号点（_kind_tokens / compile_refs / compile_segments）
+ *   零改动，也就不会出现前后端编号漂移 —— 那个坑每加一处编号都要三处同改。
+ */
+
+/** 定义表归一：只收正整数槽位号，键是引用名（ref_name / 别名，与 refKeyOf 同源）。 */
+function cleanRefDefs(raw) {
+    const out = {};
+    if (!raw || typeof raw !== "object") return out;
+    for (const [k, v] of Object.entries(raw)) {
+        const key = String(k || "").trim();
+        const n = Math.floor(Number(v));
+        if (key && Number.isFinite(n) && n >= 1) out[key] = n;
+    }
+    return out;
+}
+
+/** 本段生效的定义 = 项目定义 ← 段定义（**段级覆盖项目级**，同一个素材以段为准）。 */
+function refDefsOf(ds, idx) {
+    const seg = ((ds && ds.segments) || [])[idx];
+    const proj = cleanRefDefs(ds && ds.ref_defs);
+    const own = cleanRefDefs(seg && seg.ref_defs);
+    return { ...proj, ...own };
+}
+
+/** 本段的「不用」名单（只对项目定义生效：正文里显式 @ 过的不受它影响）。 */
+function refSkipOf(ds, idx) {
+    const seg = ((ds && ds.segments) || [])[idx];
+    const arr = Array.isArray(seg && seg.ref_skip) ? seg.ref_skip : [];
+    return new Set(arr.map((x) => String(x || "").trim()).filter(Boolean));
+}
+
+/** 按 kind 查素材类别（查不到按图片算 —— 与 v2RefsFromSchedule 的回落同口径）。
+ *  空池直接返回 image：导出侧（mpRenderState）常常不带池，纯文本渲染时
+ *  Define 行按 Picture 写就够（真要分类型时调用方会传池）。 */
+function refKindOf(pool, key) {
+    const arr = pool || [];
+    if (!arr.length) return "image";
+    const k = String(key || "").trim();
+    const a = arr.find((x) => x && (refKeyOf(x) === k || x.label === k));
+    return (a && KIND_LIST.includes(a.kind)) ? a.kind : "image";
+}
+
+/** 一类素材按槽位号重排：有定义的先占号，占不上的（越界 / 撞号）退回自动，
+ *  其余按**原顺序**填剩下的空位 —— 保证结果连续、不产生悬空号。
+ *
+ *  只能连续：官方按 `ref_image_N` 建槽，正文里写 `<Picture 3>` 而本段只有两张图
+ *  就是悬空引用。所以号越界不报错、直接回落（界面上会把可选范围限制住）。
+ *  `segDefs` 用来判优先级：同一个号被两个素材定义时，**段级先占**（用户拍板的
+ *  段级 > 项目级），项目级那条退回自动。 */
+function orderBySlots(keys, defs, segDefs, pool) {
+    const arr = keys.slice();
+    if (!arr.length) return arr;
+    const groups = { image: [], video: [], audio: [] };
+    for (const k of arr) (groups[refKindOf(pool, k)] || groups.image).push(k);
+    /* 每个 kind 排好一条队列；最后按原数组的 kind 序列逐位取队首 ——
+     * 这样「图片/视频交替引用」的正文阅读顺序不变，各类仍在自己的序列里换位。 */
+    const queue = { image: [], video: [], audio: [] };
+    for (const kd of Object.keys(groups)) {
+        const g = groups[kd];
+        if (!g.length) continue;
+        const placed = new Array(g.length).fill(null);
+        const taken = new Set();
+        const withDef = g.filter((k) => Number(defs[k]) >= 1);
+        /* 段级定义先遍历（稳定排序，同优先级保持原顺序）→ 段级先占号 */
+        withDef.sort((a, b) => (segDefs[a] ? 0 : 1) - (segDefs[b] ? 0 : 1));
+        for (const k of withDef) {
+            const d = Math.floor(Number(defs[k]));
+            if (d >= 1 && d <= g.length && !placed[d - 1]) { placed[d - 1] = k; taken.add(k); }
+        }
+        const rest = g.filter((k) => !taken.has(k));
+        let ri = 0;
+        for (let i = 0; i < g.length; i++) if (!placed[i]) placed[i] = rest[ri++];
+        queue[kd] = placed;
+    }
+    return arr.map((k) => {
+        const q = queue[refKindOf(pool, k)] || queue.image;
+        return q.length ? q.shift() : k;
+    });
+}
+
+/** 本段有效引用 = 正文派生 ∪ 项目定义 ∪ 段定义，再按槽位号重排。
+ *
+ *  为什么要把"项目定义"并进来：用户要的是「定义某张图是 picture 1，则所有段落
+ *  都自动引用它」—— 自动引用 = 进 seg.refs，后端才会真的把图传进去、并给它
+ *  分配 <Picture k>。正文里没有 @ 也能挂上，靠的就是这一步。
+ *  `seg.ref_skip` 只挡项目定义（正文里显式 @ 过 = 用户明确要它，不挡）。 */
+function refsForSegment(ds, idx, textRefs) {
+    const seg = ((ds && ds.segments) || [])[idx] || {};
+    const pool = (ds && ds.ref_assets) || [];
+    const proj = cleanRefDefs(ds && ds.ref_defs);
+    const own = cleanRefDefs(seg.ref_defs);
+    const skip = refSkipOf(ds, idx);
+    const defs = { ...proj, ...own };
+    const out = [];
+    const push = (k) => {
+        const key = String(k || "").trim();
+        if (key && !out.includes(key)) out.push(key);
+    };
+    for (const k of (textRefs || [])) push(k);                 // 正文是第一位（跳不过 skip）
+    for (const k of Object.keys(proj)) if (!skip.has(k)) push(k);
+    for (const k of Object.keys(own)) push(k);                 // 段定义 = 显式要它
+    return orderBySlots(out, defs, own, pool);
+}
+
+/** 段引用同步（ds 内联改）：正文里的 @别名 序列 + 素材定义 → seg.refs */
 function syncRefsFromText(ds, idx, text) {
     const seg = (ds.segments || [])[idx];
     if (!seg) return false;
-    const next = refsFromText(text, ds.ref_assets);
+    const next = refsForSegment(ds, idx, refsFromText(text, ds.ref_assets));
     const cur = Array.isArray(seg.refs) ? seg.refs : [];
     if (cur.length === next.length && cur.every((x, i) => x === next[i])) return false;
     seg.refs = next;
@@ -2753,6 +3070,10 @@ function restoreSegField(raw) {
         tail_src: (raw.tail_src && typeof raw.tail_src === "object") ? raw.tail_src : null,
         /* 手动锚定（双轨时间线）：读档必须还原，否则"看着有锚、跑起来没锚"——与 frame_img 同款坑 */
         anchors: Array.isArray(raw.anchors) ? raw.anchors : [],
+        /* 素材定义（2026-11-02）：与 frame_img 同一个坑 —— 读档不还原，
+         * 用户设的 Picture 1/2/3 一切项目就退回自动编号。 */
+        ref_defs: cleanRefDefs(raw.ref_defs),
+        ref_skip: Array.isArray(raw.ref_skip) ? raw.ref_skip.map(String) : [],
     };
 }
 
@@ -2910,6 +3231,11 @@ function getDs(node) {
                 tail_src: (s?.tail_src && typeof s.tail_src === "object") ? s.tail_src : null,
                 /* 手动锚定：透存（防 getDs 归一化洗掉已设 anchors；否则每帧渲染都把锚丢光） */
                 anchors: Array.isArray(s?.anchors) ? s.anchors : [],
+                /* 素材定义（2026-11-02）：段级编号表 / 「本段不用」名单。**必须透存** ——
+                 * 这是用户拍板的东西，归一化洗掉就等于每次刷新都丢定义（编号又回到自动）。 */
+                ref_defs: cleanRefDefs(s?.ref_defs),
+                ref_skip: Array.isArray(s?.ref_skip)
+                    ? s.ref_skip.map(String).filter(Boolean) : [],
                 /* v2 手动模式（null=跟随导演台） */
             };
         });
@@ -3013,6 +3339,9 @@ function getDs(node) {
             /* AI优化配置与历史（自研后端）：透存，不进后端指纹 */
             optimizer: (raw.optimizer && typeof raw.optimizer === "object") ? raw.optimizer : null,
             opt_hist: (raw.opt_hist && typeof raw.opt_hist === "object") ? raw.opt_hist : null,
+            /* 项目级素材定义（2026-11-02）：{引用名: 槽位号}，影响每一段（含以后新增的）。
+             * 段级同名字段优先；洗掉它 = 切一次项目 / 刷新一次，全项目定义全丢。 */
+            ref_defs: cleanRefDefs(raw.ref_defs),
         };
     } catch (e) {
         const rawTxt = (w && w.value) ? String(w.value) : "";
@@ -3416,12 +3745,13 @@ const MP_HEAD_RE = /^(?:\[\s*(?:segment|seg|part|shot\s*group)\s*(\d+)?\s*\]|【
 const MP_END_RE = /^(?:\[\s*end\s*\]|【\s*(?:完|END|end|结束)\s*】)$/i;
 /* 段级标签：英文为唯一写入口径；中文旧名只读兼容（认出来照样当段级标签解析，
  * 不然老文本里的「时长：8」会被当成正文吞进提示词）。 */
-const MP_FIELD_RE = /^(Duration|Standalone|Prompt|Reference|Scene|Character|Ambience|Music|Intent|Script|时长|独立镜头|提示词|参考|场景|角色|环境音|配乐|意图|剧本)\s*[:：]\s*(.*)$/i;
+const MP_FIELD_RE = /^(Duration|Standalone|Prompt|Define|Reference|Scene|Character|Ambience|Music|Intent|Script|时长|独立镜头|提示词|定义|参考|场景|角色|环境音|配乐|意图|剧本)\s*[:：]\s*(.*)$/i;
 const MP_FIELDS = {
     "duration": "seconds", "standalone": "unlink", "prompt": "main",
+    "define": "defs",
     "reference": "refs", "scene": "scene", "character": "character",
     "ambience": "soundscape", "music": "music", "intent": "intent", "script": "script",
-    "时长": "seconds", "独立镜头": "unlink", "提示词": "main", "参考": "refs",
+    "时长": "seconds", "独立镜头": "unlink", "提示词": "main", "定义": "defs", "参考": "refs",
     "场景": "scene", "角色": "character", "环境音": "soundscape", "配乐": "music",
     "意图": "intent", "剧本": "script",
 };
@@ -3559,6 +3889,25 @@ function parseMasterPrompt(text) {
                 else out.notes.push(`「${rawKey}: ${fm[2].trim()}」应为 yes/是 或 no/否，已忽略`);
             } else if (key === "refs") {
                 cur.refs = fm[2].split(/[，,、;；]+/).map((s) => s.trim()).filter(Boolean);
+            } else if (key === "defs") {
+                /* Define: Picture 1 = 猫.png —— **素材编号定义**（2026-11-02）。
+                 * 这是 @素材名 之外的可选写法：定义过的素材正文里不写 @ 也会挂上，
+                 * 编号也按定义排（见 refsForSegment / orderBySlots）。
+                 * 只认 Picture / Video / Audio —— Subject 是"可复用内容"的概念，
+                 * 不在素材编号空间里（官方 Ref2VA 用它指代角色/场景，不是某个文件）。 */
+                const dm = /^<?\s*(picture|video|audio)\s+([1-9]\d*)\s*>?\s*[=:：]\s*(.+)$/i.exec(fm[2].trim());
+                if (!dm) {
+                    out.notes.push(`「Define: ${fm[2].trim()}」格式不对`
+                        + "（应写成 Define: Picture 1 = 素材名），已忽略");
+                } else {
+                    const nm = dm[3].trim();
+                    if (!cur.defs) cur.defs = {};
+                    cur.defs[nm] = Number(dm[2]);
+                }
+                /* 段级元数据：不进正文块（inBody 不动）、不留空行记账 */
+                field = "main";
+                pendingBlank = 0;
+                continue;
             } else {
                 pendingBlank = 0;                       // 换标签：之前记的空行不跨字段
                 cur[key] = cur[key] === undefined ? fm[2].trim() : `${cur[key]}\n${fm[2].trim()}`;
@@ -3638,6 +3987,8 @@ const MPJ_PROMPT_KEYS = ["prompt", "main", "content", "body", "提示词", "正�
 const MPJ_DUR_KEYS = ["duration", "seconds", "sec", "dur", "length", "duration_seconds", "时长"];
 const MPJ_SOLO_KEYS = ["standalone", "unlink", "independent", "独立镜头"];
 const MPJ_IDX_KEYS = ["index", "idx", "n", "no", "order", "序号", "段号"];
+/* 素材定义（2026-11-02）：{"Picture 1": "猫.png"} —— 与文本通道的 Define 行同义。 */
+const MPJ_DEFS_KEYS = ["defs", "define", "ref_defs", "定义"];
 /* 官方字段对象（不给 prompt 整串、按官方字段拆着给）的拼装顺序：与 06-rules 的
  * 字段顺序一致，字段间空行分节（与文本通道里官方三/六字段的写法同形）。 */
 const MPJ_FIELD_ORDER = ["summary", "subject_definitions", "retention_analysis",
@@ -3767,6 +4118,20 @@ function parseMasterPromptJson(raw) {
         seg.main = body === undefined ? "" : body;
         if (body === undefined) badEmpty.push(String(i + 1));
         const m = (it && typeof it === "object") ? mpjKeys(it) : new Map();
+        /* 素材定义：`{"Picture 1": "猫.png", "Video 1": "参考.mp4"}`。
+         * 键是官方编号（Picture/Video/Audio + 序号），值是素材名 —— 与文本通道的
+         * `Define: Picture 1 = 猫.png` 逐字同义，只是外形是对象（agent 更好产出）。
+         * Subject 不收：它是"可复用内容"的指代，不属于某个素材文件。 */
+        const defsRaw = mpjPick(m, MPJ_DEFS_KEYS);
+        if (defsRaw && typeof defsRaw === "object" && !Array.isArray(defsRaw)) {
+            const dd = {};
+            for (const [tok, nm] of Object.entries(defsRaw)) {
+                const dm = /^\s*<?\s*(picture|video|audio)\s+([1-9]\d*)\s*>?\s*$/i.exec(String(tok));
+                const name = String(nm == null ? "" : nm).trim();
+                if (dm && name) dd[name] = Number(dm[2]);
+            }
+            if (Object.keys(dd).length) seg.defs = dd;
+        }
         const rawDur = mpjPick(m, MPJ_DUR_KEYS);
         seg.seconds = mpjSeconds(rawDur);
         if (seg.seconds === undefined && String(rawDur ?? "").trim()) badDur.push(String(i + 1));
@@ -3806,7 +4171,7 @@ function parseMasterPromptJson(raw) {
  *  会传非 1 的值：区间模式下把第 4–6 段渲染成 `[Segment 4]`…，贴回来时
  *  parseMasterPrompt 才能认出「这是要写第 4 段起」（段号是目标段号，不只是装饰）。
  *  导出（exportMasterPrompt）永远不传 = 从 1 开始，导出的就是整链。 */
-function mpRenderState(state, startAt) {
+function mpRenderState(state, startAt, pool) {
     const base0 = Number(startAt);
     const base = Number.isFinite(base0) && base0 > 0 ? Math.floor(base0) : 1;
     const blocks = [];
@@ -3821,6 +4186,17 @@ function mpRenderState(state, startAt) {
          * 贴回去又变回 yes」。 */
         if (seg.unlink !== undefined && seg.unlink !== null) {
             rows.push(`Standalone: ${seg.unlink ? "yes" : "no"}`);
+        }
+        /* 素材定义（2026-11-02）：`Define: Picture 1 = 猫.png`。
+         * 位置固定是 Standalone 之后、Prompt 之前 —— 解析器一进正文块就不再把
+         * 段级标签当标签了（Define 写进正文只会变成给模型看的字面量）。
+         * 没有定义的段一行都不写，旧档导出逐字不变。 */
+        const defs = cleanRefDefs(seg.defs || seg.ref_defs);
+        const defRows = Object.entries(defs).sort((a, b) => a[1] - b[1]);
+        for (const [key, n] of defRows) {
+            const kd = refKindOf(pool || [], key);
+            const tok = { image: "Picture", video: "Video", audio: "Audio" }[kd] || "Picture";
+            rows.push(`Define: ${tok} ${n} = ${key}`);
         }
         /* 提示词正文按 H3 官方格式（三字段 / Ref2VA 六段），自身含空行——
            标签独占一行、正文从下一行开始，贴回时按续行原样归入 main。 */
@@ -3845,8 +4221,11 @@ function exportMasterPrompt(node) {
             main: String(main ?? ""),
             seconds: Number.isFinite(sec) && sec > 0 ? sec : undefined,
             unlink: segAutoRef(seg) ? false : true,
+            /* 素材定义随导出一起走（Define 行）：不带上的话"导出→贴回"会丢定义，
+             * 编号重新按顺序排 —— 用户眼里就是"我定义的 Picture 1 又变回去了"。 */
+            defs: (seg.ref_defs && typeof seg.ref_defs === "object") ? seg.ref_defs : undefined,
         };
-    }));
+    }), undefined, ds.ref_assets);
 }
 
 /** 解析并分配到当前链（文本通道的壳）。`opt.start` 的含义见 applyMasterPromptParsed。 */
@@ -3915,6 +4294,20 @@ function applyMasterPromptParsed(node, p, opt) {
             base.unlink = s.unlink;
             base.auto_ref = s.unlink ? false : true;
         }
+        /* 素材定义（Define 行 / JSON defs，2026-11-02）：名字**归一到池里的引用名**
+         * 再落库 —— 正文、chip、后端 compile_refs 认的都是 refKeyOf，别名的定义
+         * 会"存着但不生效"（看着定义了 Picture 1，实际没排上号）。 */
+        if (s.defs && typeof s.defs === "object") {
+            const poolNow = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+            const norm = (nm) => {
+                const a = poolNow.find((x) => x && (refKeyOf(x) === nm || x.label === nm));
+                return a ? refKeyOf(a) : nm;
+            };
+            const d = {};
+            for (const [nm, n] of Object.entries(cleanRefDefs(s.defs))) d[norm(nm)] = n;
+            if (Object.keys(d).length) base.ref_defs = d;
+            else delete base.ref_defs;
+        }
         return base;
     };
     /* touched = 这次真正写到的段。官方标签归位 / 引用派生 / 对齐行清理**只对它们跑**：
@@ -3957,6 +4350,19 @@ function applyMasterPromptParsed(node, p, opt) {
      * 按每段的首尾帧锚补回去，否则贴一次总提示词就把全链的首尾帧锚冲掉。
      * 没有锚的段 resync 内部直接返回，不会打扰手写文本。 */
     for (const i of touched) stripAlignmentLines(node, i);
+    /* 定义里写了库里没有的名字：不拦（可能是"先定义、后入库"），但必须说出来 ——
+     * 否则实跑到 compile_refs 才报 E_REF_UNKNOWN，看起来像"素材莫名丢了"。 */
+    const poolAll = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    const missing = [];
+    for (const sg of segs) {
+        for (const nm of Object.keys(cleanRefDefs(sg.ref_defs))) {
+            if (!poolAll.some((x) => x && (refKeyOf(x) === nm || x.label === nm))) missing.push(nm);
+        }
+    }
+    if (missing.length) {
+        p.notes = Array.isArray(p.notes) ? p.notes : [];
+        p.notes.push(`定义里的素材在项目库里找不到：${[...new Set(missing)].join("、")}（这些不会挂上）`);
+    }
     /* 写回摘要（给界面报"写了几段、链现在几段、有没有砍/补"）：挂在 p 上返回，
      * 面板与 LED 都读它，避免各自再算一遍算出两个数。 */
     p.applied = {
@@ -7764,8 +8170,20 @@ async function flushPrompts(node, dir) {
             first: String(s.frame_img.first || "").trim().replace(/\\/g, "/"),
             end: String(s.frame_img.end || "").trim().replace(/\\/g, "/"),
         } : undefined,
+        /* 素材定义（2026-11-02）：段级编号表 + 「本段不用」名单。**必须一起落盘** ——
+         * 只存 refs 是存"结果"，存 ref_defs 才是存"意图"：下次改正文重算 refs 时
+         * 要靠它把号排回去，否则一改正文自定义编号就全散。 */
+        ref_defs: cleanRefDefs(s.ref_defs),
+        ref_skip: Array.isArray(s.ref_skip) ? s.ref_skip.map(String) : [],
     } : null);
-    const body = JSON.stringify({ dir: target, prompts: (ds.prompts || []).map(String), segments });
+    const body = JSON.stringify({
+        dir: target,
+        prompts: (ds.prompts || []).map(String),
+        segments,
+        /* 项目级素材定义（全项目默认，段级同名覆盖）。与段级分开存：
+         * 合并存会让"这段单独改了个号"变成"全项目都改了"。 */
+        ref_defs: cleanRefDefs(ds.ref_defs),
+    });
     /* 内容指纹：换图钩子 / 切项目会把落盘调用变密，而 save_prompts 每次都
      * `revision += 1`。同一份内容重复写没有任何收益，只会让版本号空涨、并可能
      * 撞上别处的乐观锁 —— 与上次**成功**写入逐字节相同就跳过。 */
@@ -7872,6 +8290,9 @@ async function switchProject(dir) {
              * 与 hydratePool 共用同一构造函数 —— 两处口径不同就会出现「切了项目
              * 引用栏不换」的偏差。 */
             ds.ref_assets = poolFromManifest(mf, await fetchAssetLinks(dir));
+            /* 项目级素材定义跟着项目走（不是跟着节点）：没有这一行，切一次项目
+             * 上一个项目的定义会被带过来、或者当前项目的定义全部消失。 */
+            ds.ref_defs = cleanRefDefs(mf.ref_defs);
             if (stale()) return;
             /* 读档/复制项目之后必须做一次旧写法迁移（`@别名` / `@别名.jpg` →
              * `@全名`）：以前只有 hydratePool 里做，而它一看到"池签名相同"就直接
@@ -8815,6 +9236,22 @@ function injectStyles() {
     .h3d-refchip.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
     .h3d-refchip .h3d-thumb{width:20px;height:20px;border-radius:9px;object-fit:cover;background:#0d0c0a;flex:none;outline:1px solid #3a352c;outline-offset:-1px}
     .h3d-refchip.on .h3d-thumb{outline-color:#2f6e57}
+    /* ---- 素材定义（2026-11-02）：chip 编号徽标 + 定义面板 ---- */
+    .h3d-chipno{flex:none;margin-left:2px;padding:0 4px;border-radius:4px;background:#10161a;border:1px solid #3a352c;color:#7fa8c8;font:10.5px/1.6 ui-monospace,Consolas,monospace}
+    .h3d-chipno.def{background:#12291f;border-color:#2f6e57;color:#7fe0b0}
+    .h3d-chipdef{flex:none;margin-left:auto;padding:3px 9px;font-size:11.5px}
+    .h3d-chipdef.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+    .h3d-defbox{max-height:min(58vh,520px);overflow:auto;display:flex;flex-direction:column;gap:4px;margin:6px 0 2px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;padding:8px 10px}
+    .h3d-defcap{margin:6px 0 2px;color:var(--h3d-cyan);font-size:11.5px;font-weight:700}
+    .h3d-defcap:first-child{margin-top:0}
+    .h3d-defrow{display:flex;gap:8px;align-items:center;font-size:12px}
+    .h3d-defname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--h3d-bone)}
+    .h3d-defkind{flex:none;color:var(--h3d-muted);font-size:11px}
+    .h3d-defsel{flex:none;min-width:88px;border:1px solid #3a352c;border-radius:5px;background:#10161a;color:var(--h3d-bone);padding:2px 4px;font-size:11.5px;outline:none}
+    .h3d-defsel:focus{border-color:#a8d8bd}
+    .h3d-defhint{flex:none;color:var(--h3d-muted);font-size:10.5px}
+    .h3d-defhint.bad{color:#e89090}
+    .h3d-defempty{color:var(--h3d-muted);font-size:11.5px;padding:2px 0}
     .h3d-chipbtn{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 3px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit;max-width:240px}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
@@ -13013,8 +13450,11 @@ function openMasterPromptJsonPreview(node, p, fileName) {
     cancel.onclick = close;
     bView.onclick = () => {
         close();
-        /* 带上起点：区间模式下预填的是 [Segment 4] 起，而不是假装这份内容是第 1 段。 */
-        openMasterPromptModal(mpRenderState(segs, wt.start()));
+        /* 带上起点：区间模式下预填的是 [Segment 4] 起，而不是假装这份内容是第 1 段。
+         * 带上池：Define 行要按素材类型写成 Picture / Video / Audio。 */
+        let poolNow = [];
+        try { poolNow = getDs(node).ref_assets || []; } catch (e) { poolNow = []; }
+        openMasterPromptModal(mpRenderState(segs, wt.start(), poolNow));
     };
     ok.onclick = () => {
         const r = applyMasterPromptParsed(node, p, wt.opt());

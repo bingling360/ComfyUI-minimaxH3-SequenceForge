@@ -187,18 +187,41 @@ ok(!!node, "findNode() 拿不到节点");
     ok((st2.segments[0].ref_skip || []).includes("狗.png"), "段级「不用」没落库");
 }
 
-/* ---------- 14. 定义面板能打开、有选择器（UI 入口没断） ---------- */
+/* ---------- 14. 定义面板：列全部池素材（未引用也能定义 = 定义即引用） ---------- */
 {
-    const ds = mkDs();
+    const ds = mkDs();          // 两段都还没有任何引用
     const n4 = harness.mkNode(ds);
     w.app.graph._nodes = [n4];
     w.openRefDefsDialog(n4, 0, () => {});
     const box = w.document.querySelector(".h3d-defbox");
     ok(!!box, "素材定义面板没打开（缺 .h3d-defbox）");
-    const sels = box ? [...box.querySelectorAll("select")] : [];
-    ok(sels.length >= 1, "定义面板里没有任何选择器");
-    const dialogs = w.document.querySelectorAll(".h3d-overlay");
-    ok(dialogs.length >= 1, "定义面板的遮罩没挂上");
+    const rows = box ? [...box.querySelectorAll(".h3d-defrow:not(.h3d-defhead)")] : [];
+    ok(rows.length === POOL.length,
+        `面板应列出全部 ${POOL.length} 个池素材（本段未引用也要能定义），实际 ${rows.length} 行`);
+    ok(rows.every((r) => r.querySelector(".h3d-defthumb")), "每行都该有缩略图位");
+    const sels = box ? [...box.querySelectorAll(".h3d-defsel-s")] : [];
+    ok(sels.length === POOL.length, `每行都该有「本段」选择器，实际 ${sels.length}`);
+
+    /* 直接在面板里给「猫」定义第 1 号：本段从没引用过它，也必须立刻挂上 */
+    if (sels.length) {
+        sels[0].value = "1";
+        sels[0].onchange();
+        const st = w.getDs(n4);
+        ok((st.segments[0].refs || []).includes("猫.png"),
+            "未引用的素材定义后必须自动进入 refs（定义 = 引用）："
+            + JSON.stringify(st.segments[0].refs));
+        ok((st.segments[0].ref_defs || {})["猫.png"] === 1, "段级定义没落库");
+    }
+    /* 再定义「狗」= 2 → refs 顺序应变成 [猫, 狗]（编号靠顺序） */
+    const box2 = w.document.querySelector(".h3d-defbox");
+    const sels2 = box2 ? [...box2.querySelectorAll(".h3d-defsel-s")] : [];
+    if (sels2.length > 1) {
+        sels2[1].value = "2";
+        sels2[1].onchange();
+        const st2 = w.getDs(n4);
+        ok((st2.segments[0].refs || []).join(",") === "猫.png,狗.png",
+            "两个定义应排出 [猫, 狗]：" + JSON.stringify(st2.segments[0].refs));
+    }
 }
 
 const real = (errors || []).filter((e) => !/Not implemented|jsdom/i.test(String(e)));

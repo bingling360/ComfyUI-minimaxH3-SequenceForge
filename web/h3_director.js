@@ -1612,14 +1612,16 @@ function setProjRefDef(node, key, n) {
  *  「我在项目里设了 1，这段怎么显示 3」的困惑 —— 同屏才能一眼看出覆盖关系。 */
 function openRefDefsDialog(node, segIdx, onChange) {
     const overlay = el("div", "h3d-overlay");
-    const dialog = el("div", "h3d-dialog h3d-dialog-wide");
+    const dialog = el("div", "h3d-dialog h3d-dialog-defs");
     dialog.append(el("h3", "", `⌗ 素材定义 · 第 ${segIdx + 1} 段`));
     dialog.append(el("p", "h3d-lead",
-        "定义 = 给素材指定官方编号（<code>Picture 1</code> / <code>Video 2</code> …）。"
-        + "定义过的素材<b>正文里不写 @ 也会挂上</b>，编号也按定义排。"
-        + "号是<b>参考素材内部</b>的序号 —— 首尾帧锚由后端固定排最前，不占这里的号，"
-        + "所以有首帧锚的段，参考素材实跑从 <code>&lt;Picture 2&gt;</code> 开始。"
-        + "本段优先于项目：项目定义影响所有段落（含以后新增的），本段可以改号或「不用」。"));
+        "定义 = <b>引用 + 固定编号</b>：定义过的素材会作为参考素材送进模型，"
+        + "并占住 <code>Picture 1</code> / <code>Video 2</code> 这类官方编号 —— "
+        + "<b>正文里一次 @ 都不写也生效</b>（后端会补最小引用声明），"
+        + "所以正文可以直接写 <code>&lt;Picture 1&gt;</code>，不必写素材名。"
+        + "「项目定义」对<b>所有段落</b>生效（含以后新增的）；「本段覆盖」只改这一段，"
+        + "可以换号，也可以排除掉某条项目定义。"
+        + "号是<b>参考素材内部</b>的序号 —— 首尾帧锚由后端固定排最前，不占这里的号。"));
     const box = el("div", "h3d-defbox");
     const row = el("div", "h3d-dialog-row");
     const bClose = el("button", "h3d-btn h3d-btn-cta", "关闭");
@@ -1645,70 +1647,79 @@ function openRefDefsDialog(node, segIdx, onChange) {
         const proj = cleanRefDefs(ds.ref_defs);
         const own = cleanRefDefs(seg.ref_defs);
         const skip = refSkipOf(ds, segIdx);
-        const cur = Array.isArray(seg.refs) ? seg.refs : [];
+        const refsNow = Array.isArray(seg.refs) ? seg.refs : [];
         box.replaceChildren();
-        /* 本段候选 = 已引用 + 段定义 + 项目定义（都是"本段会出现"的素材） */
-        const segKeys = [];
-        for (const k of [...cur, ...Object.keys(own), ...Object.keys(proj)]) {
-            if (k && !segKeys.includes(k)) segKeys.push(k);
+        if (!pool.length) {
+            box.append(el("div", "h3d-defempty", "项目里还没有素材 —— 先在素材库里调入或上传。"));
+            return;
         }
-        const maxOf = (kd) => Math.max(1, segKeys.filter((k) => refKindOf(pool, k) === kd).length);
+        /* 表头与数据行共用同一套 grid（列宽见 .h3d-defrow）：缩略图 / 名字 / 类型 /
+         * 项目定义 / 本段覆盖。**列全部池素材**——定义本身就会让素材被引用，
+         * 所以"本段还没引用"不该成为定义的门槛（以前的版本正是这么挡的）。 */
+        const head = el("div", "h3d-defrow h3d-defhead");
+        head.append(el("span", "h3d-defthumb"), el("span", "h3d-defname", "素材"),
+            el("span", "h3d-defkind", "类型"),
+            el("span", "h3d-defcol", "项目定义（全项目引用 + 编号）"),
+            el("span", "h3d-defcol", "本段覆盖"));
+        box.append(head);
 
-        box.append(el("div", "h3d-defcap", "本段（优先）"));
-        if (!segKeys.length) {
-            box.append(el("div", "h3d-defempty", "本段还没有任何素材 —— 先在引用条上点素材引用它，再来定义。"));
-        }
-        for (const key of segKeys) {
-            const kd = refKindOf(pool, key);
+        const kindOfPool = (a) => (KIND_LIST.includes(a.kind) ? a.kind : "image");
+        const kindCount = (kd) => pool.filter((a) => kindOfPool(a) === kd).length;
+        const seen = new Set();
+        for (const a of pool) {
+            const key = refKeyOf(a);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            const kd = kindOfPool(a);
+            const maxN = Math.max(1, kindCount(kd));
             const r = el("div", "h3d-defrow");
+            /* 缩略图：与引用条同一个 buildAssetThumb（图片=缩略图、视频=首帧、
+             * 音频=音符图标）—— 一张表里全是文件名的话，"Picture 1 是哪张"根本认不出。 */
+            const th = el("span", "h3d-defthumb");
+            try { th.append(buildAssetThumb(getDirValue(node), a)); } catch (e) { /* 无图留空 */ }
+            r.append(th);
             const nm = el("span", "h3d-defname");
             nm.textContent = key;
+            nm.title = key;
             r.append(nm, el("span", "h3d-defkind", KIND_NAME[kd] || ""));
-            const maxN = maxOf(kd);
-            const opts = [["自动", ""]];
-            /* 「不用」只对项目定义有意义：没定义就没什么可"不用"的 */
-            if (proj[key]) opts.push(["不用", "skip"]);
-            for (let i = 1; i <= maxN; i++) opts.push([String(i), String(i)]);
-            const val = skip.has(key) ? "skip" : (own[key] ? String(own[key]) : "");
-            const sel = mkSel(opts, val);
-            sel.onchange = () => {
-                const v = String(sel.value || "");
+
+            /* 项目定义：不定义 / 1..N。选几号 = **全项目引用它并固定这个号**。 */
+            const pOpts = [["不定义", ""]];
+            for (let i = 1; i <= maxN; i++) pOpts.push([String(i), String(i)]);
+            const selP = mkSel(pOpts, proj[key] ? String(proj[key]) : "");
+            selP.className = "h3d-defsel h3d-defsel-p";
+            selP.title = `全项目默认：引用「${key}」并固定成第 ${proj[key] || "?"} 个${KIND_NAME[kd] || ""}`;
+            selP.onchange = () => {
+                const v = String(selP.value || "");
+                setProjRefDef(node, key, v === "" ? null : Number(v));
+                paint(); fire();
+            };
+            r.append(selP);
+
+            /* 本段覆盖：自动跟随 / 本段排除 / 1..N（段级定义同样 = 引用 + 编号） */
+            const sOpts = [["自动跟随", ""]];
+            if (proj[key]) sOpts.push(["本段排除", "skip"]);
+            for (let i = 1; i <= maxN; i++) sOpts.push([String(i), String(i)]);
+            const selS = mkSel(sOpts, skip.has(key) ? "skip" : (own[key] ? String(own[key]) : ""));
+            selS.className = "h3d-defsel h3d-defsel-s";
+            selS.title = `本段：引用「${key}」并固定编号（覆盖项目定义）`;
+            selS.onchange = () => {
+                const v = String(selS.value || "");
                 if (v === "skip") { setSegRefDef(node, segIdx, key, null); setSegRefSkip(node, segIdx, key, true); }
                 else if (v === "") { setSegRefDef(node, segIdx, key, null); setSegRefSkip(node, segIdx, key, false); }
                 else { setSegRefSkip(node, segIdx, key, false); setSegRefDef(node, segIdx, key, Number(v)); }
                 paint(); fire();
             };
-            r.append(sel);
-            if (proj[key]) r.append(el("span", "h3d-defhint", `项目 ${proj[key]}`));
+            r.append(selS);
+            /* 灰一点 = 本段不会挂它（既没定义、正文里也没有）。定义了立刻变正常色 ——
+             * 这就是"定义即引用"在列表里的可见反馈。 */
+            const live = refsNow.includes(key) || (proj[key] && !skip.has(key)) || own[key];
+            r.classList.toggle("off", !live);
             box.append(r);
         }
-
-        box.append(el("div", "h3d-defcap", "项目定义（影响所有段落，含以后新增的）"));
-        if (!pool.length) {
-            box.append(el("div", "h3d-defempty", "项目里还没有素材。"));
-        }
-        const poolKeys = pool.map((a) => refKeyOf(a)).filter(Boolean);
-        for (const key of poolKeys) {
-            const kd = refKindOf(pool, key);
-            const r = el("div", "h3d-defrow");
-            const nm = el("span", "h3d-defname");
-            nm.textContent = key;
-            r.append(nm, el("span", "h3d-defkind", KIND_NAME[kd] || ""));
-            const maxN = Math.max(1, poolKeys.filter((k) => refKindOf(pool, k) === kd).length);
-            const opts = [["不定义", ""]];
-            for (let i = 1; i <= maxN; i++) opts.push([String(i), String(i)]);
-            const sel = mkSel(opts, proj[key] ? String(proj[key]) : "");
-            sel.onchange = () => {
-                const v = String(sel.value || "");
-                setProjRefDef(node, key, v === "" ? null : Number(v));
-                paint(); fire();
-            };
-            r.append(sel);
-            const own2 = own[key];
-            if (own2) r.append(el("span", "h3d-defhint", `本段覆盖为 ${own2}`));
-            else if (skip.has(key)) r.append(el("span", "h3d-defhint bad", "本段不用"));
-            box.append(r);
-        }
+        box.append(el("div", "h3d-defnote",
+            `本段当前会挂 ${new Set(refsNow.filter(Boolean)).size} 个素材 · `
+            + "号超过本段该类型素材数时会自动回落（不会产生悬空的 &lt;Picture N&gt;）"));
     };
     bClose.onclick = () => { fire(); overlay.remove(); };
     paint();
@@ -3417,6 +3428,9 @@ function addPromptSegment(node) {
     ds.prompts.push("");
     if (!ds.segments) ds.segments = [];
     ds.segments.push(defaultSegment());
+    /* 新增段立刻吃一遍项目级素材定义（2026-11-02）：不然"定义了就会在所有段落
+     * 自动有"这句在这里断掉 —— 新加的段要等用户敲一个字才会被 sync 补上。 */
+    syncRefsFromText(ds, ds.prompts.length - 1, "");
     setDs(node, ds);
     _selSeg = ds.prompts.length - 1;   // 新增即选中
     schedulePromptFlush(node);
@@ -9241,17 +9255,25 @@ function injectStyles() {
     .h3d-chipno.def{background:#12291f;border-color:#2f6e57;color:#7fe0b0}
     .h3d-chipdef{flex:none;margin-left:auto;padding:3px 9px;font-size:11.5px}
     .h3d-chipdef.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
-    .h3d-defbox{max-height:min(58vh,520px);overflow:auto;display:flex;flex-direction:column;gap:4px;margin:6px 0 2px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;padding:8px 10px}
-    .h3d-defcap{margin:6px 0 2px;color:var(--h3d-cyan);font-size:11.5px;font-weight:700}
-    .h3d-defcap:first-child{margin-top:0}
-    .h3d-defrow{display:flex;gap:8px;align-items:center;font-size:12px}
-    .h3d-defname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--h3d-bone)}
-    .h3d-defkind{flex:none;color:var(--h3d-muted);font-size:11px}
-    .h3d-defsel{flex:none;min-width:88px;border:1px solid #3a352c;border-radius:5px;background:#10161a;color:var(--h3d-bone);padding:2px 4px;font-size:11.5px;outline:none}
+    .h3d-defbox{max-height:min(74vh,760px);overflow:auto;display:flex;flex-direction:column;gap:2px;margin:6px 0 2px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;padding:8px 10px}
+    /* 一张表管两级（项目引用+编号 / 本段覆盖）。宽一点、行高一点，带缩略图 ——
+     * 全是文件名的一张表，根本认不出「Picture 1 是哪张」。 */
+    .h3d-dialog-defs{width:min(1000px,calc(100vw - 28px))}
+    .h3d-defrow{display:grid;grid-template-columns:38px minmax(120px,1fr) 54px 172px 140px;gap:9px;align-items:center;padding:4px 3px;border-radius:6px;font-size:12px}
+    .h3d-defrow:hover{background:#26231d}
+    .h3d-defrow.off{opacity:.5}
+    .h3d-defhead{color:var(--h3d-muted);font-size:11px;border-bottom:1px solid #3a352c;padding-bottom:6px;margin-bottom:3px}
+    .h3d-defhead:hover{background:none}
+    .h3d-defthumb{width:38px;height:38px;display:flex;align-items:center;justify-content:center;flex:none}
+    .h3d-defthumb img{width:38px;height:38px;border-radius:7px;object-fit:cover;background:#0d0c0a;outline:1px solid #3a352c;outline-offset:-1px}
+    .h3d-defthumb .h3d-kindmark{font-size:16px}
+    .h3d-defname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--h3d-bone)}
+    .h3d-defkind{color:var(--h3d-muted);font-size:11px}
+    .h3d-defcol{color:var(--h3d-muted);font-size:11px;line-height:1.35}
+    .h3d-defsel{width:100%;border:1px solid #3a352c;border-radius:5px;background:#10161a;color:var(--h3d-bone);padding:3px 4px;font-size:11.5px;outline:none}
     .h3d-defsel:focus{border-color:#a8d8bd}
-    .h3d-defhint{flex:none;color:var(--h3d-muted);font-size:10.5px}
-    .h3d-defhint.bad{color:#e89090}
-    .h3d-defempty{color:var(--h3d-muted);font-size:11.5px;padding:2px 0}
+    .h3d-defnote{margin-top:7px;padding-top:6px;border-top:1px dashed #3a352c;color:var(--h3d-muted);font-size:11px;line-height:1.5}
+    .h3d-defempty{color:var(--h3d-muted);font-size:11.5px;padding:4px 0}
     .h3d-chipbtn{display:inline-flex;align-items:center;gap:5px;padding:2px 9px 2px 3px;border:1px solid #3a352c;border-radius:11px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11px;font-family:inherit;max-width:240px}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}

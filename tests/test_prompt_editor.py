@@ -176,8 +176,11 @@ def test_anchor_mode_source_points():
     assert "const refBars = []" in d          # 意图/剧本/结果 各一条
     assert "gate: true" in d                  # 只有「③ 结果」那条进模型
     # 引用条 chip 点击 = 只插裸 @标签（不再按句式写入）
+    # ⚠ 窗口放宽到 1200：2026-11-02 起 chip 点击会**先算一个自动编号**
+    # （引用即定义，见 setSegRefDef），insertTag 因此后移了几百字符。
+    # 断言的语义没变：仍然必须只插裸 @，不能按句式写整段。
     i = d.index("c.addEventListener(\"mousedown\", guard(() => {")
-    assert "ed.insertTag(key);" in d[i:i + 400], "chip 点击必须只插裸 @标签"
+    assert "ed.insertTag(key);" in d[i:i + 1200], "chip 点击必须只插裸 @标签"
 
 
 def test_ref_state_timely_source_points():

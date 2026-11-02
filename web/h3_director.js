@@ -1283,40 +1283,14 @@ function buildRefBar(RB) {
             refbar.append(el("label", "", RB.title || "引用素材"));
             const counter = el("span", "h3d-secs-hint", "");
             refbar.append(counter);        // 计数先入位：chips 一律插在它前面（syncChips 用）
-            /* 「应用到所有段」（2026-11-02 v3）：项目定义**唯一**的用途就是省事的批量接口 ——
-             * 某张场景图每段都要用，在这一段把号调好，一键铺到全项目（含以后新增的段），
-             * 不用逐段再设一遍。它不是第二套编号体系，只是把本段这套抄给所有段。
-             * 左键 = 用本段这份定义合并进项目定义；右键 = 清空项目定义。 */
-            const bDefs = el("button", "h3d-btn h3d-chipdef", "📌 应用到所有段");
+            /* 「🌐 项目定义」（2026-11-02 v4）：跨段的批量入口，独立弹窗 ——
+             * 段卡这一行只管本段的引用与编号，不再混进"全项目"的概念。 */
+            const bDefs = el("button", "h3d-btn h3d-chipdef", "🌐 项目定义");
             bDefs.type = "button";
-            bDefs.title = "把本段设好的编号铺到所有段落（含以后新增的）\n"
-                + "场景图这种每段都要用的素材，设一次就够了。\n右键 = 清空全项目定义。";
+            bDefs.title = "全项目通用的素材编号：场景图这种每段都要用的素材，设一次就够"
+                + "（各段里也能改号 / 排除）。";
             bDefs.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
-            bDefs.onclick = () => {
-                let own = {};
-                try {
-                    const ds = getDs(node);
-                    own = cleanRefDefs(((ds.segments || [])[segIdx] || {}).ref_defs);
-                } catch (e) { own = {}; }
-                if (!Object.keys(own).length) {
-                    setLed("idle", "本段还没有编号 —— 先在素材右侧的下拉里选 P1 / P2…");
-                    return;
-                }
-                applyProjRefDefs(node, own);
-                setLed("done", `已铺到所有段：${Object.entries(own)
-                    .map(([k, v]) => `${k} → P${v}`).join("、")}`);
-                RB.repaint();
-                scheduleRefresh(120);
-            };
-            bDefs.oncontextmenu = (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (!confirm("清空全项目定义？（各段自己设的编号不受影响）")) return;
-                clearProjRefDefs(node);
-                setLed("done", "已清空全项目定义");
-                RB.repaint();
-                scheduleRefresh(120);
-            };
+            bDefs.onclick = () => openProjRefDefsDialog(node, () => { RB.repaint(); scheduleRefresh(120); });
             refbar.append(bDefs);
             /* 素材池取**活**的节点状态（上传/改名/删除素材后 chips 与别名表立即跟上），
              * 建卡快照 pool 只作回落 —— 快照会一直停在建卡那一刻。 */
@@ -1509,10 +1483,10 @@ function buildRefBar(RB) {
                 }
                 /* 整条转绿 = "本段挂了素材"的一眼判据（chip 一多，逐个找太慢） */
                 refbar.classList.toggle("on", nAsset > 0);
-                /* 按钮亮 = 这个项目已经铺过定义（一眼看出"这套编号是全项目共享的"） */
+                /* 按钮亮 = 这个项目已经设过全局定义（一眼看出"这套号是全项目共享的"） */
                 try {
                     const nd = Object.keys(cleanRefDefs(getDs(node).ref_defs)).length;
-                    bDefs.textContent = nd ? `📌 全项目 ${nd}` : "📌 应用到所有段";
+                    bDefs.textContent = nd ? `🌐 项目定义 ${nd}` : "🌐 项目定义";
                     bDefs.classList.toggle("on", nd > 0);
                 } catch (e) { /* 只读模式 */ }
                 paintRefMap(refs, tokens, live);
@@ -1572,9 +1546,25 @@ function buildRefBar(RB) {
                 c.addEventListener("mousedown", guard(() => {
                     if (RB.gate && !canAddRef(node, segIdx, key)) return;
                     if (!ed) return;                       // 没有可写正文（只读/无节点）
+                    /* ★ 引用即定义（2026-11-02 v4）：先算好该给的号（该类型已有引用数 + 1），
+                     * 插完正文后再把它**钉进编号表**（seg.ref_defs）。不这么做的话
+                     * "引用"与"定义"永远是两个动作，下拉一直显示「自动」，看着就是两套系统。
+                     * 已经引用过的再点 = 只多插一处 @，不重排它的号。 */
+                    let autoN = 0;
+                    try {
+                        const dsNow = getDs(node);
+                        const sg = (dsNow.segments || [])[segIdx];
+                        const cur = (sg && Array.isArray(sg.refs)) ? sg.refs : [];
+                        if (!cur.includes(key)) {
+                            const kd = KIND_LIST.includes(a.kind) ? a.kind : "image";
+                            const same = new Set(cur.filter((k) => refKindOf(livePool(), k) === kd));
+                            autoN = same.size + 1;
+                        }
+                    } catch (e) { autoN = 0; }
                     /* 裸引用：只往正文里插一个 @别名 绿框（句式由用户自己写）。 */
                     ed.insertTag(key);
                     RB.commit(ed);
+                    if (autoN) setSegRefDef(node, segIdx, key, autoN);
                     RB.repaint();              // chip + 计数 + 绿框一次到位（不等刷新）
                     scheduleRefresh(240);
                 }));
@@ -1608,6 +1598,9 @@ function buildRefBar(RB) {
                         ed.removeTag(key);              // 正文里所有该绿框一次清掉
                         RB.commit(ed);
                     }
+                    /* 引用即定义 → 取消引用必须把编号一起删。只删正文没用：
+                     * 定义还在，下次 sync 会凭它把素材加回来（✕ 就像"点了没反应"）。 */
+                    setSegRefDef(node, segIdx, key, null);
                     if (RB.gate) removeSegmentRef(node, segIdx, key);
                     RB.repaint();
                     scheduleRefresh(240);
@@ -1685,17 +1678,87 @@ function setProjRefDef(node, key, n) {
     setDs(node, ds);
 }
 
-/** 批量铺项目定义（引用条上的「📌 应用到所有段」）：一次合并 + 一次全链重算。
- *  项目定义的全部意义就是**省事的批量接口** —— 某张场景图每段都要用，
- *  在第一段调好号以后一键铺开，不必逐段再设一遍（不是第二套编号体系）。 */
-function applyProjRefDefs(node, defs) {
-    const ds = getDs(node);
-    const merged = { ...cleanRefDefs(ds.ref_defs), ...cleanRefDefs(defs) };
-    if (Object.keys(merged).length) ds.ref_defs = merged; else delete ds.ref_defs;
-    const cnt = (ds.prompts || []).length;
-    for (let i = 0; i < cnt; i++) syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
-    setDs(node, ds);
+/** 项目素材定义弹窗：**单独入口**，只干"全项目默认引用 + 编号"这一件事。
+ *  为什么不挂在段卡的引用条上：它是跨段的东西（某张场景图每段都要用），
+ *  塞在某一整段的控件里会让人以为只影响那一段。表里只有一列号 —— 项目定义
+ *  没有"在哪几段用"这个概念；某段不要它，就在那段的引用条下拉里选「本段不用」。 */
+function openProjRefDefsDialog(node, onChange) {
+    const overlay = el("div", "h3d-overlay");
+    const dialog = el("div", "h3d-dialog h3d-dialog-defs");
+    dialog.append(el("h3", "", "🌐 项目素材定义"));
+    dialog.append(el("p", "h3d-lead",
+        "这里设的编号对<b>所有段落</b>生效（含以后新增的）：这些素材会自动作为参考"
+        + "素材送进每一段，并固定占住 <code>Picture 1</code> / <code>Video 2</code> 这类编号，"
+        + "正文里不写 @ 也生效。某段不需要时，在那段引用条的下拉里选「本段不用」。"));
+    const box = el("div", "h3d-defbox");
+    const bar = el("div", "h3d-dialog-row");
+    const bClear = el("button", "h3d-btn", "清空全项目定义");
+    const bClose = el("button", "h3d-btn h3d-btn-cta", "关闭");
+    bar.append(bClear, bClose);
+    dialog.append(box, bar);
+    overlay.append(dialog);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+    document.body.append(overlay);
+
+    const fire = () => { try { onChange && onChange(); } catch (e) { /* 面板已关 */ } };
+    const kindOf = (a) => (KIND_LIST.includes(a.kind) ? a.kind : "image");
+    const paint = () => {
+        const ds = getDs(node);
+        const pool = ds.ref_assets || [];
+        const proj = cleanRefDefs(ds.ref_defs);
+        box.replaceChildren();
+        if (!pool.length) {
+            box.append(el("div", "h3d-defempty", "项目里还没有素材 —— 先在素材库里调入或上传。"));
+            return;
+        }
+        const capOf = (kd) => Math.max(1, pool.filter((a) => kindOf(a) === kd).length);
+        const head = el("div", "h3d-defrow h3d-defhead");
+        head.append(el("span", "h3d-defthumb"), el("span", "h3d-defname", "素材"),
+            el("span", "h3d-defkind", "类型"), el("span", "h3d-defcol", "全项目编号"));
+        box.append(head);
+        const seen = new Set();
+        for (const a of pool) {
+            const key = refKeyOf(a);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            const kd = kindOf(a);
+            const cap = capOf(kd);
+            const prefix = { image: "P", video: "V", audio: "A" }[kd] || "P";
+            const r = el("div", "h3d-defrow");
+            /* 缩略图：与引用条同一个 buildAssetThumb，否则"Picture 1 是哪张"认不出 */
+            const th = el("span", "h3d-defthumb");
+            try { th.append(buildAssetThumb(getDirValue(node), a)); } catch (e) { /* 无图留空 */ }
+            r.append(th);
+            const nm = el("span", "h3d-defname");
+            nm.textContent = key;
+            nm.title = key;
+            r.append(nm, el("span", "h3d-defkind", KIND_NAME[kd] || ""));
+            const sel = document.createElement("select");
+            sel.className = "h3d-defsel";
+            sel.append(new Option("不定义", ""));
+            for (let i = 1; i <= cap; i++) sel.append(new Option(`${prefix}${i}`, String(i)));
+            sel.value = proj[key] ? String(proj[key]) : "";
+            sel.onchange = () => {
+                const v = String(sel.value || "");
+                setProjRefDef(node, key, v === "" ? null : Number(v));
+                paint();
+                fire();
+            };
+            r.append(sel);
+            box.append(r);
+        }
+    };
+    bClear.onclick = () => {
+        if (!confirm("清空全项目定义？（各段自己设的编号不受影响）")) return;
+        clearProjRefDefs(node);
+        paint();
+        fire();
+    };
+    bClose.onclick = () => { fire(); overlay.remove(); };
+    paint();
 }
+
 
 /** 清空项目定义（右键「📌 应用到所有段」）：各段残留的「本段不用」一并清掉，
  *  否则下次再铺同名定义时，旧段会莫名其妙地排除它。 */
@@ -9246,6 +9309,24 @@ function injectStyles() {
     .h3d-chipsel.def{background:#12291f;border-color:#2f6e57;color:#7fe0b0}
     .h3d-chipdef{flex:none;margin-left:auto;padding:3px 9px;font-size:11.5px}
     .h3d-chipdef.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}
+    /* ---- 项目素材定义弹窗（2026-11-02 v4）：一个入口、一张表、一列号 ----
+     * ⚠ 宽度必须写成 '.h3d-dialog.h3d-dialog-defs'（双类）：只写单类会被后面的
+     * .h3d-dialog 基础宽度压回去（上一版面板只有 280px 宽、还挤出横向滚动条，
+     * 就是踩了这个）。CSS 在这段模板字符串里，注释**不能**出现反引号。 */
+    .h3d-dialog.h3d-dialog-defs{width:min(880px,calc(100vw - 32px))}
+    .h3d-defbox{max-height:min(66vh,600px);overflow:auto;display:flex;flex-direction:column;gap:2px;margin:6px 0 2px;border:1px solid #3a352c;border-radius:8px;background:#211f1a;padding:8px 10px}
+    .h3d-defrow{display:grid;grid-template-columns:38px minmax(140px,1fr) 56px 150px;gap:9px;align-items:center;padding:4px 3px;border-radius:6px;font-size:12px}
+    .h3d-defrow:hover{background:#26231d}
+    .h3d-defhead{color:var(--h3d-muted);font-size:11px;border-bottom:1px solid #3a352c;padding-bottom:6px;margin-bottom:3px}
+    .h3d-defhead:hover{background:none}
+    .h3d-defthumb{width:38px;height:38px;display:flex;align-items:center;justify-content:center;flex:none}
+    .h3d-defthumb img{width:38px;height:38px;border-radius:7px;object-fit:cover;background:#0d0c0a;outline:1px solid #3a352c;outline-offset:-1px}
+    .h3d-defname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--h3d-bone)}
+    .h3d-defkind{color:var(--h3d-muted);font-size:11px}
+    .h3d-defcol{color:var(--h3d-muted);font-size:11px}
+    .h3d-defsel{width:100%;border:1px solid #3a352c;border-radius:5px;background:#10161a;color:var(--h3d-bone);padding:3px 4px;font-size:11.5px;outline:none}
+    .h3d-defsel:focus{border-color:#a8d8bd}
+    .h3d-defempty{color:var(--h3d-muted);font-size:11.5px;padding:4px 0}
     .h3d-chipbtn{display:inline-flex;align-items:center;gap:6px;padding:3px 11px 3px 4px;border:1px solid #3a352c;border-radius:12px;background:#25221c;color:#a39d90;cursor:pointer;font-size:11.5px;font-family:inherit;max-width:270px}
     .h3d-chipbtn:hover{filter:brightness(1.25)}
     .h3d-chipbtn.on{border-color:#2f6e57;background:#12291f;color:#7fe0b0}

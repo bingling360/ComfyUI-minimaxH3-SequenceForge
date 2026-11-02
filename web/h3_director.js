@@ -1712,7 +1712,10 @@ function openProjRefDefsDialog(node, onChange) {
             box.append(el("div", "h3d-defempty", "项目里还没有素材 —— 先在素材库里调入或上传。"));
             return;
         }
-        const capOf = (kd) => Math.max(1, pool.filter((a) => kindOf(a) === kd).length);
+        /* 编号上限按**官方单段上限**给（图 9 / 视 3 / 音 3），不是池里现有几个：
+         * 用户要的是"把这张图定义成 Picture 5"这种指定能力的编号空间，
+         * 池里只有 4 张图不代表不能定义第 5 个号（真挂了超限后端会报 E_MEDIA_LIMIT）。 */
+        const capOf = (kd) => (KIND_CAPS[kd] || 9);
         const head = el("div", "h3d-defrow h3d-defhead");
         head.append(el("span", "h3d-defthumb"), el("span", "h3d-defname", "素材"),
             el("span", "h3d-defkind", "类型"), el("span", "h3d-defcol", "全项目编号"));
@@ -11272,7 +11275,19 @@ function buildCards(data) {
             const refResult = mkRefBar({
                 title: "引用素材",
                 editor: canEdit ? ta : null,
-                readRefs: () => refsFromText(String(ta.value || ""), poolNow()),
+                /* 引用条的数据源 = **本段有效引用**（正文 @ ∪ 段定义 ∪ 项目定义），
+                 * 直接走 refsForSegment —— 与写入器、后端三处同一个算法。
+                 * 以前这里只读正文，于是"定义挂上的素材"在条上完全看不见：项目定义
+                 * 明明设了 1 条，这条却显示"本段未引用素材"、chip 全灰、下面映射条也空
+                 * （用户报的"定义有了却没被引用"就是这一路数据源漏了）。 */
+                readRefs: () => {
+                    const fromText = refsFromText(String(ta.value || ""), poolNow());
+                    try {
+                        return refsForSegment(getDs(node), it.idx, fromText);
+                    } catch (e) {
+                        return fromText;
+                    }
+                },
                 commit: (ed) => applyPromptEdit(node, it.idx, ed),
                 /* showFrames 已关：首/尾帧锚定在卡片公共区（框之上），
                  * 它是段级运行参数，不属于"提示词的引用"。 */

@@ -199,6 +199,10 @@ ok(!!node, "findNode() 拿不到节点");
      * 不然"引用"和"定义"还是两个动作（下拉一直显示「自动」） */
     ok(src.indexOf("if (autoN) setSegRefDef(node, segIdx, key, autoN);") >= 0,
         "点 chip 引用时应自动写编号定义（引用即定义）");
+    /* ★ 引用条的数据源必须走 refsForSegment：只读正文的话，项目定义挂上的
+     * 素材在条上根本不出现（用户报的"项目定义了却没被引用"） */
+    ok(/refsForSegment\(getDs\(node\), it\.idx, fromText\)/.test(src),
+        "引用条数据源必须走 refsForSegment（正文 ∪ 段定义 ∪ 项目定义）");
 
     /* 点 chip = 引用 + 自动定义（号 = 该类型已有引用数 + 1），这里是数据层等价调用 */
     const ds = mkDs();
@@ -216,6 +220,9 @@ ok(!!node, "findNode() 拿不到节点");
     ok(rows.length === POOL.length, `项目定义应列全部 ${POOL.length} 个素材，实际 ${rows.length}`);
     ok(rows.every((r) => r.querySelector(".h3d-defthumb")), "每行都该有缩略图位");
     const sels = box ? [...box.querySelectorAll(".h3d-defsel")] : [];
+    /* 编号空间按**官方单段上限**给：图 9 / 视 3 / 音 3（不是"池里有几张"） */
+    ok(sels[0] && sels[0].options.length === 1 + 9,
+        `图片编号应给到 9 档（官方上限），实际 ${sels[0] ? sels[0].options.length - 1 : 0}`);
     if (sels.length) {
         sels[0].value = "1";
         sels[0].onchange();

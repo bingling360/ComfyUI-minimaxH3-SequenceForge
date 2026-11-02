@@ -1874,13 +1874,29 @@ function orderBySlots(keys, defs, segDefs, pool) {
         const placed = new Array(g.length).fill(null);
         const taken = new Set();
         const withDef = g.filter((k) => Number(defs[k]) >= 1);
-        /* 段级定义先遍历（稳定排序，同优先级保持原顺序）→ 段级先占号 */
-        withDef.sort((a, b) => (segDefs[a] ? 0 : 1) - (segDefs[b] ? 0 : 1));
+        /* 排序键 = 定义号（升序）；**同号时段级先占**（段级 > 项目级）。
+         *
+         * ★ 号超过本段素材数**不是错误、也不该被丢掉**：它只是"我想排在更后面"。
+         *   官方 tokenizer 是按顺序发号的（comfy/text_encoders/minimax.py:
+         *   `counters[kind] += 1` → "<Picture %d>: "），所以**编号必须连续**，
+         *   不存在"跳到 9 号"这回事；但"排最后"完全表达得出来 —— 越界的定义
+         *   会被压到剩余空位（3 张图里定义 P9 = 它排第 3 位）。
+         *   若在这里把越界定义直接丢掉，用户看到的就不是"排后面"而是"没生效"。 */
+        withDef.sort((a, b) => {
+            const d = Number(defs[a]) - Number(defs[b]);
+            if (d) return d;
+            return (segDefs[a] ? 0 : 1) - (segDefs[b] ? 0 : 1);
+        });
         for (const k of withDef) {
             const d = Math.floor(Number(defs[k]));
             if (d >= 1 && d <= g.length && !placed[d - 1]) { placed[d - 1] = k; taken.add(k); }
         }
-        const rest = g.filter((k) => !taken.has(k));
+        /* 没占到号的（越界的定义 + 完全没定义的）填剩余空位：
+         * **没定义的按原顺序排前面**（它们本来就在那个位置），越界的定义按号排后面
+         * （"我想排更后面"的意图保住）。反过来排会让"没定义的"被一个越界号挤走 ——
+         * 2 张图里把猫定义成 P5，应该得到 [狗, 猫]，不是 [猫, 狗]。 */
+        const rest = g.filter((k) => !taken.has(k))
+            .sort((a, b) => (Number(defs[a]) || 0) - (Number(defs[b]) || 0));
         let ri = 0;
         for (let i = 0; i < g.length; i++) if (!placed[i]) placed[i] = rest[ri++];
         queue[kd] = placed;

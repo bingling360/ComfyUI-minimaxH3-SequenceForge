@@ -179,8 +179,11 @@ def test_anchor_mode_source_points():
     # ⚠ 窗口放宽到 1200：2026-11-02 起 chip 点击会**先算一个自动编号**
     # （引用即定义，见 setSegRefDef），insertTag 因此后移了几百字符。
     # 断言的语义没变：仍然必须只插裸 @，不能按句式写整段。
-    i = d.index("c.addEventListener(\"mousedown\", guard(() => {")
-    assert "ed.insertTag(key);" in d[i:i + 1200], "chip 点击必须只插裸 @标签"
+    i = d.index("c.addEventListener(\"mousedown\", guard((e) => {")
+    # 用位置比较而不是固定窗口：这段在 2026-11-02 起多了"算自动号 + 判左右键"，
+    # 字符数会继续变，但"insertTag 紧跟在这个处理器里"这条语义不变。
+    j = d.index("ed.insertTag(key);", i)
+    assert 0 < j - i < 2000, "chip 点击必须只插裸 @标签"
 
 
 def test_ref_state_timely_source_points():

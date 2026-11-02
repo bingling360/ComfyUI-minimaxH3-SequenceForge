@@ -1346,15 +1346,22 @@ function buildRefBar(RB) {
                     const sig = `${kd}:${cap}:${proj[key] ? 1 : 0}`;
                     if (rec.sel.dataset.sig !== sig) {
                         const prefix = { image: "P", video: "V", audio: "A" }[kd] || "P";
-                        const opts = [["自动", ""]];
+                        /* 只有两态：**不用** / **P1…P9**。
+                         * 以前第一项叫「自动」，用户第一反应是"自动是什么鬼" ——
+                         * 素材要么挂上（有号）、要么不挂（不用），没有第三种状态。
+                         * 选号 = 引用 + 固定该号；选「不用」= 取消本段引用。 */
+                        const opts = [["不用", ""]];
                         for (let i = 1; i <= cap; i++) opts.push([`${prefix}${i}`, String(i)]);
-                        if (proj[key]) opts.push(["本段不用", "skip"]);
                         rec.sel.replaceChildren(...opts.map(([t, v]) => new Option(t, v)));
                         rec.sel.dataset.sig = sig;
                     }
-                    rec.sel.value = skip.has(key) ? "skip" : String(own[key] || proj[key] || "");
-                    /* 选了号（本段或项目）就点亮，一眼分出"人定的"和"排出来的" */
-                    rec.sel.classList.toggle("def", !skip.has(key) && !!(own[key] || proj[key]));
+                    /* 值 = 本段当前生效的号（段级定义 > 项目定义 > 按顺序排到的号）；
+                     * 没引用就是「不用」。 */
+                    const effM = /^<\w+\s+(\d+)>$/.exec(String(token || ""));
+                    const effN = effM ? Number(effM[1]) : 0;
+                    rec.sel.value = n > 0 ? String(own[key] || proj[key] || effN || 1) : "";
+                    /* 点亮 = 这个号是人定的（段级或项目定义），不是按顺序排出来的 */
+                    rec.sel.classList.toggle("def", n > 0 && !!(own[key] || proj[key]));
                     const src = own[key] ? "本段定义" : (proj[key] ? "项目定义" : "自动编号");
                     rec.sel.title = `「${key}」的官方编号（${src}）`
                         + (token ? ` · 实跑 ${token}` : "") + "\n"
@@ -1495,10 +1502,14 @@ function buildRefBar(RB) {
              * 之间把节点换掉 → click 永远不来（"点了没反应"）；
              * ② preventDefault 不让编辑器失焦，避免失焦回写旧文本。
              * 失败也可见（不再静默）。 */
+            /* 事件守卫：preventDefault 挡住失焦，stopPropagation 挡住画布拖拽。
+             * ⚠ 必须把事件对象传给 fn：右键也会触发 mousedown（button=2），
+             * chip 的"点一下就引用"如果不判按键，右键会**先插一次引用再清空**
+             * —— 用户看到的就是"右键取消引用之后反而多了一处/清不干净"。 */
             const guard = (fn) => (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                try { fn(); } catch (err) {
+                try { fn(e); } catch (err) {
                     console.error("[h3-director] 引用操作失败：", err);
                     setLed("error", `引用操作失败：${err?.message || err}`);
                 }
@@ -1530,20 +1541,21 @@ function buildRefBar(RB) {
                 sel.addEventListener("click", (e) => e.stopPropagation());
                 sel.onchange = () => {
                     const v = String(sel.value || "");
-                    if (v === "skip") {
-                        setSegRefDef(node, segIdx, key, null);
-                        setSegRefSkip(node, segIdx, key, true);
-                    } else if (v === "") {
-                        setSegRefDef(node, segIdx, key, null);
-                        setSegRefSkip(node, segIdx, key, false);
-                    } else {
-                        setSegRefSkip(node, segIdx, key, false);
-                        setSegRefDef(node, segIdx, key, Number(v));
+                    if (v === "") {
+                        /* 「不用」= 取消本段引用（= 点 ✕）：正文 @ 一并清掉；
+                         * 素材来自项目定义时自动记一条「本段排除」。 */
+                        clearAll();
+                        return;
                     }
+                    setSegRefSkip(node, segIdx, key, false);
+                    setSegRefDef(node, segIdx, key, Number(v));
                     RB.repaint();
                     scheduleRefresh(120);
                 };
-                c.addEventListener("mousedown", guard(() => {
+                c.addEventListener("mousedown", guard((e) => {
+                    /* 只认左键：右键是"一键清零"（见下面的 contextmenu），
+                     * 放行的话右键会先插一处引用再清空，净效果是"清不干净"。 */
+                    if (e && e.button) return;
                     if (RB.gate && !canAddRef(node, segIdx, key)) return;
                     if (!ed) return;                       // 没有可写正文（只读/无节点）
                     /* ★ 引用即定义（2026-11-02 v4）：先算好该给的号（该类型已有引用数 + 1），
@@ -1588,6 +1600,10 @@ function buildRefBar(RB) {
                     try { inProj = !!cleanRefDefs(getDs(node).ref_defs)[key]; } catch (e) { inProj = false; }
                     if (inProj) {
                         if (ed) { ed.removeTag(key); RB.commit(ed); }
+                        /* ⚠ 段级定义必须一起删：refsForSegment 会把 own 里的 key 无条件
+                         * 并回 refs（定义 = 引用），只设 skip 的话段级定义还在，
+                         * 素材照样被加回来 —— 表现就是"右键清不掉"。 */
+                        setSegRefDef(node, segIdx, key, null);
                         setSegRefSkip(node, segIdx, key, true);
                         RB.repaint();
                         scheduleRefresh(240);
@@ -1648,6 +1664,15 @@ function setSegRefDef(node, segIdx, key, n) {
     if (n === null || n === undefined || !Number.isFinite(num) || num < 1) delete defs[key];
     else defs[key] = num;
     if (Object.keys(defs).length) seg.ref_defs = defs; else delete seg.ref_defs;
+    /* 设了号 = 明确要它 → 顺手撤销「本段排除」。否则会出现"右键排除过，之后再点
+     * chip 引用/定义，它还是不出现"（skip 优先级高于项目定义、但正文优先，
+     * 正文删了就又变排除，行为很跳）。 */
+    if (defs[key]) {
+        const sk = new Set((Array.isArray(seg.ref_skip) ? seg.ref_skip : []).map(String));
+        if (sk.delete(key)) {
+            if (sk.size) seg.ref_skip = [...sk]; else delete seg.ref_skip;
+        }
+    }
     resyncRefsAt(node, segIdx, ds);
 }
 

@@ -247,6 +247,40 @@ ok(!!node, "findNode() 拿不到节点");
     ok((st2.segments[0].ref_defs || {})["猫.png"] === 1, "清空项目定义不该动段级定义");
 }
 
+/* ---------- 15. 右键清引用：不误插、能清干净（段级+项目定义共存时） ---------- */
+{
+    const fs = require("fs");
+    const src = fs.readFileSync(path.join(ROOT, "web", "h3_director.js"), "utf8");
+    /* 右键也会发 mousedown（button=2）—— 不判按键的话会先插一处引用再清空，
+     * 净效果就是"右键取消失败 / 反而多一处"。 */
+    ok(/if \(e && e\.button\) return;/.test(src), "chip 的 mousedown 必须只认左键");
+    {
+        const iBtn = src.indexOf("if (e && e.button) return;");
+        const iIns = src.indexOf("ed.insertTag(key);", iBtn);
+        ok(iBtn >= 0 && iIns > iBtn, "按键判断必须在 insertTag 之前（否则右键先插一处）");
+    }
+
+    /* 段级 + 项目定义同时存在：两个都必须清掉，refs 才会真空 */
+    const ds = mkDs();
+    ds.ref_defs = { "猫.png": 1 };
+    ds.segments[0].ref_defs = { "猫.png": 2 };
+    ok(w.refsForSegment(ds, 0, []).join(",") === "猫.png",
+        "段级覆盖项目级时也只该出现一次：" + w.refsForSegment(ds, 0, []).join(","));
+    delete ds.segments[0].ref_defs;
+    ds.segments[0].ref_skip = ["猫.png"];
+    ok(w.refsForSegment(ds, 0, []).length === 0, "删段级定义 + 本段排除后不该再有它");
+
+    /* 设号要顺手撤销「本段排除」，否则"排除过就再也引用不回来" */
+    const n6 = harness.mkNode(mkDs());
+    w.app.graph._nodes = [n6];
+    w.setSegRefSkip(n6, 0, "猫.png", true);
+    w.setSegRefDef(n6, 0, "猫.png", 1);
+    const st3 = w.getDs(n6);
+    ok(!(st3.segments[0].ref_skip || []).includes("猫.png"),
+        "设号后应撤销「本段排除」：" + JSON.stringify(st3.segments[0].ref_skip));
+    ok((st3.segments[0].refs || []).includes("猫.png"), "设号后应重新引用");
+}
+
 const real = (errors || []).filter((e) => !/Not implemented|jsdom/i.test(String(e)));
 ok(real.length === 0, "运行时报错：" + JSON.stringify(real));
 

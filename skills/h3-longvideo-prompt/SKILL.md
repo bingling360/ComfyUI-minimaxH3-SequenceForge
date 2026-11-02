@@ -91,7 +91,7 @@ non_diegetic_music: N/A
 
 除下面三处，其余格式一律**对齐官方** `h3-prompt-writing`，逐字照抄不许自创：
 
-1. **素材引用用 `@素材名`**（后端会压成官方 `<Subject N>` 等标签）。需要把某张图**固定**成官方编号时，改用段级 `Define: Picture 1 = 素材名`（可选写法，正文里直接写 `<Picture 1>`；定义 = 强制引用，不写 @ 也挂上）——见 `references/04-master-format.md`。
+1. **素材引用用 `@素材名`**（后端会压成官方 `<Subject N>` 等标签）。需要把某张图**固定**成官方编号时，改用段级 `Define: Picture 1 = 素材名`（可选写法，正文里直接写 `<Picture 1>`；定义 = 强制引用，不写 @ 也挂上）——见 `references/04-master-format.md`。编号**必须连续**（官方 tokenizer 按顺序发号，没有跳号），定义号写大了只表示「排后面」。
 2. **混合模式（FL2VA）的首尾帧对齐方式**——锚点由锚定设置挂，不写进正文。
 3. **总提示词框的分段格式**（`[Segment N]` + `Duration` / `Standalone` / `Prompt`）——这是 SequenceForge 的框语法，官方没有。
 

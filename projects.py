@@ -2097,6 +2097,272 @@ def redo_cancel(name, slot):
     return manifest
 
 
+# ---- 删除某一段：存档产物整体前移（段号自动顺延） ----
+#
+# 为什么必须动存档而不只是删提示词：manifest 的 seeds / videos / thumbs /
+# prompt_hashes / seg_res 全是**按槽位对齐**的列表，段视频 / 缩略图 / latent 切片
+# 也按槽位编号命名。只删前端提示词 → 段 3 的卡片挂着段 4 的视频、done 还停在
+# 全链完成数、盘上被删段的 seg_XXX.mp4 原封不动（用户看到的就是「删不干净」）。
+
+# 按槽位对齐、删段时要整体前移的 manifest 列表。
+# 与 `checkpoint.truncate` 的截断名单同源，另加 videos/base_videos/seg_res。
+# ⚠ `prompts` / `seg_fields` **故意不在列**：它们是前端提示词数组的镜像，
+#   由 `save_prompts` 整份覆写；这里再搬一次会和前端那一份互相打架。
+_SEG_SLOT_KEYS = ("seeds", "prompt_hashes", "thumbs", "videos", "base_videos",
+                  "seams", "bridge_scores", "seam_metrics", "trims", "seg_res")
+
+# 列表项本身就是"带段号的文件名"的键：前移之后字符串里的号必须跟着改，
+# 否则 videos[2] 还写着 seg_003.mp4、盘上文件已经叫 seg_002.mp4（段卡黑屏）。
+_SEG_NAME_KEYS = ("thumbs", "videos", "base_videos")
+
+# 段产物的编号形态：`seg_004.pt` / `seg004_auto.pt`（连写）/ `thumb_004.png` /
+# `upseg_004.mp4` / `upthumb_004.png` / `uplast_004.png` / `base_seg_004.mp4` /
+# `base_thumb_004.png`。前缀整段保留、只把数字减一（见 _renumber_seg_ref）。
+_SEG_NUM_RE = re.compile(r"(base_)?(seg|thumb|upseg|upthumb|uplast)_?(\d{3,})")
+
+
+def _renumber_seg_ref(s, g: int):
+    """把文件名字符串里 **>g 的段号**整体减一（seg_004.mp4 → seg_003.mp4）。
+
+    `g` 是**被删掉的槽位**（0-based）：等于它的号在删完就没了，只处理更大的。
+    前缀（seg_/thumb_/base_seg_/… 以及目录部分）原样保留 —— 只换数字那一段，
+    所以 `upseg_004.mp4` → `upseg_003.mp4`、`latent/seg004_auto.pt` →
+    `latent/seg003_auto.pt` 都自然成立。非字符串原样返回（列表里有空串占位）。
+    """
+    if not isinstance(s, str) or not s:
+        return s
+
+    def _rep(m):
+        digits = m.group(3)
+        k = int(digits)
+        if k <= g:
+            return m.group(0)
+        head = m.group(0)[:-len(digits)]      # 连前缀与分隔符一起保留
+        return f"{head}{k - 1:0{len(digits)}d}"
+
+    return _SEG_NUM_RE.sub(_rep, s)
+
+
+def _slot_of(ref):
+    """引用串里的**段槽位号**（取不到返回 None）。
+
+    latent 清单的 `src` 是 `seg_003.pt`（存档 latent 槽位），`file` 是
+    `latent/seg003_auto.pt`（切片本体）—— 两种形态都要认，才能判断某条目属于
+    哪一段（删段时要连切片一起删/改名）。
+    """
+    s = str(ref or "")
+    m = re.match(r"^seg_(\d{3,})\.pt$", s)
+    if m:
+        return int(m.group(1))
+    m = _SEG_NUM_RE.search(s)
+    return int(m.group(3)) if m else None
+
+
+def _seg_files_rel(k: int) -> list:
+    """槽位 k 的全部产物（相对项目根；四库新路径与旧裸名双路径都算上）。
+
+    名单口径与 `checkpoint.truncate` 的清理正则同源，另加 `latent/segNNN_auto*`：
+    段级 latent 切片按**段号**命名（见 `nodes._auto_latent_save`），段号前移时
+    不搬文件就会留下「段 2 的卡片引用段 3 的 latent」这种错位引用。
+    """
+    t = f"{k:03d}"
+    out = [f"seg_{t}.pt"]
+    for pre in ("finals/", ""):
+        out += [f"{pre}seg_{t}.mp4", f"{pre}thumb_{t}.png", f"{pre}uplast_{t}.png",
+                f"{pre}base_seg_{t}.mp4", f"{pre}base_thumb_{t}.png",
+                f"{pre}upseg_{t}.pt", f"{pre}upseg_{t}.mp4",
+                f"{pre}upthumb_{t}.png"]
+    for suf in ("_auto.pt", "_auto_v.pt", "_auto_a.pt"):
+        # contact sheet 与源 latent 同主名（见 library.sheet_path_for）
+        out += [f"latent/seg{t}{suf}", f"latent/seg{t}{suf[:-3]}.sheet.png"]
+    return out
+
+
+def _drop_seg_files(root: str, k: int):
+    """删掉槽位 k 的全部产物（缺文件不算错——段没跑过本来就没有）。"""
+    for rel in _seg_files_rel(k):
+        try:
+            os.remove(os.path.join(root, *rel.split("/")))
+        except OSError:
+            pass
+
+
+def _move_seg_files(root: str, src: int, dst: int):
+    """槽位 src 的产物改名到 dst（逐族 os.replace；升序移动时目标位已被腾空）。
+
+    单个文件失败（被播放器占用等）只跳过：下一轮 `contiguous_done` 会把 done
+    夹到第一个缺文件的槽位，从那里重做──自愈，比整条链拒绝服务好。
+    """
+    for a, b in zip(_seg_files_rel(src), _seg_files_rel(dst)):
+        pa = os.path.join(root, *a.split("/"))
+        if not os.path.isfile(pa):
+            continue
+        try:
+            os.replace(pa, os.path.join(root, *b.split("/")))
+        except OSError:
+            pass
+
+
+def delete_segment(name: str, seg, drop_finals: bool = True):
+    """删除一段并让其后的段**整体前移一位**（段号顺延），返回 (manifest, info)。
+
+    顺序即语义：
+      ① 删槽位 g 的全部产物（段 latent / 段 mp4 / 缩略图 / 尾帧锚 / 一采另存 /
+         `latent/segNNN_auto*` 切片）；
+      ② 槽位 g+1.. 的文件整体前移一位（seg_004.mp4 → seg_003.mp4 …）；
+      ③ manifest 里按槽位对齐的列表同步前移，名字带号的键把号一并改小；
+      ④ 新接缝（原 g+1、现 g）的 seams/bridge_scores/seam_metrics 置空——
+         那是按**已删段**测出来的差值，留着只会误导；
+      ⑤ 二采记录前移并重算 files 名；重摇队列丢弃已删槽位、其后减一；
+      ⑥ 自动合成的成片（manifest.finals）整份删除：内容已缺一段，下次运行重拼。
+
+    **不碰** prompts / seg_fields（前端提示词数组的镜像，由 `save_prompts` 覆写）。
+
+    ⚠ 删除会留下**一处新接缝**：前移进来的段，其头桥是照着已删段生成的（桥帧
+    仍在 latent 里），与新的上段之间可能跳变。要顺滑就重摇该段或以它为起点续拍。
+
+    seg 是 0-based 全局槽位（序章占 0）。序章槽拒绝删除。
+    删掉最后一段也允许（列表清空、done/total 归零）：前端随后会补一条崭新空段，
+    面板永远至少有一张可编辑的段卡。
+    槽位号超出 total（前端刚加段、防抖还没落盘）**不报错**，只空转——见下面注释。
+    项目名/槽位非法、项目不存在、正在生成 → ValueError（路由层映射 400）。
+    """
+    name = safe_name(name)
+    if not name:
+        raise ValueError("无效的项目目录名")
+    try:
+        g = int(seg)
+    except (TypeError, ValueError):
+        raise ValueError(f"槽位必须是整数：{seg!r}") from None
+    if g < 0:
+        raise ValueError("槽位从 0 开始（0-based 全局槽位）")
+    if checkpoint.is_busy():
+        raise ValueError("正在生成（采样/编码进行中）：等这一轮跑完再删段")
+    root = os.path.join(checkpoint.projects_root(), name)
+    manifest = checkpoint.load_manifest(root)
+    if manifest is None:
+        raise ValueError("项目不存在（没有 manifest，先新建或跑一段）")
+    off = 1 if manifest.get("has_prologue") else 0
+    if g < off:
+        raise ValueError("序章槽不能按段删除：清掉「起始视频」即可整链重来")
+    total = int(manifest.get("total") or 0)
+    done = int(manifest.get("done") or 0)
+    # ⚠ **不做 `g >= total` 的越界拦截**（2026-11-09）：`total` 只是"上次落盘时
+    # 前端的段数"，用户刚加了一段就马上删（1.5s 防抖还没落盘）时它比真实段数少
+    # 一格——拦下来就变成"这一段删不掉"。段号真越界也只是空转（没有文件可搬、
+    # 没有列表可移），紧随其后的 save_prompts 会把 total 重算正确。
+    upper = max(total, done, g + 1)
+
+    # ①② 删本槽 + 其后整体前移（升序：目标位在上一轮已被腾空，不会互相覆盖）
+    _drop_seg_files(root, g)
+    # 删不掉的文件（Windows 上播放器/资源管理器开着 mp4 就会这样）必须当场拦下：
+    # 若被删段的 seg_XXX.mp4 还占着位，下一步 os.replace 会静默失败，段 g 的卡片
+    # 就会一直挂着**已删段**的画面 —— 正是这次要根除的"删不干净"。
+    stuck = [rel for rel in _seg_files_rel(g)
+             if os.path.isfile(os.path.join(root, *rel.split("/")))]
+    if stuck:
+        raise ValueError("删除失败：这些文件删不掉（多半是播放器/资源管理器正开着它），"
+                         "关掉后重试 —— " + "、".join(stuck[:4])
+                         + ("…" if len(stuck) > 4 else ""))
+    for k in range(g + 1, upper):
+        _move_seg_files(root, k, k - 1)
+
+    # ③ 槽位列表前移（名字带号的键同步改号）
+    for key in _SEG_SLOT_KEYS:
+        seq = manifest.get(key)
+        if not isinstance(seq, list) or len(seq) <= g:
+            continue
+        seq = seq[:g] + seq[g + 1:]
+        if key in _SEG_NAME_KEYS:
+            seq = [_renumber_seg_ref(x, g) for x in seq]
+        manifest[key] = seq
+
+    # ④ 新接缝没按新邻居测过 → 清空
+    for key in ("seams", "bridge_scores", "seam_metrics"):
+        seq = manifest.get(key)
+        if isinstance(seq, list) and g < len(seq):
+            seq[g] = None
+
+    # ⑤ 二采记录 / latent 清单 / 重摇队列
+    up = manifest.get("upscale")
+    if isinstance(up, dict):
+        segs = list(up.get("segs") or [])
+        if len(segs) > g:
+            segs = segs[:g] + segs[g + 1:]
+        for k in range(g, len(segs)):
+            rec = segs[k]
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                rec["files"] = checkpoint.upscale_files(k)
+                segs[k] = rec
+        up2 = dict(up)
+        up2["segs"] = segs
+        manifest["upscale"] = up2
+    latents = []
+    for it in (manifest.get("latents") or []):
+        if not isinstance(it, dict):
+            continue
+        k = _slot_of(it.get("src"))
+        if k is None:
+            k = _slot_of(it.get("file"))
+        if k is not None:
+            if k == g:
+                continue                      # 被删段的切片：文件已随 ① 删掉
+            if k > g:
+                it = dict(it)
+                for fld in ("src", "file", "sheet"):
+                    if it.get(fld):
+                        it[fld] = _renumber_seg_ref(str(it[fld]), g)
+        latents.append(it)
+    manifest["latents"] = latents
+    q = []
+    for x in (manifest.get("redo_queue") or []):
+        try:
+            s, m = int(x[0]), str(x[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if s == g:
+            continue
+        q.append([s - 1 if s > g else s, m])
+    manifest["redo_queue"] = q
+
+    # ⑥ 自动成片：内容已对不上，整份清掉（下次运行自动重拼）。
+    # 只有删的是**链内**的槽才清——越界空转（前端刚加段还没落盘）不该顺手把成片删了。
+    dropped = 0
+    if drop_finals and g < max(total, done):
+        for rel in (manifest.get("finals") or []):
+            base = os.path.basename(str(rel or "").replace("\\", "/"))
+            if not base:
+                continue
+            for cand in (os.path.join(root, str(rel).replace("\\", "/")),
+                         os.path.join(root, "finals", base),
+                         os.path.join(root, base)):
+                try:
+                    if os.path.isfile(cand):
+                        os.remove(cand)
+                        dropped += 1
+                        break
+                except OSError:
+                    pass
+        manifest["finals"] = []
+
+    # done/total 各减一；删的是"total 之外的槽"（前端刚加还没落盘的那段）时
+    # total 不动——它记的是上一次落盘的段数，紧跟的 save_prompts 会重算。
+    manifest["done"] = done - 1 if g < done else done
+    manifest["total"] = max(0, total - 1) if g < total else total
+    manifest["updated_at"] = time.time()
+    manifest["revision"] = int(manifest.get("revision") or 1) + 1
+    manifest["manifest_schema"] = MANIFEST_SCHEMA
+    checkpoint.save_manifest(root, manifest)
+    try:
+        from . import library as _h3lib
+        _h3lib.invalidate(name)          # 段视频/缩略图改名，素材索引得重新扫
+    except Exception:
+        pass
+    return manifest, {"slot": g, "dropped_finals": dropped,
+                      "done": manifest["done"], "total": manifest["total"]}
+
+
 def _allowed_merge_roots(root: str) -> list:
     """合并来源允许落在哪些根目录下：本项目目录 + 全局素材库。"""
     out = [os.path.realpath(root)]

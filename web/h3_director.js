@@ -3585,15 +3585,136 @@ function addPromptSegment(node) {
     scheduleRefresh(60);
 }
 
-function removePromptSegment(node, idx) {
+/* 槽位整体前移后，段级引用里**带段号的 latent 文件名**必须一起改：
+ * latent/seg003_auto.pt → latent/seg002_auto.pt（后端已经把盘上的文件改名了）。
+ * 不改就是「锚指向一个不存在的文件」—— 下次运行直接报缺文件，而用户根本不知道
+ * 是删段引起的。只认 seg_/seg + 三位数字这两种形态（自动切片与存档 latent），
+ * 其余文件名（assets/xxx.png、自定义 latent 名）原样不动。 */
+function shiftSegRefName(v, g) {
+    if (typeof v !== "string" || !v) return v;
+    return v.replace(/((?:up)?seg_?)(\d{3,})/g, (m, head, digits) => {
+        const k = parseInt(digits, 10);
+        if (!Number.isFinite(k) || k <= g) return m;
+        return head + String(k - 1).padStart(digits.length, "0");
+    });
+}
+
+/** 把 ds.segments 里所有「指向某段 latent」的引用按删除槽位 g 前移一位。 */
+function shiftSegmentRefs(segs, g) {
+    (segs || []).forEach((s) => {
+        if (!s || typeof s !== "object") return;
+        if (s.latent_ref && s.latent_ref.src && typeof s.latent_ref.src === "object") {
+            s.latent_ref.src.file = shiftSegRefName(s.latent_ref.src.file, g);
+        }
+        if (s.tail_src && typeof s.tail_src === "object") {
+            s.tail_src.latent = shiftSegRefName(s.tail_src.latent, g);
+        }
+        (Array.isArray(s.anchors) ? s.anchors : []).forEach((a) => {
+            if (a && a.src && typeof a.src === "object") a.src.ref = shiftSegRefName(a.src.ref, g);
+        });
+    });
+}
+
+/** 删除某段：**连同存档一起删**，其后各段整体前移一位（段号自动顺延）。
+ *
+ *  只删前端提示词是删不干净的（旧实现）：manifest 的 videos/thumbs/seeds/
+ *  prompt_hashes/seg_res 都**按槽位对齐**，段 mp4/缩略图/latent 切片也按槽位
+ *  编号命名——删了提示词却不搬这些，段 3 的卡片就会挂着段 4 的视频、done 还停在
+ *  全链完成数、被删段的 seg_XXX.mp4 原封不动留在盘上。
+ *  真正的删除+前移在服务端 `/h3chain/delete_segment`（见 projects.delete_segment），
+ *  前端只负责把提示词数组同步过去（后端**故意不碰** prompts/seg_fields）。
+ *
+ *  ⚠ 删完会留下一处**新接缝**：前移进来的段，头桥是照着已删段生成的（桥帧还在
+ *  latent 里），与新的上段之间可能跳变。要它顺滑就对该段「🎲 重摇此段」。
+ *
+ *  data = 卡片渲染时的 {mf, plan, ds, state}（要 mf.done / has_prologue 算全局槽位）。
+ */
+async function removePromptSegment(node, idx, data) {
     const ds = getDs(node);
     if (idx < 0 || idx >= ds.prompts.length) return;
+    /* 合并导出正在读盘上的分段 mp4：这时改名/删除会把编码流抽走（同重摇的守卫） */
+    if (mergeJob.running) { alert("合并导出进行中：等它跑完再删段"); return; }
+    const mf = data?.mf || null;
+    const state = data?.state || null;
+    const off = planOff(mf);
+    const done = Math.max(0, Number(mf?.done ?? state?.done ?? 0) - off);
+    const dir = state?.dir || getDirValue(node) || "";
+    const g = off + idx;                       // 全局 0-based 槽位
+    const segNo = idx + 1;
+    const hasMf = !!dir && !!mf;               // 有 manifest 才谈得上存档
+    const generated = hasMf && g < done;       // 这一段是否已生成（有产物可删）
+    const z = (k) => String(k).padStart(3, "0");
+    const hasNext = ds.prompts.length > segNo;   // 后面还有段才谈得上"前移"
+    let tail = "";
+    if (hasMf) {
+        tail = "\n\n存档会一起处理：\n"
+            + (generated
+                ? `· 本段产物删除：seg_${z(g)}.pt、分段成片 seg_${z(g)}.mp4、缩略图、尾帧锚、\n`
+                    + `  一采另存与 latent 切片（latent/seg${z(g)}_auto*.pt）；\n`
+                : "")
+            + (hasNext
+                ? `· 其后的段整体前移一位（段 ${segNo + 1}→段 ${segNo} …），段号与产物一起挪；\n`
+                : "")
+            + "· 项目里自动合成的成片（finals/）会一并清掉（下次运行自动重拼）";
+        if (generated && g > 0) {
+            tail += `；\n· 段 ${segNo} 与上一段之间的接缝没有按新邻居重采样，可能跳变 —— `
+                + "要顺滑就对该段「🎲 重摇此段」";
+        }
+        tail += "。";
+    }
+    if (!confirm(`删除段 ${segNo}（提示词第 ${segNo} 段）？` + tail)) return;
+    /* 挂起的 1.5s 落盘先作废：它捕获的是**删除前**的提示词，落盘会把删掉的段写回去 */
+    clearTimeout(promptFlushTimer);
+    promptFlushJob = null;
+    if (hasMf) {
+        try {
+            const r = await api.fetchApi("/h3chain/delete_segment", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ dir, slot: g, drop_finals: true }),
+            });
+            if (r.status === 404 || r.status === 405) {
+                setApiError(`删段接口未注册（HTTP ${r.status}）：请重启 ComfyUI 并检查控制台`
+                    + `「路由已注册」日志。本次未删除任何存档。`);
+                return;
+            }
+            if (!r.ok) {
+                const j = await r.json().catch(() => ({}));
+                alert(`删除失败：${j.error || `HTTP ${r.status}`}`);
+                return;
+            }
+        } catch (e) {
+            alert(`删除失败：${e}`);
+            return;
+        }
+    }
+    /* 提示词/分段字段本地同步（后端不碰这两份，它按前端这份为准） */
     ds.prompts.splice(idx, 1);
     if (ds.segments) ds.segments.splice(idx, 1);
-    if (!ds.prompts.length) { ds.prompts = [""]; if (ds.segments) ds.segments = [defaultSegment()]; }
+    /* 段级 latent 引用跟着改名（后端已把 latent/segNNN_auto*.pt 前移） */
+    shiftSegmentRefs(ds.segments, g);
+    /* 重摇标记也按同一规则前移：槽位号变了，留着会指到别的段上 */
+    if (Array.isArray(ds.redo_segs) && ds.redo_segs.length) {
+        ds.redo_segs = ds.redo_segs
+            .filter((x) => x && Number(x.slot) !== g)
+            .map((x) => ({ ...x, slot: Number(x.slot) > g ? Number(x.slot) - 1 : Number(x.slot) }));
+    }
+    /* 删到一段不剩 → 立刻补一条**崭新的空段**（提示词空串 + 默认分段字段）：
+     * 面板永远至少有一张段卡可编辑，用户不必再点「＋」从头开始。
+     * 注意顺序：先 shiftSegmentRefs（此时数组里只剩要保留的段），再补空段 ——
+     * 反过来的话新空段会被当成"原第 2 段"白改一遍名字。 */
+    const wiped = !ds.prompts.length;
+    if (wiped) {
+        ds.prompts = [""];
+        if (ds.segments) ds.segments = [defaultSegment()];
+    }
     setDs(node, ds);
     if (_selSeg >= ds.prompts.length) _selSeg = Math.max(0, ds.prompts.length - 1);
-    schedulePromptFlush(node);
+    /* 立刻落盘（别等防抖）：manifest 里的 prompts 必须和删完的数组对齐 */
+    await flushPrompts(node, dir || getDirValue(node));
+    setLed("idle", wiped
+        ? `段 ${segNo} 已删除：链已清空，已新建一段空白段`
+        : (generated ? `段 ${segNo} 已删除，其后各段前移一位` : `段 ${segNo} 已删除`));
     scheduleRefresh(60);
 }
 
@@ -7998,9 +8119,16 @@ async function stopGeneration() {
 
 /* ---------- 项目动作（游戏式存读档） ---------- */
 
-/** 提交重摇（页脚 CTA）：随机种子 + 临时开审片（逐段推进：每重摇一段暂停审看），
+/** 提交重摇（页脚 CTA）：临时开审片（逐段推进：每重摇一段暂停审看），
  *  队列快照在服务端——提交后立即恢复控件并清 ds 标记（manifest 队列接管徽章显示）。
  *  redo 与「重跑起始段」互斥（后端 redo 优先）：提交时显式清零避免旧值干扰。
+ *
+ *  ★ 种子**不再自动改**（2026-11-08）：以前这里会写一个随机种子进「种子」控件，
+ *  后端再拿存档种子 +7919 递推，重摇一次种子自己变一次——用户既复现不了某一版，
+ *  也没法「同参数再摇一次」。现在种子完全跟随链参数（画布上的「种子」控件），
+ *  想换一版请自己改它；控件开着 control_after_generate 时由 ComfyUI 自己的下拉
+ *  （fixed/increment/randomize）决定每次运行后的推进。
+ *
  *  共享参数**不再全量静默纠偏**：后端 `assert_match` 只回报不报错（2026-10-12 起
  *  连分辨率也不再硬拦），steps/cfg/采样器/调度器/fade_ratio/gate 的变更
  *  「只回报、不报错、不触发重做」（docs/手动锚定_分段latent参考规范化_实施规划.md §4.3）
@@ -8029,7 +8157,6 @@ async function submitRedo() {
         return;
     }
     setWidgetValue(node, W_REROLL, 0);
-    setWidgetValue(node, W_SEED, Math.floor(Math.random() * 2 ** 48));
     const ds = getDs(node);          // redo_segs 已在弹窗标记时写入
     setDs(node, ds);
     syncModeWidget(node, ds.mode);
@@ -8070,8 +8197,8 @@ function openRerollModal(idx, data) {
     const dialog = el("div", "h3d-dialog");
     dialog.innerHTML = `
         <h3>🎲 重摇段 ${idx + 1}</h3>
-        <p class="h3d-lead">只重做这一段（换种子重新采样），其余段保留不动——
-        可先给多段分别标记，再点页脚「重摇已标记 N 段」一次提交（互不级联）。
+        <p class="h3d-lead">只重做这一段（种子跟随链参数的「种子」控件，不再自动换种子），
+        其余段保留不动——可先给多段分别标记，再点页脚「重摇已标记 N 段」一次提交（互不级联）。
         锚定模式决定重采样时模型看向哪些接缝锚点（与本段「独立镜头」属性无关）。</p>
         <div class="h3d-sub">锚定模式${cur ? `（当前：${cur}）` : ""}</div>`;
     const optrow = el("div", "h3d-optrow");
@@ -8188,7 +8315,7 @@ function openRerollModal(idx, data) {
 /** 只跑某一段（预览下一段）：审片模式组合，顺序生成段 done+1 后暂停（无损）。
  *  segNo = done+1：不设重跑 → 顺序生成下一段后暂停；
  *  segNo > done+1：链式续拍必须按顺序，拦截并说明；
- *  segNo <= done：已完成段不走此入口（「重摇」只重做本段 /「从这段继续」级联重做）。
+ *  segNo <= done：已完成段不走此入口（「重摇」只重做本段 /「从这段继续」从该段起重做）。
  *  队列提交后立即还原控件（提示词快照已在服务端，用户界面不残留临时值）。 */
 async function doRunOnly(segNo, done) {
     const node = findNode();
@@ -8197,7 +8324,7 @@ async function doRunOnly(segNo, done) {
     if (segNo !== done + 1) {
         alert(`链式续拍需按顺序生成：段 ${done + 1} 尚未完成。\n`
             + `请先连续生成到段 ${done + 1}（普通「▶ 继续」每次一段）；`
-            + `已完成段想重做请用「🎲 重摇」（只重做该段）或「▶ 从这段继续」（其后全部重做）。`);
+            + `已完成段想重做请用「🎲 重摇」（只重做该段）或「▶ 从这段继续」（从该段起重做）。`);
         return;
     }
     const prevReview = getWidgetValue(node, "审片模式") ?? "关闭";
@@ -8221,41 +8348,58 @@ async function doRunOnly(segNo, done) {
     scheduleRefresh();
 }
 
-/** 从段 idx+1 之后继续生成到底（游戏读档语义）：
- *  保留第 1..n 段（n=idx+1，plan 口径），n 之后有旧存档时先截断（弹确认），
- *  然后连续生成到链尾。「重跑起始段」= 全局 1-based（序章占 1），提交后立即还原——
- *  残留旧值会让下一次普通运行再次截断（本次修复的隐患）。
+/** 从**本段**起重做（游戏读档语义）：段 n（n=idx+1，plan 口径）及其后的旧存档先截断，
+ *  然后从段 n 起按序重新生成。
+ *
+ *  ★ 起点是**本段**（2026-11-08 改）：旧实现传 `n+off+1`，实际从段 n+1 起跑 ——
+ *  点「从这段继续」得到的却是"跳过本段、从下一段开始"，与本段不满意的使用场景
+ *  （想重做这一段）正好相反。现在传 `n+off`，第 n 段自己也会重采样。
+ *
+ *  ★ 是否"只生成这一段"由**审片模式**决定，本函数不覆盖它：
+ *   · 审片模式=逐段确认 → 后端截断后只生成段 n 就 break（预览一段，满意再续）；
+ *   · 审片模式=关闭 → 截断后一口气生成到链尾。
+ *
+ *  「重跑起始段」= 全局 1-based（序章占 1），提交后立即还原——残留旧值会让下一次
+ *  普通运行再次截断（本次修复的隐患）。
  *
  *  ⚠ `off` 必须由调用方传 `planOff(mf)`：`重跑起始段` 是**全局 1-based 段号**
  *  （序章占 1 号）。少了 off，有上传序章的项目会连序章一起截断＝整链重做。
  *
- *  ⚠ 分辨率边界（2026-10-12）：已保留段是旧分辨率、当前画布是新分辨率时，
- *  续拍的**第一段**（段 n+1）不会参考段 n —— **只有这一处断开**，其后各段
- *  照常互相引用上段；全链分辨率不一致 → 本次不自动成片（只提示，不阻断）。 */
+ *  ⚠ 分辨率边界（2026-10-12）：保留段是旧分辨率、当前画布是新分辨率时，重做的
+ *  **第一段**（段 n）不会参考段 n-1 —— **只有这一处断开**，其后各段照常互相引用
+ *  上段；全链分辨率不一致 → 本次不自动成片（只提示，不阻断）。 */
 async function continueFromSegment(idx, done, off, mf) {
     const node = findNode();
     if (!node) { alert("画布上未找到 H3 Seamless Chain 节点"); return; }
     const offN = Number(off) || 0;
     const n = idx + 1;
+    const review = String(getWidgetValue(node, "审片模式") ?? "关闭") === "逐段确认";
+    /* 重做起点 = 段 n 自己的全局槽位（0-based = offN+n-1），
+     * 「重跑起始段」是 1-based → offN+n。链首（段 1、无序章）时为 1。 */
+    const reroll = n + offN;
     let resNote = "";
     const _curWH = currentCanvasWH(node);
-    /* 保留段的**最后一段**（全局槽位 = offN + n - 1；序章占 0 号）的分辨率。
-     * 按槽位读 seg_res，不拿 params 顶替——params 只代表"上次运行画布"，
-     * 重摇过靠后段时它与段 n 无关。 */
-    const _prevWH = archivedRes(mf, offN + n - 1);
+    /* **保留段的最后一段** = 段 n 的上一段（全局槽位 = offN+n-2；序章占 0 号，
+     * 段 1 时它就是序章；无序章时 -1 → null）。按槽位读 seg_res，不拿 params
+     * 顶替——params 只代表"上次运行画布"，重摇过靠后段时它与段 n-1 无关。 */
+    const _prevWH = archivedRes(mf, offN + n - 2);
     if (_curWH && _prevWH && (_curWH[0] !== _prevWH[0] || _curWH[1] !== _prevWH[1])) {
-        resNote = `\n\n⚠ 当前画布 ${_curWH[0]}×${_curWH[1]} 与已保留段的 `
+        resNote = `\n\n⚠ 当前画布 ${_curWH[0]}×${_curWH[1]} 与保留的上一段的 `
             + `${_prevWH[0]}×${_prevWH[1]} 不同：\n`
-            + `· 段 ${n + 1}（续拍的第一段）不会参考段 ${n} —— 只有这一处断开，`
+            + `· 段 ${n}（重做的第一段）不会参考段 ${n - 1} —— 只有这一处断开，`
             + "其后各段仍照常引用上段；\n"
             + "· 全链分辨率不一致时最终不会自动成片（分段 mp4 与合并导出都正常）。";
     }
-    if ((n < done || resNote)
-        && !confirm(`从段 ${n + 1} 继续生成？\n段 ${n + 1} 之后的旧存档会被丢弃，`
-            + `从段 ${n + 1} 起逐段重新生成到链尾。` + resNote)) return;
+    const scope = review
+        ? `本次只生成段 ${n} 就暂停（审片模式=逐段确认），段 ${n + 1} 起下次运行按序续上`
+        : `本次从段 ${n} 起一路生成到链尾（审片模式=关闭）`;
+    if (!confirm(`从段 ${n} 起重做？\n`
+        + `段 ${n} 及其之后的旧存档会被丢弃，${scope}。`
+        + (n < done ? `\n（原有段 ${n}-${done} 共 ${done - n + 1} 段存档将被清掉）` : "")
+        + resNote)) return;
     const prevReroll = getWidgetValue(node, W_REROLL) ?? 0;
-    setWidgetValue(node, W_REROLL, n < done ? n + offN + 1 : 0);
-    setLed("running", `从段 ${Math.min(n + 1, done + 1)} 续拍已提交`);
+    setWidgetValue(node, W_REROLL, reroll);
+    setLed("running", `从段 ${n} 重做已提交（${review ? "只跑这一段" : "跑到链尾"}）`);
     await queuePrompt();
     setWidgetValue(node, W_REROLL, prevReroll);
 }
@@ -11769,20 +11913,20 @@ function buildCards(data) {
                 };
                 actions.append(back);
             } else if (isDone) {
-                /* 已完成段两个入口：「从这段继续」= 其后全部级联重做（主动想全重来时用）；
-                   「重摇」= 只重做本段（换种子，按锚定模式接缝），其余段保留不动——
-                   可标记多段后由页脚统一提交（间隔选择重做，互不级联） */
+                /* 已完成段两个入口：「从这段继续」= 从**本段**起重做（本段也重采样，
+                   审片模式下只跑这一段、关闭时一路到链尾）；「重摇」= 只重做本段
+                   （按锚定模式接缝、种子跟随链参数），其余段保留不动——可标记多段
+                   后由页脚统一提交（间隔选择重做，互不级联） */
                 const cont = el("button", "h3d-btn h3d-btn-cta", "▶ 从这段继续");
-                cont.title = `保留段 1–${idx + 1}，从段 ${idx + 2} 起连续生成到链尾`
-                    + (idx + 1 < done ? `（段 ${idx + 2} 之后的旧存档会被丢弃）` : "")
-                    + "；若当前画布与已保留段分辨率不同，段 "
-                    + `${idx + 2} 不参考段 ${idx + 1}（只有这一处断开），且不会自动成片`;
+                cont.title = `从段 ${idx + 1} 起重做：段 ${idx + 1} 也会重新采样，`
+                    + `其后各段按序重做（当前画布与保留段分辨率不同时，段 ${idx + 1} `
+                    + "不参考上一段，只有这一处断开）";
                 cont.onclick = () => continueFromSegment(idx, done, off, mf);
                 actions.append(cont);
                 const rerollBtn = el("button", "h3d-btn", redoMode ? "🎲 重摇·改标记" : "🎲 重摇此段");
-                rerollBtn.title = `只重做段 ${idx + 1}（换种子重新采样，按锚定模式接缝），其余段保留不动；`
-                    + `可连续标记多段，点页脚「重摇已标记 N 段」一次提交；`
-                    + `「从这段继续」才是该段之后全部重做`;
+                rerollBtn.title = `只重做段 ${idx + 1}（种子跟随链参数的种子，按锚定模式接缝），`
+                    + `其余段保留不动；可连续标记多段，点页脚「重摇已标记 N 段」一次提交；`
+                    + `「从这段继续」才是从该段起级联重做`;
                 rerollBtn.onclick = () => openRerollModal(idx, data);
                 actions.append(rerollBtn);
             } else {
@@ -11793,8 +11937,9 @@ function buildCards(data) {
             }
             if (node && it.idx !== undefined) {
                 const rm = el("button", "h3d-btn h3d-btn-danger", "✕ 删除此段");
-                rm.title = "删除这一段提示词（其后段落自动前移）";
-                rm.onclick = () => removePromptSegment(node, it.idx);
+                rm.title = "删除这一段（提示词 + 已生成的分段存档/成片/latent 切片），"
+                    + "其后各段整体前移一位（段 3 变段 2 …）；新接缝可能跳变，需要顺滑就重摇该段";
+                rm.onclick = () => removePromptSegment(node, it.idx, data);
                 actions.append(rm);
             }
         }
@@ -13140,7 +13285,7 @@ function renderFooter(z, data) {
         run.disabled = true;
         run.textContent = "▶ 开始生成（先配置段落）";
     } else if (pend && node) {
-        /* 重摇标记优先（最新意图）：提交=随机种子+逐段审片推进；
+        /* 重摇标记优先（最新意图）：提交=逐段审片推进（种子跟随链参数，不自动换）；
            队列残留段后端自动合并进本次执行 */
         run.disabled = false;
         run.textContent = `🎲 重摇已标记 ${pend} 段`;

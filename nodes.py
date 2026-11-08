@@ -406,26 +406,19 @@ def _parse_redo_segs(ds, done, exec_kinds, off, disabled=None):
     return out
 
 
-_REDO_SEED_STEP = 7919   # 重摇步长（素数；与接缝自动重摇的 `cur_seed += 7919` 同款）
+def _redo_seed(ctrl_seed, i, archived=None):
+    """重摇段种子：**跟随链参数的种子**（控件种子 + 段序号），不再自动换种子。
 
+    历史（2026-09-16 ~ 2026-11-08）：重摇段曾经「从本段存档种子推进一个素数步长」，
+    于是每点一次「重摇此段」种子就自己变一次 —— 用户无法复现某一版，也没法
+    「同参数再摇一次拿同一版」。现在这条自动换种子的通道整条去掉：种子只认画布上
+    的「种子」控件（与「重跑起始段」同一规则 `控件种子 + 段序号`），
+    想要新一版就自己改控件种子；控件开着 control_after_generate 时由 ComfyUI
+    自己的下拉（fixed/increment/randomize）决定每次运行后的推进方式。
 
-def _redo_seed(ctrl_seed, i, archived):
-    """重摇段种子：**从本段存档种子推进一个素数步长**（无存档才回落到控件种子）。
-
-    为什么不再用「控件种子 + i」：一次跑完的链里 `seeds[g]` 恰好就等于
-    `控件种子 + i`，于是首次重摇落到 +1、第二次又落回 `控件种子 + i`（＝原版）、
-    第三次再 +1 …… **连续重摇只在两个种子之间来回**，用户第二版拿到的正是原来
-    那一版（观感就是"重摇没用 / 越摇越差"）。从存档种子推进则每次都换新种子，
-    且按模运算周期不会回到任何旧版；base_hash 每次都变 → 二采记录自动失效
-    重渲（重摇换种子 = 高清必须跟着重做）。
-
-    `archived` 缺失/非法（极老存档、槽位越界）才退回「控件种子 + i」，与
-    「重跑起始段」同规则。想指定某个种子：用「重跑起始段」+ 改控件种子。
+    `archived` 只为兼容旧调用签名保留，**不参与计算**：存档种子是"上一版用了什么"
+    的记录，不是"这一版该用什么"。
     """
-    try:
-        return (int(archived) + _REDO_SEED_STEP) % 0xffffffffffffffff
-    except (TypeError, ValueError):
-        pass
     return (int(ctrl_seed) + i) % 0xffffffffffffffff
 
 
@@ -1340,7 +1333,10 @@ class H3SeamlessChainSampler(io.ComfyNode):
                                        "全部落在项目文件夹 output/h3_projects/<项目名>/ 内，报告注明路径。"
                                        "「分段」=落存档+分段视频（等价旧「自动存档」，可续跑）；"
                                        "是否拼完整成片由「自动成片」开关独立控制。开启后存档自动启用"),
-                io.Int.Input("重跑起始段", default=0, min=0, max=63,
+                # max=65：段数上限 64 + 序章占 1 号。前端「▶ 从这段继续」现在从**本段**
+                # 起跑，最后一段的全局 1-based 号正好是 65（有序章时）——旧上限 63 会
+                # 在 64 段链上被静默夹到 63，从倒数第二段起跑（错一段）。
+                io.Int.Input("重跑起始段", default=0, min=0, max=65,
                              tooltip="0=自动（沿用存档进度，改过提示词的段自动重做）；N=从第 N 段起丢弃存档重新生成"
                                      "（有序章时序章为第 1 段），配合改「种子」即可重摇该段及之后。用完记得改回 0"),
                 io.Combo.Input("接缝重摇", options=["关闭", "自动"], default="关闭",
@@ -4398,14 +4394,13 @@ class H3SeamlessChainSampler(io.ComfyNode):
                 frames, wav, sample_rate, end_t, vis_len, seg_bridge_score, gate_lines = \
                     _decode_crop(i, video_t, audio_t, skip_f, gi=g, next_bridge=next_wants_bridge)
             else:
-                # 种子规则：重摇段用控件种子（与存档相同则 bump +1，保证每次重摇必变
-                # ——base_hash 随种子变化驱动二采自动重渲）；重摇（重跑起始段>0）用
-                # 控件种子；否则延续断点种子序列的等差，使审片多轮运行与一次跑完
-                # 逐帧一致；断点无生成段种子（仅序章/新链）才用控件种子
-                if _redo_mode is not None:
-                    cur_seed = _redo_seed(seed, i, seeds[g] if g < len(seeds) else None)
-                elif reroll > 0:
-                    cur_seed = (seed + i) % 0xffffffffffffffff
+                # 种子规则：重摇段 与「重跑起始段」一律**跟随链参数的种子**（控件种子 +
+                # 段序号）——2026-11-08 起重摇不再自动换种子：同一份参数重复重摇得到
+                # 同一版（可复现），想换一版就自己改「种子」控件。其余情况延续断点种子
+                # 序列的等差，使审片多轮运行与一次跑完逐帧一致；断点无生成段种子
+                # （仅序章/新链）才用控件种子。
+                if _redo_mode is not None or reroll > 0:
+                    cur_seed = _redo_seed(seed, i)
                 elif len(seeds) > off:
                     cur_seed = (seeds[-1] + g - len(seeds) + 1) % 0xffffffffffffffff
                 else:

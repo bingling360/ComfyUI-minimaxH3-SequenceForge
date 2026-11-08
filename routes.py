@@ -11,6 +11,7 @@
 - GET  /upscale_models  列出 latent_upscale_models 目录里的放大权重（二采面板下拉）
 - GET  /bridge_models   列出本插件 models/ 里的语义桥权重（语义桥面板下拉）
 - POST /upscale_reset   清掉某段的二采记录与高清产物（下次运行重做该段）
+- POST /delete_segment  删除某段存档并让其后各段整体前移（段号顺延）
 
 均受限于输出目录内、防目录穿越；无新依赖。
 注册有运行期兜底：ensure_registered() 幂等重试，节点执行时会再调一次，
@@ -94,6 +95,7 @@ ROUTES = [
     ("POST", "/h3chain/merge"),
     ("POST", "/h3chain/upscale_reset"),
     ("POST", "/h3chain/redo_cancel"),
+    ("POST", "/h3chain/delete_segment"),
     ("POST", "/h3chain/expand"),
     ("POST", "/h3chain/expand_multi"),
     ("POST", "/h3chain/expand_optimize"),
@@ -563,6 +565,27 @@ def add_routes(routes):
         except ValueError as e:
             return _err(str(e), code="BAD_REQUEST", status=400)
         return web.json_response({"ok": True, "manifest": manifest})
+
+    async def delete_segment(request):
+        """删除某一段的存档并让其后各段整体前移（段号顺延）。
+
+        前端「✕ 删除此段」的后端一半：只删提示词是删不干净的（段视频/缩略图/
+        latent 切片都按槽位编号命名，manifest 的 videos/thumbs/seeds 也按槽位对齐）。
+        详细语义见 `projects.delete_segment`。`slot` 是 0-based 全局槽位。
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return _err("请求体不是合法 JSON", code="BAD_JSON", status=400)
+        try:
+            manifest, info = projects.delete_segment(
+                str(data.get("dir") or ""), data.get("slot"),
+                drop_finals=data.get("drop_finals", True) is not False)
+        except ValueError as e:
+            return _err(str(e), code="BAD_REQUEST", status=400)
+        d = str(data.get("dir") or "")
+        return web.json_response({"ok": True, **info,
+                                  "manifest": projects.with_viewable_paths(d, manifest)})
 
     async def redo_cancel(request):
         """撤销重摇标记：从 manifest 重摇队列移除该槽位（幂等）。"""
@@ -3288,6 +3311,7 @@ def add_routes(routes):
         ("POST", "/h3chain/merge", merge),
         ("POST", "/h3chain/upscale_reset", upscale_reset),
         ("POST", "/h3chain/redo_cancel", redo_cancel),
+        ("POST", "/h3chain/delete_segment", delete_segment),
     ]
 
     def _mount(target, method, path, handler):

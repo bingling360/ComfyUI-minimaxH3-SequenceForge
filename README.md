@@ -399,15 +399,19 @@ Review mode auto-enables archiving (otherwise cross-run continuation is impossib
 
 - **Prompt-change auto re-run** (`重跑起始段=0`): per-segment prompt hashing. Changing segment *N* rebuilds **only segment *N*** — double-anchored against segment *N-1*'s archived tail and segment *N+1*'s archived head, then slotted back. No cascade. Changing sampling params (steps / CFG / sampler / scheduler / model) triggers **no** redo; it only affects newly generated segments. **Resolution is no longer a hard constraint either** (2026-10-12): archived segments keep their own resolution and only newly generated ones use the current canvas; where neighbours differ, the automatic "reference previous tail" bridge and seam metrics are skipped, and a mixed-resolution chain is not auto-composed — all advisory, never blocking.
 - **Targeted reroll** (`重跑起始段=N`): discard the archive from segment *N*, regenerate *N* and onward with `seed + segment number`. Without changing the seed it equals a plain redo; change the seed for new randomness.
+- **Console buttons (2026-11-08).**
+  - `▶ continue from here` on segment *N* = discard *N* and everything after it, then regenerate **starting at *N* itself**. With `审片模式=逐段确认` it stops after that one segment; with review off it runs to the end of the chain.
+  - `🎲 reroll this segment` = re-sample **only** *N* (anchored by the chosen mode). The seed now simply **follows the chain seed** (`seed` widget + segment number) — the old auto-bump (+7919 from the archived seed) and the front-end random seed are gone, so the same settings reproduce the same take; change the `种子` widget for a new one.
+  - `✕ delete this segment` = delete the prompt **and** its archive, then shift every following segment up by one slot (files renamed, manifest slot lists moved, `latents/segNNN_auto*` slices renamed, stale auto-final removed). The new seam is not re-sampled, so reroll segment *N* afterwards if it jumps.
 
 ---
 
 ## 13. Selective redo
 
-`▶ continue from here` cascades through all following segments. To swap out only a few segments and keep the rest:
+`▶ continue from here` reruns the clicked segment **and** cascades through all following segments (it starts at that segment, not the next one). To swap out only a few segments and keep the rest:
 
 1. On a finished segment, click `🎲 reroll` → choose an **anchor mode** (default double) → *mark*. Mark as many segments as you like; cards show a `🔁 pending reroll · mode` badge.
-2. Submit with the footer's `🎲 reroll N marked segments`. A random seed is derived and review mode is temporarily enabled; the queue snapshot goes into `manifest.redo_queue`. Pending marks can be cancelled.
+2. Submit with the footer's `🎲 reroll N marked segments`. The seed stays whatever the chain's `种子` widget says (no auto-randomisation); review mode is temporarily enabled and the queue snapshot goes into `manifest.redo_queue`. Pending marks can be cancelled.
 3. Review mode advances **one segment per run**; when done, one more run reassembles the full cut (or use merge export).
 4. **Anchor modes** (temporary strategy for this reroll, independent of the segment's *standalone* attribute): double (seamless replacement) / previous only / next only / none (free, hard cut at both ends). Explicit identity anchors (last-frame image, per-segment tail anchor) take priority.
 5. **Seed bump:** if a rerolled segment's seed equals the archive's, it is auto-incremented → the segment fingerprint changes → its second-pass record is invalidated and re-rendered, **without** truncating later segments' second-pass records. This is where the time savings come from.

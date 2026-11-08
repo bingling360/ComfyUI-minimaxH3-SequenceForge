@@ -153,8 +153,9 @@ const vis = (n) => (n ? n.offsetParent !== null || n.getClientRects().length > 0
         /* 只数**守卫**（带 alert 的那几处）：footer 里还有一处 `if (mergeJob.running)`
          * 是改按钮文案的，不是守卫，别一起数进来。 */
         const hits = [...DIR_SRC.matchAll(/if \(mergeJob\.running\) \{ alert\(/g)];
-        assert.strictEqual(hits.length, 4,
-            "该有 4 处互斥守卫（二采提交 / 提交生成 / 提交重摇 / 标记重摇），实际 " + hits.length);
+        assert.strictEqual(hits.length, 5,
+            "该有 5 处互斥守卫（二采提交 / 提交生成 / 提交重摇 / 标记重摇 / 删除此段），实际 "
+            + hits.length);
     });
 
     await t("入口在**标题栏最右**（✕ 左边），不在工具条；两个按钮此刻还不出现", async () => {

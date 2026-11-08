@@ -114,7 +114,7 @@ function boot(node, mf) {
         ok(!/当前画布/.test(txt3), "邻居已标重摇 → 不再报分辨率边界", txt3);
     }
 
-    /* ---------- 3) 「从这段继续」：重跑起始段必须带 off ---------- */
+    /* ---------- 3) 「从这段继续」：从**本段**起重做，且必须带 off ---------- */
     /* 提交后 `continueFromSegment` 会把「重跑起始段」还原（防残留旧值让下次普通
      * 运行再次截断），所以不能在调用后读控件——改成拦 `setWidgetValue` 记录落值。 */
     function spyReroll(w) {
@@ -125,23 +125,41 @@ function boot(node, mf) {
     }
 
     {
-        /* 3a) 无序章（off=0）：从段 1 继续 → 重跑起始段 = 2 */
+        /* 3a) 无序章（off=0）：从段 1 继续 → 重跑起始段 = 1（**本段**也重采样；
+              旧实现是 2，等于跳过本段、从下一段起跑） */
         const node = mkNode("16:9", 1.0);
         const { w } = boot(node, MANIFEST);
         const seen = spyReroll(w);
         await w.continueFromSegment(0, 3, 0, MANIFEST);
         const hit = seen.filter(([name]) => name === "重跑起始段").map(([, v]) => v);
-        ok(hit[0] === 2, "无序章：从段 1 继续 → 重跑起始段 2", hit, 2);
+        ok(hit[0] === 1, "无序章：从段 1 继续 → 重跑起始段 1（含本段）", hit, 1);
 
-        /* 3b) 有序章（off=1）：序章占全局槽位 0，从段 1 继续 → 重跑起始段 3
-              （旧写法漏传 off → 2，会把序章也截掉＝整链重做） */
+        /* 3b) 有序章（off=1）：序章占全局槽位 0，从段 1 继续 → 重跑起始段 2
+              （旧写法漏传 off → 1，会把序章也截掉＝整链重做） */
         const mfP = Object.assign({}, MANIFEST, { has_prologue: true, done: 4, total: 4 });
         const node2 = mkNode("16:9", 1.0);
         const b2 = boot(node2, mfP);
         const seen2 = spyReroll(b2.w);
         await b2.w.continueFromSegment(0, 3, 1, mfP);
         const hit2 = seen2.filter(([name]) => name === "重跑起始段").map(([, v]) => v);
-        ok(hit2[0] === 3, "有序章：从段 1 继续 → 重跑起始段 3（不得连序章一起截断）", hit2, 3);
+        ok(hit2[0] === 2, "有序章：从段 1 继续 → 重跑起始段 2（不得连序章一起截断）", hit2, 2);
+
+        /* 3c) 确认框必须说清"从本段起重做"，且本次范围随审片模式变化
+              （审片开=只跑这一段；关=跑到链尾）——用户看的就这一句 */
+        const node3 = mkNode("16:9", 1.0);
+        const b3 = boot(node3, MANIFEST);
+        let msg = "";
+        b3.w.confirm = (m) => { msg = String(m); return true; };
+        await b3.w.continueFromSegment(1, 3, 0, MANIFEST);       // 段 2（done=3）
+        ok(/从段 2 起重做/.test(msg), "确认框说清从**本段**起重做", msg);
+        ok(/原有段 2-3 共 2 段存档将被清掉/.test(msg), "说清会清掉哪些存档", msg);
+        ok(/本次从段 2 起一路生成到链尾/.test(msg), "审片关闭 → 说明跑到链尾", msg);
+
+        node3.widgets.find((x) => x.name === "审片模式").value = "逐段确认";
+        msg = "";
+        await b3.w.continueFromSegment(1, 3, 0, MANIFEST);
+        ok(/本次只生成段 2 就暂停/.test(msg), "审片开启 → 说明只跑这一段", msg);
+        ok(/下次运行按序续上/.test(msg), "并说明后续段下次续（不是丢掉不管）", msg);
     }
 
     /* ---------- 4) archivedRes：按槽位读 seg_res（与后端 _archived_res 同口径） ---------- */
